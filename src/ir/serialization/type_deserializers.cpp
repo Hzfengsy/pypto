@@ -537,8 +537,25 @@ static IRNodePtr DeserializeFunction(const msgpack::object& fields_obj, msgpack:
   auto params_obj = GET_FIELD_OBJ("params");
   if (params_obj.type == msgpack::type::ARRAY) {
     for (uint32_t i = 0; i < params_obj.via.array.size; ++i) {
-      params.push_back(
-          std::static_pointer_cast<const Var>(ctx.DeserializeNode(params_obj.via.array.ptr[i], zone)));
+      auto var = std::static_pointer_cast<const Var>(ctx.DeserializeNode(params_obj.via.array.ptr[i], zone));
+      params.push_back(var);
+    }
+  }
+
+  // Read param_directions; default all to In only when field is absent (backward compatibility)
+  std::vector<ParamDirection> param_directions(params.size(), ParamDirection::In);
+  auto dirs_opt = GetOptionalFieldObj(fields_obj, "param_directions", ctx);
+  if (dirs_opt.has_value()) {
+    CHECK(dirs_opt->type == msgpack::type::ARRAY)
+        << "Invalid param_directions type for Function: expected ARRAY";
+    CHECK(dirs_opt->via.array.size == params.size())
+        << "Invalid param_directions size for Function: expected " << params.size() << ", got "
+        << dirs_opt->via.array.size;
+    for (uint32_t i = 0; i < dirs_opt->via.array.size; ++i) {
+      uint8_t code = dirs_opt->via.array.ptr[i].as<uint8_t>();
+      CHECK(code <= static_cast<uint8_t>(ParamDirection::InOut))
+          << "Invalid ParamDirection value: " << static_cast<int>(code);
+      param_directions[i] = static_cast<ParamDirection>(code);
     }
   }
 
@@ -552,7 +569,7 @@ static IRNodePtr DeserializeFunction(const msgpack::object& fields_obj, msgpack:
 
   auto body = std::static_pointer_cast<const Stmt>(ctx.DeserializeNode(GET_FIELD_OBJ("body"), zone));
 
-  return std::make_shared<Function>(name, params, return_types, body, span, func_type);
+  return std::make_shared<Function>(name, params, param_directions, return_types, body, span, func_type);
 }
 
 // Deserialize Program
