@@ -573,20 +573,21 @@ class TestIRBuilderLet:
         func = f.get_result()
         assert func is not None
 
-    def test_let_with_type_mismatch(self):
-        """Test that let() raises error when explicit type doesn't match inferred type."""
+    def test_let_with_type_override(self):
+        """Test that let() uses explicit type as override instead of inferred type."""
         ib = IRBuilder()
 
-        with pytest.raises(ValueError, match="Type mismatch"):
-            with ib.function("mismatch_test") as f:
-                f.return_type(ir.ScalarType(DataType.INT64))
+        with ib.function("override_test") as f:
+            f.return_type(ir.ScalarType(DataType.INT64))
 
-                # Create INT64 expression but provide FP32 type
-                const = ir.ConstInt(42, DataType.INT64, ir.Span.unknown())
-                wrong_type = ir.ScalarType(DataType.FP32)
+            # Create INT64 expression but provide FP32 type override
+            const = ir.ConstInt(42, DataType.INT64, ir.Span.unknown())
+            override_type = ir.ScalarType(DataType.FP32)
 
-                # This should raise ValueError
-                ib.let("x", const, type=wrong_type)
+            # The explicit type should override the inferred type
+            x = ib.let("x", const, type=override_type)
+            assert isinstance(x.type, ir.ScalarType)
+            assert x.type.dtype == DataType.FP32
 
     def test_let_with_scalar_value(self):
         """Test let() with int/float values that get normalized."""

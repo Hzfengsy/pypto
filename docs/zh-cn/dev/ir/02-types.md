@@ -126,6 +126,38 @@ pipe_all = ir.PipeType(ir.PipeType.ALL) # All pipes
 unknown = ir.UnknownType()
 ```
 
+### DSL 中的 MemRef 类型注解
+
+MemRef 可以在 `@pl.program` / `@pl.function` DSL 代码中作为位置参数指定在类型注解中：
+
+```python
+import pypto.language as pl
+
+@pl.program
+class MyProgram:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, x: pl.Tensor[[64, 64], pl.FP32]):
+        # Tile with MemRef (3-arg: shape, dtype, memref)
+        tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemRef(pl.MemorySpace.Vec, 0, 16384, 0)] = pl.block.load(x, offsets=[0, 0], shapes=[64, 64])
+
+        # Tensor with MemRef (3-arg: shape, dtype, memref)
+        y: pl.Tensor[[64], pl.FP32, pl.MemRef(pl.MemorySpace.DDR, 0, 256, 1)] = pl.add(x, 1.0)
+
+        # Tensor with layout and MemRef (4-arg: shape, dtype, layout, memref)
+        z: pl.Tensor[[64], pl.FP32, pl.NZ, pl.MemRef(pl.MemorySpace.DDR, 0, 256, 2)] = pl.add(x, 1.0)
+```
+
+**`pl.MemRef(memory_space, addr, size, id)` 参数：**
+
+| 参数 | 类型 | 说明 |
+| ---- | ---- | ---- |
+| `memory_space` | `pl.MemorySpace.*` | 目标内存 (DDR, Vec, Mat, Left, Right, Acc) |
+| `addr` | `int` | 基地址偏移 |
+| `size` | `int` | 内存分配大小（字节） |
+| `id` | `int` | 内存缓冲区标识符 |
+
+**消歧义（3 参数 Tensor）：** 解析器会自动区分 `pl.MemRef(...)` 和 `pl.NZ`/`pl.DN`/`pl.ND` 布局枚举。
+
 ### MemorySpace 枚举
 
 | 值 | 说明 |

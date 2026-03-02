@@ -60,6 +60,15 @@ class TypeResolver:
         "NZ": ir.TensorLayout.NZ,
     }
 
+    _MEMORY_SPACE_MAP: dict[str, "ir.MemorySpace"] = {
+        "DDR": ir.MemorySpace.DDR,
+        "Vec": ir.MemorySpace.Vec,
+        "Mat": ir.MemorySpace.Mat,
+        "Left": ir.MemorySpace.Left,
+        "Right": ir.MemorySpace.Right,
+        "Acc": ir.MemorySpace.Acc,
+    }
+
     def __init__(
         self,
         expr_evaluator: ExprEvaluator,
@@ -192,7 +201,10 @@ class TypeResolver:
         Supports:
         - pl.Tensor[[64, 128], pl.FP16]
         - pl.Tensor[[64, 128], pl.FP16, pl.NZ]
+        - pl.Tensor[[64, 128], pl.FP16, pl.MemRef(...)]
+        - pl.Tensor[[64, 128], pl.FP16, pl.NZ, pl.MemRef(...)]
         - pl.Tile[[64, 64], pl.FP32]
+        - pl.Tile[[64, 64], pl.FP32, pl.MemRef(...)]
 
         Args:
             subscript_node: AST Subscript node
@@ -218,27 +230,26 @@ class TypeResolver:
             dtype = self.resolve_dtype(slice_value)
             return ir.ScalarType(dtype)
 
-        # Tensor supports [shape, dtype] or [shape, dtype, layout]; Tile supports [shape, dtype]
-        if not isinstance(slice_value, ast.Tuple) or len(slice_value.elts) not in (2, 3):
+        # Tensor: [shape, dtype], [shape, dtype, layout_or_memref], [shape, dtype, layout, memref]
+        # Tile: [shape, dtype], [shape, dtype, memref]
+        valid_counts = (2, 3, 4) if type_name == "Tensor" else (2, 3)
+        if not isinstance(slice_value, ast.Tuple) or len(slice_value.elts) not in valid_counts:
             if type_name == "Tensor":
                 message = (
-                    f"{type_name} subscript requires [shape, dtype] or [shape, dtype, layout], "
-                    f"got: {ast.unparse(slice_value)}"
+                    f"{type_name} subscript requires [shape, dtype], [shape, dtype, layout_or_memref], "
+                    f"or [shape, dtype, layout, memref], got: {ast.unparse(slice_value)}"
                 )
                 hint = (
-                    "Use pl.Tensor[[shape], dtype] or pl.Tensor[[shape], dtype, layout] format, e.g., "
-                    "pl.Tensor[[64, 128], pl.FP32, pl.NZ]"
+                    "Use pl.Tensor[[shape], dtype], pl.Tensor[[shape], dtype, layout], "
+                    "or pl.Tensor[[shape], dtype, pl.MemRef(...)] format"
                 )
             else:
-                message = f"{type_name} subscript requires [shape, dtype], got: {ast.unparse(slice_value)}"
-                hint = f"Use pl.{type_name}[[shape], dtype] format, e.g., pl.{type_name}[[64, 128], pl.FP32]"
+                message = (
+                    f"{type_name} subscript requires [shape, dtype] or [shape, dtype, memref], "
+                    f"got: {ast.unparse(slice_value)}"
+                )
+                hint = f"Use pl.{type_name}[[shape], dtype] or pl.{type_name}[[shape], dtype, pl.MemRef(...)]"
             raise ParserTypeError(message, hint=hint)
-
-        if len(slice_value.elts) == 3 and type_name != "Tensor":
-            raise ParserTypeError(
-                f"Layout is only supported for Tensor, not {type_name}",
-                hint=f"Use pl.{type_name}[[shape], dtype] format without layout",
-            )
 
         shape_node = slice_value.elts[0]
         dtype_node = slice_value.elts[1]
@@ -246,15 +257,44 @@ class TypeResolver:
         shape = self._to_ir_shape(self._parse_shape(shape_node))
         dtype = self.resolve_dtype(dtype_node)
 
-        if type_name == "Tile":
-            return ir.TileType(shape, dtype)
+        n_elts = len(slice_value.elts)
 
-        if len(slice_value.elts) == 3:
-            layout = self.resolve_layout(slice_value.elts[2])
+        # 2 args: [shape, dtype]
+        if n_elts == 2:
+            if type_name == "Tile":
+                return ir.TileType(shape, dtype)
+            return ir.TensorType(shape, dtype)
+
+        # 3 args: [shape, dtype, layout_or_memref] for Tensor, [shape, dtype, memref] for Tile
+        if n_elts == 3:
+            third = slice_value.elts[2]
+            if type_name == "Tile":
+                if not self._is_memref_node(third):
+                    raise ParserTypeError(
+                        "Tile 3rd argument must be pl.MemRef(...)",
+                        hint="Use pl.Tile[[shape], dtype, pl.MemRef(...)]",
+                    )
+                memref = self.resolve_memref(third)
+                return ir.TileType(shape, dtype, memref)
+            # Tensor: disambiguate 3rd arg
+            if self._is_memref_node(third):
+                memref = self.resolve_memref(third)
+                return ir.TensorType(shape, dtype, memref)
+            layout = self.resolve_layout(third)
             tensor_view = ir.TensorView([], layout)
             return ir.TensorType(shape, dtype, None, tensor_view)
 
-        return ir.TensorType(shape, dtype)
+        # 4 args: [shape, dtype, layout, memref] — Tensor only
+        layout = self.resolve_layout(slice_value.elts[2])
+        tensor_view = ir.TensorView([], layout)
+        memref_node = slice_value.elts[3]
+        if not self._is_memref_node(memref_node):
+            raise ParserTypeError(
+                "Tensor 4th argument must be pl.MemRef(...)",
+                hint="Use pl.Tensor[[shape], dtype, layout, pl.MemRef(...)]",
+            )
+        memref = self.resolve_memref(memref_node)
+        return ir.TensorType(shape, dtype, memref, tensor_view)
 
     def _resolve_tuple_type(self, subscript_node: ast.Subscript) -> list[ir.Type]:
         """Resolve tuple[T1, T2, ...] return type annotation.
@@ -669,6 +709,151 @@ class TypeResolver:
             span=span,
             hint="Use pl.ND, pl.DN, or pl.NZ",
         )
+
+    def resolve_type_if_memref(self, annotation: ast.expr | None) -> "ir.Type | None":
+        """Resolve annotation type only when it contains MemRef information.
+
+        Returns the resolved type if the annotation includes a pl.MemRef(...)
+        argument, or None to fall back to the default inferred type.
+
+        Args:
+            annotation: Type annotation AST node, or None if not annotated
+
+        Returns:
+            Resolved IR type with memref, or None if no memref in annotation
+        """
+        if not isinstance(annotation, ast.Subscript):
+            return None
+        slice_value = annotation.slice
+        if not isinstance(slice_value, ast.Tuple):
+            return None
+        if not any(self._is_memref_node(elt) for elt in slice_value.elts):
+            return None
+        resolved = self.resolve_type(annotation)
+        if isinstance(resolved, list):
+            return None
+        return resolved
+
+    def _is_memref_node(self, node: ast.expr) -> bool:
+        """Check if an AST node is a pl.MemRef(...) call."""
+        if not isinstance(node, ast.Call):
+            return False
+        func = node.func
+        return (isinstance(func, ast.Attribute) and func.attr == "MemRef") or (
+            isinstance(func, ast.Name) and func.id == "MemRef"
+        )
+
+    def resolve_memref(self, node: ast.expr) -> "ir.MemRef":
+        """Resolve a pl.MemRef(memory_space, addr, size, id) AST call to ir.MemRef.
+
+        Args:
+            node: AST Call node for pl.MemRef(...)
+
+        Returns:
+            ir.MemRef instance
+
+        Raises:
+            ParserTypeError: If the MemRef call is malformed
+        """
+        if not isinstance(node, ast.Call):
+            raise ParserTypeError(
+                f"Expected pl.MemRef(...) call, got: {ast.unparse(node)}",
+                hint="Use pl.MemRef(pl.MemorySpace.DDR, addr, size, id)",
+            )
+
+        span = self._get_span(node)
+
+        if len(node.args) != 4:
+            raise ParserTypeError(
+                f"pl.MemRef requires 4 arguments (memory_space, addr, size, id), got {len(node.args)}",
+                span=span,
+                hint="Use pl.MemRef(pl.MemorySpace.DDR, 0, 1024, 0)",
+            )
+
+        memory_space = self._resolve_memory_space(node.args[0])
+        addr_expr = self._resolve_memref_addr(node.args[1])
+        size = self._resolve_int_literal(node.args[2], "size")
+        memref_id = self._resolve_int_literal(node.args[3], "id")
+
+        return ir.MemRef(memory_space, addr_expr, size, memref_id, span)
+
+    def _resolve_memory_space(self, node: ast.expr) -> "ir.MemorySpace":
+        """Resolve a memory space AST node (e.g., pl.MemorySpace.DDR)."""
+        span = self._get_span(node)
+
+        if isinstance(node, ast.Attribute):
+            name = node.attr
+            if name in self._MEMORY_SPACE_MAP:
+                return self._MEMORY_SPACE_MAP[name]
+            raise ParserTypeError(
+                f"Unknown memory space: {name}",
+                span=span,
+                hint=f"Use one of: {', '.join(self._MEMORY_SPACE_MAP.keys())}",
+            )
+
+        if isinstance(node, ast.Name):
+            name = node.id
+            if name in self._MEMORY_SPACE_MAP:
+                return self._MEMORY_SPACE_MAP[name]
+
+        raise ParserTypeError(
+            f"Cannot resolve memory space: {ast.unparse(node)}",
+            span=span,
+            hint="Use pl.MemorySpace.DDR, pl.MemorySpace.Vec, etc.",
+        )
+
+    def _resolve_memref_addr(self, node: ast.expr) -> "ir.Expr":
+        """Resolve a MemRef address to an IR expression."""
+        value = self._try_resolve_int(node)
+        if value is not None:
+            return ir.ConstInt(value, DataType.INT64, self._get_span(node))
+
+        raise ParserTypeError(
+            f"MemRef address must be an integer, got: {ast.unparse(node)}",
+            span=self._get_span(node),
+            hint="Use an integer value for the address, e.g., 0 or 1024",
+        )
+
+    def _resolve_int_literal(self, node: ast.expr, name: str) -> int:
+        """Resolve an AST node to an integer literal."""
+        value = self._try_resolve_int(node)
+        if value is not None:
+            return value
+
+        raise ParserTypeError(
+            f"MemRef {name} must be an integer, got: {ast.unparse(node)}",
+            span=self._get_span(node),
+            hint=f"Use an integer value for {name}",
+        )
+
+    def _try_resolve_int(self, node: ast.expr) -> int | None:
+        """Try to resolve an AST node to a Python int.
+
+        Handles integer literals, unary negation of integer literals,
+        and expressions evaluable via ExprEvaluator.
+
+        Args:
+            node: AST expression node
+
+        Returns:
+            Integer value, or None if the node cannot be resolved to an int
+        """
+        if isinstance(node, ast.Constant) and isinstance(node.value, int):
+            return node.value
+
+        if (
+            isinstance(node, ast.UnaryOp)
+            and isinstance(node.op, ast.USub)
+            and isinstance(node.operand, ast.Constant)
+            and isinstance(node.operand.value, int)
+        ):
+            return -node.operand.value
+
+        success, value = self.expr_evaluator.try_eval_expr(node)
+        if success and isinstance(value, int):
+            return value
+
+        return None
 
 
 __all__ = ["TypeResolver"]

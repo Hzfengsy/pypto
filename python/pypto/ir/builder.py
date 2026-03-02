@@ -337,7 +337,8 @@ class IRBuilder:
         common pattern of creating a variable and immediately assigning to it.
 
         The type is automatically inferred from the value expression. If an explicit
-        type is provided, it is used to validate that the inferred type matches.
+        type is provided, it overrides the inferred type (useful for annotation-driven
+        types such as memref on Tile/Tensor).
 
         For Call expressions with GlobalVar ops, the return type is automatically
         inferred from the function signature if available.
@@ -345,19 +346,16 @@ class IRBuilder:
         Args:
             name: Variable name
             value: Expression value (int, float, or Expr)
-            type: Optional type for validation. If provided, must match the inferred type.
+            type: Optional type override. If provided, used instead of the inferred type.
             span: Optional explicit span. If None, captured from call site.
 
         Returns:
             Var: The created variable
 
-        Raises:
-            ValueError: If explicit type is provided and doesn't match inferred type
-
         Example:
             >>> # Type is inferred from the expression:
             >>> x = ib.let("x", 42)
-            >>> # Or with explicit type validation:
+            >>> # Or with explicit type override:
             >>> x = ib.let("x", 42, type=ir.ScalarType(ir.DataType.INT64))
             >>> # For function calls, type is auto-inferred from function signature:
             >>> result = ib.let("result", ir.Call(func_gvar, [x], span))
@@ -384,14 +382,9 @@ class IRBuilder:
         # Infer type from the value expression
         inferred_type = value_expr.type
 
-        # If explicit type is provided, validate it matches the inferred type
-        if type is not None and type != inferred_type:
-            raise ValueError(
-                f"Type mismatch in let statement for variable '{name}':\n"
-                f"  Inferred type: {inferred_type}\n"
-                f"  Provided type: {type}"
-            )
-        final_type = inferred_type
+        # If explicit type is provided, use it as an override
+        # This supports annotation-driven types (e.g., memref on Tile/Tensor)
+        final_type = type if type is not None else inferred_type
 
         var = self._builder.var(name, final_type, actual_span)
         self._builder.assign(var, value_expr, actual_span)

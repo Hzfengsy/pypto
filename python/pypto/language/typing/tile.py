@@ -15,29 +15,37 @@ Tile represents a block in unified buffer memory, used for block-level programmi
 from collections.abc import Sequence
 
 from pypto.pypto_core import DataType
-from pypto.pypto_core.ir import Expr
+from pypto.pypto_core.ir import Expr, MemRef
 
 
 class TileMeta(type):
     """Metaclass for Tile to enable subscript notation."""
 
-    def __getitem__(cls, item: tuple[Sequence[int], DataType]) -> "Tile":
-        """Enable Tile[[shape], dtype] syntax.
+    def __getitem__(cls, item: tuple) -> "Tile":
+        """Enable Tile[[shape], dtype] and Tile[[shape], dtype, memref] syntax.
 
         Args:
-            item: Tuple of (shape, dtype)
+            item: Tuple of (shape, dtype) or (shape, dtype, memref)
 
         Returns:
-            Tile instance with shape and dtype (annotation-only mode)
+            Tile instance with shape, dtype, and optional memref
         """
-        if not isinstance(item, tuple) or len(item) != 2:
-            raise TypeError("Tile requires [shape, dtype] notation")
+        if not isinstance(item, tuple) or len(item) not in (2, 3):
+            raise TypeError("Tile requires [shape, dtype] or [shape, dtype, memref] notation")
 
+        if len(item) == 3:
+            shape, dtype, memref = item
+            return cls(shape, dtype, memref=memref, _annotation_only=True)
         shape, dtype = item
         return cls(shape, dtype, _annotation_only=True)
 
     def __call__(
-        cls, shape=None, dtype=None, expr: Expr | None = None, _annotation_only: bool = False
+        cls,
+        shape=None,
+        dtype=None,
+        expr: Expr | None = None,
+        memref: "MemRef | None" = None,
+        _annotation_only: bool = False,
     ) -> "Tile":
         """Enable both Tile((shape), dtype) syntax and runtime wrapping."""
         if (
@@ -48,8 +56,8 @@ class TileMeta(type):
             and expr is None
         ):
             real_shape, real_dtype = shape
-            return type.__call__(cls, real_shape, real_dtype, None, _annotation_only)
-        return type.__call__(cls, shape, dtype, expr, _annotation_only)
+            return type.__call__(cls, real_shape, real_dtype, None, memref, _annotation_only)
+        return type.__call__(cls, shape, dtype, expr, memref, _annotation_only)
 
 
 class Tile(metaclass=TileMeta):
@@ -80,6 +88,7 @@ class Tile(metaclass=TileMeta):
         shape: Sequence[int] | None = None,
         dtype: DataType | None = None,
         expr: Expr | None = None,
+        memref: MemRef | None = None,
         _annotation_only: bool = False,
     ):
         """Initialize Tile.
@@ -88,16 +97,19 @@ class Tile(metaclass=TileMeta):
             shape: Shape (for annotation mode)
             dtype: Data type (for annotation mode)
             expr: IR expression to wrap (for runtime mode)
+            memref: Optional memory reference
             _annotation_only: Whether this is annotation-only mode
         """
         if _annotation_only:
             self.shape = shape
             self.dtype = dtype
+            self.memref = memref
             self._expr = None
         elif expr is not None:
             self._expr = expr
             self.shape = None
             self.dtype = None
+            self.memref = None
         else:
             raise ValueError(
                 "Tile must be initialized with either (shape, dtype) for "
@@ -126,8 +138,7 @@ class Tile(metaclass=TileMeta):
         """String representation."""
         if self._expr is not None:
             return f"Tile(expr={self._expr})"
-        else:
-            return f"Tile[[{self.shape}], {self.dtype}]"
+        return f"Tile[[{self.shape}], {self.dtype}]"
 
 
 __all__ = ["Tile"]

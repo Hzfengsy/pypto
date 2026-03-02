@@ -8,6 +8,9 @@
 # -----------------------------------------------------------------------------------------------------------
 """Comprehensive tests for MemRef, MemorySpace, and TileView."""
 
+import textwrap
+
+import pypto.language as pl
 import pytest
 from pypto import DataType, ir
 from pypto.ir import IRBuilder
@@ -1067,8 +1070,8 @@ class TestPythonSyntaxPrinting:
 
         assert "pl.Tensor" in printed
         assert "pl.FP32" in printed
-        assert "memref=" in printed
-        # MemRef prints as full constructor syntax: pl.MemRef(pl.MemorySpace.DDR, addr, size, id)
+        # MemRef prints as positional arg (no keyword) with full constructor syntax
+        assert "memref=" not in printed
         assert "pl.MemRef" in printed
         assert "pl.MemorySpace.DDR" in printed
         assert "4096" in printed  # 0x1000 in decimal
@@ -1102,9 +1105,12 @@ class TestPythonSyntaxPrinting:
 
         assert "pl.Tile" in printed
         assert "pl.FP16" in printed
-        assert "memref=" in printed
-        # MemRef with name "mem_left_8" (includes memory space) prints as variable reference
-        assert "mem_left_8" in printed
+        # MemRef prints as positional arg with full constructor syntax (fixes #281)
+        assert "memref=" not in printed
+        assert "pl.MemRef" in printed
+        assert "pl.MemorySpace.Left" in printed
+        assert "8192" in printed  # 0x2000 in decimal
+        assert "512" in printed  # size
         assert "tile_view=" in printed
         assert "pl.TileView" in printed
         assert "valid_shape=" in printed
@@ -1228,7 +1234,8 @@ class TestPythonSyntaxPrinting:
 
         assert "pl.Tensor" in printed
         assert "pl.FP16" in printed
-        assert "memref=" in printed
+        # MemRef prints as positional (no keyword), tensor_view as keyword
+        assert "memref=" not in printed
         assert "pl.MemRef" in printed
         assert "tensor_view=" in printed
         assert "pl.TensorView" in printed
@@ -1329,8 +1336,10 @@ class TestIRBuilderHelpers:
         assert "pl.Tile" in printed
         assert "pl.Tile[[32, 32], pl.FP32," in printed
         assert "pl.FP32" in printed
-        # MemRef with name "mem_right_36" (includes memory space) prints as variable reference
-        assert "memref=mem_right_36" in printed
+        # MemRef prints as positional arg with full constructor syntax (no keyword)
+        assert "memref=" not in printed
+        assert "pl.MemRef" in printed
+        assert "pl.MemorySpace.Right" in printed
         assert "tile_view=pl.TileView" in printed
 
 
@@ -1551,6 +1560,182 @@ class TestTensorTypeWithTensorView:
         assert len(tensor_type.shape) == 2
         assert tensor_type.tensor_view is not None
         assert tensor_type.tensor_view.layout == ir.TensorLayout.ND
+
+
+class TestMemRefRoundTrip:
+    """Tests for MemRef round-trip: print → parse → IR."""
+
+    def test_printer_memref_valid_python(self):
+        """Print IR with memref → verify compile() succeeds."""
+        span = ir.Span.unknown()
+        dim64 = ir.ConstInt(64, DataType.INT64, span)
+        shape = [dim64, dim64]
+        tensor_type = ir.TensorType(shape, DataType.FP32)
+
+        memref = ir.MemRef(ir.MemorySpace.Vec, ir.ConstInt(0, DataType.INT64, span), 16384, 0)
+        tile_type = ir.TileType(shape, DataType.FP32, memref)
+
+        input_var = ir.Var("x", tensor_type, span)
+        tile_var = ir.Var("tile_a", tile_type, span)
+
+        assign = ir.AssignStmt(tile_var, input_var, span)
+        ret = ir.ReturnStmt(span)
+        body = ir.SeqStmts([assign, ret], span)
+        func = ir.Function("test_fn", [input_var], [], body, span, ir.FunctionType.InCore)
+        program = ir.Program([func], "TestProg", span)
+
+        printed = ir.python_print(program)
+
+        # Verify valid Python syntax
+        compile(printed, "<test_memref_valid_python>", "exec")
+
+        # Verify memref syntax in output
+        assert "pl.MemRef" in printed
+        assert "pl.MemorySpace.Vec" in printed
+        assert "16384" in printed
+
+    def test_parse_tensor_with_memref(self):
+        """Parse pl.Tensor[[64], pl.FP32, pl.MemRef(...)] annotation."""
+        code = textwrap.dedent("""\
+            @pl.program
+            class TestProg:
+                @pl.function
+                def test_fn(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                    y: pl.Tensor[[64], pl.FP32, pl.MemRef(pl.MemorySpace.DDR, 0, 256, 1)] = pl.add(x, 1.0)
+                    return y
+        """)
+        program = pl.parse(code)
+        assert isinstance(program, ir.Program)
+
+        # Verify the parsed IR contains memref by re-printing
+        printed = ir.python_print(program)
+        assert "pl.MemRef" in printed
+        assert "pl.MemorySpace.DDR" in printed
+        assert "256" in printed
+
+    def test_parse_tile_with_memref(self):
+        """Parse pl.Tile[[64, 64], pl.FP32, pl.MemRef(...)] annotation."""
+        code = textwrap.dedent("""\
+            @pl.program
+            class TestProg:
+                @pl.function(type=pl.FunctionType.InCore)
+                def test_fn(self, x: pl.Tensor[[64, 64], pl.FP32]):
+                    tile_a: pl.Tile[
+                        [64, 64], pl.FP32,
+                        pl.MemRef(pl.MemorySpace.Vec, 0, 16384, 0)
+                    ] = pl.block.load(x, offsets=[0, 0], shapes=[64, 64])
+        """)
+        program = pl.parse(code)
+        assert isinstance(program, ir.Program)
+
+        printed = ir.python_print(program)
+        assert "pl.MemRef" in printed
+        assert "pl.MemorySpace.Vec" in printed
+        assert "16384" in printed
+
+    def test_parse_tensor_layout_and_memref(self):
+        """Parse 4-arg: pl.Tensor[[64], pl.FP32, pl.NZ, pl.MemRef(...)]."""
+        code = textwrap.dedent("""\
+            @pl.program
+            class TestProg:
+                @pl.function
+                def test_fn(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                    y: pl.Tensor[
+                        [64], pl.FP32, pl.NZ,
+                        pl.MemRef(pl.MemorySpace.DDR, 0, 256, 2)
+                    ] = pl.add(x, 1.0)
+                    return y
+        """)
+        program = pl.parse(code)
+        assert isinstance(program, ir.Program)
+
+        # Verify both layout and memref are preserved
+        printed = ir.python_print(program)
+        assert "pl.MemRef" in printed
+        assert "pl.MemorySpace.DDR" in printed
+        # Layout should appear as tensor_view
+        assert "tensor_view=" in printed
+
+    def test_roundtrip_tile_memref(self):
+        """Parse → print → parse → assert_structural_equal for tile with memref."""
+        code = textwrap.dedent("""\
+            @pl.program
+            class TestProg:
+                @pl.function(type=pl.FunctionType.InCore)
+                def test_fn(self, x: pl.Tensor[[64, 64], pl.FP32]):
+                    tile_a: pl.Tile[
+                        [64, 64], pl.FP32,
+                        pl.MemRef(pl.MemorySpace.Vec, 0, 16384, 0)
+                    ] = pl.block.load(x, offsets=[0, 0], shapes=[64, 64])
+        """)
+        parsed1 = pl.parse(code)
+        printed = ir.python_print(parsed1)
+        parsed2 = pl.parse(printed)
+        ir.assert_structural_equal(parsed1, parsed2, enable_auto_mapping=True)
+
+    def test_roundtrip_tensor_memref(self):
+        """Parse → print → parse → assert_structural_equal for tensor with memref."""
+        code = textwrap.dedent("""\
+            @pl.program
+            class TestProg:
+                @pl.function
+                def test_fn(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                    y: pl.Tensor[[64], pl.FP32, pl.MemRef(pl.MemorySpace.DDR, 0, 256, 1)] = pl.add(x, 1.0)
+                    return y
+        """)
+        parsed1 = pl.parse(code)
+        printed = ir.python_print(parsed1)
+        parsed2 = pl.parse(printed)
+        ir.assert_structural_equal(parsed1, parsed2, enable_auto_mapping=True)
+
+    def test_all_memory_spaces(self):
+        """Round-trip all 6 memory spaces."""
+        spaces = ["DDR", "Vec", "Mat", "Left", "Right", "Acc"]
+        for space_name in spaces:
+            code = textwrap.dedent(f"""\
+                @pl.program
+                class TestProg:
+                    @pl.function(type=pl.FunctionType.InCore)
+                    def test_fn(self, x: pl.Tensor[[64, 64], pl.FP32]):
+                        tile_a: pl.Tile[
+                            [64, 64], pl.FP32,
+                            pl.MemRef(pl.MemorySpace.{space_name}, 0, 16384, 0)
+                        ] = pl.block.load(x, offsets=[0, 0], shapes=[64, 64])
+            """)
+            parsed1 = pl.parse(code)
+            printed = ir.python_print(parsed1)
+            assert f"pl.MemorySpace.{space_name}" in printed, (
+                f"Memory space {space_name} not in printed output"
+            )
+            parsed2 = pl.parse(printed)
+            ir.assert_structural_equal(parsed1, parsed2, enable_auto_mapping=True)
+
+    def test_backwards_compat_two_args(self):
+        """Existing 2-arg [shape, dtype] still works."""
+        code = textwrap.dedent("""\
+            @pl.program
+            class TestProg:
+                @pl.function(type=pl.FunctionType.InCore)
+                def test_fn(self, x: pl.Tensor[[64, 64], pl.FP32]):
+                    tile_a: pl.Tile[[64, 64], pl.FP32] = pl.block.load(x, offsets=[0, 0], shapes=[64, 64])
+        """)
+        # Should parse without errors — 2-arg syntax still works
+        program = pl.parse(code)
+        assert isinstance(program, ir.Program)
+
+    def test_backwards_compat_three_args_layout(self):
+        """Existing 3-arg [shape, dtype, layout] still works for Tensor."""
+        code = textwrap.dedent("""\
+            @pl.program
+            class TestProg:
+                @pl.function
+                def test_fn(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                    y: pl.Tensor[[64], pl.FP32, pl.NZ] = pl.add(x, 1.0)
+                    return y
+        """)
+        # Should parse without errors
+        program = pl.parse(code)
+        assert isinstance(program, ir.Program)
 
 
 if __name__ == "__main__":

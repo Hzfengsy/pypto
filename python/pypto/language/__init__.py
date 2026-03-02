@@ -38,7 +38,7 @@ Typical usage:
 """
 
 from pypto.pypto_core import DataType
-from pypto.pypto_core.ir import ForKind, FunctionType, MemorySpace, TensorLayout
+from pypto.pypto_core.ir import ForKind, FunctionType, MemorySpace, MemRef, TensorLayout
 
 from . import parser
 from .dsl_api import cond, const, incore, parallel, range, while_, yield_
@@ -257,6 +257,7 @@ __all__ = [
     "dim",
     "FunctionType",
     "ForKind",
+    "MemRef",
     "MemorySpace",
     "TensorLayout",
     "ND",

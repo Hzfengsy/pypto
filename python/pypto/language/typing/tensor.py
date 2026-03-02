@@ -13,30 +13,36 @@ from collections.abc import Sequence
 from typing import Any
 
 from pypto.pypto_core import DataType
-from pypto.pypto_core.ir import Expr, TensorLayout
+from pypto.pypto_core.ir import Expr, MemRef, TensorLayout
 
 
 class TensorMeta(type):
     """Metaclass for Tensor to enable subscript notation."""
 
-    def __getitem__(
-        cls,
-        item: tuple[Sequence[int], DataType] | tuple[Sequence[int], DataType, TensorLayout],
-    ) -> "Tensor":
-        """Enable Tensor[[shape], dtype] and Tensor[[shape], dtype, layout] syntax.
+    def __getitem__(cls, item: tuple) -> "Tensor":
+        """Enable Tensor[[shape], dtype], Tensor[[shape], dtype, layout_or_memref],
+        and Tensor[[shape], dtype, layout, memref] syntax.
 
         Args:
-            item: Tuple of (shape, dtype) or (shape, dtype, layout)
+            item: Tuple of 2, 3, or 4 elements
 
         Returns:
-            Tensor instance with shape, dtype, and optional layout (annotation-only mode)
+            Tensor instance with shape, dtype, and optional layout/memref
         """
-        if not isinstance(item, tuple) or len(item) not in (2, 3):
-            raise TypeError("Tensor requires [shape, dtype] or [shape, dtype, layout] notation")
+        if not isinstance(item, tuple) or len(item) not in (2, 3, 4):
+            raise TypeError(
+                "Tensor requires [shape, dtype], [shape, dtype, layout_or_memref], "
+                "or [shape, dtype, layout, memref] notation"
+            )
 
+        if len(item) == 4:
+            shape, dtype, layout, memref = item
+            return cls(shape, dtype, layout=layout, memref=memref, _annotation_only=True)
         if len(item) == 3:
-            shape, dtype, layout = item
-            return cls(shape, dtype, layout=layout, _annotation_only=True)
+            shape, dtype, third = item
+            if isinstance(third, MemRef):
+                return cls(shape, dtype, memref=third, _annotation_only=True)
+            return cls(shape, dtype, layout=third, _annotation_only=True)
         shape, dtype = item
         return cls(shape, dtype, _annotation_only=True)
 
@@ -46,6 +52,7 @@ class TensorMeta(type):
         dtype: Any = None,
         expr: Expr | None = None,
         layout: "TensorLayout | None" = None,
+        memref: "MemRef | None" = None,
         _annotation_only: bool = False,
     ) -> "Tensor":  # type: ignore[misc]
         """Enable both Tensor((shape), dtype) syntax and runtime wrapping.
@@ -55,6 +62,7 @@ class TensorMeta(type):
             dtype: Data type (for annotation mode)
             expr: IR expression to wrap (for runtime mode)
             layout: Optional tensor layout (ND, DN, NZ)
+            memref: Optional memory reference
             _annotation_only: Internal flag for annotation-only mode
 
         Returns:
@@ -69,8 +77,8 @@ class TensorMeta(type):
             and expr is None
         ):
             real_shape, real_dtype = shape
-            return type.__call__(cls, real_shape, real_dtype, None, layout, _annotation_only)
-        return type.__call__(cls, shape, dtype, expr, layout, _annotation_only)
+            return type.__call__(cls, real_shape, real_dtype, None, layout, memref, _annotation_only)
+        return type.__call__(cls, shape, dtype, expr, layout, memref, _annotation_only)
 
 
 class Tensor(metaclass=TensorMeta):
@@ -103,6 +111,7 @@ class Tensor(metaclass=TensorMeta):
         dtype: DataType | None = None,
         expr: Expr | None = None,
         layout: TensorLayout | None = None,
+        memref: MemRef | None = None,
         _annotation_only: bool = False,
     ):
         """Initialize Tensor.
@@ -112,18 +121,21 @@ class Tensor(metaclass=TensorMeta):
             dtype: Data type (for annotation mode)
             expr: IR expression to wrap (for runtime mode)
             layout: Optional tensor layout (ND, DN, NZ)
+            memref: Optional memory reference
             _annotation_only: Whether this is annotation-only mode
         """
         if _annotation_only:
             self.shape = shape
             self.dtype = dtype
             self.layout = layout
+            self.memref = memref
             self._expr = None
         elif expr is not None:
             self._expr = expr
             self.shape = None
             self.dtype = None
             self.layout = None
+            self.memref = None
         else:
             raise ValueError(
                 "Tensor must be initialized with either (shape, dtype) for "

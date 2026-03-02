@@ -236,8 +236,9 @@ class ASTParser:
             )
         value_expr = self.parse_expression(stmt.value)
 
-        # Create variable with let
-        var = self.builder.let(var_name, value_expr, span=span)
+        # Use annotation type as override when it carries memref info
+        annotation_type = self.type_resolver.resolve_type_if_memref(stmt.annotation)
+        var = self.builder.let(var_name, value_expr, type=annotation_type, span=span)
 
         # Register in scope
         self.scope_manager.define_var(var_name, var, span=span)

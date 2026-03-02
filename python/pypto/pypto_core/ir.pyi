@@ -552,6 +552,29 @@ class TileType(ShapedType):
             Exception: If shape has more than 2 dimensions
         """
 
+    @overload
+    def __init__(self, shape: Sequence[int], dtype: DataType, memref: MemRef | None) -> None:
+        """Create a tile type with memory reference.
+
+        Args:
+            shape: Shape dimensions as integers (automatically converted to ConstInt)
+            dtype: Element data type
+            memref: Optional memory reference
+        """
+
+    @overload
+    def __init__(
+        self, shape: Sequence[int], dtype: DataType, memref: MemRef | None, tile_view: TileView | None
+    ) -> None:
+        """Create a tile type with memory reference and tile view.
+
+        Args:
+            shape: Shape dimensions as integers (automatically converted to ConstInt)
+            dtype: Element data type
+            memref: Optional memory reference
+            tile_view: Optional tile view information
+        """
+
 class TupleType(Type):
     """Tuple type representation (contains multiple types)."""
 

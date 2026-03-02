@@ -290,14 +290,14 @@ std::string IRPythonPrinter::Print(const TypePtr& type) {
     PrintShapeDims(oss, tensor_type->shape_);
     oss << "], " << prefix_ << "." << DataTypeToString(tensor_type->dtype_);
 
-    // Add optional memref parameter if present
-    if (tensor_type->memref_.has_value()) {
-      oss << ", memref=" << PrintMemRef(*tensor_type->memref_.value());
-    }
-
-    // Add optional tensor_view parameter if present
+    // Add optional tensor_view parameter if present (before memref for positional ordering)
     if (tensor_type->tensor_view_.has_value()) {
       oss << ", tensor_view=" << PrintTensorView(tensor_type->tensor_view_.value());
+    }
+
+    // Add optional memref as positional arg
+    if (tensor_type->memref_.has_value()) {
+      oss << ", " << PrintMemRef(*tensor_type->memref_.value());
     }
 
     oss << "]";
@@ -311,14 +311,14 @@ std::string IRPythonPrinter::Print(const TypePtr& type) {
     PrintShapeDims(oss, tile_type->shape_);
     oss << "], " << prefix_ << "." << DataTypeToString(tile_type->dtype_);
 
-    // Add optional memref parameter if present
-    if (tile_type->memref_.has_value()) {
-      oss << ", memref=" << tile_type->memref_.value()->name_;
-    }
-
-    // Add optional tile_view parameter if present
+    // Add optional tile_view parameter if present (before memref for positional ordering)
     if (tile_type->tile_view_.has_value()) {
       oss << ", tile_view=" << PrintTileView(tile_type->tile_view_.value());
+    }
+
+    // Add optional memref as positional arg
+    if (tile_type->memref_.has_value()) {
+      oss << ", " << PrintMemRef(*tile_type->memref_.value());
     }
     oss << "]";
     return oss.str();

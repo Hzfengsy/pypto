@@ -126,6 +126,38 @@ Placeholder for unknown or inferred types.
 unknown = ir.UnknownType()
 ```
 
+### MemRef Type Annotations in DSL
+
+MemRef can be specified as a positional argument in type annotations within `@pl.program` / `@pl.function` DSL code:
+
+```python
+import pypto.language as pl
+
+@pl.program
+class MyProgram:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, x: pl.Tensor[[64, 64], pl.FP32]):
+        # Tile with MemRef (3-arg: shape, dtype, memref)
+        tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemRef(pl.MemorySpace.Vec, 0, 16384, 0)] = pl.block.load(x, offsets=[0, 0], shapes=[64, 64])
+
+        # Tensor with MemRef (3-arg: shape, dtype, memref)
+        y: pl.Tensor[[64], pl.FP32, pl.MemRef(pl.MemorySpace.DDR, 0, 256, 1)] = pl.add(x, 1.0)
+
+        # Tensor with layout and MemRef (4-arg: shape, dtype, layout, memref)
+        z: pl.Tensor[[64], pl.FP32, pl.NZ, pl.MemRef(pl.MemorySpace.DDR, 0, 256, 2)] = pl.add(x, 1.0)
+```
+
+**`pl.MemRef(memory_space, addr, size, id)` parameters:**
+
+| Parameter | Type | Description |
+| --------- | ---- | ----------- |
+| `memory_space` | `pl.MemorySpace.*` | Target memory (DDR, Vec, Mat, Left, Right, Acc) |
+| `addr` | `int` | Base address offset |
+| `size` | `int` | Memory allocation size in bytes |
+| `id` | `int` | Memory buffer identifier |
+
+**Disambiguation (3-arg Tensor):** The parser distinguishes `pl.MemRef(...)` from `pl.NZ`/`pl.DN`/`pl.ND` layout enums automatically.
+
 ### MemorySpace Enum
 
 | Value | Description |
