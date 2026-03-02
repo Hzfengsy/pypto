@@ -454,6 +454,80 @@ class TestAllocCleanup:
         assert _count_alloc_stmts(func) == 3, "All alloc stmts should be preserved when no reuse occurs"
 
 
+class TestCastNoReuse:
+    """Tests that block.cast outputs do NOT reuse other variables' memory.
+
+    PTOAS binds a fixed datatype to each tile buffer during allocation.
+    When block.cast changes the datatype, the reused buffer rejects data
+    of the new type. Memory reuse is disabled for cast outputs until PTOAS
+    supports multi-dtype reuse on the same buffer.
+    """
+
+    def test_cast_output_does_not_reuse(self):
+        """Cast output should get fresh memory even when a dead tile is available.
+
+        Lifetimes: tile_a[0,1], tile_b[1,2], tile_cast[2,3], tile_c[3,4]
+        Without the restriction, tile_cast would reuse tile_a. With it,
+        tile_cast must allocate fresh memory and tile_c can reuse tile_a.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[64, 64], pl.FP32],
+                output: pl.Tensor[[64, 64], pl.FP32],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                tile_a: pl.Tile[[64, 64], pl.FP32] = pl.load(input_a, [0, 0], [64, 64])
+                tile_b: pl.Tile[[64, 64], pl.FP32] = pl.add(tile_a, tile_a)
+                tile_cast: pl.Tile[[64, 64], pl.BF16] = pl.cast(tile_b, target_type=pl.BF16)
+                tile_c: pl.Tile[[64, 64], pl.BF16] = pl.add(tile_cast, tile_cast)
+                result: pl.Tensor[[64, 64], pl.FP32] = pl.store(tile_c, [0, 0], [64, 64], output)
+                return result
+
+        func = _prepare_and_run_memory_reuse(Before)
+
+        _assert_all_have_memrefs(func)
+        # tile_cast must NOT reuse tile_a (cast needs fresh buffer)
+        _assert_not_shares_memref(func, "tile_a", "tile_cast")
+        # tile_c (non-cast) can still reuse tile_a
+        _assert_shares_memref(func, "tile_a", "tile_c")
+
+    def test_cast_among_regular_ops(self):
+        """Cast output is skipped for reuse while regular ops still reuse normally.
+
+        Lifetimes: tile_a[0,1], tile_b[1,2], tile_cast[2,3], tile_d[3,4], tile_e[4,5]
+        tile_cast must not reuse anyone; tile_d reuses tile_a, tile_e reuses tile_b.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[64, 64], pl.FP32],
+                output: pl.Tensor[[64, 64], pl.FP32],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                tile_a: pl.Tile[[64, 64], pl.FP32] = pl.load(input_a, [0, 0], [64, 64])
+                tile_b: pl.Tile[[64, 64], pl.FP32] = pl.add(tile_a, tile_a)
+                tile_cast: pl.Tile[[64, 64], pl.BF16] = pl.cast(tile_b, target_type=pl.BF16)
+                tile_d: pl.Tile[[64, 64], pl.BF16] = pl.add(tile_cast, tile_cast)
+                tile_e: pl.Tile[[64, 64], pl.BF16] = pl.add(tile_d, tile_d)
+                result: pl.Tensor[[64, 64], pl.FP32] = pl.store(tile_e, [0, 0], [64, 64], output)
+                return result
+
+        func = _prepare_and_run_memory_reuse(Before)
+
+        _assert_all_have_memrefs(func)
+        # cast output must not reuse
+        _assert_not_shares_memref(func, "tile_a", "tile_cast")
+        _assert_not_shares_memref(func, "tile_b", "tile_cast")
+        # regular ops still reuse normally
+        _assert_shares_memref(func, "tile_a", "tile_d")
+        _assert_shares_memref(func, "tile_b", "tile_e")
+
+
 class TestViewOperationsMemoryReuse:
     """Tests for view operations (reshape/view/transpose) with memory reuse."""
 

@@ -47,6 +47,7 @@ struct LifetimeInterval {
   int last_use_point;        ///< Last use point (topological order)
   MemorySpace memory_space;  ///< Memory space
   uint64_t size;             ///< Size in bytes
+  bool no_reuse = false;     ///< If true, this variable must NOT reuse another variable's memory
 };
 
 namespace {
@@ -101,6 +102,7 @@ LifetimeAnalysisResult ComputeLifetimesFromDependencies(const std::vector<BasicB
   std::vector<VarPtr> ordered_vars;  // Variables in definition order
   std::map<VarPtr, StmtPtr> var_def_stmt;
   std::map<VarPtr, std::vector<StmtPtr>> var_use_stmts;
+  std::set<VarPtr> no_reuse_vars;  // Variables that must not reuse other variables' memory
 
   // Helper to collect variable uses from an expression
   class VarUseCollector : public IRVisitor {
@@ -121,6 +123,13 @@ LifetimeAnalysisResult ComputeLifetimesFromDependencies(const std::vector<BasicB
         if (tile_type) {
           ordered_vars.push_back(assign->var_);  // Preserve definition order
           var_def_stmt[assign->var_] = stmt;
+
+          // Check if this variable is defined by a block.cast operation
+          if (auto call = As<Call>(assign->value_)) {
+            if (call->op_->name_ == "block.cast") {
+              no_reuse_vars.insert(assign->var_);
+            }
+          }
         }
 
         // Collect variables used in the value expression (for ALL AssignStmt, not just TileType)
@@ -227,6 +236,14 @@ LifetimeAnalysisResult ComputeLifetimesFromDependencies(const std::vector<BasicB
     interval.memory_space = memref->memory_space_;
     interval.size = memref->size_;
 
+    // Mark as no_reuse if any variable in the sharing group requires fresh allocation
+    for (const auto& group_var : sharing_group) {
+      if (no_reuse_vars.count(group_var)) {
+        interval.no_reuse = true;
+        break;
+      }
+    }
+
     lifetimes.push_back(interval);
 
     // Mark all variables in the group as processed
@@ -273,6 +290,11 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(const std::vector<LifetimeIn
       size_t curr_idx = indices[i];
       const auto& curr_lifetime = lifetimes[curr_idx];
       VarPtr curr_var = curr_lifetime.variable;
+
+      // Skip variables that must not reuse other variables' memory (e.g., block.cast outputs)
+      if (curr_lifetime.no_reuse) {
+        continue;
+      }
 
       // Find best candidate to reuse from (earliest with sufficient size)
       for (size_t j = 0; j < i; j++) {
