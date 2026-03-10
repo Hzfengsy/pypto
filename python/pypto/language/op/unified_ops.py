@@ -25,6 +25,9 @@ __all__ = [
     "div",
     "maximum",
     "exp",
+    "sqrt",
+    "row_expand_mul",
+    "col_expand_mul",
     "reshape",
     "transpose",
     "slice",
@@ -132,6 +135,39 @@ def exp(input: T) -> T:
     if isinstance(input, Tile):
         return _tile.exp(input)
     raise TypeError(f"exp: expected Tensor or Tile, got {type(input).__name__}")
+
+
+def sqrt(input: T) -> T:
+    """Element-wise square root, dispatched by input type."""
+    if isinstance(input, Tensor):
+        return _tensor.sqrt(input)
+    if isinstance(input, Tile):
+        return _tile.sqrt(input)
+    raise TypeError(f"sqrt: expected Tensor or Tile, got {type(input).__name__}")
+
+
+def row_expand_mul(lhs: T, rhs: T) -> T:
+    """Row-wise broadcast multiplication, dispatched by input type."""
+    if isinstance(lhs, Tensor) and isinstance(rhs, Tensor):
+        return _tensor.row_expand_mul(lhs, rhs)
+    if isinstance(lhs, Tile) and isinstance(rhs, Tile):
+        return _tile.row_expand_mul(lhs, rhs)
+    raise TypeError(
+        "row_expand_mul: expected both operands to be Tensor or both to be Tile, "
+        f"got lhs={type(lhs).__name__}, rhs={type(rhs).__name__}"
+    )
+
+
+def col_expand_mul(lhs: T, rhs: T) -> T:
+    """Column-wise broadcast multiplication, dispatched by input type."""
+    if isinstance(lhs, Tensor) and isinstance(rhs, Tensor):
+        return _tensor.col_expand_mul(lhs, rhs)
+    if isinstance(lhs, Tile) and isinstance(rhs, Tile):
+        return _tile.col_expand_mul(lhs, rhs)
+    raise TypeError(
+        "col_expand_mul: expected (Tensor, Tensor) or (Tile, Tile), "
+        f"got ({type(lhs).__name__}, {type(rhs).__name__})"
+    )
 
 
 def reshape(input: T, shape: Sequence[IntLike]) -> T:
