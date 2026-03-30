@@ -145,8 +145,8 @@ class TestCastModeRoundTrip:
 
         printed = cast_func.as_python()
 
-        # Mode should be printed as string name, not integer
-        assert "mode='round'" in printed
+        # Mode should be printed as string name, not integer (quote style may vary)
+        assert "mode='round'" in printed or 'mode="round"' in printed
         assert "mode=2" not in printed
 
     def test_printer_outputs_all_mode_names(self):
@@ -164,7 +164,9 @@ class TestCastModeRoundTrip:
         for name in mode_names:
             cast_func = _make_cast_func(name)
             printed = cast_func.as_python()
-            assert f"mode='{name}'" in printed, f"Expected mode='{name}' in printed output, got: {printed}"
+            assert f"mode='{name}'" in printed or f'mode="{name}"' in printed, (
+                f"Expected mode='{name}' in printed output, got: {printed}"
+            )
 
     def test_parser_accepts_int_mode(self):
         """Test that parser accepts mode=2 (int) via IR API."""
@@ -205,8 +207,8 @@ class TestCastModeRoundTrip:
 
         printed = original.as_python()
 
-        # Default mode is "round", so it should still print as 'round'
-        assert "mode='round'" in printed
+        # Default mode is "round", so it should still print as 'round' (quote style may vary)
+        assert "mode='round'" in printed or 'mode="round"' in printed
 
         reparsed = pl.parse(printed)
         ir.assert_structural_equal(original, reparsed)

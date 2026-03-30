@@ -135,6 +135,13 @@ std::vector<std::pair<std::string, std::any>> ConvertKwargsDict(const nb::dict& 
   return kwargs;
 }
 
+/// Conditionally apply the registered format callback.
+/// When `format` is true, post-processes `code` through the callback (e.g., ruff).
+/// When false, returns `code` unchanged — useful for tests that match exact substrings.
+std::string MaybeFormat(const std::string& code, bool format) {
+  return format ? ApplyFormatCallback(code) : code;
+}
+
 void BindIR(nb::module_& m) {
   nb::module_ ir = m.def_submodule("ir", "PyPTO IR (Intermediate Representation) module");
 
@@ -175,7 +182,7 @@ void BindIR(nb::module_& m) {
   auto type_class = nb::class_<Type>(ir, "Type", "Base class for type representations");
   BindFields<Type>(type_class);
   type_class.def(
-      "__str__", [](const TypePtr& self) { return PythonPrint(self, "pl"); },
+      "__str__", [](const TypePtr& self) { return ApplyFormatCallback(PythonPrint(self, "pl")); },
       "Python-style string representation");
   type_class.def(
       "__eq__", [](const TypePtr& self, const TypePtr& other) { return structural_equal(self, other); },
@@ -202,22 +209,19 @@ void BindIR(nb::module_& m) {
           "same_as", [](const IRNodePtr& self, const IRNodePtr& other) { return self == other; },
           nb::arg("other"), "Check if this IR node is the same as another IR node.")
       .def(
-          "__str__",
-          [](const IRNodePtr& self) {
-            // Use unified PythonPrint API with default "pl" prefix
-            return PythonPrint(self, "pl");
-          },
+          "__str__", [](const IRNodePtr& self) { return ApplyFormatCallback(PythonPrint(self, "pl")); },
           "Python-style string representation")
       .def(
           "as_python",
-          [](const IRNodePtr& self, const std::string& prefix, bool concise) {
-            return PythonPrint(self, prefix, concise);
+          [](const IRNodePtr& self, const std::string& prefix, bool concise, bool format) {
+            return MaybeFormat(PythonPrint(self, prefix, concise), format);
           },
-          nb::arg("prefix") = "pl", nb::arg("concise") = false,
+          nb::arg("prefix") = "pl", nb::arg("concise") = false, nb::arg("format") = true,
           "Convert to Python-style string representation.\n\n"
           "Args:\n"
           "    prefix: Module prefix (default 'pl' for 'import pypto.language as pl')\n"
-          "    concise: If true, omit intermediate type annotations (default false)");
+          "    concise: If true, omit intermediate type annotations (default false)\n"
+          "    format: If true, apply registered format callback (default true)");
 
   // Expr - abstract base, const shared_ptr
   auto expr_class = nb::class_<Expr, IRNode>(ir, "Expr", "Base class for all expressions");
@@ -949,25 +953,49 @@ void BindIR(nb::module_& m) {
   // Python-style printer function - unified API for IRNode
   ir.def(
       "python_print",
-      [](const IRNodePtr& node, const std::string& prefix, bool concise) {
-        return PythonPrint(node, prefix, concise);
+      [](const IRNodePtr& node, const std::string& prefix, bool concise, bool format) {
+        return MaybeFormat(PythonPrint(node, prefix, concise), format);
       },
-      nb::arg("node"), nb::arg("prefix") = "pl", nb::arg("concise") = false,
+      nb::arg("node"), nb::arg("prefix") = "pl", nb::arg("concise") = false, nb::arg("format") = true,
       "Print IR node (Expr, Stmt, Function, or Program) in Python IR syntax.\n\n"
       "Args:\n"
       "    node: IR node to print\n"
       "    prefix: Module prefix (default 'pl' for 'import pypto.language as pl')\n"
-      "    concise: If true, omit intermediate type annotations (default false)");
+      "    concise: If true, omit intermediate type annotations (default false)\n"
+      "    format: If true, apply registered format callback (default true)");
 
   // Python-style printer function for Type objects - use separate name to avoid overload ambiguity
   ir.def(
       "python_print_type",
-      [](const TypePtr& type, const std::string& prefix) { return PythonPrint(type, prefix); },
-      nb::arg("type"), nb::arg("prefix") = "pl",
+      [](const TypePtr& type, const std::string& prefix, bool format) {
+        return MaybeFormat(PythonPrint(type, prefix), format);
+      },
+      nb::arg("type"), nb::arg("prefix") = "pl", nb::arg("format") = true,
       "Print Type object in Python IR syntax.\n\n"
       "Args:\n"
       "    type: Type to print\n"
-      "    prefix: Module prefix (default 'pl' for 'import pypto.language as pl')");
+      "    prefix: Module prefix (default 'pl' for 'import pypto.language as pl')\n"
+      "    format: If true, apply registered format callback (default true)");
+
+  // Register a Python callable to format printed IR output (e.g., ruff).
+  // Pass None to unregister. The callback receives a code string and returns formatted code.
+  ir.def(
+      "register_format_callback",
+      [](nb::object cb) {
+        if (cb.is_none()) {
+          RegisterFormatCallback(nullptr);
+        } else {
+          // Store as nb::object to prevent garbage collection of the Python callback
+          nb::object stored_cb = nb::borrow(cb);
+          RegisterFormatCallback([stored_cb](const std::string& code) -> std::string {
+            return nb::cast<std::string>(stored_cb(code));
+          });
+        }
+      },
+      nb::arg("callback"),
+      "Register a Python callable to post-process printed IR output.\n\n"
+      "The callback receives a code string and returns the formatted code.\n"
+      "Pass None to unregister and revert to raw output.");
 
   // operator functions for Var (wrapped in Python for span capture and normalization)
   // Using standalone C++ API functions from scalar_expr.h

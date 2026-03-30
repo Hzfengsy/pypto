@@ -18,6 +18,8 @@ This module provides:
 - Enhanced type constructors (e.g., TensorType with integer shape support)
 """
 
+import shutil as _shutil
+
 # Re-export all core IR types and functions from native module
 from pypto.pypto_core import DataType
 from pypto.pypto_core.ir import *  # noqa: F403
@@ -87,3 +89,13 @@ __all__ = [
     "op_conversion",
     "register_op_conversion",
 ]  # fmt: skip
+
+# Register ruff as the format callback for IR printing (best-effort: no-op if ruff is unavailable)
+if _shutil.which("ruff"):
+    from pypto.ir.formatter import ruff_format as _ruff_format
+    from pypto.pypto_core import ir as _ir_core
+
+    _ir_core.register_format_callback(_ruff_format)
+    del _ruff_format, _ir_core
+
+del _shutil

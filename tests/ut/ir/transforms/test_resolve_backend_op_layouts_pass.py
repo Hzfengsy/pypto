@@ -49,7 +49,7 @@ class TestResolveBackendOpLayouts:
         finally:
             backend.reset_for_testing()
 
-        printed = ir.python_print(after)
+        printed = ir.python_print(after, format=False)
         # tile.muls is now also constrained to row_major, so acc_0 gets reshaped too
         assert "pl.tile.reshape(acc_0, [1, 16])" in printed
         assert "pl.tile.muls(" in printed
@@ -87,7 +87,7 @@ class TestResolveBackendOpLayouts:
         finally:
             backend.reset_for_testing()
 
-        printed = ir.python_print(after)
+        printed = ir.python_print(after, format=False)
         assert "pl.tile.reshape(partial, [1, 16])" in printed
         assert "pl.tile.abs(" in printed
         assert "result:" in printed and "= pl.tile.reshape(" in printed
@@ -121,7 +121,7 @@ class TestResolveBackendOpLayouts:
         finally:
             backend.reset_for_testing()
 
-        printed = ir.python_print(after)
+        printed = ir.python_print(after, format=False)
         assert "pl.tile.reshape(partial, [1, 16])" in printed
         assert "pl.tile.muls(" in printed
         assert "scaled:" in printed and "= pl.tile.reshape(" in printed

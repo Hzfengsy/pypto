@@ -12,7 +12,12 @@
 from pypto.pypto_core import ir as _ir_core
 
 
-def python_print(node: _ir_core.IRNode | _ir_core.Type, prefix: str = "pl", concise: bool = False) -> str:
+def python_print(
+    node: _ir_core.IRNode | _ir_core.Type,
+    prefix: str = "pl",
+    concise: bool = False,
+    format: bool = True,
+) -> str:
     """Print IR node or Type object in Python IR syntax.
 
     This is a unified wrapper that dispatches to the appropriate C++ function
@@ -22,11 +27,12 @@ def python_print(node: _ir_core.IRNode | _ir_core.Type, prefix: str = "pl", conc
         node: IR node (Expr, Stmt, Function, Program) or Type object to print
         prefix: Module prefix (default 'pl' for 'import pypto.language as pl')
         concise: If true, omit intermediate type annotations (default false)
+        format: If true, apply registered format callback (default true)
 
     Returns:
         Python-style string representation
     """
     if isinstance(node, _ir_core.Type):
-        return _ir_core.python_print_type(node, prefix)
+        return _ir_core.python_print_type(node, prefix, format)
     else:
-        return _ir_core.python_print(node, prefix, concise)
+        return _ir_core.python_print(node, prefix, concise, format)

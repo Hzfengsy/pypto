@@ -12,6 +12,7 @@
 #ifndef PYPTO_IR_TRANSFORMS_PRINTER_H_
 #define PYPTO_IR_TRANSFORMS_PRINTER_H_
 
+#include <functional>
 #include <ostream>
 #include <string>
 
@@ -81,12 +82,28 @@ std::string PythonPrint(const IRNodePtr& node, const std::string& prefix = "pl",
  */
 std::string PythonPrint(const TypePtr& type, const std::string& prefix = "pl");
 
+/// Callback type for external code formatters (e.g., ruff registered from Python).
+using FormatCallback = std::function<std::string(const std::string&)>;
+
+/// Register a post-processing formatter. Called once from Python at import time.
+/// Pass nullptr to unregister.
+void RegisterFormatCallback(FormatCallback callback);
+
+/// Apply the registered format callback if one exists.
+/// Returns the input unchanged when no callback is registered (safety net).
+std::string ApplyFormatCallback(const std::string& code);
+
 /// Stream insertion for IR nodes and types.
 /// Enables direct use in CHECK/LOG macros and std::ostream output.
 /// ExprPtr, StmtPtr, etc. implicitly convert to IRNodePtr.
-inline std::ostream& operator<<(std::ostream& os, const IRNodePtr& node) { return os << PythonPrint(node); }
+/// Applies the registered format callback for readable output.
+inline std::ostream& operator<<(std::ostream& os, const IRNodePtr& node) {
+  return os << ApplyFormatCallback(PythonPrint(node));
+}
 
-inline std::ostream& operator<<(std::ostream& os, const TypePtr& type) { return os << PythonPrint(type); }
+inline std::ostream& operator<<(std::ostream& os, const TypePtr& type) {
+  return os << ApplyFormatCallback(PythonPrint(type));
+}
 
 }  // namespace ir
 }  // namespace pypto

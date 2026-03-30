@@ -1757,5 +1757,21 @@ std::string PythonPrint(const TypePtr& type, const std::string& prefix) {
   return printer.Print(type);
 }
 
+// ================================
+// Format Callback
+// ================================
+namespace {
+FormatCallback g_format_callback;  // set once at import time, read-only after
+}  // namespace
+
+void RegisterFormatCallback(FormatCallback callback) { g_format_callback = std::move(callback); }
+
+std::string ApplyFormatCallback(const std::string& code) {
+  if (g_format_callback) {
+    return g_format_callback(code);
+  }
+  return code;
+}
+
 }  // namespace ir
 }  // namespace pypto

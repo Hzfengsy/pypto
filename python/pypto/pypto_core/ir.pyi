@@ -9,7 +9,7 @@
 """Type stubs for PyPTO IR (Intermediate Representation) module."""
 
 import enum
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Final, overload
 
 from pypto import DataType
@@ -141,12 +141,13 @@ class IRNode:
     def same_as(self, other: IRNode) -> bool:
         """Check if this IR node is the same as another IR node."""
 
-    def as_python(self, prefix: str = "pl", concise: bool = False) -> str:
+    def as_python(self, prefix: str = "pl", concise: bool = False, format: bool = True) -> str:
         """Convert to Python-style string representation.
 
         Args:
             prefix: Module prefix (default 'pl' for 'import pypto.language as pl')
             concise: If true, omit intermediate type annotations (default false)
+            format: If true, apply registered format callback (default true)
 
         Returns:
             Python-style string representation
@@ -2706,27 +2707,36 @@ class ProgramBuilder:
         """
 
 # ========== Python Printer ==========
-def python_print(node: IRNode, prefix: str = "pl", concise: bool = False) -> str:
+def python_print(node: IRNode, prefix: str = "pl", concise: bool = False, format: bool = True) -> str:
     """Print an IR node as a Python string.
 
     Args:
         node: IR node to print
         prefix: Module prefix (default 'pl' for 'import pypto.language as pl')
         concise: If true, omit intermediate type annotations (default false)
+        format: If true, apply registered format callback (default true)
 
     Returns:
         String representation of the IR node
     """
 
-def python_print_type(type: Type, prefix: str = "pl") -> str:
+def python_print_type(type: Type, prefix: str = "pl", format: bool = True) -> str:
     """Print a Type object as a Python string.
 
     Args:
         type: Type object to print
         prefix: Module prefix (default 'pl' for 'import pypto.language as pl')
+        format: If true, apply registered format callback (default true)
 
     Returns:
         String representation of the Type
+    """
+
+def register_format_callback(callback: Callable[[str], str] | None) -> None:
+    """Register a Python callable to post-process printed IR output.
+
+    The callback receives a code string and returns the formatted code.
+    Pass None to unregister and revert to raw output.
     """
 
 def add(lhs: Expr, rhs: Expr, span: Span = ...) -> Expr:

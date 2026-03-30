@@ -831,8 +831,8 @@ def test_python_print_while_stmt_ssa_multiple_iter_args():
     assert "for" in result
     assert "pl.while_" in result
     assert "init_values" in result
-    # Should have tuple unpacking for both iter_args
-    assert "(x, y)" in result or "( x, y )" in result or "(x,y)" in result
+    # Should have tuple unpacking for both iter_args (ruff may remove redundant parens)
+    assert "x, y" in result
     # Should have pl.cond() for condition
     assert "pl.cond(" in result
 

@@ -1407,8 +1407,8 @@ class TestIRBuilderHelpers:
             [32, 32], DataType.FP32, memref=memref, tile_view=tv, memory_space=ir.MemorySpace.Right
         )
 
-        # Print to Python syntax
-        printed = ir.python_print_type(tile_t)
+        # Print to Python syntax (use format=False for substring matching)
+        printed = ir.python_print_type(tile_t, format=False)
 
         # Verify output contains all expected elements
         assert "pl.Tile" in printed

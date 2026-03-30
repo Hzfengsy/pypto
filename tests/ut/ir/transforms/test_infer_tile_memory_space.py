@@ -23,16 +23,23 @@ from pypto import ir, passes
 def _assert_var_memory_space(printed: str, var_name: str, memory_space: str) -> None:
     """Assert a TileType variable has the expected memory_space in printed output.
 
-    Searches for a line containing `var_name:` with a `pl.Tile[` annotation
-    and checks that it includes `pl.Mem.<memory_space>`.
+    Searches for an assignment of `var_name` with a `pl.Tile[` annotation
+    and checks that the annotation includes `pl.Mem.<memory_space>`.
+    Handles multiline annotations (e.g., when ruff splits long Tile types).
     """
-    for line in printed.split("\n"):
-        if f"{var_name}:" in line and "pl.Tile[" in line:
-            assert f", pl.Mem.{memory_space}" in line, (
-                f"Expected pl.Mem.{memory_space} for '{var_name}', but line was: {line.strip()}"
-            )
-            return
-    raise AssertionError(f"Variable '{var_name}' with pl.Tile type not found in printed output")
+    # Find the start of the variable's type annotation
+    marker = f"{var_name}: pl.Tile["
+    # Also try the multiline variant where ruff breaks after "pl.Tile["
+    marker_ml = f"{var_name}: pl.Tile[\n"
+    idx = printed.find(marker)
+    if idx == -1:
+        idx = printed.find(marker_ml)
+    assert idx != -1, f"Variable '{var_name}' with pl.Tile type not found in printed output"
+    # Extract a window after the marker large enough to contain the full annotation
+    window = printed[idx : idx + 300]
+    assert f"pl.Mem.{memory_space}" in window, (
+        f"Expected pl.Mem.{memory_space} for '{var_name}', but annotation was: {window.split(chr(10))[0]}"
+    )
 
 
 class TestInferTileMemorySpaceKwargOps:

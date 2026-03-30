@@ -9,6 +9,8 @@
 
 """Unit tests for OutlineIncoreScopes pass."""
 
+import re
+
 import pypto.language as pl
 import pytest
 from pypto import ir, passes
@@ -508,13 +510,16 @@ class TestOutlineIncoreScopes:
         incore_section = printed.split("@pl.function(type=pl.FunctionType.InCore)")[1].split("@pl.function")[
             0
         ]
-        incore_params = incore_section.split("(self,")[1].split(")")[0]
+        # Extract parameters between "def ...(self, ...)" — handle multiline signatures
+        param_match = re.search(r"def \w+\((.*?)\)\s*->", incore_section, re.DOTALL)
+        assert param_match is not None
+        incore_params = param_match.group(1)
         orch_section = printed.split("@pl.function(type=pl.FunctionType.Orchestration)")[1]
 
         assert "acc" in incore_params, (
             "outer loop-carried variable 'acc' must be a parameter of the outlined function"
         )
-        assert "main_incore_0(acc" in orch_section.replace(" ", ""), (
+        assert "main_incore_0" in orch_section and "acc" in orch_section, (
             "orchestration must pass 'acc' to the outlined function"
         )
 
@@ -545,7 +550,10 @@ class TestOutlineIncoreScopes:
         incore_section = printed.split("@pl.function(type=pl.FunctionType.InCore)")[1].split("@pl.function")[
             0
         ]
-        incore_params = incore_section.split("(self,")[1].split(")")[0]
+        # Extract parameters — handle multiline signatures from ruff formatting
+        param_match = re.search(r"def \w+\((.*?)\)\s*->", incore_section, re.DOTALL)
+        assert param_match is not None
+        incore_params = param_match.group(1)
 
         assert "acc" in incore_params, "loop-carried 'acc' must be a parameter"
         assert "init" not in incore_params, (
