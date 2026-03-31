@@ -74,12 +74,10 @@ Backtrace::Backtrace() {
 }
 
 void Backtrace::ErrorCallback(void* data, const char* msg, int errnum) {
-#ifndef NDEBUG
   // Log errors in backtrace generation to stderr for debugging
   if (msg) {
     fprintf(stderr, "libbacktrace error: %s (errno: %d)\n", msg, errnum);
   }
-#endif
 }
 
 /// Clean up file paths from debug info that may contain temp build directory prefixes.

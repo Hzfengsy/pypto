@@ -56,7 +56,7 @@ endif()
 # Compiler flags
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
 set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG")
-set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-g -O2")
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-g -O2 -DNDEBUG")
 
 # Fix debug info paths when building in a temp directory (e.g., pip install)
 # This remaps paths in DWARF debug info so backtraces show clean relative paths
