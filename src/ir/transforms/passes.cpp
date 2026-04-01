@@ -210,6 +210,8 @@ namespace {
 
 void EmitWarnings(const std::vector<Diagnostic>& diags, const std::string& phase) {
   for (const auto& d : diags) {
+    INTERNAL_CHECK(d.severity == DiagnosticSeverity::Warning)
+        << "Warning verifier emitted non-Warning diagnostic: " << d.rule_name;
     LOG_WARN << "[" << d.rule_name << "] (" << phase << ") " << d.message;
   }
 }

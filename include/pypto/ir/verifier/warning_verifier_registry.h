@@ -68,6 +68,10 @@ class WarningCheckSet {
   uint32_t bits_;
 
   static uint32_t Bit(WarningCheck c) { return uint32_t{1} << static_cast<uint32_t>(c); }
+
+  static_assert(static_cast<uint32_t>(WarningCheck::kCount) <= 32,
+                "WarningCheck count exceeds 32, which is the maximum supported by WarningCheckSet's uint32_t "
+                "bitset");
 };
 
 /**

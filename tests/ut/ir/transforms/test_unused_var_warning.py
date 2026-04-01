@@ -210,9 +210,9 @@ def test_pass_context_warning_config():
 
 
 def test_pass_context_default_warning_config():
-    """PassContext defaults to PrePipeline warning level with no disabled warnings."""
+    """PassContext defaults to the environment's default warning level with no disabled warnings."""
     ctx = passes.PassContext([])
-    assert ctx.get_warning_level() == passes.WarningLevel.PRE_PIPELINE
+    assert ctx.get_warning_level() == passes.get_default_warning_level()
     assert ctx.get_disabled_warnings().empty()
 
 
