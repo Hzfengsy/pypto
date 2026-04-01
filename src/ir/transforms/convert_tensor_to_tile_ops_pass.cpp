@@ -610,12 +610,19 @@ class TypePropagatingMutator : public IRMutator {
 
   /// Handle a non-converted assignment: propagate type change if value type changed.
   StmtPtr HandlePassThroughAssign(const AssignStmtPtr& op, const ExprPtr& new_value) {
-    if (new_value.get() == op->value_.get()) return op;
+    if (new_value.get() == op->value_.get()) {
+      // Assignment is unchanged — clear any stale remap so future uses of this Var*
+      // are not rewritten to an older replacement.
+      var_remap_.erase(op->var_.get());
+      return op;
+    }
     if (new_value->GetType() != op->value_->GetType()) {
       auto new_var = std::make_shared<Var>(op->var_->name_hint_, new_value->GetType(), op->var_->span_);
       var_remap_[op->var_.get()] = new_var;
       return std::make_shared<AssignStmt>(new_var, new_value, op->span_);
     }
+    // Value changed but type did not — keep original Var, clear any stale remap.
+    var_remap_.erase(op->var_.get());
     return std::make_shared<AssignStmt>(op->var_, new_value, op->span_);
   }
 
@@ -703,9 +710,13 @@ class TensorToTileMutator : public TypePropagatingMutator {
       stmts.push_back(VisitStmt(prologue_stmt));
     }
 
+    // Revisit result after mutating prologue — prologue conversions may have
+    // remapped vars that the result expression references.
+    auto new_result = VisitExpr(conv_result.result);
+
     auto tile_name = MakeTileValueName(op->var_->name_hint_);
-    auto tile_var = std::make_shared<Var>(tile_name, conv_result.result->GetType(), op->var_->span_);
-    stmts.push_back(std::make_shared<AssignStmt>(tile_var, conv_result.result, op->span_));
+    auto tile_var = std::make_shared<Var>(tile_name, new_result->GetType(), op->var_->span_);
+    stmts.push_back(std::make_shared<AssignStmt>(tile_var, new_result, op->span_));
     var_remap_[op->var_.get()] = tile_var;
 
     return SeqStmts::Flatten(std::move(stmts), op->span_);
@@ -730,7 +741,8 @@ class TensorToTileMutator : public TypePropagatingMutator {
     for (auto& prologue_stmt : conv_result.prologue) {
       stmts.push_back(VisitStmt(prologue_stmt));
     }
-    stmts.push_back(std::make_shared<EvalStmt>(conv_result.result, op->span_));
+    auto new_result = VisitExpr(conv_result.result);
+    stmts.push_back(std::make_shared<EvalStmt>(new_result, op->span_));
     return SeqStmts::Flatten(std::move(stmts), op->span_);
   }
 
