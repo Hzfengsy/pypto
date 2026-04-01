@@ -940,7 +940,7 @@ FunctionPtr AddGMSlotBufferParam(const FunctionPtr& func) {
   auto new_directions = func->param_directions_;
   new_directions.push_back(ParamDirection::In);
   return std::make_shared<Function>(func->name_, new_params, new_directions, func->return_types_, func->body_,
-                                    func->span_, func->func_type_, func->level_, func->role_);
+                                    func->span_, func->func_type_, func->level_, func->role_, func->attrs_);
 }
 
 StmtPtr RewriteCallsForGMBuffer(const StmtPtr& body, const std::unordered_set<std::string>& modified_funcs,
@@ -1076,9 +1076,9 @@ void InjectGMSlotBufferInPlace(std::vector<FunctionPtr>& functions) {
 
     if (!mod_callees.empty()) {
       auto nb = RewriteCallsForGMBuffer(func->body_, mod_callees, gm_param);
-      func =
-          std::make_shared<Function>(func->name_, func->params_, func->param_directions_, func->return_types_,
-                                     nb, func->span_, func->func_type_, func->level_, func->role_);
+      func = std::make_shared<Function>(func->name_, func->params_, func->param_directions_,
+                                        func->return_types_, nb, func->span_, func->func_type_, func->level_,
+                                        func->role_, func->attrs_);
     }
   }
 }

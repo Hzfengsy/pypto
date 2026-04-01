@@ -427,6 +427,8 @@ class Function : public IRNode {
     if (!HasAttr("split")) return std::nullopt;
     int val = GetAttr<int>("split", 0);
     if (val == 0) return std::nullopt;
+    CHECK(val >= 0 && val <= static_cast<int>(SplitMode::LeftRight))
+        << "Invalid split mode value in attrs: " << val;
     return static_cast<SplitMode>(val);
   }
 };

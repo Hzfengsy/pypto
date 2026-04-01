@@ -141,7 +141,7 @@ class TestFunctionAttrsPrinterRoundtrip:
             def main(self, x: pl.Tensor[[16, 128], pl.FP16]) -> pl.Tensor[[16, 128], pl.FP16]:
                 return x
 
-        with pytest.raises(Exception):
+        with pytest.raises(ValueError):
             ir.assert_structural_equal(A, B)
 
 
