@@ -425,36 +425,24 @@ ExprPtr ResolveTileAlias(const ExprPtr& expr, const TileAliasMap& alias_map) {
   return current;
 }
 
-/// Collect all Var pointers referenced within an expression tree (RHS uses only).
-/// Used to determine whether an alias variable is still live after yield replacement.
-void CollectExprVarRefs(const ExprPtr& expr, std::unordered_set<const Var*>& refs) {
-  if (!expr) return;
-  if (auto var = As<Var>(expr)) {
-    refs.insert(var.get());
-    return;
-  }
-  if (auto call = As<Call>(expr)) {
-    for (const auto& arg : call->args_) {
-      CollectExprVarRefs(arg, refs);
-    }
-  }
-}
+/// Visitor that collects all Var pointers used as RHS expressions.
+/// Overrides AssignStmt handling to skip LHS definitions — only captures actual uses.
+/// Uses IRVisitor's built-in recursion to handle nested control flow (IfStmt, ForStmt, etc.).
+class VarUseCollector : public IRVisitor {
+ public:
+  const std::unordered_set<const Var*>& uses() const { return uses_; }
 
-/// Collect all Var pointers used as RHS expressions across a flat statement list.
-/// Excludes LHS definitions — only captures actual uses.
-std::unordered_set<const Var*> CollectStmtVarUses(const std::vector<StmtPtr>& stmts) {
-  std::unordered_set<const Var*> uses;
-  for (const auto& s : stmts) {
-    if (auto assign = As<AssignStmt>(s)) {
-      CollectExprVarRefs(assign->value_, uses);
-    } else if (auto ys = As<YieldStmt>(s)) {
-      for (const auto& v : ys->value_) CollectExprVarRefs(v, uses);
-    } else if (auto es = As<EvalStmt>(s)) {
-      CollectExprVarRefs(es->expr_, uses);
-    }
+ protected:
+  void VisitExpr_(const VarPtr& op) override { uses_.insert(op.get()); }
+  void VisitExpr_(const IterArgPtr& op) override { uses_.insert(op.get()); }
+  void VisitStmt_(const AssignStmtPtr& op) override {
+    // Only visit RHS value, not LHS var — definitions are not uses.
+    VisitExpr(op->value_);
   }
-  return uses;
-}
+
+ private:
+  std::unordered_set<const Var*> uses_;
+};
 
 /// Find the index of the YieldStmt in a flat statement list (backward search).
 /// Returns stmts.size() if not found.
@@ -1666,9 +1654,11 @@ IncoreTransformResult TransformIncoreFunction(const FunctionPtr& func,
           }
           if (candidates.empty()) return;
 
-          // Collect all var references from RHS expressions (after yield replacement).
+          // Full IR walk to collect all var uses (handles nested control flow).
           // Only remove aliases whose var is truly unused.
-          auto used = CollectStmtVarUses(stmts);
+          VarUseCollector collector;
+          for (const auto& s : stmts) collector.VisitStmt(s);
+          const auto& used = collector.uses();
           stmts.erase(std::remove_if(stmts.begin(), stmts.end(),
                                      [&candidates, &used](const StmtPtr& s) {
                                        auto assign = As<AssignStmt>(s);
