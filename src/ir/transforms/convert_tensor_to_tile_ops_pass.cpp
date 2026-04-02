@@ -425,6 +425,37 @@ ExprPtr ResolveTileAlias(const ExprPtr& expr, const TileAliasMap& alias_map) {
   return current;
 }
 
+/// Collect all Var pointers referenced within an expression tree (RHS uses only).
+/// Used to determine whether an alias variable is still live after yield replacement.
+void CollectExprVarRefs(const ExprPtr& expr, std::unordered_set<const Var*>& refs) {
+  if (!expr) return;
+  if (auto var = As<Var>(expr)) {
+    refs.insert(var.get());
+    return;
+  }
+  if (auto call = As<Call>(expr)) {
+    for (const auto& arg : call->args_) {
+      CollectExprVarRefs(arg, refs);
+    }
+  }
+}
+
+/// Collect all Var pointers used as RHS expressions across a flat statement list.
+/// Excludes LHS definitions — only captures actual uses.
+std::unordered_set<const Var*> CollectStmtVarUses(const std::vector<StmtPtr>& stmts) {
+  std::unordered_set<const Var*> uses;
+  for (const auto& s : stmts) {
+    if (auto assign = As<AssignStmt>(s)) {
+      CollectExprVarRefs(assign->value_, uses);
+    } else if (auto ys = As<YieldStmt>(s)) {
+      for (const auto& v : ys->value_) CollectExprVarRefs(v, uses);
+    } else if (auto es = As<EvalStmt>(s)) {
+      CollectExprVarRefs(es->expr_, uses);
+    }
+  }
+  return uses;
+}
+
 /// Find the index of the YieldStmt in a flat statement list (backward search).
 /// Returns stmts.size() if not found.
 size_t FindYieldIndex(const std::vector<StmtPtr>& stmts) {
@@ -1622,21 +1653,27 @@ IncoreTransformResult TransformIncoreFunction(const FunctionPtr& func,
         then_stmts[then_yield_idx] = std::make_shared<YieldStmt>(new_then_yield_values, then_yield->span_);
         else_stmts[else_yield_idx] = std::make_shared<YieldStmt>(new_else_yield_values, else_yield->span_);
 
-        // Remove dead alias assignments for yield values replaced by store sinking.
-        // Safe because sink candidates are simple pass-through branches (alias + yield).
+        // Remove alias assignments for yield values replaced by store sinking,
+        // but only if the alias var has no remaining uses in the branch.
         auto remove_dead_aliases = [&sink_candidates](std::vector<StmtPtr>& stmts, const YieldStmtPtr& yield,
                                                       const TileAliasMap& alias_map) {
-          std::unordered_set<const Var*> dead_vars;
+          std::unordered_set<const Var*> candidates;
           for (const auto& cand : sink_candidates) {
             auto old_var = As<Var>(yield->value_[cand.ifstmt_rv_index]);
             if (old_var && alias_map.count(old_var.get())) {
-              dead_vars.insert(old_var.get());
+              candidates.insert(old_var.get());
             }
           }
+          if (candidates.empty()) return;
+
+          // Collect all var references from RHS expressions (after yield replacement).
+          // Only remove aliases whose var is truly unused.
+          auto used = CollectStmtVarUses(stmts);
           stmts.erase(std::remove_if(stmts.begin(), stmts.end(),
-                                     [&dead_vars](const StmtPtr& s) {
+                                     [&candidates, &used](const StmtPtr& s) {
                                        auto assign = As<AssignStmt>(s);
-                                       return assign && dead_vars.count(assign->var_.get()) > 0;
+                                       return assign && candidates.count(assign->var_.get()) > 0 &&
+                                              used.count(assign->var_.get()) == 0;
                                      }),
                       stmts.end());
         };
