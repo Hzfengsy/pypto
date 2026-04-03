@@ -364,7 +364,13 @@ static std::string MakePrintCodegenPTO(const std::string& pto_op_name, const Cal
   CHECK(op->args_.size() == 1) << "Operation:" << pto_op_name << "] requires 1 argument, but got "
                                << op->args_.size();
   std::string src = codegen.GetExprAsCode(op->args_[0]);
-  codegen.Emit(pto_op_name + " ins(" + src + " | !pto.partition_tensor_view<MxNxdtype>)");
+  std::string src_type = codegen.GetExprTypeAnnotation(op->args_[0]);
+  std::string line = pto_op_name + " ins(" + src;
+  if (!src_type.empty()) {
+    line += " : " + src_type;
+  }
+  line += ")";
+  codegen.Emit(line);
   return "";
 }
 
