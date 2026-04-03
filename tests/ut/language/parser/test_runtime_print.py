@@ -12,6 +12,7 @@
 import pypto.language as pl
 import pytest
 from pypto import ir
+from pypto.language.parser.diagnostics.exceptions import InvalidOperationError
 
 
 class TestRuntimePrintTile:
@@ -184,7 +185,7 @@ class TestRuntimePrintErrors:
 
     def test_runtime_print_requires_tile_or_tensor(self):
         """runtime_print with scalar should raise an error."""
-        with pytest.raises(Exception):
+        with pytest.raises(InvalidOperationError):
 
             @pl.function
             def func(x: pl.Scalar[pl.FP32]) -> pl.Scalar[pl.FP32]:
