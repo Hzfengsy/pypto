@@ -10,9 +10,12 @@
 
 import enum
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any, Final, overload
+from typing import TYPE_CHECKING, Any, Final, overload
 
 from pypto import DataType
+
+if TYPE_CHECKING:
+    from pypto.language.typing.scalar import Scalar
 
 class Span:
     """Source location information tracking file, line, and column positions."""
@@ -381,14 +384,14 @@ class TensorView:
     @overload
     def __init__(
         self,
-        stride: Sequence[Expr | int],
+        stride: Sequence[Expr | int | Scalar],
         layout: TensorLayout,
-        valid_shape: Sequence[Expr | int] = ...,
+        valid_shape: Sequence[Expr | int | Scalar] = ...,
     ) -> None:
         """Create a tensor view with stride, layout and optional valid shape.
 
         Args:
-            stride: Stride for each dimension (Expr or int, ints auto-converted to ConstInt)
+            stride: Stride for each dimension (Expr, int, or Scalar/DynVar)
             layout: Tensor layout type (ND, DN, or NZ)
             valid_shape: Valid shape for each dimension (optional, defaults to empty)
         """

@@ -9,16 +9,20 @@
 
 """Dynamic shape variables for use in type annotations."""
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-if TYPE_CHECKING:
-    pass
+from pypto.pypto_core import DataType
+from pypto.pypto_core.ir import Expr, ScalarType, Span, Var
+
+from .scalar import Scalar
 
 
-class DynVar:
+class DynVar(Scalar):
     """Dynamic shape variable for use in type annotations.
 
     Creates a symbolic dimension that becomes an ir.Var node in the IR shape.
+    Inherits from Scalar so that DynVar is accepted wherever Scalar/IntLike
+    is expected (e.g. shape parameters, TensorView valid_shape).
 
     Example:
         M = pl.dynamic("M")
@@ -37,6 +41,23 @@ class DynVar:
         # that encounter this DynVar object share the same ir.Var instance,
         # ensuring structural equality across @pl.function boundaries.
         self._ir_var: Any = None
+        # Bypass Scalar.__init__ (which requires dtype or expr) and set
+        # its fields directly.  The actual expr is provided lazily via unwrap().
+        self.dtype = None
+        self.expr = None
+        self._annotation_only = False
+
+    def unwrap(self) -> Expr:
+        """Return the underlying ir.Var, creating it eagerly if needed.
+
+        This allows DynVar to participate in _normalize_intlike() and other
+        Scalar-consuming paths without requiring prior TypeResolver resolution.
+        """
+        if self._ir_var is None:
+            self._ir_var = Var(self.name, ScalarType(DataType.INDEX), Span.unknown())
+        # Keep Scalar.expr in sync so direct .expr access returns a valid value.
+        self.expr = self._ir_var
+        return self._ir_var
 
     def __repr__(self) -> str:
         return f"DynVar({self.name!r})"
@@ -51,7 +72,7 @@ def dynamic(name: str) -> DynVar:
     Returns:
         DynVar that can be used in shape annotations
     """
-    return DynVar(name)
+    return DynVar(name)  # type: ignore[return-value]  # metaclass __call__ typed as -> Scalar
 
 
 __all__ = ["DynVar", "dynamic"]

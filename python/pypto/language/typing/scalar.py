@@ -57,6 +57,11 @@ class ScalarMeta(type):
         Returns:
             Scalar instance
         """
+        # Subclasses (e.g. DynVar) bypass Scalar's arg reinterpretation logic
+        # and delegate directly to their own __init__.
+        if cls is not Scalar:
+            return cast("Scalar", type.__call__(cls, *args, **kwargs))
+
         _validate_scalar_meta_call(args, kwargs)
 
         # When called with just dtype (legacy notation), treat it as annotation mode
