@@ -37,6 +37,7 @@ Typical usage:
         return x
 """
 
+from pypto.ir import TensorView, TileView
 from pypto.pypto_core import DataType
 from pypto.pypto_core.ir import (
     ForKind,
@@ -49,9 +50,7 @@ from pypto.pypto_core.ir import (
     Role,
     SplitMode,
     TensorLayout,
-    TensorView,
     TileLayout,
-    TileView,
 )
 
 from . import parser

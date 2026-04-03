@@ -43,7 +43,7 @@ class DynVar(Scalar):
         self._ir_var: Any = None
         # Bypass Scalar.__init__ (which requires dtype or expr) and set
         # its fields directly.  The actual expr is provided lazily via unwrap().
-        self.dtype = None
+        self.dtype = DataType.INDEX
         self.expr = None
         self._annotation_only = False
 

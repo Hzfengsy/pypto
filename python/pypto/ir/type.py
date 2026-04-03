@@ -108,10 +108,20 @@ TileType.__init__ = _tile_type_init_wrapper
 
 
 def _normalize_seq(seq: Sequence[Expr | int] | None) -> list[Expr]:
-    """Normalize a sequence of Expr or int to a list of Expr."""
+    """Normalize a sequence of Expr, int, or Scalar/DynVar to a list of Expr."""
+    from pypto.language.typing.scalar import Scalar  # noqa: PLC0415  # lazy: circular import
+
     if not seq:
         return []
-    return [_normalize_expr(v) if isinstance(v, int) else v for v in seq]
+    result: list[Expr] = []
+    for v in seq:
+        if isinstance(v, int):
+            result.append(_normalize_expr(v))
+        elif isinstance(v, Scalar):
+            result.append(v.unwrap())
+        else:
+            result.append(v)
+    return result
 
 
 class _TensorViewMeta(type):
