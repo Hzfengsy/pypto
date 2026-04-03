@@ -203,6 +203,25 @@ inline void InheritTileViewLayout(TileView& dst, const std::shared_ptr<const Til
   }
 }
 
+/**
+ * @brief Deduce return types for a cross-function call by substituting dynamic
+ *        shape variables in the callee's return types with concrete values from
+ *        the actual call arguments.
+ *
+ * Builds a mapping from Var dimensions in callee param types to the
+ * corresponding dimensions in actual arg types, then substitutes those
+ * Vars in each return type.  Handles TensorType (shape + tensor_view),
+ * TileType (shape + tile_view), and TupleType (recursive).
+ *
+ * @param callee_params  Callee function parameter variables
+ * @param args           Actual call argument expressions
+ * @param return_types   Callee's declared return types
+ * @return Substituted return types (unchanged if no dynamic vars found)
+ */
+std::vector<TypePtr> DeduceCallReturnType(const std::vector<VarPtr>& callee_params,
+                                          const std::vector<ExprPtr>& args,
+                                          const std::vector<TypePtr>& return_types);
+
 }  // namespace ir
 }  // namespace pypto
 

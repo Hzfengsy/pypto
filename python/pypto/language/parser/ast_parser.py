@@ -2147,6 +2147,12 @@ class ASTParser:
 
                     args = [self.parse_expression(arg) for arg in call.args]
                     return_types = func_obj.return_types if func_obj else []
+                    if func_obj is not None and return_types:
+                        return_types = ir.deduce_call_return_type(
+                            list(func_obj.params),
+                            args,
+                            return_types,
+                        )
                     return self._make_call_with_return_type(gvar, args, return_types, span)
                 else:
                     raise UndefinedVariableError(
@@ -2373,7 +2379,12 @@ class ASTParser:
         args = [self.parse_expression(arg) for arg in call.args]
 
         gvar = ir.GlobalVar(func_name)
-        return self._make_call_with_return_type(gvar, args, ext_func.return_types, span)
+        return_types = ir.deduce_call_return_type(
+            list(ext_func.params),
+            args,
+            list(ext_func.return_types),
+        )
+        return self._make_call_with_return_type(gvar, args, return_types, span)
 
     @staticmethod
     def _is_docstring(stmt: ast.stmt) -> bool:

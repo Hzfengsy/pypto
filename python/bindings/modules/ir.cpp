@@ -49,6 +49,7 @@
 #include "pypto/ir/transforms/utils/parent_stmt_analysis.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
+#include "pypto/ir/type_inference.h"
 
 namespace nb = nanobind;
 
@@ -1325,6 +1326,12 @@ void BindIR(nb::module_& m) {
       "Deep-clone a statement subtree, creating fresh Var objects at definition sites.\n\n"
       "Returns a tuple of (cloned_body, var_map) where var_map is a list of\n"
       "(original_var, cloned_var) pairs for definition-site clones.");
+
+  // Cross-function call return type deduction
+  ir.def("deduce_call_return_type", &DeduceCallReturnType, nb::arg("callee_params"), nb::arg("args"),
+         nb::arg("return_types"),
+         "Deduce return types for a cross-function call by substituting "
+         "dynamic shape variables from callee params with actual arg shapes.");
 }
 
 }  // namespace python

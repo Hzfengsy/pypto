@@ -1391,6 +1391,141 @@ class TestFunctionCallArgCountValidation:
                     return result
 
 
+class TestCrossFunctionDynamicShapeSubstitution:
+    """Tests for dynamic shape variable substitution at cross-function call sites (issue #864)."""
+
+    def test_cross_function_dynamic_shape_substitution(self):
+        """Callee with dynamic [M, N] shapes, caller passes [128, 128] → return type is [128, 128]."""
+        M = pl.dynamic("M")
+        N = pl.dynamic("N")
+
+        @pl.program
+        class DynShape:
+            @pl.function(type=pl.FunctionType.InCore)
+            def add_kernel(
+                self,
+                a: pl.Tensor[[M, N], pl.FP32],
+                b: pl.Tensor[[M, N], pl.FP32],
+            ) -> pl.Tensor[[M, N], pl.FP32]:
+                result: pl.Tensor[[M, N], pl.FP32] = pl.add(a, b)
+                return result
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orchestrator(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                b: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                c: pl.Tensor[[128, 128], pl.FP32] = self.add_kernel(a, b)
+                return c
+
+        orch_func = DynShape.get_function("orchestrator")
+        assert orch_func is not None
+        body = orch_func.body
+        assert isinstance(body, ir.SeqStmts)
+        assign_stmt = body.stmts[0]
+        assert isinstance(assign_stmt, ir.AssignStmt)
+        call_expr = assign_stmt.value
+        assert isinstance(call_expr, ir.Call)
+        call_type = call_expr.type
+        assert isinstance(call_type, ir.TensorType)
+        # Verify shape dims are concrete ConstInt, not Var
+        for dim in call_type.shape:
+            assert isinstance(dim, ir.ConstInt), f"Expected ConstInt, got {type(dim).__name__}: {dim}"
+            assert dim.value == 128
+
+    def test_cross_function_dynamic_shape_partial(self):
+        """Callee has [M, 64] — only M should be substituted."""
+        M = pl.dynamic("M")
+
+        @pl.program
+        class PartialDyn:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[M, 64], pl.FP32],
+            ) -> pl.Tensor[[M, 64], pl.FP32]:
+                return a
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orch(
+                self,
+                a: pl.Tensor[[256, 64], pl.FP32],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                c: pl.Tensor[[256, 64], pl.FP32] = self.kernel(a)
+                return c
+
+        orch_func = PartialDyn.get_function("orch")
+        assert orch_func is not None
+        assert isinstance(orch_func.body, ir.SeqStmts)
+        assign_stmt = orch_func.body.stmts[0]
+        assert isinstance(assign_stmt, ir.AssignStmt)
+        call_type = assign_stmt.value.type
+        assert isinstance(call_type, ir.TensorType)
+        # First dim should be 256 (substituted), second should be 64 (unchanged)
+        assert isinstance(call_type.shape[0], ir.ConstInt)
+        assert call_type.shape[0].value == 256
+        assert isinstance(call_type.shape[1], ir.ConstInt)
+        assert call_type.shape[1].value == 64
+
+    def test_cross_function_static_shapes_unchanged(self):
+        """All-static shapes → no substitution needed, return types unchanged."""
+
+        @pl.program
+        class StaticShape:
+            @pl.function
+            def helper(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function
+            def caller(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                c: pl.Tensor[[64], pl.FP32] = self.helper(x)
+                return c
+
+        caller_func = StaticShape.get_function("caller")
+        assert caller_func is not None
+        assert isinstance(caller_func.body, ir.SeqStmts)
+        assign_stmt = caller_func.body.stmts[0]
+        assert isinstance(assign_stmt, ir.AssignStmt)
+        call_type = assign_stmt.value.type
+        assert isinstance(call_type, ir.TensorType)
+        assert isinstance(call_type.shape[0], ir.ConstInt)
+        assert call_type.shape[0].value == 64
+
+    def test_cross_function_dynamic_shape_mismatch_raises(self):
+        """Callee has [M, N], [M, N] but caller passes [128, 64], [127, 64] → M conflicts."""
+        M = pl.dynamic("M")
+        N = pl.dynamic("N")
+
+        with pytest.raises(Exception, match="conflicting bindings"):
+
+            @pl.program
+            class ShapeMismatch:
+                @pl.function(type=pl.FunctionType.InCore)
+                def kernel(
+                    self,
+                    a: pl.Tensor[[M, N], pl.FP32],
+                    b: pl.Tensor[[M, N], pl.FP32],
+                ) -> pl.Tensor[[M, N], pl.FP32]:
+                    result: pl.Tensor[[M, N], pl.FP32] = pl.add(a, b)
+                    return result
+
+                @pl.function(type=pl.FunctionType.Orchestration)
+                def orch(
+                    self,
+                    a: pl.Tensor[[128, 64], pl.FP32],
+                    b: pl.Tensor[[127, 64], pl.FP32],
+                ) -> pl.Tensor[[128, 64], pl.FP32]:
+                    c: pl.Tensor[[128, 64], pl.FP32] = self.kernel(a, b)
+                    return c
+
+
 class TestExternalFunctionControlFlow:
     """Tests for external @pl.function calls with control flow and SSA patterns."""
 

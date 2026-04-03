@@ -13,13 +13,18 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <functional>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "pypto/core/dtype.h"
+#include "pypto/core/logging.h"
+#include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/transforms/printer.h"
@@ -258,6 +263,128 @@ std::string FormatShape(const std::vector<ExprPtr>& shape) {
   }
   oss << "]";
   return oss.str();
+}
+
+// ============================================================================
+// Cross-function call return type deduction
+// ============================================================================
+
+std::vector<TypePtr> DeduceCallReturnType(const std::vector<VarPtr>& callee_params,
+                                          const std::vector<ExprPtr>& args,
+                                          const std::vector<TypePtr>& return_types) {
+  if (return_types.empty()) return return_types;
+
+  // 1. Build Var* -> ExprPtr mapping from param shapes vs arg shapes
+  std::unordered_map<const Var*, ExprPtr> var_map;
+  size_t n = std::min(callee_params.size(), args.size());
+  for (size_t i = 0; i < n; ++i) {
+    auto param_type = callee_params[i]->GetType();
+    auto arg_type = args[i]->GetType();
+    if (!param_type || !arg_type) continue;
+    auto p_shaped = As<ShapedType>(param_type);
+    auto a_shaped = As<ShapedType>(arg_type);
+    if (!p_shaped || !a_shaped) continue;
+    size_t ndim = std::min(p_shaped->shape_.size(), a_shaped->shape_.size());
+    for (size_t d = 0; d < ndim; ++d) {
+      if (auto var = As<Var>(p_shaped->shape_[d])) {
+        auto [it, inserted] = var_map.emplace(var.get(), a_shaped->shape_[d]);
+        // Validate consistency only when both are statically known constants.
+        // Symbolic dims (Vars, exprs) may be equal at runtime — defer to runtime.
+        if (!inserted) {
+          auto existing_const = GetConstantDimension(it->second);
+          auto new_const = GetConstantDimension(a_shaped->shape_[d]);
+          if (existing_const && new_const) {
+            CHECK(*existing_const == *new_const)
+                << "Dynamic shape variable '" << var->name_hint_
+                << "' has conflicting bindings: " << FormatShape({it->second}) << " vs "
+                << FormatShape({a_shaped->shape_[d]}) << " (from argument " << i << ", dimension " << d
+                << ")";
+          }
+        }
+      }
+    }
+  }
+  if (var_map.empty()) return return_types;
+
+  // 2. Substitution helpers
+  auto subst_dim = [&](const ExprPtr& dim) -> ExprPtr {
+    if (auto var = As<Var>(dim)) {
+      auto it = var_map.find(var.get());
+      if (it != var_map.end()) return it->second;
+    }
+    return dim;
+  };
+
+  auto subst_dims = [&](const std::vector<ExprPtr>& dims) {
+    std::vector<ExprPtr> result;
+    result.reserve(dims.size());
+    bool changed = false;
+    for (const auto& d : dims) {
+      auto nd = subst_dim(d);
+      if (nd.get() != d.get()) changed = true;
+      result.push_back(nd);
+    }
+    return std::pair{std::move(result), changed};
+  };
+
+  std::function<TypePtr(const TypePtr&)> subst_type;
+  subst_type = [&](const TypePtr& type) -> TypePtr {
+    if (!type) return type;
+    if (auto t = As<TensorType>(type)) {
+      auto [new_shape, changed] = subst_dims(t->shape_);
+      std::optional<TensorView> new_tv = t->tensor_view_;
+      if (new_tv.has_value()) {
+        auto [new_stride, s_changed] = subst_dims(new_tv->stride);
+        auto [new_vs, vs_changed] = subst_dims(new_tv->valid_shape);
+        if (s_changed || vs_changed) {
+          new_tv->stride = std::move(new_stride);
+          new_tv->valid_shape = std::move(new_vs);
+          changed = true;
+        }
+      }
+      if (!changed) return type;
+      return std::make_shared<TensorType>(std::move(new_shape), t->dtype_, t->memref_, std::move(new_tv));
+    }
+    if (auto t = As<TileType>(type)) {
+      auto [new_shape, changed] = subst_dims(t->shape_);
+      std::optional<TileView> new_tv = t->tile_view_;
+      if (new_tv.has_value()) {
+        auto [new_vs, vs_changed] = subst_dims(new_tv->valid_shape);
+        auto [new_stride, s_changed] = subst_dims(new_tv->stride);
+        auto new_start = subst_dim(new_tv->start_offset);
+        bool so_changed = (new_start.get() != new_tv->start_offset.get());
+        if (vs_changed || s_changed || so_changed) {
+          new_tv->valid_shape = std::move(new_vs);
+          new_tv->stride = std::move(new_stride);
+          new_tv->start_offset = std::move(new_start);
+          changed = true;
+        }
+      }
+      if (!changed) return type;
+      return std::make_shared<TileType>(std::move(new_shape), t->dtype_, t->memref_, std::move(new_tv),
+                                        t->memory_space_);
+    }
+    if (auto t = As<TupleType>(type)) {
+      std::vector<TypePtr> new_types;
+      bool changed = false;
+      for (const auto& inner : t->types_) {
+        auto nt = subst_type(inner);
+        if (nt.get() != inner.get()) changed = true;
+        new_types.push_back(nt);
+      }
+      if (!changed) return type;
+      return std::make_shared<TupleType>(std::move(new_types));
+    }
+    return type;  // ScalarType, etc. — no shape dims
+  };
+
+  // 3. Apply to all return types
+  std::vector<TypePtr> result;
+  result.reserve(return_types.size());
+  for (const auto& rt : return_types) {
+    result.push_back(subst_type(rt));
+  }
+  return result;
 }
 
 }  // namespace ir

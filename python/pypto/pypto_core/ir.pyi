@@ -2946,6 +2946,25 @@ def deep_clone(body: Stmt) -> tuple[Stmt, list[tuple[Var, Var]]]:
         (original_var, cloned_var) pairs for definition-site clones.
     """
 
+def deduce_call_return_type(
+    callee_params: Sequence[Var],
+    args: Sequence[Expr],
+    return_types: Sequence[Type],
+) -> list[Type]:
+    """Deduce return types for a cross-function call.
+
+    Substitutes dynamic shape variables in callee return types
+    with concrete values from actual argument types.
+
+    Args:
+        callee_params: Callee function parameter variables
+        args: Actual call argument expressions
+        return_types: Callee's declared return types
+
+    Returns:
+        Substituted return types (unchanged if no dynamic vars found)
+    """
+
 class IRVisitor:
     """Read-only IR visitor. Subclass and override visit_* methods.
 
