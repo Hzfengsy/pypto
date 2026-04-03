@@ -1487,18 +1487,31 @@ static std::unordered_map<const Var*, std::string> CollectDynVarMapping(const Pr
     const std::function<void(const TypePtr&)>& collect_from_type_;
   };
 
+  // Collect dynamic dim vars from type annotations, and simultaneously track
+  // all defined vars (params + body defs) so we can filter them out below.
   DynVarCollector collector(collect_from_type);
+  std::unordered_set<const Var*> defined_vars;
   for (const auto& [gvar, func] : program->functions_) {
     for (const auto& param : func->params_) {
       collector.VisitExpr(param);
+      defined_vars.insert(param.get());
     }
     for (const auto& ret_type : func->return_types_) {
       collect_from_type(ret_type);
     }
     if (func->body_) {
       collector.VisitStmt(func->body_);
+      std::vector<const Var*> body_defs;
+      CollectVarDefsInOrder(func->body_, body_defs);
+      defined_vars.insert(body_defs.begin(), body_defs.end());
     }
   }
+
+  // Filter out locally-defined vars and function params: they should not get
+  // pl.dynamic() declarations — only truly free dimension variables should.
+  dyn_var_ptrs.erase(std::remove_if(dyn_var_ptrs.begin(), dyn_var_ptrs.end(),
+                                    [&defined_vars](const Var* v) { return defined_vars.count(v) > 0; }),
+                     dyn_var_ptrs.end());
 
   // Phase 2: Assign unique printed names, disambiguating collisions.
   // Reuses the same rename logic as BuildVarRenameMap / BuildMemRefRenameMap.

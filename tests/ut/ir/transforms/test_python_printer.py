@@ -428,6 +428,58 @@ class TestDynVarAndSSARename:
         ]
         assert len(lhs_names) == len(set(lhs_names))
 
+    def test_local_var_in_valid_shape_not_declared_dynamic(self):
+        """Locally-defined var in tensor_view.valid_shape should not get pl.dynamic() (issue #854)."""
+        span = ir.Span.unknown()
+
+        # Free dynamic dim var (should get pl.dynamic)
+        var_n = ir.Var("N", ir.ScalarType(DataType.INDEX), span)
+
+        # Locally-defined variable (assigned in the body)
+        var_valid_len = ir.Var("valid_len", ir.ScalarType(DataType.INDEX), span)
+
+        # TensorView where valid_shape references the local var
+        tensor_view = ir.TensorView(
+            stride=[ir.ConstInt(1, DataType.INT64, span)],
+            layout=ir.TensorLayout.ND,
+            valid_shape=[var_valid_len],
+        )
+        viewed_type = ir.TensorType([var_n], DataType.FP32, tensor_view=tensor_view)
+
+        x = ir.Var("x", viewed_type, span)
+
+        # Body: valid_len = ConstInt(32) (locally defined via AssignStmt)
+        assign = ir.AssignStmt(var_valid_len, ir.ConstInt(32, DataType.INDEX, span), span)
+        ret = ir.ReturnStmt([x], span)
+        body = ir.SeqStmts([assign, ret], span)
+
+        func = ir.Function("main", [x], [ir.TensorType([var_n], DataType.FP32)], body, span)
+        prog = ir.Program([func], "TestProg", span)
+        src = prog.as_python()
+
+        # N is a free dim var => should get pl.dynamic declaration
+        assert 'N = pl.dynamic("N")' in src
+        # valid_len is locally defined => should NOT get pl.dynamic declaration
+        assert 'pl.dynamic("valid_len")' not in src
+
+    def test_param_var_used_as_dim_not_declared_dynamic(self):
+        """Function param var used as a dimension should not get pl.dynamic() (issue #854)."""
+        span = ir.Span.unknown()
+
+        # n is a function parameter (scalar)
+        n_param = ir.Var("n", ir.ScalarType(DataType.INDEX), span)
+
+        # x has shape [n_param] — n_param is a function param, not a free dim var
+        x = ir.Var("x", ir.TensorType([n_param], DataType.FP32), span)
+
+        ret = ir.ReturnStmt([x], span)
+        func = ir.Function("main", [n_param, x], [ir.TensorType([n_param], DataType.FP32)], ret, span)
+        prog = ir.Program([func], "TestProg", span)
+        src = prog.as_python()
+
+        # n is a function param => should NOT get pl.dynamic declaration
+        assert "pl.dynamic" not in src
+
 
 class TestOpOutputNormalization:
     """Op-specific printer output normalization."""
