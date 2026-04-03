@@ -460,6 +460,96 @@ class TestYieldMemRef:
         assert tile_types["alias_a"].shares_memref_with(tile_types["tile_a"])
 
 
+class TestDynamicValidShape:
+    """Regression tests for dynamic valid_shape Var handling in phi-node return vars."""
+
+    def test_if_phi_preserves_dynamic_valid_shape_vars(self):
+        """IfStmt phi return vars must not clone Vars in TileView.valid_shape (issue #870).
+
+        When PatchReturnVarsFromYield updates the return var's MemRef, it must not
+        re-remap expressions that were already remapped by the base IRMutator visit.
+        Double-remapping creates a fresh, undefined Var clone that fails UseAfterDef.
+        """
+        span = ir.Span.unknown()
+        idx = ir.DataType.INDEX
+
+        # Params: flag (condition) and ctx_len (used to compute valid_len)
+        flag = ir.Var("flag", ir.ScalarType(idx), span)
+        ctx_len = ir.Var("ctx_len", ir.ScalarType(idx), span)
+
+        # valid_len = ctx_len + 0  (defined before IfStmt)
+        valid_len = ir.Var("valid_len", ir.ScalarType(idx), span)
+        assign_valid_len = ir.AssignStmt(
+            valid_len, ir.Add(ctx_len, ir.ConstInt(0, idx, span), idx, span), span
+        )
+
+        # TileType with dynamic valid_shape=[1, valid_len]
+        tile_view = ir.TileView(
+            [ir.ConstInt(1, idx, span), valid_len],
+            [ir.ConstInt(1, idx, span), ir.ConstInt(120, idx, span)],
+            ir.ConstInt(0, idx, span),
+        )
+        tile_type = ir.TileType([1, 120], ir.DataType.FP32, None, tile_view, MemorySpace.Vec)
+
+        # Two tile vars: seed and updated
+        seed = ir.Var("seed", tile_type, span)
+        updated = ir.Var("updated", tile_type, span)
+        tpop_call = ir.Call(ir.Op("tile.tpop_from_aic"), [], {"aiv_idx": 0}, tile_type, span)
+        muls_call = ir.Call(ir.Op("tile.muls"), [seed], {"scalar": 1.0}, tile_type, span)
+
+        # Phi return var
+        phi_var = ir.Var("result_phi", tile_type, span)
+
+        # IfStmt: if flag == 0 then yield seed else yield updated
+        condition = ir.Eq(flag, ir.ConstInt(0, idx, span), idx, span)
+        if_stmt = ir.IfStmt(
+            condition,
+            ir.YieldStmt([seed], span),
+            ir.YieldStmt([updated], span),
+            [phi_var],
+            span,
+        )
+
+        body = ir.SeqStmts(
+            [
+                assign_valid_len,
+                ir.AssignStmt(seed, tpop_call, span),
+                ir.AssignStmt(updated, muls_call, span),
+                if_stmt,
+                ir.ReturnStmt([phi_var], span),
+            ],
+            span,
+        )
+        func = ir.Function("repro", [flag, ctx_len], [tile_type], body, span, type=ir.FunctionType.AIV)
+        program = ir.Program([func], "test_program", span)
+
+        # Run InitMemRef with verification but without roundtrip (raw IR may not
+        # survive print→parse because TileView with dynamic Vars has no DSL syntax).
+        with passes.PassContext(
+            [passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)],
+        ):
+            after = passes.init_mem_ref()(program)
+
+        # Explicitly verify UseAfterDef — the bug caused this property to fail
+        props = passes.IRPropertySet()
+        props.insert(passes.IRProperty.UseAfterDef)
+        diagnostics = passes.PropertyVerifierRegistry.verify(props, after)
+        errors = [d for d in diagnostics if d.severity == passes.DiagnosticSeverity.Error]
+        assert not errors, f"UseAfterDef errors after InitMemRef: {[d.message for d in errors]}"
+
+        # Double-check: return var's valid_shape must reference a defined Var
+        func_after = _first_function(after)
+        if_after = next(
+            stmt for stmt in cast(ir.SeqStmts, func_after.body).stmts if isinstance(stmt, ir.IfStmt)
+        )
+        rv = if_after.return_vars[0]
+        assert isinstance(rv.type, ir.TileType)
+        assert rv.type.tile_view is not None
+        vs = rv.type.tile_view.valid_shape
+        assert len(vs) == 2
+        assert isinstance(vs[1], ir.Var), "valid_shape[1] should be a Var, not a fresh clone"
+
+
 class TestEdgeCases:
     """Edge cases requiring raw IR construction."""
 

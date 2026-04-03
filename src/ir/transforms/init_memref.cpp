@@ -390,9 +390,8 @@ class InitMemRefMutator : public IRMutator {
       auto yield_var = get_yield_var(i);
       auto yield_tile = yield_var ? GetTileTypeWithMemRef(yield_var->GetType()) : nullptr;
       if (As<TileType>(new_return_vars[i]->GetType()) && yield_tile) {
-        auto new_type = CloneTypeWithMemRefAndRemapExprs(
-            new_return_vars[i]->GetType(), yield_tile->memref_,
-            [this](const ExprPtr& expr) { return VisitExpr(expr); }, yield_tile->GetMemorySpace());
+        auto new_type = CloneTypeWithMemRef(new_return_vars[i]->GetType(), yield_tile->memref_,
+                                            yield_tile->GetMemorySpace());
         auto new_rv =
             std::make_shared<Var>(new_return_vars[i]->name_hint_, new_type, new_return_vars[i]->span_);
         var_map_[old_return_vars[i]] = new_rv;
