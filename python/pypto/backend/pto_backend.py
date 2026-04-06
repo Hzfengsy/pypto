@@ -330,12 +330,20 @@ def _generate_kernel_wrapper(func: _ir_core.Function, ptoas_code: str) -> str:
     3. ``kernel_entry`` wrapper with arg unpacking and forward call
     """
     header = _KERNEL_HEADER.format(func_name=func.name)
-    # TPRINT is guarded by #ifdef _DEBUG in pto-isa headers.
-    # Define _DEBUG before the include when the kernel uses TPRINT.
+    # TPRINT is guarded by #ifdef _DEBUG in pto-isa headers.  Defining
+    # _DEBUG globally is too broad (it enables cce::printf calls that don't
+    # compile on simulation).  Instead, provide a no-op fallback so the
+    # generated code compiles in all environments.
     if "TPRINT" in ptoas_code:
         header = header.replace(
-            "#include <pto/pto-inst.hpp>",
-            "#define _DEBUG\n#include <pto/pto-inst.hpp>",
+            "using namespace pto;",
+            "using namespace pto;\n\n"
+            "#ifndef _DEBUG\n"
+            "namespace pto {\n"
+            "template <typename T>\n"
+            "PTO_INST void TPRINT(T& /*src*/) {}\n"
+            "} // namespace pto\n"
+            "#endif",
         )
     ptoas_body = _preprocess_ptoas_output(ptoas_code)
     unpacking_code, var_names = _generate_arg_unpacking(func)
