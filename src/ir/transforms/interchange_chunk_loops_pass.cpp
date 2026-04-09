@@ -17,10 +17,12 @@
 #include <utility>
 #include <vector>
 
+#include "pypto/core/error.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/core.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
+#include "pypto/ir/program.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/mutator.h"
@@ -29,6 +31,7 @@
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/auto_name_utils.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
+#include "pypto/ir/verifier/verifier.h"
 
 namespace pypto {
 namespace ir {
@@ -353,8 +356,23 @@ class InterchangeChunkLoopsMutator : public IRMutator {
 
  private:
   bool inside_auto_incore_ = false;
+  bool inside_incore_context_ = false;
   std::optional<SplitMode> current_split_;
   std::unordered_map<const Var*, ExprPtr> substitution_map_;
+
+  /**
+   * @brief Visit a body that will be placed inside an InCore scope.
+   *
+   * Sets inside_incore_context_ so nested chains skip their own InCore wrapping.
+   * Returns whether a parent chain already provides InCore context (prev value).
+   */
+  std::pair<StmtPtr, bool> VisitBodyInIncoreContext(const StmtPtr& body) {
+    bool prev_incore = inside_incore_context_;
+    inside_incore_context_ = true;
+    auto result = VisitStmt(body);
+    inside_incore_context_ = prev_incore;
+    return {result, prev_incore};
+  }
 
   /**
    * @brief Collect a chain of chunk loops starting from a ChunkOuter.
@@ -448,6 +466,15 @@ class InterchangeChunkLoopsMutator : public IRMutator {
     const auto& innermost = chain.back().for_stmt;
     if (ContainsInCoreScope(innermost->body_)) {
       return IRMutator::VisitStmt_(op);
+    }
+
+    // Warn if this interchange is nested inside a parent chain's InCore context
+    if (inside_incore_context_) {
+      LOG_WARN << op->span_.filename_ << ":" << op->span_.begin_line_ << " — "
+               << "Nested chunked parallel loop found with intervening statements between it and its parent "
+               << "chunked parallel — the inner chunk will share the parent's InCore scope instead of "
+               << "getting its own. Consider removing the intervening statements or restructuring the loop "
+               << "nest so the chunked parallels are directly nested.";
     }
 
     // Perform the interchange
@@ -561,7 +588,8 @@ class InterchangeChunkLoopsMutator : public IRMutator {
                         const std::vector<ChainEntry>& chain, const Span& span) {
     // Get the body from the last loop in inners (not chain.back(), which may be a remainder)
     const auto& innermost = inners.back();
-    auto body = VisitStmt(innermost->body_);
+
+    auto [body, prev_incore] = VisitBodyInIncoreContext(innermost->body_);
 
     // Build inners inside-out
     StmtPtr current = body;
@@ -573,9 +601,11 @@ class InterchangeChunkLoopsMutator : public IRMutator {
                                           LoopOrigin::ChunkInner);
     }
 
-    // Wrap in InCore
-    current = std::make_shared<ScopeStmt>(ScopeKind::InCore, current, span, std::nullopt, std::nullopt,
-                                          current_split_);
+    // Wrap in InCore — skip if a parent chain already provides InCore context
+    if (!prev_incore) {
+      current = std::make_shared<ScopeStmt>(ScopeKind::InCore, current, span, std::nullopt, std::nullopt,
+                                            current_split_);
+    }
 
     // Build outers inside-out, preserving the original ForKind.
     for (int i = static_cast<int>(outers.size()) - 1; i >= 0; --i) {
@@ -661,7 +691,7 @@ class InterchangeChunkLoopsMutator : public IRMutator {
     }
 
     // Visit the innermost body with substitutions
-    auto body = VisitStmt(orig_innermost->body_);
+    auto [body, prev_incore] = VisitBodyInIncoreContext(orig_innermost->body_);
 
     // Build the loop nest inside-out, starting from the innermost (last in reordered)
     StmtPtr current = body;
@@ -695,8 +725,9 @@ class InterchangeChunkLoopsMutator : public IRMutator {
           current, new_return_vars[i], orig_loop->span_, orig_loop->kind_, std::nullopt,
           ChunkPolicy::LeadingFull, is_inner ? LoopOrigin::ChunkInner : LoopOrigin::ChunkOuter);
 
-      // Insert InCore scope right after building all inners (at the boundary)
-      if (!is_inner && i + 1 < static_cast<int>(total_loops) &&
+      // Insert InCore scope right after building all inners (at the boundary).
+      // Skip if a parent chain already provides InCore context.
+      if (!prev_incore && !is_inner && i + 1 < static_cast<int>(total_loops) &&
           reordered[i + 1]->loop_origin_ == LoopOrigin::ChunkInner) {
         // The current ForStmt body already contains the inner loops.
         // We need to wrap the inner loop nest (current's body) in InCore.
@@ -782,6 +813,62 @@ Pass InterchangeChunkLoops() {
                             kInterchangeChunkLoopsProperties);
 }
 }  // namespace pass
+
+// ============================================================================
+// NoNestedInCore structural property verifier
+// ============================================================================
+
+namespace {
+
+constexpr int kNestedIncoreCode = 501;
+
+/// Detects nested ScopeStmt(InCore) scopes in an IR tree.
+class NestedInCoreScopeDetector : public IRVisitor {
+ public:
+  explicit NestedInCoreScopeDetector(std::vector<Diagnostic>& diagnostics) : diagnostics_(diagnostics) {}
+
+  void VisitStmt_(const ScopeStmtPtr& op) override {
+    if (!op) return;
+    if (op->scope_kind_ == ScopeKind::InCore) {
+      if (inside_incore_) {
+        diagnostics_.emplace_back(DiagnosticSeverity::Error, "NoNestedInCore", kNestedIncoreCode,
+                                  "Nested InCore scope detected — InCore scopes must not contain other "
+                                  "InCore scopes",
+                                  op->span_);
+      }
+      bool prev = inside_incore_;
+      inside_incore_ = true;
+      IRVisitor::VisitStmt_(op);
+      inside_incore_ = prev;
+    } else {
+      IRVisitor::VisitStmt_(op);
+    }
+  }
+
+ private:
+  std::vector<Diagnostic>& diagnostics_;
+  bool inside_incore_ = false;
+};
+
+}  // namespace
+
+class NoNestedIncorePropertyVerifierImpl : public PropertyVerifier {
+ public:
+  [[nodiscard]] std::string GetName() const override { return "NoNestedInCore"; }
+
+  void Verify(const ProgramPtr& program, std::vector<Diagnostic>& diagnostics) override {
+    if (!program) return;
+    for (const auto& [gv, func] : program->functions_) {
+      if (!func || !func->body_) continue;
+      NestedInCoreScopeDetector detector(diagnostics);
+      detector.VisitStmt(func->body_);
+    }
+  }
+};
+
+PropertyVerifierPtr CreateNoNestedIncorePropertyVerifier() {
+  return std::make_shared<NoNestedIncorePropertyVerifierImpl>();
+}
 
 }  // namespace ir
 }  // namespace pypto
