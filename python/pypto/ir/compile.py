@@ -10,10 +10,13 @@
 """High-level API functions for PyPTO IR compilation."""
 
 import os
+from contextlib import AbstractContextManager, nullcontext
 from datetime import datetime
+from typing import Any
 
 from pypto.backend import BackendType
 from pypto.backend.pto_backend import PartialCodegenError, generate
+from pypto.compile_profiling import CompileProfiler, get_active_profiler
 from pypto.pypto_core import backend as _backend_core
 from pypto.pypto_core import ir as _ir_core
 from pypto.pypto_core import passes as _passes
@@ -42,6 +45,7 @@ def compile(
     verification_level: _passes.VerificationLevel | None = None,
     warning_level: _passes.WarningLevel | None = None,
     disabled_warnings: _passes.WarningCheckSet | None = None,
+    profiling: bool = False,
 ) -> str:
     """Compile a Program through passes and codegen.
 
@@ -65,6 +69,8 @@ def compile(
             None uses the default (PrePipeline, or PYPTO_WARNING_LEVEL env var).
         disabled_warnings: Set of warning checks to disable. None uses the default
             (UnusedControlFlowResult disabled).
+        profiling: If True, enable compile profiling that records per-stage
+            wall-clock timings.  Results are written to ``output_dir/report/``.
 
     Returns:
         Path to the output directory containing all artifacts
@@ -101,6 +107,14 @@ def compile(
             "Set the warning level on the existing PassContext instead."
         )
 
+    # --- Compile profiling ---------------------------------------------------
+    prof = get_active_profiler()
+    owns_profiler = False
+    if prof is None and profiling:
+        prof = CompileProfiler()
+        prof.__enter__()
+        owns_profiler = True
+
     report_dir = os.path.join(output_dir, "report")
     os.makedirs(report_dir, exist_ok=True)
     report_instrument = _passes.ReportInstrument(report_dir)
@@ -123,19 +137,31 @@ def compile(
         disabled = disabled_warnings if disabled_warnings is not None else default_disabled
     ctx = _passes.PassContext(instruments, vlevel, wlevel, disabled)
 
-    with ctx:
-        pm = PassManager.get_strategy(strategy)
-        passes_dump_dir = os.path.join(output_dir, "passes_dump")
-        transformed_program = pm.run_passes(program, dump_ir=dump_passes, output_dir=passes_dump_dir)
+    def _stage(name: str) -> AbstractContextManager[Any]:
+        if prof is not None:
+            return prof.stage(name)
+        return nullcontext()
 
-    if backend_type in (BackendType.Ascend910B, BackendType.Ascend950):
-        try:
-            files = generate(transformed_program, output_dir, skip_ptoas=skip_ptoas)
-        except PartialCodegenError as exc:
-            _write_files(exc.files, output_dir)
-            raise
-        _write_files(files, output_dir)
-    else:
-        raise ValueError(f"Unsupported backend type: {backend_type}")
+    try:
+        with ctx:
+            pm = PassManager.get_strategy(strategy)
+            passes_dump_dir = os.path.join(output_dir, "passes_dump")
+            with _stage("passes"):
+                transformed_program = pm.run_passes(program, dump_ir=dump_passes, output_dir=passes_dump_dir)
+
+        if backend_type in (BackendType.Ascend910B, BackendType.Ascend950):
+            try:
+                with _stage("codegen"):
+                    files = generate(transformed_program, output_dir, skip_ptoas=skip_ptoas)
+            except PartialCodegenError as exc:
+                _write_files(exc.files, output_dir)
+                raise
+            _write_files(files, output_dir)
+        else:
+            raise ValueError(f"Unsupported backend type: {backend_type}")
+    finally:
+        if owns_profiler and prof is not None:
+            prof.__exit__(None, None, None)
+            prof.write_report(report_dir)
 
     return output_dir

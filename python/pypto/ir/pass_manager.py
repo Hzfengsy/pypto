@@ -14,6 +14,7 @@ import re
 from collections.abc import Callable
 from enum import Enum
 
+from pypto.compile_profiling import CompileProfiler
 from pypto.pypto_core import ir as core_ir
 from pypto.pypto_core import passes
 
@@ -209,7 +210,9 @@ class PassManager:
             ValueError: If dump_ir=True but output_dir is None
         """
         if not dump_ir:
-            # Use C++ PassPipeline for property-tracked execution
+            prof = CompileProfiler.current()
+            if prof is not None:
+                return self._run_with_profiling(input_ir, prof)
             return self._pipeline.run(input_ir)
 
         # Dump mode: validate parameters, use CallbackInstrument for IR dumping
@@ -245,8 +248,17 @@ class PassManager:
         all_checks = passes.WarningVerifierRegistry.get_all_checks()
         effective_checks = all_checks.difference(disabled)
 
+        prof = CompileProfiler.current()
+        stage_open = False
+
+        def before_pass_profiling(_pass_obj: passes.Pass, _program: core_ir.Program) -> None:
+            nonlocal stage_open
+            if prof is not None:
+                prof._begin_stage(self.pass_names[pass_index])
+                stage_open = True
+
         def after_pass(_pass_obj: passes.Pass, program: core_ir.Program) -> None:
-            nonlocal pass_index
+            nonlocal pass_index, stage_open
             pass_name = self.pass_names[pass_index]
             stem = f"{pass_index + 1:02d}_after_{pass_name}"
 
@@ -269,9 +281,20 @@ class PassManager:
                     with open(warn_path, "w") as f:
                         f.write(formatted)
 
+            if prof is not None and stage_open:
+                prof._end_stage()
+                stage_open = False
             pass_index += 1
 
+        extra_instruments: list[passes.PassInstrument] = []
         dump_instrument = passes.CallbackInstrument(after_pass=after_pass, name="IRDump")
+        extra_instruments.append(dump_instrument)
+
+        if prof is not None:
+            timing_instrument = passes.CallbackInstrument(
+                before_pass=before_pass_profiling, name="PipelineProfilingBeforePass"
+            )
+            extra_instruments.insert(0, timing_instrument)
 
         # Compose dump instrument with any outer context's instruments and settings.
         # C++ pipeline handles pre-pipeline warnings (LOG_WARN); post-pass warnings
@@ -281,9 +304,50 @@ class PassManager:
         level = ctx.get_verification_level() if ctx else passes.get_default_verification_level()
 
         with passes.PassContext(
-            outer_instruments + [dump_instrument], level, passes.WarningLevel.PRE_PIPELINE, disabled
+            [*outer_instruments, *extra_instruments], level, passes.WarningLevel.PRE_PIPELINE, disabled
         ):
-            return self._pipeline.run(input_ir)
+            try:
+                return self._pipeline.run(input_ir)
+            finally:
+                if stage_open and prof is not None:
+                    prof._end_stage()
+
+    def _run_with_profiling(self, input_ir: core_ir.Program, prof: CompileProfiler) -> core_ir.Program:
+        """Run the pipeline with per-pass timing recorded into *prof*."""
+        pass_index = 0
+        stage_open = False
+
+        def before_pass(_pass_obj: passes.Pass, _program: core_ir.Program) -> None:
+            nonlocal pass_index, stage_open
+            prof._begin_stage(self.pass_names[pass_index])
+            stage_open = True
+
+        def after_pass(_pass_obj: passes.Pass, _program: core_ir.Program) -> None:
+            nonlocal pass_index, stage_open
+            if stage_open:
+                prof._end_stage()
+                stage_open = False
+            pass_index += 1
+
+        timing_instrument = passes.CallbackInstrument(
+            before_pass=before_pass, after_pass=after_pass, name="PipelineProfiling"
+        )
+        ctx = passes.PassContext.current()
+        outer_instruments = list(ctx.get_instruments()) if ctx else []
+        level = ctx.get_verification_level() if ctx else passes.get_default_verification_level()
+        wlevel = ctx.get_warning_level() if ctx else passes.get_default_warning_level()
+        if ctx:
+            disabled = ctx.get_disabled_warnings()
+        else:
+            disabled = passes.WarningCheckSet()
+            disabled.insert(passes.WarningCheck.UnusedControlFlowResult)
+
+        with passes.PassContext([*outer_instruments, timing_instrument], level, wlevel, disabled):
+            try:
+                return self._pipeline.run(input_ir)
+            finally:
+                if stage_open:
+                    prof._end_stage()
 
     def get_pass_names(self) -> list[str]:
         """Get the names of all passes in this manager.

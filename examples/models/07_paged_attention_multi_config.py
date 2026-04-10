@@ -717,10 +717,10 @@ def build_tensor_specs_multi_config(
 def main():
     parser = argparse.ArgumentParser(description="Multi-config paged attention example")
     parser.add_argument(
-        "--enable-profiling",
+        "--runtime-profiling",
         action="store_true",
         default=False,
-        help="Enable runtime profiling and generate swimlane JSON",
+        help="Enable on-device runtime profiling and generate swimlane JSON",
     )
     args = parser.parse_args()
 
@@ -762,7 +762,8 @@ def main():
             strategy=OptimizationStrategy.Default,
             dump_passes=True,
             backend_type=BackendType.Ascend910B,
-            enable_profiling=args.enable_profiling,
+            compile_profiling=True,
+            runtime_profiling=args.runtime_profiling,
         ),
     )
     print(f"Result: {result}")
