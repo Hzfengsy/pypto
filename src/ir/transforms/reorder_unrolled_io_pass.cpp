@@ -10,12 +10,12 @@
  */
 
 #include <cstddef>
+#include <functional>
 #include <map>
 #include <memory>
-#include <optional>
+#include <queue>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -34,8 +34,6 @@
 namespace pypto {
 namespace ir {
 namespace {
-
-constexpr const char* kUnrollReplicatedAttr = "unroll_replicated";
 
 /// IO category used for priority during the topological sort. Lower is emitted first.
 enum class IOCategory : int { Load = 0, Compute = 1, Store = 2 };
@@ -84,8 +82,19 @@ IOCategory CategorizeStmt(const StmtPtr& stmt, const IOCategoryOps& ops) {
   return IOCategory::Compute;
 }
 
+/// Terminators (`YieldStmt`, `ReturnStmt`, `BreakStmt`, `ContinueStmt`) must
+/// stay last in their scope: moving them ahead of a side-effecting `tile.store`
+/// would make the store unreachable. Valid SSA always places a terminator at
+/// the end of the enclosing `SeqStmts`.
+bool IsTerminator(const StmtPtr& stmt) {
+  return std::dynamic_pointer_cast<const YieldStmt>(stmt) ||
+         std::dynamic_pointer_cast<const ReturnStmt>(stmt) ||
+         std::dynamic_pointer_cast<const BreakStmt>(stmt) ||
+         std::dynamic_pointer_cast<const ContinueStmt>(stmt);
+}
+
 /**
- * @brief Mutator that reorders statements inside ``unroll_replicated`` SeqStmts:
+ * @brief Mutator that reorders every multi-stmt ``SeqStmts`` in the program:
  *        loads pulled to the top, stores pushed to the bottom, compute in the middle —
  *        all subject to the dependency graph.
  */
@@ -94,88 +103,106 @@ class ReorderUnrolledIOMutator : public IRMutator {
   explicit ReorderUnrolledIOMutator(ProgramPtr program)
       : program_(std::move(program)), io_ops_(IOCategoryOps::Build()) {}
 
-  StmtPtr VisitStmt_(const ForStmtPtr& op) override {
-    // Recurse first so any inner unroll-replicated regions are reordered too.
+  StmtPtr VisitStmt_(const SeqStmtsPtr& op) override {
+    // Recurse first so any nested SeqStmts are reordered bottom-up.
     auto visited = IRMutator::VisitStmt_(op);
-    auto for_stmt = std::dynamic_pointer_cast<const ForStmt>(visited);
-    if (!for_stmt || !for_stmt->HasAttr(kUnrollReplicatedAttr)) {
-      return visited;
-    }
-    auto seq = std::dynamic_pointer_cast<const SeqStmts>(for_stmt->body_);
+    auto seq = std::dynamic_pointer_cast<const SeqStmts>(visited);
     if (!seq || seq->stmts_.size() < 2) {
       return visited;  // single stmt — nothing to reorder
     }
-    auto reordered = ReorderRegion(seq);
-    if (reordered.get() == seq.get()) {
+    // Regions that violate the InOut-use discipline are left alone: under
+    // strict verification they would be caught earlier, but with
+    // VerificationLevel.NONE a pre-existing violation can reach us and we
+    // shouldn't reorder potentially-unsound dataflow. We do the discipline
+    // check ourselves so that the subsequent `BuildStmtDependencyGraph` call
+    // (which would repeat the check when given a non-null program) can skip
+    // it by passing `nullptr` — avoiding an O(N) double traversal.
+    if (!stmt_dep::CollectInOutUseDisciplineDiagnostics(seq, program_).empty()) {
       return visited;
     }
-    auto new_for = MutableCopy(for_stmt);
-    new_for->body_ = reordered;
-    return new_for;
+    return ReorderRegion(seq);
   }
 
  private:
-  /// Stable, priority-aware topological sort.
+  /// Stable, priority-aware topological sort. Caller is responsible for
+  /// verifying the InOut-use discipline before invoking.
+  ///
+  /// Complexity: O(N + E + N log N) per region — adjacency list built once,
+  /// the ready set maintained as a min-heap keyed by (category, index).
+  /// N = number of top-level stmts, E = number of def-use edges (bounded by N).
+  ///
+  /// A trailing terminator (`YieldStmt` / `ReturnStmt` / `BreakStmt` /
+  /// `ContinueStmt`) is peeled off before sorting and re-appended at the end
+  /// so stores can never be emitted after it (which would make them
+  /// unreachable / semantically dropped).
   StmtPtr ReorderRegion(const SeqStmtsPtr& seq) {
-    // Discipline check ensures dataflow soundness — see RFC #1026 / PR #1029.
-    stmt_dep::CheckInOutUseDiscipline(seq, program_);
-    auto graph = stmt_dep::BuildStmtDependencyGraph(seq, program_);
+    // Pass `nullptr` for the program — we've already validated the discipline,
+    // and re-running it inside BuildStmtDependencyGraph would be redundant work.
+    auto graph = stmt_dep::BuildStmtDependencyGraph(seq, /*program=*/nullptr);
 
     const auto& stmts = seq->stmts_;
     const size_t N = stmts.size();
 
-    std::vector<IOCategory> cats(N);
-    for (size_t i = 0; i < N; ++i) cats[i] = CategorizeStmt(stmts[i], io_ops_);
+    // Peel off a trailing terminator — it stays last regardless of category.
+    const bool has_terminator = IsTerminator(stmts.back());
+    const size_t sort_count = has_terminator ? N - 1 : N;
+    if (sort_count < 2) return seq;  // nothing to reorder among non-terminators
 
-    // Per-stmt count of unsatisfied predecessors. BuildStmtDependencyGraph
-    // only records within-region edges (last_def is populated from stmts in
-    // this region), so every predecessor counted here is a sibling statement.
-    std::vector<size_t> remaining(N, 0);
-    for (size_t i = 0; i < N; ++i) {
-      auto it = graph.predecessors.find(stmts[i].get());
-      if (it != graph.predecessors.end()) remaining[i] = it->second.size();
+    std::vector<IOCategory> cats(sort_count);
+    std::unordered_map<const Stmt*, size_t> idx_of;
+    idx_of.reserve(sort_count);
+    for (size_t i = 0; i < sort_count; ++i) {
+      cats[i] = CategorizeStmt(stmts[i], io_ops_);
+      idx_of.emplace(stmts[i].get(), i);
     }
 
-    std::vector<bool> emitted(N, false);
+    // Build successors adjacency lists + in-degree counts in one pass over
+    // the region's predecessor map. Predecessor entries for the terminator
+    // (if any) are ignored so it cannot decrement any non-terminator's
+    // remaining count and end up "ready" early.
+    std::vector<std::vector<size_t>> successors(sort_count);
+    std::vector<size_t> remaining(sort_count, 0);
+    for (size_t j = 0; j < sort_count; ++j) {
+      auto it = graph.predecessors.find(stmts[j].get());
+      if (it == graph.predecessors.end()) continue;
+      for (const Stmt* pred : it->second) {
+        auto pit = idx_of.find(pred);
+        if (pit == idx_of.end()) continue;  // predecessor is the terminator — ignore
+        successors[pit->second].push_back(j);
+        ++remaining[j];
+      }
+    }
+
+    // Ready-set as a min-heap keyed by (category_bias, original_index). For
+    // non-store stmts the key is (category, i); stores get a bias of +1 above
+    // the max non-store category so they only surface when nothing else is
+    // ready — preserving the original load-top / compute-middle / store-bottom
+    // behavior. Using index as the tiebreaker keeps the sort stable.
+    constexpr int kStoreDeferBias = static_cast<int>(IOCategory::Store) + 100;
+    using HeapKey = std::pair<int, size_t>;
+    std::priority_queue<HeapKey, std::vector<HeapKey>, std::greater<>> ready;
+    auto key_for = [&](size_t i) -> HeapKey {
+      int bias = (cats[i] == IOCategory::Store) ? kStoreDeferBias : static_cast<int>(cats[i]);
+      return {bias, i};
+    };
+    for (size_t i = 0; i < sort_count; ++i) {
+      if (remaining[i] == 0) ready.push(key_for(i));
+    }
+
     std::vector<StmtPtr> out;
     out.reserve(N);
-
-    auto pick_next = [&]() -> std::optional<size_t> {
-      // Prefer the smallest (cat, idx) among non-store ready stmts; only fall
-      // back to a store when nothing else is ready, so stores defer to the end.
-      std::optional<std::pair<int, size_t>> best_non_store;
-      std::optional<size_t> best_store;
-      for (size_t i = 0; i < N; ++i) {
-        if (emitted[i] || remaining[i] != 0) continue;
-        if (cats[i] == IOCategory::Store) {
-          if (!best_store) best_store = i;
-        } else {
-          std::pair<int, size_t> key{static_cast<int>(cats[i]), i};
-          if (!best_non_store || key < *best_non_store) best_non_store = key;
-        }
-      }
-      if (best_non_store) return best_non_store->second;
-      return best_store;
-    };
-
-    while (out.size() < N) {
-      auto pick = pick_next();
-      INTERNAL_CHECK(pick.has_value())
-          << "ReorderUnrolledIO: dependency graph appears cyclic — should be impossible "
-             "for an SSA region under the InOut-use discipline";
-      size_t i = *pick;
-      emitted[i] = true;
+    while (!ready.empty()) {
+      size_t i = ready.top().second;
+      ready.pop();
       out.push_back(stmts[i]);
-      // Decrement successors' unsatisfied-pred counts.
-      for (size_t j = 0; j < N; ++j) {
-        if (emitted[j] || remaining[j] == 0) continue;
-        auto it = graph.predecessors.find(stmts[j].get());
-        if (it == graph.predecessors.end()) continue;
-        if (it->second.count(stmts[i].get())) {
-          --remaining[j];
-        }
+      for (size_t j : successors[i]) {
+        if (--remaining[j] == 0) ready.push(key_for(j));
       }
     }
+    INTERNAL_CHECK(out.size() == sort_count)
+        << "ReorderUnrolledIO: dependency graph appears cyclic — should be impossible "
+           "for an SSA region under the InOut-use discipline";
+    if (has_terminator) out.push_back(stmts.back());
 
     // No-op detection.
     bool changed = false;
