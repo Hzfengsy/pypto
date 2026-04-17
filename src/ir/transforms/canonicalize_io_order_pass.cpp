@@ -30,13 +30,21 @@
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/stmt_dependency_analysis.h"
+#include "pypto/ir/type.h"
 
 namespace pypto {
 namespace ir {
 namespace {
 
 /// IO category used for priority during the topological sort. Lower is emitted first.
-enum class IOCategory : int { Load = 0, Compute = 1, Store = 2 };
+///
+/// ``ScalarCompute`` sits above ``Load`` so that address-arithmetic assigns
+/// (e.g. ``k = i * 512``) — the typical predecessors of a tile.load offset —
+/// are emitted first, allowing all sibling clones' loads to become ready and
+/// cluster at the top of the region. Without this split, a per-clone scalar
+/// gate would interleave between clones and prevent the load-cluster layout
+/// that ping-pong buffering depends on.
+enum class IOCategory : int { ScalarCompute = 0, Load = 1, TileCompute = 2, Store = 3 };
 
 /// Singletons for the ops the pass cares about — resolved once from the registry
 /// and compared by identity in ``CategorizeStmt``. Using pointer identity instead
@@ -71,15 +79,24 @@ IOCategory CategorizeStmt(const StmtPtr& stmt, const IOCategoryOps& ops) {
   if (auto assign = std::dynamic_pointer_cast<const AssignStmt>(stmt)) {
     auto op = CalledOp(assign->value_);
     if (op) {
+      // tile.read keeps Load even though its LHS is scalar — it's I/O against
+      // a tile and belongs in the load tier alongside tile.load.
       if (ops.IsLoadLike(op)) return IOCategory::Load;
       if (ops.IsStoreLike(op)) return IOCategory::Store;
     }
+    INTERNAL_CHECK(assign->var_) << "Internal error: AssignStmt has null var_";
+    // Scalar-producing compute lifts to the top so it unblocks downstream
+    // loads; tile/tensor-producing compute stays in the middle.
+    if (std::dynamic_pointer_cast<const ScalarType>(assign->var_->GetType())) {
+      return IOCategory::ScalarCompute;
+    }
+    return IOCategory::TileCompute;
   }
   if (auto eval = std::dynamic_pointer_cast<const EvalStmt>(stmt)) {
     auto op = CalledOp(eval->expr_);
     if (op && ops.IsStoreLike(op)) return IOCategory::Store;
   }
-  return IOCategory::Compute;
+  return IOCategory::TileCompute;
 }
 
 /// Terminators (`YieldStmt`, `ReturnStmt`, `BreakStmt`, `ContinueStmt`) must
@@ -94,14 +111,21 @@ bool IsTerminator(const StmtPtr& stmt) {
 }
 
 /**
- * @brief Mutator that reorders every multi-stmt ``SeqStmts`` in the program:
- *        loads pulled to the top, stores pushed to the bottom, compute in the middle —
- *        all subject to the dependency graph.
+ * @brief Mutator that reorders every multi-stmt ``SeqStmts`` in the program.
+ *
+ * Layered priority (top → bottom): scalar compute, loads, tile compute, stores —
+ * all subject to the dependency graph. Lifting scalar compute (typically address
+ * arithmetic) above loads ensures sibling clones' loads become ready together
+ * and cluster at the top, the layout ``MemoryReuse`` needs for ping-pong.
+ *
+ * Soundness precondition (InOut-use discipline) is validated once per function
+ * by the driver before the mutator runs, so per-region checks are unnecessary
+ * here. Keeping the check out of the visitor avoids O(function-size) work for
+ * every nested ``SeqStmts`` we visit.
  */
-class ReorderUnrolledIOMutator : public IRMutator {
+class CanonicalizeIOOrderMutator : public IRMutator {
  public:
-  explicit ReorderUnrolledIOMutator(ProgramPtr program)
-      : program_(std::move(program)), io_ops_(IOCategoryOps::Build()) {}
+  CanonicalizeIOOrderMutator() : io_ops_(IOCategoryOps::Build()) {}
 
   StmtPtr VisitStmt_(const SeqStmtsPtr& op) override {
     // Recurse first so any nested SeqStmts are reordered bottom-up.
@@ -110,34 +134,27 @@ class ReorderUnrolledIOMutator : public IRMutator {
     if (!seq || seq->stmts_.size() < 2) {
       return visited;  // single stmt — nothing to reorder
     }
-    // Regions that violate the InOut-use discipline are left alone: under
-    // strict verification they would be caught earlier, but with
-    // VerificationLevel.NONE a pre-existing violation can reach us and we
-    // shouldn't reorder potentially-unsound dataflow. We do the discipline
-    // check ourselves so that the subsequent `BuildStmtDependencyGraph` call
-    // (which would repeat the check when given a non-null program) can skip
-    // it by passing `nullptr` — avoiding an O(N) double traversal.
-    if (!stmt_dep::CollectInOutUseDisciplineDiagnostics(seq, program_).empty()) {
-      return visited;
-    }
     return ReorderRegion(seq);
   }
 
  private:
-  /// Stable, priority-aware topological sort. Caller is responsible for
-  /// verifying the InOut-use discipline before invoking.
+  /// Stable, priority-aware topological sort.
   ///
-  /// Complexity: O(N + E + N log N) per region — adjacency list built once,
-  /// the ready set maintained as a min-heap keyed by (category, index).
-  /// N = number of top-level stmts, E = number of def-use edges (bounded by N).
+  /// Complexity: O(N log N + E) per region — the dependency graph is built
+  /// once, successors/in-degrees are filled in a single linear pass, and the
+  /// ready set is maintained as a min-heap keyed by (category, index).
+  /// N is the number of top-level stmts in the region; E is the number of
+  /// def-use edges produced by ``BuildStmtDependencyGraph`` (equal to the
+  /// region's total variable uses, and so O(N²) in the pathological worst
+  /// case even though it is linear-with-a-small-constant in practice).
   ///
   /// A trailing terminator (`YieldStmt` / `ReturnStmt` / `BreakStmt` /
   /// `ContinueStmt`) is peeled off before sorting and re-appended at the end
   /// so stores can never be emitted after it (which would make them
   /// unreachable / semantically dropped).
   StmtPtr ReorderRegion(const SeqStmtsPtr& seq) {
-    // Pass `nullptr` for the program — we've already validated the discipline,
-    // and re-running it inside BuildStmtDependencyGraph would be redundant work.
+    // The driver already validated the InOut-use discipline at function scope,
+    // so passing `nullptr` here skips a redundant check inside the builder.
     auto graph = stmt_dep::BuildStmtDependencyGraph(seq, /*program=*/nullptr);
 
     const auto& stmts = seq->stmts_;
@@ -173,18 +190,14 @@ class ReorderUnrolledIOMutator : public IRMutator {
       }
     }
 
-    // Ready-set as a min-heap keyed by (category_bias, original_index). For
-    // non-store stmts the key is (category, i); stores get a bias of +1 above
-    // the max non-store category so they only surface when nothing else is
-    // ready — preserving the original load-top / compute-middle / store-bottom
-    // behavior. Using index as the tiebreaker keeps the sort stable.
-    constexpr int kStoreDeferBias = static_cast<int>(IOCategory::Store) + 100;
+    // Ready-set as a min-heap keyed by (category, original_index). Emitting
+    // the smallest category first gives the desired top-to-bottom layout —
+    // ``ScalarCompute`` (0) first, then ``Load`` (1), ``TileCompute`` (2), and
+    // finally ``Store`` (3). Using the original index as the tiebreaker keeps
+    // the sort stable within each tier.
     using HeapKey = std::pair<int, size_t>;
     std::priority_queue<HeapKey, std::vector<HeapKey>, std::greater<>> ready;
-    auto key_for = [&](size_t i) -> HeapKey {
-      int bias = (cats[i] == IOCategory::Store) ? kStoreDeferBias : static_cast<int>(cats[i]);
-      return {bias, i};
-    };
+    auto key_for = [&](size_t i) -> HeapKey { return {static_cast<int>(cats[i]), i}; };
     for (size_t i = 0; i < sort_count; ++i) {
       if (remaining[i] == 0) ready.push(key_for(i));
     }
@@ -200,7 +213,7 @@ class ReorderUnrolledIOMutator : public IRMutator {
       }
     }
     INTERNAL_CHECK(out.size() == sort_count)
-        << "ReorderUnrolledIO: dependency graph appears cyclic — should be impossible "
+        << "CanonicalizeIOOrder: dependency graph appears cyclic — should be impossible "
            "for an SSA region under the InOut-use discipline";
     if (has_terminator) out.push_back(stmts.back());
 
@@ -216,7 +229,6 @@ class ReorderUnrolledIOMutator : public IRMutator {
     return std::make_shared<SeqStmts>(std::move(out), seq->span_);
   }
 
-  ProgramPtr program_;
   IOCategoryOps io_ops_;
 };
 
@@ -224,14 +236,24 @@ class ReorderUnrolledIOMutator : public IRMutator {
 
 namespace pass {
 
-Pass ReorderUnrolledIO() {
+Pass CanonicalizeIOOrder() {
   auto pass_func = [](const ProgramPtr& program) -> ProgramPtr {
-    INTERNAL_CHECK(program) << "ReorderUnrolledIO cannot run on null program";
+    INTERNAL_CHECK(program) << "CanonicalizeIOOrder cannot run on null program";
 
     std::map<GlobalVarPtr, FunctionPtr, GlobalVarPtrLess> new_functions;
     bool any_change = false;
     for (const auto& [gvar, func] : program->functions_) {
-      ReorderUnrolledIOMutator mutator(program);
+      // Validate the InOut-use discipline once per function: variable scopes
+      // don't cross function boundaries, so a single walk over the function
+      // body catches every violation that could affect any nested SeqStmts.
+      // Under strict verification such violations are rejected earlier, but
+      // with VerificationLevel.NONE a non-conforming function can reach us,
+      // and we must not reorder potentially-unsound dataflow.
+      if (!stmt_dep::CollectInOutUseDisciplineDiagnostics(func->body_, program).empty()) {
+        new_functions.emplace(gvar, func);
+        continue;
+      }
+      CanonicalizeIOOrderMutator mutator;
       auto new_body = mutator.VisitStmt(func->body_);
       if (new_body.get() == func->body_.get()) {
         new_functions.emplace(gvar, func);
@@ -249,7 +271,7 @@ Pass ReorderUnrolledIO() {
     return new_program;
   };
 
-  return CreateProgramPass(pass_func, "ReorderUnrolledIO", kReorderUnrolledIOProperties);
+  return CreateProgramPass(pass_func, "CanonicalizeIOOrder", kCanonicalizeIOOrderProperties);
 }
 
 }  // namespace pass

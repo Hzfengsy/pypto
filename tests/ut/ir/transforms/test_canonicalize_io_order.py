@@ -7,11 +7,12 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""DSL-style Before/Expected tests for the ReorderUnrolledIO pass.
+"""DSL-style Before/Expected tests for the CanonicalizeIOOrder pass.
 
 The pass walks every ``SeqStmts`` in the program and reorders its top-level
-statements so tile.load floats to the top, tile.store sinks to the bottom, and
-compute settles in the middle — subject to the SSA dependency graph.
+statements into four priority tiers — scalar compute first, then tile.load,
+then tile compute, and finally tile.store — all subject to the SSA dependency
+graph.
 """
 
 import pypto.language as pl
@@ -20,14 +21,14 @@ from pypto import ir, passes
 
 
 def _run_pass(program: ir.Program) -> ir.Program:
-    """Run ReorderUnrolledIO with structural verification disabled — our
+    """Run CanonicalizeIOOrder with structural verification disabled — our
     Before programs use minimal tile IR that doesn't satisfy the full set of
     structural prerequisites the pipeline normally enforces."""
     with passes.PassContext([], passes.VerificationLevel.NONE):
-        return passes.reorder_unrolled_io()(program)
+        return passes.canonicalize_io_order()(program)
 
 
-class TestReorderUnrolledIO:
+class TestCanonicalizeIOOrder:
     """Before/Expected pairs verifying the priority-aware topological reorder."""
 
     def test_symmetric_pingpong_layout(self):
@@ -61,8 +62,10 @@ class TestReorderUnrolledIO:
         After = _run_pass(Before)
         ir.assert_structural_equal(After, Expected)
 
-    def test_load_blocked_by_compute_stays_put(self):
-        """A load whose offset depends on a compute stmt cannot float past it."""
+    def test_scalar_offset_lifts_above_independent_load(self):
+        """Scalar compute lifts above loads (cat 0 < cat 1) while still preceding
+        any load that depends on it. ``off`` floats to the top; ``ta2`` stays
+        below ``off``; ``ta`` (independent) follows once ``off`` is emitted."""
 
         @pl.program
         class Before:
@@ -75,18 +78,57 @@ class TestReorderUnrolledIO:
                     tc: pl.Tile[[64, 64], pl.FP32] = pl.tile.add(ta, ta2)
                     pl.tile.store(tc, [0, 0], out)
 
-        # `ta` (independent) lifts to the top. `off` must still precede `ta2`
-        # (ta2 reads `off`). `ta2` stays below `off`. Computes and stores after.
         @pl.program
         class Expected:
             @pl.function(strict_ssa=True)
             def main(self, in_a: pl.Tensor[[128, 64], pl.FP32], out: pl.Tensor[[128, 64], pl.FP32]):
                 for i in pl.range(0, 2, 1):
-                    ta: pl.Tile[[64, 64], pl.FP32] = pl.tile.load(in_a, [0, 0], [64, 64])
                     off: pl.Scalar[pl.INDEX] = 64
+                    ta: pl.Tile[[64, 64], pl.FP32] = pl.tile.load(in_a, [0, 0], [64, 64])
                     ta2: pl.Tile[[64, 64], pl.FP32] = pl.tile.load(in_a, [off, 0], [64, 64])
                     tc: pl.Tile[[64, 64], pl.FP32] = pl.tile.add(ta, ta2)
                     pl.tile.store(tc, [0, 0], out)
+
+        After = _run_pass(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_scalar_compute_lifts_to_top_unblocking_loads(self):
+        """Per-clone scalar address-arithmetic lifts above all loads, allowing
+        sibling clones' loads to cluster at the top.
+
+        Without ``ScalarCompute`` priority, ``off1`` (idx 4) would only emit
+        after group 0's compute and store, and ``t1`` would never reach the
+        load cluster. With it, both ``off0`` and ``off1`` go first, both loads
+        cluster, then both computes, then both stores — the layout that
+        ``MemoryReuse`` needs for ping-pong buffering."""
+
+        @pl.program
+        class Before:
+            @pl.function(strict_ssa=True)
+            def main(self, in_a: pl.Tensor[[256, 64], pl.FP32], out: pl.Tensor[[256, 64], pl.FP32]):
+                for i in pl.range(0, 2, 1):
+                    off0: pl.Scalar[pl.INDEX] = i * 64
+                    t0: pl.Tile[[64, 64], pl.FP32] = pl.tile.load(in_a, [off0, 0], [64, 64])
+                    c0: pl.Tile[[64, 64], pl.FP32] = pl.tile.add(t0, t0)
+                    pl.tile.store(c0, [off0, 0], out)
+                    off1: pl.Scalar[pl.INDEX] = (i + 1) * 64
+                    t1: pl.Tile[[64, 64], pl.FP32] = pl.tile.load(in_a, [off1, 0], [64, 64])
+                    c1: pl.Tile[[64, 64], pl.FP32] = pl.tile.add(t1, t1)
+                    pl.tile.store(c1, [off1, 0], out)
+
+        @pl.program
+        class Expected:
+            @pl.function(strict_ssa=True)
+            def main(self, in_a: pl.Tensor[[256, 64], pl.FP32], out: pl.Tensor[[256, 64], pl.FP32]):
+                for i in pl.range(0, 2, 1):
+                    off0: pl.Scalar[pl.INDEX] = i * 64
+                    off1: pl.Scalar[pl.INDEX] = (i + 1) * 64
+                    t0: pl.Tile[[64, 64], pl.FP32] = pl.tile.load(in_a, [off0, 0], [64, 64])
+                    t1: pl.Tile[[64, 64], pl.FP32] = pl.tile.load(in_a, [off1, 0], [64, 64])
+                    c0: pl.Tile[[64, 64], pl.FP32] = pl.tile.add(t0, t0)
+                    c1: pl.Tile[[64, 64], pl.FP32] = pl.tile.add(t1, t1)
+                    pl.tile.store(c0, [off0, 0], out)
+                    pl.tile.store(c1, [off1, 0], out)
 
         After = _run_pass(Before)
         ir.assert_structural_equal(After, Expected)
