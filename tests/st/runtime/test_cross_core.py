@@ -22,18 +22,64 @@ Tests:
   BiDirectNoSplitTest : V↔C, no split.             c += (a+1) @ b (parallel over N in blocks)
 """
 
+import sys
 from typing import Any
 
 import pypto.language as pl
 import pytest
 import torch
 from harness.core.harness import DataType, PTOTestCase, TensorSpec
+from pypto.backend import BackendType
 
 M = 32
 K = 64
 N = 512
 N_BLOCK = 64
 N_BLOCKS = N // N_BLOCK
+
+_PLATFORM_TO_BACKEND: dict[str, BackendType] = {
+    "a2a3": BackendType.Ascend910B,
+    "a2a3sim": BackendType.Ascend910B,
+    "a5": BackendType.Ascend950,
+    # Keep CPU sim on the legacy 910B codegen path.  The a5sim runtime still
+    # exercises the simulator platform, but cross-core mixed-kernel execution
+    # is not stable with the Ascend950 backend for these cases.
+    "a5sim": BackendType.Ascend910B,
+}
+_DEFAULT_PLATFORM = "a2a3"
+
+
+def _resolve_platform(config: pytest.Config) -> str:
+    """Resolve the effective platform from the session-wide allowlist."""
+    raw_platform = str(config.getoption("--platform") or "")
+    tokens = [tok.strip() for tok in raw_platform.split(",") if tok.strip()]
+    valid_platforms = tuple(dict.fromkeys(tok for tok in tokens if tok in _PLATFORM_TO_BACKEND))
+    if tokens and not valid_platforms:
+        raise pytest.UsageError(
+            "tests/st/runtime/test_cross_core.py supports --platform values (a2a3, a2a3sim, a5, or a5sim)"
+        )
+    return valid_platforms[0] if valid_platforms else _DEFAULT_PLATFORM
+
+
+def _resolve_backend_type(config: pytest.Config) -> BackendType:
+    """Resolve backend from the selected platform, defaulting to a2a3."""
+    platform = _resolve_platform(config)
+    try:
+        return _PLATFORM_TO_BACKEND[platform]
+    except KeyError as exc:
+        raise pytest.UsageError(
+            f"Unsupported --platform {platform!r} for tests/st/runtime/test_cross_core.py"
+        ) from exc
+
+
+def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
+    """Drive backend selection from the session-wide --platform filter."""
+    if "backend_type" not in metafunc.fixturenames:
+        return
+
+    platform = _resolve_platform(metafunc.config)
+    backend_type = _resolve_backend_type(metafunc.config)
+    metafunc.parametrize("backend_type", [backend_type], ids=[platform])
 
 
 @pl.program
@@ -499,59 +545,53 @@ class BiDirectNoSplitTest(PTOTestCase):
 
 
 class TestCrossCore:
-    """Cross-core communication system tests.
+    """Cross-core communication system tests."""
 
-    The 9 cases below intentionally do not parametrize over ``platform``.
-    They exercise the cross-core compile/runtime pipeline using the default
-    backend (Ascend910B) and rely on the session-wide ``--platform`` value
-    chosen by CI to pick the execution target (a2a3, a2a3sim or a5sim).
-    """
-
-    def test_tpush_tpop_v2c_updown(self, test_runner):
+    def test_tpush_tpop_v2c_updown(self, test_runner, backend_type):
         """V2C updown pipe: compile through full pipeline and verify kernel artifacts."""
-        result = test_runner.run(V2CUDTest())
+        result = test_runner.run(V2CUDTest(backend_type=backend_type))
         assert result.passed, f"Cross-core V2C updown compilation failed: {result.error}"
 
-    def test_tpush_tpop_v2c_leftright(self, test_runner):
+    def test_tpush_tpop_v2c_leftright(self, test_runner, backend_type):
         """V2C left-right pipe: compile through full pipeline and verify kernel artifacts."""
-        result = test_runner.run(V2CLRTest())
+        result = test_runner.run(V2CLRTest(backend_type=backend_type))
         assert result.passed, f"Cross-core V2C left-right compilation failed: {result.error}"
 
-    def test_tpush_tpop_v2c_nosplit(self, test_runner):
+    def test_tpush_tpop_v2c_nosplit(self, test_runner, backend_type):
         """V2C no-split pipe: compile through full pipeline and verify correctness."""
-        result = test_runner.run(V2CNoSplitTest())
+        result = test_runner.run(V2CNoSplitTest(backend_type=backend_type))
         assert result.passed, f"Cross-core V2C no-split compilation failed: {result.error}"
 
-    def test_tpop_c2v_leftright(self, test_runner):
+    def test_tpop_c2v_leftright(self, test_runner, backend_type):
         """C2V left-right pipe: compile through full pipeline and verify correctness."""
-        result = test_runner.run(C2VLRTest())
+        result = test_runner.run(C2VLRTest(backend_type=backend_type))
         assert result.passed, f"Cross-core C2V left-right compilation failed: {result.error}"
 
-    def test_tpop_c2v_updown(self, test_runner):
+    def test_tpop_c2v_updown(self, test_runner, backend_type):
         """C2V updown pipe: compile through full pipeline and verify correctness."""
-        result = test_runner.run(C2VUDTest())
+        result = test_runner.run(C2VUDTest(backend_type=backend_type))
         assert result.passed, f"Cross-core C2V updown compilation failed: {result.error}"
 
-    def test_tpop_c2v_nosplit(self, test_runner):
+    def test_tpop_c2v_nosplit(self, test_runner, backend_type):
         """C2V no-split pipe: compile through full pipeline and verify correctness."""
-        result = test_runner.run(C2VNoSplitTest())
+        result = test_runner.run(C2VNoSplitTest(backend_type=backend_type))
         assert result.passed, f"Cross-core C2V no-split compilation failed: {result.error}"
 
-    def test_tpop_bidirect_updown(self, test_runner):
+    def test_tpop_bidirect_updown(self, test_runner, backend_type):
         """Bidirect updown pipe: compile through full pipeline and verify correctness."""
-        result = test_runner.run(BiDirectUDTest())
+        result = test_runner.run(BiDirectUDTest(backend_type=backend_type))
         assert result.passed, f"Cross-core bidirect updown compilation failed: {result.error}"
 
-    def test_tpop_bidirect_leftright(self, test_runner):
+    def test_tpop_bidirect_leftright(self, test_runner, backend_type):
         """Bidirect left-right pipe: compile through full pipeline and verify correctness."""
-        result = test_runner.run(BiDirectLRTest())
+        result = test_runner.run(BiDirectLRTest(backend_type=backend_type))
         assert result.passed, f"Cross-core bidirect left-right compilation failed: {result.error}"
 
-    def test_tpop_bidirect_nosplit(self, test_runner):
+    def test_tpop_bidirect_nosplit(self, test_runner, backend_type):
         """Bidirect no-split pipe: compile through full pipeline and verify correctness."""
-        result = test_runner.run(BiDirectNoSplitTest())
+        result = test_runner.run(BiDirectNoSplitTest(backend_type=backend_type))
         assert result.passed, f"Cross-core bidirect no-split compilation failed: {result.error}"
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    raise SystemExit(pytest.main([__file__, "-v", *sys.argv[1:]]))
