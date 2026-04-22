@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, Union, cast, overload
 
 if TYPE_CHECKING:
@@ -835,9 +836,12 @@ def cluster(*, name_hint: str = "") -> ClusterContext:
 
 
 class SpmdContext:
-    """Context manager for SPMD dispatch scope.
+    """Context manager / loop iterator for SPMD dispatch scope.
 
-    The parser recognizes this pattern and creates a ScopeStmt(Spmd).
+    The parser recognizes both ``with pl.spmd(...):`` (builds a
+    ``ScopeStmt(Spmd)`` whose body must be a single function call) and
+    ``for i in pl.spmd(...):`` (auto-outlines the loop body into an InCore
+    function with ``i`` bound to ``pl.tile.get_block_idx()``).
     """
 
     def __init__(
@@ -856,34 +860,68 @@ class SpmdContext:
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         pass
 
+    def __iter__(self) -> Iterator[Any]:
+        # Lets `for i in pl.spmd(...)` type-check and parse at the Python
+        # level. The @pl.program / @pl.function decorators intercept the AST,
+        # so this method should never actually run — if it does, the caller
+        # is using pl.spmd() outside the DSL interception path. Raise
+        # loudly rather than silently yielding zero iterations.
+        raise RuntimeError(
+            "pl.spmd(...) loop form is only valid inside a @pl.program / "
+            "@pl.function body; the parser replaces the for-loop with an "
+            "SpmdScopeStmt. If you're seeing this, the surrounding function "
+            "was not decorated."
+        )
+
 
 def spmd(
-    *,
     core_num: int,
+    *,
     sync_start: bool = False,
     name_hint: str = "",
 ) -> SpmdContext:
     """Dispatch a kernel with SPMD (Single Program Multiple Data) multi-block execution.
 
-    The body must contain exactly one function call. Can be used standalone
-    (creates an implicit cluster) or nested inside pl.cluster().
+    The first argument is the number of blocks and is positional — mirroring
+    ``range(n)``. Loop start is fixed at 0 and step at 1; each block gets an
+    index ``i`` in ``[0, core_num)``.
+
+    Two usage forms:
+
+    1. ``with pl.spmd(n):`` — body must be a single call to a pre-defined
+       InCore kernel. Can stand alone (implicit cluster) or nest inside
+       ``pl.cluster()``.
+
+    2. ``for i in pl.spmd(n):`` — loop-style. The iteration variable binds
+       the per-block index (equivalent to ``pl.tile.get_block_idx()``); the
+       body is auto-outlined into a synthetic InCore function, so inline
+       tile/tensor ops work without a separate ``@pl.function(type=InCore)``
+       declaration.
 
     Args:
-        core_num: Number of blocks for SPMD dispatch. Must be a positive integer.
+        core_num: Number of blocks for SPMD dispatch. Positional; must be a
+            positive integer.
         sync_start: If True, all blocks start execution simultaneously (default: False).
         name_hint: Optional name hint for the outlined function.
 
     Returns:
-        Context manager for SPMD scope
+        Context manager / loop iterator for the SPMD scope.
 
     Examples:
-        >>> # Standalone SPMD (pure AIV kernel)
-        >>> with pl.spmd(core_num=4):
+        >>> # Single-kernel context-manager form
+        >>> with pl.spmd(4):
         ...     out = self.kernel(a, b, out)
+        >>>
+        >>> # Loop form — body runs per-block with i = tile.get_block_idx()
+        >>> for i in pl.spmd(4):
+        ...     offset = i * 128
+        ...     tile_a = pl.load(a, [offset, 0], [128, 128])
+        ...     tile_b = pl.load(b, [offset, 0], [128, 128])
+        ...     out = pl.store(pl.add(tile_a, tile_b), [offset, 0], out)
         >>>
         >>> # SPMD inside cluster (mixed kernel)
         >>> with pl.cluster():
-        ...     with pl.spmd(core_num=4, sync_start=True):
+        ...     with pl.spmd(4, sync_start=True):
         ...         out = self.kernel(a, b, out)
     """
     if not isinstance(core_num, int) or isinstance(core_num, bool) or core_num <= 0:

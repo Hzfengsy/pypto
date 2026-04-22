@@ -163,7 +163,7 @@ class TestOutlineClusterScopes:
                 x: pl.Tensor[[64], pl.FP32],
                 out: pl.Out[pl.Tensor[[64], pl.FP32]],
             ) -> pl.Tensor[[64], pl.FP32]:
-                with pl.spmd(core_num=4, sync_start=True):
+                with pl.spmd(4, sync_start=True):
                     out = self.kernel(x, out)
                 return out
 
@@ -300,6 +300,70 @@ class TestOutlineClusterScopes:
 
         # Verify it has 2 return types (y and z)
         assert len(group_func.return_types) == 2
+
+    def test_outline_spmd_for_loop_auto_outlines_incore(self):
+        """`for i in pl.spmd(N)` auto-outlines into Spmd + InCore.
+
+        The new loop form binds the iteration variable to
+        ``pl.tile.get_block_idx()`` inside an implicit InCoreScopeStmt,
+        giving inline tile ops direct access to the block index without a
+        separate ``@pl.function(type=InCore)`` declaration.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                for i in pl.spmd(4):
+                    offset = i * 128
+                    tile_a: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [offset, 0], [128, 128])
+                    out = pl.store(tile_a, [offset, 0], out)
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.InOut[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                i = pl.tile.get_block_idx()
+                offset = i * 128
+                tile_a: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [offset, 0], [128, 128])
+                out = pl.store(tile_a, [offset, 0], out)
+                # The outline pass renames the post-store SSA result to the
+                # store target; express that explicit rename as an alias here.
+                out_final: pl.Tensor[[512, 128], pl.FP32] = out
+                return out_final
+
+            @pl.function(type=pl.FunctionType.Spmd, attrs={"core_num": 4})
+            def main_spmd_0(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.InOut[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                out = self.main_incore_0(a, out)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                out = self.main_spmd_0(a, out)
+                return out
+
+        Before = passes.convert_to_ssa()(Before)
+        Expected = passes.convert_to_ssa()(Expected)
+        After = passes.outline_incore_scopes()(Before)
+        After = passes.outline_cluster_scopes()(After)
+        ir.assert_structural_equal(After, Expected)
 
     def test_cluster_outlined_verifier_rejects_cluster_in_incore(self):
         """Test that ClusterOutlined verifier flags Cluster scopes in InCore functions."""
