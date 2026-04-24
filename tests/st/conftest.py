@@ -15,11 +15,13 @@ harness package (migrated from pto-testing-framework).
 """
 
 import inspect
+import queue
 import random
 import re
 import shutil
 import sys
 import tempfile
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -43,10 +45,8 @@ from harness.core.harness import ALL_PLATFORM_IDS, PTOTestCase  # noqa: E402
 from harness.core.test_runner import (  # noqa: E402
     TestRunner,
     _cache_key,
-    _precompile_cache,
-    _resolve_platform,
-    prebuild_binaries,
-    precompile_test_cases,
+    shutdown_pipeline,
+    start_pipeline,
 )
 from pypto import LogLevel, set_log_level  # noqa: E402
 from pypto.runtime.runner import RunConfig  # noqa: E402
@@ -54,6 +54,10 @@ from pypto.runtime.runner import RunConfig  # noqa: E402
 # Temp directories created for pre-compilation (when --save-kernels is not set).
 # Cleaned up in pytest_sessionfinish.
 _temp_precompile_dirs: list[Path] = []
+
+# Per-device test counter populated by ``_report_device`` and dumped at
+# session end via ``pytest_terminal_summary``.
+_device_counter: Counter[int] = Counter()
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -87,9 +91,16 @@ def pytest_addoption(parser):
     parser.addoption(
         "--device",
         action="store",
-        default=0,
-        type=int,
-        help="Device ID for hardware tests (default: 0)",
+        default="0",
+        type=str,
+        help=(
+            "Device id(s) for hardware tests. Accepts a single id ('0'), an "
+            "inclusive range ('0-7'), or a comma-separated list ('0,1,12'). "
+            "Ranges and lists may be mixed ('0-3,8,12-15'). All ids are "
+            "placed into a session-wide pool that bounds execute-task "
+            "parallelism; per-test device selection happens inside the "
+            "pipeline execute task (default: 0)."
+        ),
     )
     parser.addoption(
         "--strategy",
@@ -164,6 +175,53 @@ def pytest_addoption(parser):
     )
 
 
+def _parse_device_option(raw: str | int) -> list[int]:
+    """Parse the ``--device`` option into a list of device ids.
+
+    Accepts a single integer (``"0"`` or ``0``), an inclusive range
+    (``"0-7"``), a comma-separated list (``"0,1,12"``), or any combination
+    (``"0-3,8,12-15"``). Device ids may be non-contiguous.
+    """
+    text = str(raw).strip()
+    if not text:
+        raise pytest.UsageError("--device must not be empty")
+
+    devices: list[int] = []
+    for token in text.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            if "-" in token:
+                start_str, end_str = token.split("-", 1)
+                start, end = int(start_str), int(end_str)
+                if end < start:
+                    raise pytest.UsageError(f"--device range must be non-decreasing, got {token!r}")
+                devices.extend(range(start, end + 1))
+            else:
+                devices.append(int(token))
+        except ValueError:
+            raise pytest.UsageError(f"Invalid device ID or range in --device: {token!r}") from None
+
+    if not devices:
+        raise pytest.UsageError(f"--device yielded no device ids: {raw!r}")
+    # Preserve order while deduplicating (user ordering dictates worker mapping).
+    return list(dict.fromkeys(devices))
+
+
+def _resolve_device_id(raw: str | int) -> int:
+    """Return a representative device id for the session ``RunConfig``.
+
+    Per-test device selection happens inside the pipeline execute task
+    (see ``_fused_execute_task`` in ``harness.core.test_runner``), which
+    pulls from a session-wide pool seeded with every id from ``--device``.
+    This value is consulted only by the legacy inline-compile fallback in
+    :meth:`TestRunner._run_inline` when a test case was not discovered at
+    collection time, so the first id is sufficient.
+    """
+    return _parse_device_option(raw)[0]
+
+
 def _parse_platform_filter(raw: str) -> tuple[str, ...]:
     """Parse the comma-separated ``--platform`` value into an ordered tuple.
 
@@ -186,6 +244,38 @@ def _parse_platform_filter(raw: str) -> tuple[str, ...]:
             f"--platform must include at least one of: {', '.join(ALL_PLATFORM_IDS)}; got {raw!r}"
         )
     return valid
+
+
+@pytest.fixture(autouse=True)
+def _report_device(request) -> None:
+    """Report which device executed each test at the end of the test body.
+
+    ``TestRunner.run`` writes the resolved device id into a single-slot
+    stash (``_last_device``) right before returning to the test body.  We
+    read it after ``yield`` so the line shows the device the test actually
+    ran on.  Tests that don't go through ``TestRunner.run`` see ``None``
+    and are skipped from the per-device counter.
+    """
+    yield
+    from harness.core.test_runner import _last_device  # noqa: PLC0415
+
+    device_id = _last_device["value"]
+    _last_device["value"] = None
+    if device_id is None:
+        return
+    sys.stdout.write(f"\n[DEVICE] {request.node.nodeid} -> device {device_id}\n")
+    sys.stdout.flush()
+    _device_counter[device_id] += 1
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:  # noqa: ARG001
+    """Emit a per-device test count summary at the end of the session."""
+    if not _device_counter:
+        return
+    total = sum(_device_counter.values())
+    terminalreporter.write_sep("=", f"per-device test count ({total} total)")
+    for dev in sorted(_device_counter):
+        terminalreporter.write_line(f"  device {dev:>3}: {_device_counter[dev]} tests")
 
 
 @pytest.fixture(scope="session")
@@ -213,7 +303,7 @@ def test_config(request) -> RunConfig:
 
     return RunConfig(
         platform=fallback_platform,
-        device_id=request.config.getoption("--device"),
+        device_id=_resolve_device_id(request.config.getoption("--device")),
         save_kernels=save_kernels,
         save_kernels_dir=save_kernels_dir,
         dump_passes=request.config.getoption("--dump-passes"),
@@ -410,13 +500,16 @@ def pytest_collection_finish(session: pytest.Session) -> None:
     if not seen:
         return
 
-    dump_passes: bool = session.config.getoption("--dump-passes")
     max_workers: int | None = session.config.getoption("--precompile-workers")
-
-    # Without --precompile-workers the pre-compilation/cache phases are skipped
-    # entirely; each test compiles on demand inside TestRunner.run().
+    # Without --precompile-workers the pipeline is skipped entirely; each
+    # test compiles + executes inline inside TestRunner._run_inline().
     if max_workers is None:
         return
+
+    dump_passes: bool = session.config.getoption("--dump-passes")
+    codegen_only: bool = session.config.getoption("--codegen-only")
+    pto_isa_commit: str | None = session.config.getoption("--pto-isa-commit")
+    runtime_profiling: bool = session.config.getoption("--runtime-profiling")
 
     # ── determine cache directory ─────────────────────────────────────────────
     save_kernels: bool = session.config.getoption("--save-kernels")
@@ -432,50 +525,38 @@ def pytest_collection_finish(session: pytest.Session) -> None:
         cache_dir = Path(tempfile.mkdtemp(prefix="pypto_precompile_"))
         _temp_precompile_dirs.append(cache_dir)
 
-    # ── compile in parallel ───────────────────────────────────────────────────
-    test_cases = list(seen.values())
-    workers_str = str(max_workers) if max_workers is not None else "auto"
     # ``--platform`` is a CSV allowlist; the per-test value resolved by
-    # ``tc.get_platform()`` overrides this fallback inside ``TestRunner``,
-    # so any one entry from the filter is sufficient here. We compute it
-    # *before* precompilation so the cache key reflects the resolved
-    # platform for legacy (non-parametrized) test cases.
+    # ``tc.get_platform()`` overrides this fallback inside the pipeline.
     platform_filter = _parse_platform_filter(session.config.getoption("--platform"))
-    platform: str = platform_filter[0] if platform_filter else "a2a3"
-    print(f"\n[PyPTO] Pre-compiling {len(test_cases)} test case(s) in parallel (workers={workers_str})…")
-    precompile_test_cases(
-        test_cases,
-        cache_dir,
-        platform=platform,
-        dump_passes=dump_passes,
-        max_workers=max_workers,
+    session_platform: str = platform_filter[0] if platform_filter else "a2a3"
+
+    # Build the device pool from --device.  N parallel executes max.
+    devices = _parse_device_option(session.config.getoption("--device"))
+    device_pool: queue.Queue[int] = queue.Queue()
+    for d in devices:
+        device_pool.put(d)
+
+    test_cases = list(seen.values())
+    print(
+        f"\n[PyPTO] Pipeline: {len(test_cases)} test case(s); "
+        f"compile_workers={max_workers}, devices={devices}"
     )
-
-    n_ok = sum(1 for _, err in _precompile_cache.values() if err is None)
-    n_fail = len(_precompile_cache) - n_ok
-    print(f"[PyPTO] Pre-compilation done — {n_ok} ok, {n_fail} failed\n")
-
-    # ── Phase 2: pre-build binary artifacts ──────────────────────────────
-    # Compile incore kernels and orchestration .so in parallel.
-    # Results are saved to work_dir/cache/.
-    if n_ok > 0 and not session.config.getoption("--codegen-only"):
-        ok_cases = []
-        for tc in test_cases:
-            key = _cache_key(tc, _resolve_platform(platform, tc))
-            if key in _precompile_cache and _precompile_cache[key][1] is None:
-                ok_cases.append(tc)
-        pto_isa_commit: str | None = session.config.getoption("--pto-isa-commit")
-        print(
-            f"[PyPTO] Pre-building binary artifacts for {len(ok_cases)} test case(s)"
-            f" in parallel (workers={workers_str})…"
-        )
-        n_built = prebuild_binaries(
-            ok_cases, cache_dir, platform, max_workers=max_workers, pto_isa_commit=pto_isa_commit
-        )
-        print(f"[PyPTO] Binary pre-build done — {n_built} case(s) compiled\n")
+    start_pipeline(
+        test_cases=test_cases,
+        cache_dir=cache_dir,
+        session_platform=session_platform,
+        dump_passes=dump_passes,
+        codegen_only=codegen_only,
+        pto_isa_commit=pto_isa_commit,
+        compile_workers=max_workers,
+        device_pool=device_pool,
+        runtime_profiling=runtime_profiling,
+    )
+    print("[PyPTO] Pipeline scheduled — pytest item loop starting\n")
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:  # noqa: ARG001
-    """Clean up temporary pre-compilation directories created during the session."""
+    """Tear down the pipeline and clean up temporary precompile directories."""
+    shutdown_pipeline()
     for d in _temp_precompile_dirs:
         shutil.rmtree(d, ignore_errors=True)
