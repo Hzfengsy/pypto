@@ -75,45 +75,53 @@ class VerificationLevel(Enum):
     BASIC = ...
     ROUNDTRIP = ...
 
-class WarningLevel(Enum):
-    """Controls automatic warning checks in PassPipeline."""
+class DiagnosticPhase(Enum):
+    """Controls when DiagnosticInstrument runs registered checks (warnings + perf hints)."""
 
     NONE = ...
     PRE_PIPELINE = ...
     POST_PASS = ...
-    BOTH = ...
+    POST_PIPELINE = ...
 
-class WarningCheck(Enum):
-    """Identifies a specific warning check."""
+class DiagnosticCheck(Enum):
+    """Identifies a specific diagnostic check."""
 
     UnusedVariable = ...
     UnusedControlFlowResult = ...
+    TileInnermostDimGranularity = ...
 
-class WarningCheckSet:
-    """A set of warning checks backed by a bitset."""
+class DiagnosticCheckSet:
+    """A set of diagnostic checks backed by a bitset."""
 
     def __init__(self) -> None: ...
-    def insert(self, check: WarningCheck) -> None: ...
-    def remove(self, check: WarningCheck) -> None: ...
-    def contains(self, check: WarningCheck) -> bool: ...
+    def insert(self, check: DiagnosticCheck) -> None: ...
+    def remove(self, check: DiagnosticCheck) -> None: ...
+    def contains(self, check: DiagnosticCheck) -> bool: ...
     def empty(self) -> bool: ...
-    def difference(self, other: WarningCheckSet) -> WarningCheckSet: ...
-    def to_list(self) -> list[WarningCheck]: ...
+    def difference(self, other: DiagnosticCheckSet) -> DiagnosticCheckSet: ...
+    def union_with(self, other: DiagnosticCheckSet) -> DiagnosticCheckSet: ...
+    def to_list(self) -> list[DiagnosticCheck]: ...
     def __str__(self) -> str: ...
     def __repr__(self) -> str: ...
     def __eq__(self, other: object) -> bool: ...
     def __ne__(self, other: object) -> bool: ...
 
-class WarningVerifierRegistry:
-    """Registry of warning verifiers."""
+class DiagnosticCheckRegistry:
+    """Registry of diagnostic checks (warnings + performance hints)."""
 
     @staticmethod
-    def run_checks(checks: WarningCheckSet, program: Program) -> list[Diagnostic]: ...
+    def run_checks(
+        checks: DiagnosticCheckSet, phase: DiagnosticPhase, program: Program
+    ) -> list[Diagnostic]: ...
     @staticmethod
-    def get_all_checks() -> WarningCheckSet: ...
+    def get_all_checks() -> DiagnosticCheckSet: ...
+    @staticmethod
+    def get_warning_checks() -> DiagnosticCheckSet: ...
+    @staticmethod
+    def get_perf_hint_checks() -> DiagnosticCheckSet: ...
 
-def get_default_warning_level() -> WarningLevel:
-    """Get the default warning level (from PYPTO_WARNING_LEVEL env var, default: PrePipeline)."""
+def get_default_diagnostic_phase() -> DiagnosticPhase:
+    """Get the default diagnostic phase (from PYPTO_WARNING_LEVEL env var, default: PrePipeline)."""
 
 def get_verified_properties() -> IRPropertySet:
     """Get the set of properties automatically verified during compilation."""
@@ -178,15 +186,11 @@ class CallbackInstrument(PassInstrument):
         """Create a callback instrument with optional before/after callbacks."""
         ...
 
-class WarningInstrument(PassInstrument):
-    """Instrument that runs warning checks before/after passes."""
+class DiagnosticInstrument(PassInstrument):
+    """Instrument that runs registered diagnostic checks (warnings + perf hints)."""
 
-    def __init__(
-        self,
-        phase: WarningLevel = WarningLevel.PRE_PIPELINE,
-        checks: WarningCheckSet = ...,
-    ) -> None:
-        """Create a warning instrument with optional phase and check set."""
+    def __init__(self, checks: DiagnosticCheckSet = ...) -> None:
+        """Create a diagnostic instrument running the given check set."""
         ...
 
 class ReportType(Enum):
@@ -206,22 +210,27 @@ class ReportInstrument(PassInstrument):
         """Enable a report type after a specific pass."""
         ...
 
+    def get_output_dir(self) -> str:
+        """Path of the directory that holds report files."""
+        ...
+
 class PassContext:
     """Context that holds instruments and pass configuration.
 
     When active, Pass.__call__ will run the context's instruments
     before/after each pass execution. Also controls automatic
-    verification and warning levels for PassPipeline.
+    verification and the diagnostic channel (warnings + performance
+    hints) for PassPipeline.
     """
 
     def __init__(
         self,
         instruments: list[PassInstrument],
         verification_level: VerificationLevel = VerificationLevel.BASIC,
-        warning_level: WarningLevel = WarningLevel.PRE_PIPELINE,
-        disabled_warnings: WarningCheckSet = ...,  # default: {UnusedControlFlowResult}
+        diagnostic_phase: DiagnosticPhase = DiagnosticPhase.PRE_PIPELINE,
+        disabled_diagnostics: DiagnosticCheckSet = ...,  # default: {UnusedControlFlowResult}
     ) -> None:
-        """Create a PassContext with instruments, verification level, warning level, and disabled warnings."""
+        """Create a PassContext with instruments, verification level, phase, and disabled diagnostics."""
         ...
 
     def __enter__(self) -> PassContext: ...
@@ -235,12 +244,12 @@ class PassContext:
         """Get the verification level for this context."""
         ...
 
-    def get_warning_level(self) -> WarningLevel:
-        """Get the warning level for this context."""
+    def get_diagnostic_phase(self) -> DiagnosticPhase:
+        """Get the diagnostic phase gate for this context."""
         ...
 
-    def get_disabled_warnings(self) -> WarningCheckSet:
-        """Get the disabled warning checks."""
+    def get_disabled_diagnostics(self) -> DiagnosticCheckSet:
+        """Get the diagnostic checks suppressed by this context."""
         ...
 
     def get_instruments(self) -> list[PassInstrument]:
@@ -438,6 +447,7 @@ class DiagnosticSeverity(Enum):
 
     Error = ...
     Warning = ...
+    PerfHint = ...
 
 class Diagnostic:
     """Single diagnostic message from verification."""
@@ -445,6 +455,7 @@ class Diagnostic:
     severity: DiagnosticSeverity
     rule_name: str
     error_code: int
+    hint_code: str
     message: str
     span: Span
 
@@ -492,14 +503,14 @@ __all__ = [
     "IRPropertySet",
     "VerificationMode",
     "VerificationLevel",
-    "WarningLevel",
-    "WarningCheck",
-    "WarningCheckSet",
-    "WarningVerifierRegistry",
-    "WarningInstrument",
+    "DiagnosticPhase",
+    "DiagnosticCheck",
+    "DiagnosticCheckSet",
+    "DiagnosticCheckRegistry",
+    "DiagnosticInstrument",
     "get_verified_properties",
     "get_default_verification_level",
-    "get_default_warning_level",
+    "get_default_diagnostic_phase",
     "get_default_verify_properties",
     "get_structural_properties",
     "verify_properties",

@@ -12,6 +12,7 @@
 #ifndef PYPTO_BACKEND_910B_BACKEND_910B_HANDLER_H_
 #define PYPTO_BACKEND_910B_BACKEND_910B_HANDLER_H_
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -46,6 +47,10 @@ class Ascend910BHandler : public BackendHandler {
 
   [[nodiscard]] ir::TileView BuildCrossCoreTransferView(ir::MemorySpace dest_ms,
                                                         const ir::TileView& original_view) const override;
+
+  [[nodiscard]] uint32_t GetGmAccessGranularityBytes() const override { return 512; }
+  [[nodiscard]] uint32_t GetL2CacheLineBytes() const override { return 512; }
+  [[nodiscard]] uint32_t GetRecommendedInnermostDimBytes() const override { return 512; }
 
  private:
   Ascend910BHandler() = default;

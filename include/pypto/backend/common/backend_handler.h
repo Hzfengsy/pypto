@@ -12,6 +12,7 @@
 #ifndef PYPTO_BACKEND_COMMON_BACKEND_HANDLER_H_
 #define PYPTO_BACKEND_COMMON_BACKEND_HANDLER_H_
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -156,6 +157,40 @@ class BackendHandler {
    */
   [[nodiscard]] virtual ir::TileView BuildCrossCoreTransferView(ir::MemorySpace dest_ms,
                                                                 const ir::TileView& original_view) const = 0;
+
+  // ---------------------------------------------------------------------------
+  // Performance-hint thresholds (issue #1180)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * @brief GM access granularity in bytes.
+   *
+   * The hardware fetches at this granularity, so a tile innermost dimension
+   * smaller than this value forces the bus to discard part of every fetch.
+   * Ascend910B: 512 bytes. Ascend950: 128 bytes.
+   */
+  [[nodiscard]] virtual uint32_t GetGmAccessGranularityBytes() const = 0;
+
+  /**
+   * @brief L2 cache line size in bytes.
+   *
+   * A tile innermost dimension below this size leaves part of every cache
+   * line unused. Both Ascend910B and Ascend950 use 512-byte L2 cache lines.
+   */
+  [[nodiscard]] virtual uint32_t GetL2CacheLineBytes() const = 0;
+
+  /**
+   * @brief Recommended minimum innermost-dim size, in bytes, for tile ops
+   *        whose data round-trips through GM (`tile.load` / `tile.store`).
+   *
+   * Below this threshold the TileInnermostDimGranularity perf-hint check
+   * (PH001) emits an advisory diagnostic.
+   *
+   * On Ascend910B this equals the GM granularity (512 B); on Ascend950 it is
+   * the GM granularity (128 B), with 512 B preferable to fully utilise the
+   * L2 cache line but 128 B taken as the hard threshold for the hint.
+   */
+  [[nodiscard]] virtual uint32_t GetRecommendedInnermostDimBytes() const = 0;
 };
 
 }  // namespace backend

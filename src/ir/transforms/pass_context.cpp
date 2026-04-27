@@ -27,8 +27,8 @@
 #include "pypto/ir/reporter/report_generator_registry.h"
 #include "pypto/ir/transforms/ir_property.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/verifier/diagnostic_check_registry.h"
 #include "pypto/ir/verifier/property_verifier_registry.h"
-#include "pypto/ir/verifier/warning_verifier_registry.h"
 
 namespace pypto {
 namespace ir {
@@ -135,49 +135,132 @@ void ReportInstrument::WriteReport(const Report& report, const std::string& file
   }
 }
 
-// WarningInstrument
+// Diagnostic emission helpers ------------------------------------------------
 
-WarningInstrument::WarningInstrument(WarningLevel phase, WarningCheckSet checks)
-    : phase_(phase), checks_(checks), pre_pipeline_done_(false) {}
+namespace {
 
-void WarningInstrument::RunBeforePass(const Pass& /*pass*/, const ProgramPtr& program) {
-  if (pre_pipeline_done_) return;
+/// Format one diagnostic as a single line of text. Used both for stderr and
+/// the perf_hints.log file so the two views stay consistent.
+std::string FormatDiagnosticLine(const Diagnostic& d, const std::string& phase_label) {
+  std::ostringstream out;
+  switch (d.severity) {
+    case DiagnosticSeverity::Warning:
+      out << "[warning] [" << d.rule_name << "]";
+      if (!phase_label.empty()) out << " (" << phase_label << ")";
+      out << " " << d.message;
+      if (d.span.is_valid()) out << " at " << d.span.to_string();
+      break;
+    case DiagnosticSeverity::PerfHint:
+      out << "[perf_hint";
+      if (!d.hint_code.empty()) out << " " << d.hint_code;
+      out << "] " << d.rule_name << ": " << d.message;
+      if (d.span.is_valid()) out << " at " << d.span.to_string();
+      break;
+    case DiagnosticSeverity::Error:
+      // EmitDiagnostics never receives Error severity; guarded below.
+      out << "[error] [" << d.rule_name << "] " << d.message;
+      break;
+  }
+  return out.str();
+}
 
-  if (phase_ == WarningLevel::PrePipeline || phase_ == WarningLevel::Both) {
-    auto diags = WarningVerifierRegistry::GetInstance().RunChecks(checks_, program);
-    for (const auto& d : diags) {
-      LOG_WARN << "[" << d.rule_name << "] " << d.message;
+/// Find the output_dir of the first ReportInstrument in the active context,
+/// or the empty string if there is no context or no ReportInstrument.
+std::string FindReportOutputDir() {
+  const auto* ctx = PassContext::Current();
+  if (ctx == nullptr) return {};
+  for (const auto& inst : ctx->GetInstruments()) {
+    if (auto* r = dynamic_cast<ReportInstrument*>(inst.get())) {
+      return r->GetOutputDir();
     }
   }
-  pre_pipeline_done_ = true;
+  return {};
 }
 
-void WarningInstrument::RunAfterPass(const Pass& pass, const ProgramPtr& program) {
-  if (phase_ != WarningLevel::PostPass && phase_ != WarningLevel::Both) return;
+}  // namespace
 
-  auto diags = WarningVerifierRegistry::GetInstance().RunChecks(checks_, program);
+void EmitDiagnostics(const std::vector<Diagnostic>& diags, const std::string& phase_label) {
+  if (diags.empty()) return;
+
+  // 1. stderr — every diagnostic, gated by LogLevel.
   for (const auto& d : diags) {
-    LOG_WARN << "[" << d.rule_name << "] (after " << pass.GetName() << ") " << d.message;
+    INTERNAL_CHECK(d.severity != DiagnosticSeverity::Error)
+        << "Error severity must not flow through DiagnosticInstrument: " << d.rule_name;
+    const std::string line = FormatDiagnosticLine(d, phase_label);
+    if (d.severity == DiagnosticSeverity::Warning) {
+      LOG_WARN << line;
+    } else {
+      LOG_INFO << line;
+    }
+  }
+
+  // 2. File — only PerfHint, only when a ReportInstrument is registered.
+  const std::string dir = FindReportOutputDir();
+  if (dir.empty()) return;
+
+  bool has_perf_hint = false;
+  for (const auto& d : diags) {
+    if (d.severity == DiagnosticSeverity::PerfHint) {
+      has_perf_hint = true;
+      break;
+    }
+  }
+  if (!has_perf_hint) return;
+
+  const std::string path = dir + "/perf_hints.log";
+  std::ofstream f(path, std::ios::app);
+  if (!f.is_open()) {
+    LOG_WARN << "Failed to open " << path << " for perf-hint append";
+    return;
+  }
+  for (const auto& d : diags) {
+    if (d.severity == DiagnosticSeverity::PerfHint) {
+      f << FormatDiagnosticLine(d, phase_label) << "\n";
+    }
   }
 }
 
-std::string WarningInstrument::GetName() const { return "WarningInstrument"; }
+// DiagnosticInstrument
+
+DiagnosticInstrument::DiagnosticInstrument(DiagnosticCheckSet checks)
+    : checks_(checks), pre_pipeline_done_(false) {}
+
+void DiagnosticInstrument::RunBeforePass(const Pass& /*pass*/, const ProgramPtr& program) {
+  if (pre_pipeline_done_) return;
+  pre_pipeline_done_ = true;
+  auto diags =
+      DiagnosticCheckRegistry::GetInstance().RunChecks(checks_, DiagnosticPhase::PrePipeline, program);
+  EmitDiagnostics(diags, "pipeline_input");
+}
+
+void DiagnosticInstrument::RunAfterPass(const Pass& pass, const ProgramPtr& program) {
+  auto diags = DiagnosticCheckRegistry::GetInstance().RunChecks(checks_, DiagnosticPhase::PostPass, program);
+  EmitDiagnostics(diags, pass.GetName());
+}
+
+void DiagnosticInstrument::RunAfterPipeline(const ProgramPtr& program) {
+  auto diags =
+      DiagnosticCheckRegistry::GetInstance().RunChecks(checks_, DiagnosticPhase::PostPipeline, program);
+  EmitDiagnostics(diags, "pipeline_output");
+}
+
+std::string DiagnosticInstrument::GetName() const { return "DiagnosticInstrument"; }
 
 // PassContext
 
 PassContext::PassContext(std::vector<PassInstrumentPtr> instruments, VerificationLevel verification_level,
-                         WarningLevel warning_level, WarningCheckSet disabled_warnings)
+                         DiagnosticPhase diagnostic_phase, DiagnosticCheckSet disabled_diagnostics)
     : instruments_(std::move(instruments)),
       verification_level_(verification_level),
-      warning_level_(warning_level),
-      disabled_warnings_(disabled_warnings),
+      diagnostic_phase_(diagnostic_phase),
+      disabled_diagnostics_(disabled_diagnostics),
       previous_(nullptr) {}
 
 VerificationLevel PassContext::GetVerificationLevel() const { return verification_level_; }
 
-WarningLevel PassContext::GetWarningLevel() const { return warning_level_; }
+DiagnosticPhase PassContext::GetDiagnosticPhase() const { return diagnostic_phase_; }
 
-const WarningCheckSet& PassContext::GetDisabledWarnings() const { return disabled_warnings_; }
+const DiagnosticCheckSet& PassContext::GetDisabledDiagnostics() const { return disabled_diagnostics_; }
 
 const std::vector<PassInstrumentPtr>& PassContext::GetInstruments() const { return instruments_; }
 
@@ -204,6 +287,13 @@ void PassContext::RunAfterPass(const Pass& pass, const ProgramPtr& program) {
   for (const auto& instrument : instruments_) {
     INTERNAL_CHECK(instrument != nullptr) << "PassContext contains a null PassInstrument";
     instrument->RunAfterPass(pass, program);
+  }
+}
+
+void PassContext::RunAfterPipeline(const ProgramPtr& program) {
+  for (const auto& instrument : instruments_) {
+    INTERNAL_CHECK(instrument != nullptr) << "PassContext contains a null PassInstrument";
+    instrument->RunAfterPipeline(program);
   }
 }
 

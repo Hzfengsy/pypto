@@ -22,7 +22,7 @@
 #include "pypto/ir/program.h"
 #include "pypto/ir/reporter/report.h"
 #include "pypto/ir/transforms/ir_property.h"
-#include "pypto/ir/verifier/warning_verifier_registry.h"
+#include "pypto/ir/verifier/diagnostic_check_registry.h"
 
 namespace pypto {
 
@@ -34,6 +34,21 @@ namespace ir {
 
 // Forward declare Pass to avoid circular include (pass_context.h <-> passes.h)
 class Pass;
+
+/**
+ * @brief Emit a batch of diagnostics from the unified diagnostic channel.
+ *
+ * Routes Warning severity to LOG_WARN and PerfHint severity to LOG_INFO.
+ * If a `ReportInstrument` is in the active context, PerfHint diagnostics are
+ * also appended to `${ReportInstrument.output_dir}/perf_hints.log` so build
+ * logs persist across runs. Error severity is rejected by INTERNAL_CHECK —
+ * errors should be thrown via `VerificationError`, not emitted here.
+ *
+ * @param diags Diagnostics to emit. May be empty (no-op).
+ * @param phase_label Human-readable label for the source phase
+ *        (e.g. "pipeline_input", "pipeline_output", a pass name).
+ */
+void EmitDiagnostics(const std::vector<Diagnostic>& diags, const std::string& phase_label);
 
 /**
  * @brief Controls when property verification runs
@@ -68,6 +83,14 @@ class PassInstrument {
    * @param program The program after transformation
    */
   virtual void RunAfterPass(const Pass& pass, const ProgramPtr& program) = 0;
+
+  /**
+   * @brief Called once after the final pass in the pipeline.
+   *
+   * Default no-op. Override to run end-of-pipeline analyses such as
+   * performance-hint checks (issue #1180) that need a fully lowered IR.
+   */
+  virtual void RunAfterPipeline(const ProgramPtr& /*program*/) {}
 
   /**
    * @brief Get the name of this instrument
@@ -148,6 +171,15 @@ class ReportInstrument : public PassInstrument {
   void RunAfterPass(const Pass& pass, const ProgramPtr& program) override;
   [[nodiscard]] std::string GetName() const override;
 
+  /**
+   * @brief Path of the directory that holds report files.
+   *
+   * Exposed so that `DiagnosticInstrument` can append its perf-hint log
+   * (`perf_hints.log`) into the same folder when this instrument is present
+   * in the active context.
+   */
+  [[nodiscard]] const std::string& GetOutputDir() const { return output_dir_; }
+
  private:
   std::string output_dir_;
   std::unordered_map<std::string, std::set<ReportType>> triggers_;
@@ -156,22 +188,31 @@ class ReportInstrument : public PassInstrument {
 };
 
 /**
- * @brief Instrument that runs warning checks before/after passes
+ * @brief Instrument that runs registered diagnostic checks (warnings + perf hints).
  *
- * For advanced use outside PassPipeline or fine-grained per-instrument control.
+ * Checks declare their phase at registration; this instrument fires each
+ * check at every pass boundary and the registry filters by phase. Output is
+ * dispatched by `EmitDiagnostics` which routes Warning to `LOG_WARN` and
+ * PerfHint to `LOG_INFO`, and additionally appends PerfHint diagnostics to
+ * `${ReportInstrument.output_dir}/perf_hints.log` when a `ReportInstrument`
+ * is in the active context.
+ *
+ * For advanced use outside PassPipeline or fine-grained per-instrument
+ * control. PassPipeline::Run runs the registered checks directly without
+ * needing this instrument; constructing one explicitly is only required when
+ * driving passes outside the pipeline.
  */
-class WarningInstrument : public PassInstrument {
+class DiagnosticInstrument : public PassInstrument {
  public:
-  explicit WarningInstrument(WarningLevel phase = WarningLevel::PrePipeline,
-                             WarningCheckSet checks = WarningVerifierRegistry::GetAllChecks());
+  explicit DiagnosticInstrument(DiagnosticCheckSet checks = DiagnosticCheckRegistry::GetAllChecks());
 
   void RunBeforePass(const Pass& pass, const ProgramPtr& program) override;
   void RunAfterPass(const Pass& pass, const ProgramPtr& program) override;
+  void RunAfterPipeline(const ProgramPtr& program) override;
   [[nodiscard]] std::string GetName() const override;
 
  private:
-  WarningLevel phase_;
-  WarningCheckSet checks_;
+  DiagnosticCheckSet checks_;
   bool pre_pipeline_done_;
 };
 
@@ -190,16 +231,21 @@ class WarningInstrument : public PassInstrument {
 class PassContext {
  public:
   /**
-   * @brief Create a context with instruments and optional verification/warning levels
+   * @brief Create a context with instruments and optional verification/diagnostic settings
    * @param instruments List of pass instruments
    * @param verification_level Verification level (default: Basic)
-   * @param warning_level Warning level (default: PrePipeline)
-   * @param disabled_warnings Warning checks to skip (default: UnusedControlFlowResult)
+   * @param diagnostic_phase Default phase gate for the diagnostic channel
+   *        (default: PrePipeline). Setting this to None disables warnings AND
+   *        performance hints; finer-grained control uses `disabled_diagnostics`.
+   * @param disabled_diagnostics Diagnostic checks to skip — keyed by
+   *        DiagnosticCheck enum (default: UnusedControlFlowResult).
+   *        Performance hints are on by default; disable individual hints by
+   *        adding their DiagnosticCheck values here.
    */
   explicit PassContext(std::vector<PassInstrumentPtr> instruments,
                        VerificationLevel verification_level = VerificationLevel::Basic,
-                       WarningLevel warning_level = WarningLevel::PrePipeline,
-                       WarningCheckSet disabled_warnings = {WarningCheck::UnusedControlFlowResult});
+                       DiagnosticPhase diagnostic_phase = DiagnosticPhase::PrePipeline,
+                       DiagnosticCheckSet disabled_diagnostics = {DiagnosticCheck::UnusedControlFlowResult});
 
   /**
    * @brief Push this context onto the thread-local stack
@@ -222,19 +268,30 @@ class PassContext {
   void RunAfterPass(const Pass& pass, const ProgramPtr& program);
 
   /**
+   * @brief Run all instruments' RunAfterPipeline (called by PassPipeline once
+   *        after the final pass has finished).
+   */
+  void RunAfterPipeline(const ProgramPtr& program);
+
+  /**
    * @brief Get the verification level for this context
    */
   [[nodiscard]] VerificationLevel GetVerificationLevel() const;
 
   /**
-   * @brief Get the warning level for this context
+   * @brief Get the diagnostic phase gate for this context.
+   *
+   * `None` disables warnings and performance hints entirely. Other values
+   * are passed through to the instrument; per-check phase still comes from
+   * the registry.
    */
-  [[nodiscard]] WarningLevel GetWarningLevel() const;
+  [[nodiscard]] DiagnosticPhase GetDiagnosticPhase() const;
 
   /**
-   * @brief Get the disabled warning checks
+   * @brief Get the diagnostic checks suppressed by this context (keyed by
+   *        `DiagnosticCheck`). Applies to both warnings and performance hints.
    */
-  [[nodiscard]] const WarningCheckSet& GetDisabledWarnings() const;
+  [[nodiscard]] const DiagnosticCheckSet& GetDisabledDiagnostics() const;
 
   /**
    * @brief Get the instruments registered on this context
@@ -263,8 +320,8 @@ class PassContext {
  private:
   std::vector<PassInstrumentPtr> instruments_;
   VerificationLevel verification_level_;
-  WarningLevel warning_level_;
-  WarningCheckSet disabled_warnings_;
+  DiagnosticPhase diagnostic_phase_;
+  DiagnosticCheckSet disabled_diagnostics_;
   PassContext* previous_;
 
   static thread_local PassContext* current_;

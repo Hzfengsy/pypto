@@ -23,8 +23,8 @@
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/type.h"
+#include "pypto/ir/verifier/diagnostic_check_registry.h"
 #include "pypto/ir/verifier/verifier.h"
-#include "pypto/ir/verifier/warning_verifier_registry.h"
 
 namespace pypto {
 namespace ir {

@@ -25,12 +25,12 @@ from pypto.pypto_core import DataType
 from pypto.pypto_core.ir import *  # noqa: F403
 from pypto.pypto_core.ir import IRMutator, IRVisitor
 from pypto.pypto_core.passes import (
+    DiagnosticCheck,
+    DiagnosticCheckSet,
+    DiagnosticPhase,
     PassContext,
     VerificationLevel,
     VerificationMode,
-    WarningCheck,
-    WarningCheckSet,
-    WarningLevel,
 )
 
 # Import call-site direction helpers (input/output/inout/...) for hand-written IR.
@@ -108,9 +108,9 @@ __all__ = [
     "VerificationMode",
     "VerificationLevel",
     "PassContext",
-    "WarningLevel",
-    "WarningCheck",
-    "WarningCheckSet",
+    "DiagnosticPhase",
+    "DiagnosticCheck",
+    "DiagnosticCheckSet",
     "ConversionContext",
     "op_conversion",
     "register_op_conversion",

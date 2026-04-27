@@ -28,6 +28,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <fstream>
 #include <iostream>
@@ -240,11 +241,7 @@ class LineLogger : public std::vector<std::string> {
 class LoggerManager {
  public:
   std::mutex log_mtx;
-#ifdef NDEBUG
-  LogLevel level{LogLevel::WARN};
-#else
-  LogLevel level{LogLevel::DEBUG};
-#endif
+  LogLevel level{ComputeDefaultLogLevel()};
   bool std_enabled{true};
   StdLogger std_logger;
   std::unordered_map<std::string, std::unique_ptr<FileLogger>> file_logger_dict;
@@ -344,6 +341,37 @@ class LoggerManager {
   static LoggerManager& GetManager() {
     static LoggerManager manager;
     return manager;
+  }
+
+ private:
+  /**
+   * @brief Resolve the default log level for this process.
+   *
+   * Reads `PYPTO_LOG_LEVEL` once. Accepted values: "debug", "info", "warn",
+   * "error", "fatal", "event", "none" (case-sensitive). When the env var is
+   * unset, falls back to INFO in release and DEBUG in non-release builds.
+   *
+   * INFO is the release default so performance hints (issue #1180) and other
+   * advisory pass output reach the console without users having to opt in.
+   */
+  static LogLevel ComputeDefaultLogLevel() {
+    const char* env = std::getenv("PYPTO_LOG_LEVEL");
+    if (env != nullptr) {
+      std::string val(env);
+      if (val == "debug") return LogLevel::DEBUG;
+      if (val == "info") return LogLevel::INFO;
+      if (val == "warn") return LogLevel::WARN;
+      if (val == "error") return LogLevel::ERROR;
+      if (val == "fatal") return LogLevel::FATAL;
+      if (val == "event") return LogLevel::EVENT;
+      if (val == "none") return LogLevel::NONE;
+      // Unknown value — fall through to compile-time default.
+    }
+#ifdef NDEBUG
+    return LogLevel::INFO;
+#else
+    return LogLevel::DEBUG;
+#endif
   }
 };
 

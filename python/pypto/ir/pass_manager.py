@@ -247,15 +247,15 @@ class PassManager:
         # _pass_obj.get_name() because registered names may differ from C++ names.
         pass_index = 0
 
-        # Resolve warning checks once for post-pass dump.
+        # Resolve diagnostic checks once for post-pass dump.
         ctx = passes.PassContext.current()
         if ctx:
-            disabled = ctx.get_disabled_warnings()
+            disabled = ctx.get_disabled_diagnostics()
         else:
             # Match PassContext default: disable UnusedControlFlowResult
-            disabled = passes.WarningCheckSet()
-            disabled.insert(passes.WarningCheck.UnusedControlFlowResult)
-        all_checks = passes.WarningVerifierRegistry.get_all_checks()
+            disabled = passes.DiagnosticCheckSet()
+            disabled.insert(passes.DiagnosticCheck.UnusedControlFlowResult)
+        all_checks = passes.DiagnosticCheckRegistry.get_all_checks()
         effective_checks = all_checks.difference(disabled)
 
         prof = CompileProfiler.current()
@@ -282,7 +282,9 @@ class PassManager:
 
             # Dump per-pass warnings alongside the IR
             if not effective_checks.empty():
-                diags = passes.WarningVerifierRegistry.run_checks(effective_checks, program)
+                diags = passes.DiagnosticCheckRegistry.run_checks(
+                    effective_checks, passes.DiagnosticPhase.POST_PASS, program
+                )
                 warn_diags = [d for d in diags if d.severity == passes.DiagnosticSeverity.Warning]
                 if warn_diags:
                     dump_filename = os.path.relpath(os.path.join(output_dir, f"{stem}.py"))
@@ -314,7 +316,7 @@ class PassManager:
         level = ctx.get_verification_level() if ctx else passes.get_default_verification_level()
 
         with passes.PassContext(
-            [*outer_instruments, *extra_instruments], level, passes.WarningLevel.PRE_PIPELINE, disabled
+            [*outer_instruments, *extra_instruments], level, passes.DiagnosticPhase.PRE_PIPELINE, disabled
         ):
             try:
                 return self._pipeline.run(input_ir)
@@ -345,14 +347,14 @@ class PassManager:
         ctx = passes.PassContext.current()
         outer_instruments = list(ctx.get_instruments()) if ctx else []
         level = ctx.get_verification_level() if ctx else passes.get_default_verification_level()
-        wlevel = ctx.get_warning_level() if ctx else passes.get_default_warning_level()
+        dphase = ctx.get_diagnostic_phase() if ctx else passes.get_default_diagnostic_phase()
         if ctx:
-            disabled = ctx.get_disabled_warnings()
+            disabled = ctx.get_disabled_diagnostics()
         else:
-            disabled = passes.WarningCheckSet()
-            disabled.insert(passes.WarningCheck.UnusedControlFlowResult)
+            disabled = passes.DiagnosticCheckSet()
+            disabled.insert(passes.DiagnosticCheck.UnusedControlFlowResult)
 
-        with passes.PassContext([*outer_instruments, timing_instrument], level, wlevel, disabled):
+        with passes.PassContext([*outer_instruments, timing_instrument], level, dphase, disabled):
             try:
                 return self._pipeline.run(input_ir)
             finally:

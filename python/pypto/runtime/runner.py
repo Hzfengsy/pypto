@@ -40,7 +40,7 @@ import torch
 from pypto.backend import BackendType
 from pypto.ir.pass_manager import OptimizationStrategy
 from pypto.pypto_core import backend as _backend_core
-from pypto.pypto_core.passes import WarningCheckSet, WarningLevel
+from pypto.pypto_core.passes import DiagnosticCheckSet, DiagnosticPhase
 
 _OUTPUTS_DIR = Path("outputs")
 
@@ -90,10 +90,13 @@ class RunConfig:
             per-stage wall-clock timings (parse, passes, codegen).
             Results are written to ``report/pipeline_profile.{txt,json}`` in
             the output directory.
-        warning_level: Override warning level for compilation. ``None`` uses the
-            default (``PrePipeline``, or ``PYPTO_WARNING_LEVEL`` env var).
-        disabled_warnings: Set of warning checks to disable during compilation.
-            ``None`` uses the default (``UnusedControlFlowResult`` disabled).
+        diagnostic_phase: Override the diagnostic phase gate for compilation.
+            ``None`` uses the default (``PrePipeline``, or ``PYPTO_WARNING_LEVEL``
+            env var). Setting to ``None`` silences warnings AND performance hints;
+            finer-grained control uses ``disabled_diagnostics``.
+        disabled_diagnostics: Set of diagnostic checks to disable during
+            compilation (covers warnings and perf hints). ``None`` uses the
+            default (``UnusedControlFlowResult`` disabled, perf hints enabled).
         golden_data_dir: Target directory for ``.pt`` data files.  When set,
             the generated ``golden.py`` always loads tensors from this path.
             If the directory already contains all required ``.pt`` files they
@@ -118,8 +121,8 @@ class RunConfig:
     pto_isa_commit: str | None = None
     runtime_profiling: bool = False
     compile_profiling: bool = False
-    warning_level: WarningLevel | None = None
-    disabled_warnings: WarningCheckSet | None = None
+    diagnostic_phase: DiagnosticPhase | None = None
+    disabled_diagnostics: DiagnosticCheckSet | None = None
     golden_data_dir: str | None = None
 
     def __post_init__(self) -> None:
@@ -192,8 +195,8 @@ def compile_program(
     strategy: OptimizationStrategy,
     backend_type: BackendType,
     dump_passes: bool = False,
-    warning_level: WarningLevel | None = None,
-    disabled_warnings: WarningCheckSet | None = None,
+    diagnostic_phase: DiagnosticPhase | None = None,
+    disabled_diagnostics: DiagnosticCheckSet | None = None,
     profiling: bool = False,
 ) -> None:
     """Compile *program* to *work_dir* and patch orchestration headers.
@@ -207,8 +210,8 @@ def compile_program(
         strategy: PyPTO optimisation strategy applied during compilation.
         backend_type: Code-generation backend.
         dump_passes: If ``True``, dump intermediate IR after each pass.
-        warning_level: Override warning level for compilation.
-        disabled_warnings: Set of warning checks to disable.
+        diagnostic_phase: Override the diagnostic phase gate for compilation.
+        disabled_diagnostics: Set of diagnostic checks to disable.
         profiling: If ``True``, enable compile profiling.
     """
     from pypto import ir  # noqa: PLC0415
@@ -219,8 +222,8 @@ def compile_program(
         strategy=strategy,
         dump_passes=dump_passes,
         backend_type=backend_type,
-        warning_level=warning_level,
-        disabled_warnings=disabled_warnings,
+        diagnostic_phase=diagnostic_phase,
+        disabled_diagnostics=disabled_diagnostics,
         profiling=profiling,
     )
     _patch_orchestration_headers(work_dir)
@@ -268,8 +271,8 @@ def run(
         strategy=config.strategy,
         backend_type=config.backend_type,
         dump_passes=config.dump_passes,
-        warning_level=config.warning_level,
-        disabled_warnings=config.disabled_warnings,
+        diagnostic_phase=config.diagnostic_phase,
+        disabled_diagnostics=config.disabled_diagnostics,
         platform=config.platform,
         profiling=config.compile_profiling,
     )

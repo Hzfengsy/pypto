@@ -143,7 +143,12 @@ void BindBackend(nb::module_& m) {
       .def("requires_runtime_subblock_bridge", &BackendHandler::RequiresRuntimeSubblockBridge,
            "Whether split AIV wrappers must source the subblock id from the runtime context")
       .def("requires_no_split_dual_aiv_dispatch", &BackendHandler::RequiresNoSplitDualAivDispatch,
-           "Whether mixed kernels with no split mode must still be dispatched on both AIV lanes");
+           "Whether mixed kernels with no split mode must still be dispatched on both AIV lanes")
+      .def("get_gm_access_granularity_bytes", &BackendHandler::GetGmAccessGranularityBytes,
+           "GM access granularity in bytes (issue #1180 perf-hint threshold input)")
+      .def("get_l2_cache_line_bytes", &BackendHandler::GetL2CacheLineBytes, "L2 cache line size in bytes")
+      .def("get_recommended_innermost_dim_bytes", &BackendHandler::GetRecommendedInnermostDimBytes,
+           "Recommended minimum innermost-dim size, in bytes, for tile ops touching GM");
 
   // ========== Backend abstract base class ==========
   nb::class_<Backend>(backend_mod, "Backend", "Abstract backend base class")

@@ -24,8 +24,8 @@
 #include "pypto/ir/program.h"
 #include "pypto/ir/transforms/ir_property.h"
 #include "pypto/ir/transforms/pass_context.h"
+#include "pypto/ir/verifier/diagnostic_check_registry.h"
 #include "pypto/ir/verifier/property_verifier_registry.h"
-#include "pypto/ir/verifier/warning_verifier_registry.h"
 
 namespace pypto {
 namespace ir {
@@ -206,18 +206,6 @@ PassPipeline::PassPipeline() = default;
 
 void PassPipeline::AddPass(Pass pass) { passes_.push_back(std::move(pass)); }
 
-namespace {
-
-void EmitWarnings(const std::vector<Diagnostic>& diags, const std::string& phase) {
-  for (const auto& d : diags) {
-    INTERNAL_CHECK(d.severity == DiagnosticSeverity::Warning)
-        << "Warning verifier emitted non-Warning diagnostic: " << d.rule_name;
-    LOG_WARN << "[" << d.rule_name << "] (" << phase << ") " << d.message;
-  }
-}
-
-}  // namespace
-
 ProgramPtr PassPipeline::Run(const ProgramPtr& program) const {
   CHECK(program) << "PassPipeline cannot run on null program";
 
@@ -230,18 +218,34 @@ ProgramPtr PassPipeline::Run(const ProgramPtr& program) const {
   const bool should_verify = level != VerificationLevel::None;
   IRPropertySet verified;
 
-  // Warning configuration from PassContext or env-var defaults
-  WarningLevel wlevel = ctx ? ctx->GetWarningLevel() : GetDefaultWarningLevel();
-  const bool should_warn = wlevel != WarningLevel::None;
-  WarningCheckSet effective_checks;
-  if (should_warn) {
-    WarningCheckSet disabled = ctx ? ctx->GetDisabledWarnings() : WarningCheckSet{};
-    effective_checks = WarningVerifierRegistry::GetAllChecks().Difference(disabled);
+  // Diagnostic configuration from PassContext or env-var defaults.
+  // The phase gate is global: setting None disables the channel entirely;
+  // any other value lets each registered check fire at its own declared
+  // phase (per-check registration, not per-context).
+  DiagnosticPhase dphase = ctx ? ctx->GetDiagnosticPhase() : GetDefaultDiagnosticPhase();
+  // If the user has already added a DiagnosticInstrument to the context,
+  // it will fire all phases via PassInstrument hooks — skip the inline calls
+  // here to avoid running every check twice.
+  bool has_diag_instrument = false;
+  if (ctx != nullptr) {
+    for (const auto& inst : ctx->GetInstruments()) {
+      if (dynamic_cast<DiagnosticInstrument*>(inst.get()) != nullptr) {
+        has_diag_instrument = true;
+        break;
+      }
+    }
+  }
+  const bool should_diagnose = dphase != DiagnosticPhase::None && !has_diag_instrument;
+  DiagnosticCheckSet effective_checks;
+  if (should_diagnose) {
+    DiagnosticCheckSet disabled = ctx ? ctx->GetDisabledDiagnostics() : DiagnosticCheckSet{};
+    effective_checks = DiagnosticCheckRegistry::GetAllChecks().Difference(disabled);
   }
 
-  if (should_warn && (wlevel == WarningLevel::PrePipeline || wlevel == WarningLevel::Both)) {
-    auto diags = WarningVerifierRegistry::GetInstance().RunChecks(effective_checks, current);
-    EmitWarnings(diags, "pipeline_input");
+  if (should_diagnose) {
+    auto diags = DiagnosticCheckRegistry::GetInstance().RunChecks(effective_checks,
+                                                                  DiagnosticPhase::PrePipeline, current);
+    EmitDiagnostics(diags, "pipeline_input");
   }
 
   // Verify structural invariants at pipeline start
@@ -269,11 +273,24 @@ ProgramPtr PassPipeline::Run(const ProgramPtr& program) const {
       }
     }
 
-    if (should_warn && (wlevel == WarningLevel::PostPass || wlevel == WarningLevel::Both)) {
-      auto diags = WarningVerifierRegistry::GetInstance().RunChecks(effective_checks, current);
-      EmitWarnings(diags, p.GetName());
+    if (should_diagnose) {
+      auto diags = DiagnosticCheckRegistry::GetInstance().RunChecks(effective_checks,
+                                                                    DiagnosticPhase::PostPass, current);
+      EmitDiagnostics(diags, p.GetName());
     }
   }
+
+  // End-of-pipeline diagnostics — performance hints typically run here, after
+  // all tile shapes / memory layouts are finalised (issue #1180).
+  if (should_diagnose) {
+    auto diags = DiagnosticCheckRegistry::GetInstance().RunChecks(effective_checks,
+                                                                  DiagnosticPhase::PostPipeline, current);
+    EmitDiagnostics(diags, "pipeline_output");
+  }
+  if (ctx != nullptr) {
+    ctx->RunAfterPipeline(current);
+  }
+
   return current;
 }
 

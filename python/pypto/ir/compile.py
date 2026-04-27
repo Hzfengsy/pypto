@@ -46,8 +46,8 @@ def compile(  # noqa: PLR0913
     backend_type: BackendType = BackendType.Ascend910B,
     skip_ptoas: bool = False,
     verification_level: _passes.VerificationLevel | None = None,
-    warning_level: _passes.WarningLevel | None = None,
-    disabled_warnings: _passes.WarningCheckSet | None = None,
+    diagnostic_phase: _passes.DiagnosticPhase | None = None,
+    disabled_diagnostics: _passes.DiagnosticCheckSet | None = None,
     profiling: bool = False,
     platform: str | None = None,
 ) -> "CompiledProgram":
@@ -69,10 +69,13 @@ def compile(  # noqa: PLR0913
             instead of compiled C++ kernel wrappers.
         verification_level: Override verification level for this compilation via
             PassContext. None uses the default (Basic, or PYPTO_VERIFY_LEVEL env var).
-        warning_level: Override warning level for this compilation via PassContext.
-            None uses the default (PrePipeline, or PYPTO_WARNING_LEVEL env var).
-        disabled_warnings: Set of warning checks to disable. None uses the default
-            (UnusedControlFlowResult disabled).
+        diagnostic_phase: Override the diagnostic phase gate for this compilation
+            via PassContext. None uses the default (PrePipeline, or
+            PYPTO_WARNING_LEVEL env var). Setting to None silences warnings AND
+            performance hints; finer-grained control uses ``disabled_diagnostics``.
+        disabled_diagnostics: Set of diagnostic checks to disable (covers both
+            warnings and performance hints). None uses the default
+            (UnusedControlFlowResult disabled, perf hints enabled).
         profiling: If True, enable compile profiling that records per-stage
             wall-clock timings.  Results are written to ``output_dir/report/``.
         platform: Target execution platform.  One of ``"a2a3sim"``,
@@ -106,10 +109,10 @@ def compile(  # noqa: PLR0913
             "compile() was called with verification_level while a PassContext is already active. "
             "Set the verification level on the existing PassContext instead."
         )
-    if warning_level is not None and outer is not None:
+    if diagnostic_phase is not None and outer is not None:
         raise RuntimeError(
-            "compile() was called with warning_level while a PassContext is already active. "
-            "Set the warning level on the existing PassContext instead."
+            "compile() was called with diagnostic_phase while a PassContext is already active. "
+            "Set the diagnostic phase on the existing PassContext instead."
         )
 
     # --- Compile profiling ---------------------------------------------------
@@ -127,20 +130,22 @@ def compile(  # noqa: PLR0913
 
     instruments: list[_passes.PassInstrument] = [report_instrument]
     # Resolve effective settings: explicit arg > outer context > global default.
-    default_disabled = _passes.WarningCheckSet()
-    default_disabled.insert(_passes.WarningCheck.UnusedControlFlowResult)
+    default_disabled = _passes.DiagnosticCheckSet()
+    default_disabled.insert(_passes.DiagnosticCheck.UnusedControlFlowResult)
     if outer is not None:
         instruments = list(outer.get_instruments()) + instruments
         vlevel = verification_level if verification_level is not None else outer.get_verification_level()
-        wlevel = warning_level if warning_level is not None else outer.get_warning_level()
-        disabled = disabled_warnings if disabled_warnings is not None else outer.get_disabled_warnings()
+        dphase = diagnostic_phase if diagnostic_phase is not None else outer.get_diagnostic_phase()
+        disabled = (
+            disabled_diagnostics if disabled_diagnostics is not None else outer.get_disabled_diagnostics()
+        )
     else:
         vlevel = (
             verification_level if verification_level is not None else _passes.get_default_verification_level()
         )
-        wlevel = warning_level if warning_level is not None else _passes.get_default_warning_level()
-        disabled = disabled_warnings if disabled_warnings is not None else default_disabled
-    ctx = _passes.PassContext(instruments, vlevel, wlevel, disabled)
+        dphase = diagnostic_phase if diagnostic_phase is not None else _passes.get_default_diagnostic_phase()
+        disabled = disabled_diagnostics if disabled_diagnostics is not None else default_disabled
+    ctx = _passes.PassContext(instruments, vlevel, dphase, disabled)
 
     def _stage(name: str) -> AbstractContextManager[Any]:
         if prof is not None:

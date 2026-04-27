@@ -216,25 +216,32 @@ const IRPropertySet& GetDefaultVerifyProperties();
 VerificationLevel GetDefaultVerificationLevel();
 
 /**
- * @brief Controls automatic warning checks in PassPipeline
+ * @brief Controls when DiagnosticInstrument runs registered checks
  *
- * Warnings are non-fatal diagnostics for likely user errors or pass bugs.
+ * Checks (warnings + performance hints) declare a phase at registration time;
+ * the instrument fires each registered check at its declared phase. The
+ * `disabled` parameter on PassContext suppresses individual checks regardless
+ * of phase.
+ *
+ * Phases are independent of severity: a Warning may run at PrePipeline, and a
+ * PerfHint may run at PostPipeline — declared per check, not per severity.
  */
-enum class WarningLevel {
-  None,         ///< All warnings disabled
-  PrePipeline,  ///< Run once before first pass (default — user-facing)
-  PostPass,     ///< Run after every pass (pass debugging)
-  Both          ///< Both phases
+enum class DiagnosticPhase {
+  None,          ///< Disable the diagnostic channel entirely
+  PrePipeline,   ///< Run once before the first pass (default for warnings)
+  PostPass,      ///< Run after every pass (debugging)
+  PostPipeline,  ///< Run once after the last pass (default for performance hints)
 };
 
 /**
- * @brief Get the default warning level from environment
+ * @brief Get the default diagnostic phase from environment
  *
  * Checks the PYPTO_WARNING_LEVEL environment variable on first call
- * (values: "none", "pre_pipeline", "post_pass", "both").
- * Defaults to PrePipeline.
+ * (values: "none", "pre_pipeline", "post_pass", "post_pipeline").
+ * Defaults to PrePipeline. The variable name is retained for backward
+ * compatibility with shells that have it set.
  */
-WarningLevel GetDefaultWarningLevel();
+DiagnosticPhase GetDefaultDiagnosticPhase();
 
 }  // namespace ir
 }  // namespace pypto

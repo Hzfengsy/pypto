@@ -25,9 +25,9 @@
 #include "pypto/ir/transforms/ir_property.h"
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/utils/stmt_dependency_analysis.h"
+#include "pypto/ir/verifier/diagnostic_check_registry.h"
 #include "pypto/ir/verifier/property_verifier_registry.h"
 #include "pypto/ir/verifier/verification_error.h"
-#include "pypto/ir/verifier/warning_verifier_registry.h"
 
 namespace nb = nanobind;
 
@@ -110,46 +110,59 @@ void BindPass(nb::module_& m) {
       .value("ROUNDTRIP", VerificationLevel::Roundtrip,
              "BASIC + print→parse structural-equality check after every pass");
 
-  // Bind WarningLevel enum
-  nb::enum_<WarningLevel>(passes, "WarningLevel", "Controls automatic warning checks in PassPipeline")
-      .value("NONE", WarningLevel::None, "All warnings disabled")
-      .value("PRE_PIPELINE", WarningLevel::PrePipeline, "Run once before first pass (default)")
-      .value("POST_PASS", WarningLevel::PostPass, "Run after every pass (pass debugging)")
-      .value("BOTH", WarningLevel::Both, "Both pre-pipeline and post-pass");
+  // Bind DiagnosticPhase enum
+  nb::enum_<DiagnosticPhase>(passes, "DiagnosticPhase",
+                             "Controls when DiagnosticInstrument runs registered checks "
+                             "(warnings + performance hints)")
+      .value("NONE", DiagnosticPhase::None, "Disable warnings and performance hints entirely")
+      .value("PRE_PIPELINE", DiagnosticPhase::PrePipeline,
+             "Run pre-pipeline checks once before first pass (default)")
+      .value("POST_PASS", DiagnosticPhase::PostPass, "Run post-pass checks after every pass (debugging)")
+      .value("POST_PIPELINE", DiagnosticPhase::PostPipeline,
+             "Run post-pipeline checks once after the last pass (default for performance hints)");
 
-  passes.def("get_default_warning_level", &GetDefaultWarningLevel,
-             "Get the default warning level (from PYPTO_WARNING_LEVEL env var, default: PrePipeline)");
+  passes.def("get_default_diagnostic_phase", &GetDefaultDiagnosticPhase,
+             "Get the default diagnostic phase (from PYPTO_WARNING_LEVEL env var, default: PrePipeline)");
 
-  // Bind WarningCheck enum
-  nb::enum_<WarningCheck>(passes, "WarningCheck", "Identifies a specific warning check")
-      .value("UnusedVariable", WarningCheck::UnusedVariable, "Variable defined but never read")
-      .value("UnusedControlFlowResult", WarningCheck::UnusedControlFlowResult,
-             "Unused return variable from for/while/if statement");
+  // Bind DiagnosticCheck enum
+  nb::enum_<DiagnosticCheck>(passes, "DiagnosticCheck", "Identifies a specific diagnostic check")
+      .value("UnusedVariable", DiagnosticCheck::UnusedVariable, "Variable defined but never read")
+      .value("UnusedControlFlowResult", DiagnosticCheck::UnusedControlFlowResult,
+             "Unused return variable from for/while/if statement")
+      .value("TileInnermostDimGranularity", DiagnosticCheck::TileInnermostDimGranularity,
+             "Tile innermost dim below recommended HW memory-access granularity (PH001)");
 
-  // Bind WarningCheckSet
-  nb::class_<WarningCheckSet>(passes, "WarningCheckSet", "A set of warning checks")
-      .def(nb::init<>(), "Create an empty warning check set")
-      .def("insert", &WarningCheckSet::Insert, nb::arg("check"), "Insert a warning check")
-      .def("remove", &WarningCheckSet::Remove, nb::arg("check"), "Remove a warning check")
-      .def("contains", &WarningCheckSet::Contains, nb::arg("check"), "Check if check is in set")
-      .def("empty", &WarningCheckSet::Empty, "Check if empty")
-      .def("difference", &WarningCheckSet::Difference, nb::arg("other"), "Return this minus other")
-      .def("to_list", &WarningCheckSet::ToVector, "Convert to list of warning checks")
-      .def("__str__", &WarningCheckSet::ToString)
-      .def("__repr__", &WarningCheckSet::ToString)
-      .def("__eq__", &WarningCheckSet::operator==)
-      .def("__ne__", &WarningCheckSet::operator!=);
+  // Bind DiagnosticCheckSet
+  nb::class_<DiagnosticCheckSet>(passes, "DiagnosticCheckSet", "A set of diagnostic checks")
+      .def(nb::init<>(), "Create an empty diagnostic check set")
+      .def("insert", &DiagnosticCheckSet::Insert, nb::arg("check"), "Insert a diagnostic check")
+      .def("remove", &DiagnosticCheckSet::Remove, nb::arg("check"), "Remove a diagnostic check")
+      .def("contains", &DiagnosticCheckSet::Contains, nb::arg("check"), "Check if check is in set")
+      .def("empty", &DiagnosticCheckSet::Empty, "Check if empty")
+      .def("difference", &DiagnosticCheckSet::Difference, nb::arg("other"), "Return this minus other")
+      .def("union_with", &DiagnosticCheckSet::Union, nb::arg("other"), "Return union of this and other")
+      .def("to_list", &DiagnosticCheckSet::ToVector, "Convert to list of diagnostic checks")
+      .def("__str__", &DiagnosticCheckSet::ToString)
+      .def("__repr__", &DiagnosticCheckSet::ToString)
+      .def("__eq__", &DiagnosticCheckSet::operator==)
+      .def("__ne__", &DiagnosticCheckSet::operator!=);
 
-  // Bind WarningVerifierRegistry
-  nb::class_<WarningVerifierRegistry>(passes, "WarningVerifierRegistry", "Registry of warning verifiers")
+  // Bind DiagnosticCheckRegistry
+  nb::class_<DiagnosticCheckRegistry>(passes, "DiagnosticCheckRegistry",
+                                      "Registry of diagnostic checks (warnings + performance hints)")
       .def_static(
           "run_checks",
-          [](const WarningCheckSet& checks, const ProgramPtr& program) {
-            return WarningVerifierRegistry::GetInstance().RunChecks(checks, program);
+          [](const DiagnosticCheckSet& checks, DiagnosticPhase phase, const ProgramPtr& program) {
+            return DiagnosticCheckRegistry::GetInstance().RunChecks(checks, phase, program);
           },
-          nb::arg("checks"), nb::arg("program"), "Run warning checks and collect diagnostics")
-      .def_static("get_all_checks", &WarningVerifierRegistry::GetAllChecks,
-                  "Get all registered warning checks");
+          nb::arg("checks"), nb::arg("phase"), nb::arg("program"),
+          "Run diagnostic checks at the given phase and collect diagnostics")
+      .def_static("get_all_checks", &DiagnosticCheckRegistry::GetAllChecks,
+                  "Get all registered diagnostic checks")
+      .def_static("get_warning_checks", &DiagnosticCheckRegistry::GetWarningChecks,
+                  "Get all registered Warning-severity checks")
+      .def_static("get_perf_hint_checks", &DiagnosticCheckRegistry::GetPerfHintChecks,
+                  "Get all registered PerfHint-severity checks");
 
   // Verification functions
   passes.def(
@@ -195,27 +208,31 @@ void BindPass(nb::module_& m) {
       passes, "ReportInstrument", "Instrument that generates reports to files after specified passes")
       .def(nb::init<std::string>(), nb::arg("output_dir"), "Create a report instrument with output directory")
       .def("enable_report", &ReportInstrument::EnableReport, nb::arg("type"), nb::arg("trigger_pass"),
-           "Enable a report type after a specific pass");
+           "Enable a report type after a specific pass")
+      .def("get_output_dir", &ReportInstrument::GetOutputDir,
+           "Path of the directory that holds report files (used by perf hints to "
+           "persist `perf_hints.log` alongside other reports)");
 
-  // WarningInstrument
-  nb::class_<WarningInstrument, PassInstrument>(passes, "WarningInstrument",
-                                                "Instrument that runs warning checks before/after passes")
-      .def(nb::init<WarningLevel, WarningCheckSet>(), nb::arg("phase") = WarningLevel::PrePipeline,
-           nb::arg("checks") = WarningVerifierRegistry::GetAllChecks(),
-           "Create a warning instrument with optional phase and check set");
+  // DiagnosticInstrument — unified warnings + performance hints (issue #1180)
+  nb::class_<DiagnosticInstrument, PassInstrument>(
+      passes, "DiagnosticInstrument",
+      "Instrument that runs registered diagnostic checks (warnings + performance hints)")
+      .def(nb::init<DiagnosticCheckSet>(), nb::arg("checks") = DiagnosticCheckRegistry::GetAllChecks(),
+           "Create a diagnostic instrument running the given check set");
 
   // PassContext
   nb::class_<PassContext>(passes, "PassContext",
                           "Context that holds instruments and pass configuration.\n\n"
                           "When active, Pass.__call__ will run the context's instruments\n"
                           "before/after each pass execution. Also controls automatic\n"
-                          "verification and warning levels for PassPipeline.")
-      .def(nb::init<std::vector<PassInstrumentPtr>, VerificationLevel, WarningLevel, WarningCheckSet>(),
+                          "verification and the diagnostic channel (warnings + performance\n"
+                          "hints) for PassPipeline.")
+      .def(nb::init<std::vector<PassInstrumentPtr>, VerificationLevel, DiagnosticPhase, DiagnosticCheckSet>(),
            nb::arg("instruments"), nb::arg("verification_level") = VerificationLevel::Basic,
-           nb::arg("warning_level") = WarningLevel::PrePipeline,
-           nb::arg("disabled_warnings") = WarningCheckSet{WarningCheck::UnusedControlFlowResult},
-           "Create a PassContext with instruments, verification level, warning level, "
-           "and optional disabled warnings")
+           nb::arg("diagnostic_phase") = DiagnosticPhase::PrePipeline,
+           nb::arg("disabled_diagnostics") = DiagnosticCheckSet{DiagnosticCheck::UnusedControlFlowResult},
+           "Create a PassContext with instruments, verification level, diagnostic phase gate, "
+           "and optional disabled diagnostic checks")
       .def("__enter__",
            [](PassContext& self) -> PassContext& {
              self.EnterContext();
@@ -224,8 +241,10 @@ void BindPass(nb::module_& m) {
       .def("__exit__", [](PassContext& self, const nb::args&) { self.ExitContext(); })
       .def("get_verification_level", &PassContext::GetVerificationLevel,
            "Get the verification level for this context")
-      .def("get_warning_level", &PassContext::GetWarningLevel, "Get the warning level for this context")
-      .def("get_disabled_warnings", &PassContext::GetDisabledWarnings, "Get the disabled warning checks")
+      .def("get_diagnostic_phase", &PassContext::GetDiagnosticPhase,
+           "Get the diagnostic phase gate for this context")
+      .def("get_disabled_diagnostics", &PassContext::GetDisabledDiagnostics,
+           "Get the diagnostic checks suppressed by this context")
       .def("get_instruments", &PassContext::GetInstruments, "Get the instruments registered on this context")
       .def_static("current", &PassContext::Current, nb::rv_policy::reference,
                   "Get the currently active context, or None if no context is active");
@@ -400,13 +419,17 @@ void BindPass(nb::module_& m) {
   // Bind DiagnosticSeverity enum
   nb::enum_<DiagnosticSeverity>(passes, "DiagnosticSeverity", "Severity level for diagnostics")
       .value("Error", DiagnosticSeverity::Error, "Error that must be fixed")
-      .value("Warning", DiagnosticSeverity::Warning, "Warning that should be reviewed");
+      .value("Warning", DiagnosticSeverity::Warning, "Warning that should be reviewed")
+      .value("PerfHint", DiagnosticSeverity::PerfHint,
+             "Advisory performance hint (best-effort, not 100% accurate)");
 
   // Bind Diagnostic structure
   nb::class_<Diagnostic>(passes, "Diagnostic", "Single diagnostic message from verification")
-      .def_ro("severity", &Diagnostic::severity, "Severity level (Error or Warning)")
+      .def_ro("severity", &Diagnostic::severity, "Severity level (Error, Warning, or PerfHint)")
       .def_ro("rule_name", &Diagnostic::rule_name, "Name of the verification rule")
       .def_ro("error_code", &Diagnostic::error_code, "Specific error code")
+      .def_ro("hint_code", &Diagnostic::hint_code,
+              "Stable hint code for PerfHint diagnostics (e.g. \"PH001\"); empty otherwise")
       .def_ro("message", &Diagnostic::message, "Human-readable error message")
       .def_ro("span", &Diagnostic::span, "Source location of the issue");
 

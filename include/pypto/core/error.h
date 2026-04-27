@@ -311,11 +311,16 @@ class InternalError : public Error {
 /**
  * @brief Severity level for diagnostics
  *
- * Diagnostics can be either errors (must be fixed) or warnings (should be reviewed).
+ * - Error: IR is invalid; must be fixed.
+ * - Warning: likely user mistake or pass bug; should be reviewed.
+ * - PerfHint: advisory performance hint; opt-in, best-effort, not 100% accurate.
+ *   Lives below Warning so users can grep / suppress without confusing it with
+ *   a correctness signal.
  */
 enum class DiagnosticSeverity {
-  Error,    ///< Error that must be fixed
-  Warning,  ///< Warning that should be reviewed
+  Error,
+  Warning,
+  PerfHint,
 };
 
 /**
@@ -324,11 +329,15 @@ enum class DiagnosticSeverity {
  * Represents a single issue found during IR verification. Contains information
  * about the severity, which rule detected it, the specific error code, a human-readable
  * message, and the source location where the issue was found.
+ *
+ * `hint_code` is a stable string code (e.g. "PH001") used by performance-hint
+ * diagnostics to give users a grep / suppress key. Empty for Error / Warning.
  */
 struct Diagnostic {
-  DiagnosticSeverity severity;  ///< Severity level (Error or Warning)
+  DiagnosticSeverity severity;  ///< Severity level (Error, Warning, or PerfHint)
   std::string rule_name;        ///< Name of the verification rule (e.g., "SSAVerify", "TypeCheck")
   int error_code;               ///< Specific error code from the rule's error type enum
+  std::string hint_code;        ///< Stable hint code for PerfHint (e.g. "PH001"); empty otherwise
   std::string message;          ///< Human-readable error message
   ir::Span span;                ///< Source location of the issue
 
@@ -338,12 +347,24 @@ struct Diagnostic {
   Diagnostic() : severity(DiagnosticSeverity::Error), error_code(0), span(ir::Span::unknown()) {}
 
   /**
-   * @brief Construct a diagnostic with all fields
+   * @brief Construct a diagnostic with all required fields (no hint code)
    */
   Diagnostic(DiagnosticSeverity sev, std::string rule, int code, std::string msg, ir::Span s)
       : severity(sev),
         rule_name(std::move(rule)),
         error_code(code),
+        message(std::move(msg)),
+        span(std::move(s)) {}
+
+  /**
+   * @brief Construct a diagnostic with a stable hint code (used by PerfHint diagnostics)
+   */
+  Diagnostic(DiagnosticSeverity sev, std::string rule, int code, std::string hcode, std::string msg,
+             ir::Span s)
+      : severity(sev),
+        rule_name(std::move(rule)),
+        error_code(code),
+        hint_code(std::move(hcode)),
         message(std::move(msg)),
         span(std::move(s)) {}
 };

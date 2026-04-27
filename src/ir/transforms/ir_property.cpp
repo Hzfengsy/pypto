@@ -154,25 +154,25 @@ const IRPropertySet& GetDefaultVerifyProperties() {
   return props;
 }
 
-WarningLevel GetDefaultWarningLevel() {
-  static const WarningLevel level = [] {
+DiagnosticPhase GetDefaultDiagnosticPhase() {
+  static const DiagnosticPhase phase = [] {
     const char* env = std::getenv("PYPTO_WARNING_LEVEL");
     if (env == nullptr) {
-      return WarningLevel::PrePipeline;
+      return DiagnosticPhase::PrePipeline;
     }
     std::string val(env);
     if (val == "none") {
-      return WarningLevel::None;
+      return DiagnosticPhase::None;
     }
     if (val == "post_pass") {
-      return WarningLevel::PostPass;
+      return DiagnosticPhase::PostPass;
     }
-    if (val == "both") {
-      return WarningLevel::Both;
+    if (val == "post_pipeline") {
+      return DiagnosticPhase::PostPipeline;
     }
-    return WarningLevel::PrePipeline;
+    return DiagnosticPhase::PrePipeline;
   }();
-  return level;
+  return phase;
 }
 
 }  // namespace ir

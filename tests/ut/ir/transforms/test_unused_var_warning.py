@@ -17,8 +17,8 @@ from pypto.ir import builder
 
 def _run_unused_var_check(program: ir.Program) -> list[passes.Diagnostic]:
     """Run the UnusedVariable warning check and return all warnings."""
-    all_checks = passes.WarningVerifierRegistry.get_all_checks()
-    return passes.WarningVerifierRegistry.run_checks(all_checks, program)
+    all_checks = passes.DiagnosticCheckRegistry.get_warning_checks()
+    return passes.DiagnosticCheckRegistry.run_checks(all_checks, passes.DiagnosticPhase.PRE_PIPELINE, program)
 
 
 def _warnings(diagnostics: list[passes.Diagnostic]) -> list[passes.Diagnostic]:
@@ -189,63 +189,63 @@ def test_warn_severity_is_warning():
 # ---------------------------------------------------------------------------
 
 
-def test_warning_check_set():
-    """WarningCheckSet basic operations."""
-    wcs = passes.WarningCheckSet()
-    assert wcs.empty()
+def test_diagnostic_check_set():
+    """DiagnosticCheckSet basic operations."""
+    dcs = passes.DiagnosticCheckSet()
+    assert dcs.empty()
 
-    wcs.insert(passes.WarningCheck.UnusedVariable)
-    assert not wcs.empty()
-    assert wcs.contains(passes.WarningCheck.UnusedVariable)
+    dcs.insert(passes.DiagnosticCheck.UnusedVariable)
+    assert not dcs.empty()
+    assert dcs.contains(passes.DiagnosticCheck.UnusedVariable)
 
-    wcs.remove(passes.WarningCheck.UnusedVariable)
-    assert wcs.empty()
-    assert not wcs.contains(passes.WarningCheck.UnusedVariable)
+    dcs.remove(passes.DiagnosticCheck.UnusedVariable)
+    assert dcs.empty()
+    assert not dcs.contains(passes.DiagnosticCheck.UnusedVariable)
 
 
-def test_warning_check_set_difference():
-    """WarningCheckSet.difference removes specified checks."""
-    all_checks = passes.WarningVerifierRegistry.get_all_checks()
-    assert all_checks.contains(passes.WarningCheck.UnusedVariable)
+def test_diagnostic_check_set_difference():
+    """DiagnosticCheckSet.difference removes specified checks."""
+    all_checks = passes.DiagnosticCheckRegistry.get_all_checks()
+    assert all_checks.contains(passes.DiagnosticCheck.UnusedVariable)
 
-    disabled = passes.WarningCheckSet()
-    disabled.insert(passes.WarningCheck.UnusedVariable)
+    disabled = passes.DiagnosticCheckSet()
+    disabled.insert(passes.DiagnosticCheck.UnusedVariable)
     effective = all_checks.difference(disabled)
-    assert not effective.contains(passes.WarningCheck.UnusedVariable)
+    assert not effective.contains(passes.DiagnosticCheck.UnusedVariable)
 
 
-def test_warning_level_enum():
-    """WarningLevel enum has expected values."""
-    assert passes.WarningLevel.NONE != passes.WarningLevel.PRE_PIPELINE
-    assert passes.WarningLevel.PRE_PIPELINE != passes.WarningLevel.POST_PASS
-    assert passes.WarningLevel.POST_PASS != passes.WarningLevel.BOTH
+def test_diagnostic_phase_enum():
+    """DiagnosticPhase enum has expected values."""
+    assert passes.DiagnosticPhase.NONE != passes.DiagnosticPhase.PRE_PIPELINE
+    assert passes.DiagnosticPhase.PRE_PIPELINE != passes.DiagnosticPhase.POST_PASS
+    assert passes.DiagnosticPhase.POST_PASS != passes.DiagnosticPhase.POST_PIPELINE
 
 
-def test_pass_context_warning_config():
-    """PassContext accepts and returns warning configuration."""
-    disabled = passes.WarningCheckSet()
-    disabled.insert(passes.WarningCheck.UnusedVariable)
+def test_pass_context_diagnostic_config():
+    """PassContext accepts and returns diagnostic configuration."""
+    disabled = passes.DiagnosticCheckSet()
+    disabled.insert(passes.DiagnosticCheck.UnusedVariable)
 
     ctx = passes.PassContext(
         [],
-        warning_level=passes.WarningLevel.BOTH,
-        disabled_warnings=disabled,
+        diagnostic_phase=passes.DiagnosticPhase.POST_PASS,
+        disabled_diagnostics=disabled,
     )
-    assert ctx.get_warning_level() == passes.WarningLevel.BOTH
-    assert ctx.get_disabled_warnings().contains(passes.WarningCheck.UnusedVariable)
+    assert ctx.get_diagnostic_phase() == passes.DiagnosticPhase.POST_PASS
+    assert ctx.get_disabled_diagnostics().contains(passes.DiagnosticCheck.UnusedVariable)
 
 
-def test_pass_context_default_warning_config():
-    """PassContext defaults: default warning level, UnusedControlFlowResult disabled."""
+def test_pass_context_default_diagnostic_config():
+    """PassContext defaults: default phase, UnusedControlFlowResult disabled."""
     ctx = passes.PassContext([])
-    assert ctx.get_warning_level() == passes.get_default_warning_level()
-    disabled = ctx.get_disabled_warnings()
-    assert disabled.contains(passes.WarningCheck.UnusedControlFlowResult)
-    assert not disabled.contains(passes.WarningCheck.UnusedVariable)
+    assert ctx.get_diagnostic_phase() == passes.get_default_diagnostic_phase()
+    disabled = ctx.get_disabled_diagnostics()
+    assert disabled.contains(passes.DiagnosticCheck.UnusedControlFlowResult)
+    assert not disabled.contains(passes.DiagnosticCheck.UnusedVariable)
 
 
-def test_pipeline_disabled_warnings_no_output():
-    """PassPipeline with WarningLevel.NONE should not emit warnings."""
+def test_pipeline_disabled_diagnostics_no_output():
+    """PassPipeline with DiagnosticPhase.NONE should not emit diagnostics."""
     ib = builder.IRBuilder()
 
     with ib.function("pipeline_test") as f:
@@ -256,11 +256,11 @@ def test_pipeline_disabled_warnings_no_output():
 
     program = ir.Program([f.get_result()], "prog", ir.Span.unknown())
 
-    # Disable verification to avoid structural errors, disable warnings
+    # Disable verification to avoid structural errors, disable diagnostics
     ctx = passes.PassContext(
         [],
         verification_level=passes.VerificationLevel.NONE,
-        warning_level=passes.WarningLevel.NONE,
+        diagnostic_phase=passes.DiagnosticPhase.NONE,
     )
     with ctx:
         pipeline = passes.PassPipeline()
