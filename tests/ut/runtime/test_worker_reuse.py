@@ -131,6 +131,21 @@ class TestActiveWorkerLookup:
         fake_simpler_worker.close.assert_called_once()
 
 
+# ``execute_on_device`` lives in ``device_runner`` which eagerly imports the
+# ``simpler`` package. The Worker-only tests above mock just the
+# ``simpler.Worker`` class via ``_SimplerWorker`` and do not need
+# ``device_runner`` loaded — but the tests in this class invoke
+# ``execute_on_device`` directly, so they are skipped when ``simpler`` is not
+# installed (e.g. unit-tests CI).
+try:
+    import simpler  # noqa: F401  # pyright: ignore[reportMissingImports]
+except ImportError:
+    _has_simpler = False
+else:
+    _has_simpler = True
+
+
+@pytest.mark.skipif(not _has_simpler, reason="execute_on_device requires the simpler package")
 class TestExecuteOnDeviceReuse:
     """Verify ``execute_on_device`` reuses an active Worker rather than constructing a new one."""
 
