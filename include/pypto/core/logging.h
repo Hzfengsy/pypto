@@ -25,6 +25,8 @@
 #ifndef PYPTO_CORE_LOGGING_H_
 #define PYPTO_CORE_LOGGING_H_
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -357,7 +359,12 @@ class LoggerManager {
   static LogLevel ComputeDefaultLogLevel() {
     const char* env = std::getenv("PYPTO_LOG_LEVEL");
     if (env != nullptr) {
+      // Case-insensitive lookup so users can spell e.g. "INFO" or "Warn"
+      // — error messages elsewhere print enum names in upper case, which
+      // makes the lower-case-only contract surprising.
       std::string val(env);
+      std::transform(val.begin(), val.end(), val.begin(),
+                     [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
       if (val == "debug") return LogLevel::DEBUG;
       if (val == "info") return LogLevel::INFO;
       if (val == "warn") return LogLevel::WARN;

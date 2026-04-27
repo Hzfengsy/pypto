@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -207,6 +208,12 @@ void EmitDiagnostics(const std::vector<Diagnostic>& diags, const std::string& ph
   }
   if (!has_perf_hint) return;
 
+  // PassContext is thread-local, but multiple threads can run concurrent
+  // pipelines whose distinct ReportInstruments happen to share an output
+  // directory. Serialise file appends so per-line writes don't interleave.
+  static std::mutex perf_hints_log_mu;
+  std::lock_guard<std::mutex> lock(perf_hints_log_mu);
+
   const std::string path = dir + "/perf_hints.log";
   std::ofstream f(path, std::ios::app);
   if (!f.is_open()) {
@@ -225,20 +232,36 @@ void EmitDiagnostics(const std::vector<Diagnostic>& diags, const std::string& ph
 DiagnosticInstrument::DiagnosticInstrument(DiagnosticCheckSet checks)
     : checks_(checks), pre_pipeline_done_(false) {}
 
+namespace {
+
+/// Whether the active context disables the diagnostic channel. Honoring this
+/// from the instrument (in addition to PassPipeline) means
+/// `diagnostic_phase=NONE` reliably silences output regardless of which
+/// driver runs the passes.
+bool DiagnosticsDisabledByContext() {
+  const auto* ctx = PassContext::Current();
+  return ctx != nullptr && ctx->GetDiagnosticPhase() == DiagnosticPhase::None;
+}
+
+}  // namespace
+
 void DiagnosticInstrument::RunBeforePass(const Pass& /*pass*/, const ProgramPtr& program) {
   if (pre_pipeline_done_) return;
   pre_pipeline_done_ = true;
+  if (DiagnosticsDisabledByContext()) return;
   auto diags =
       DiagnosticCheckRegistry::GetInstance().RunChecks(checks_, DiagnosticPhase::PrePipeline, program);
   EmitDiagnostics(diags, "pipeline_input");
 }
 
 void DiagnosticInstrument::RunAfterPass(const Pass& pass, const ProgramPtr& program) {
+  if (DiagnosticsDisabledByContext()) return;
   auto diags = DiagnosticCheckRegistry::GetInstance().RunChecks(checks_, DiagnosticPhase::PostPass, program);
   EmitDiagnostics(diags, pass.GetName());
 }
 
 void DiagnosticInstrument::RunAfterPipeline(const ProgramPtr& program) {
+  if (DiagnosticsDisabledByContext()) return;
   auto diags =
       DiagnosticCheckRegistry::GetInstance().RunChecks(checks_, DiagnosticPhase::PostPipeline, program);
   EmitDiagnostics(diags, "pipeline_output");

@@ -129,13 +129,13 @@ std::vector<Diagnostic> DiagnosticCheckRegistry::RunChecks(const DiagnosticCheck
     std::size_t before = all_diagnostics.size();
     verifier->Verify(program, all_diagnostics);
 
-    // Stamp severity / hint_code from the registration to keep verifiers
-    // honest — a single source of truth for what severity a check carries.
+    // Stamp severity / hint_code from the registration unconditionally — the
+    // registry is the single source of truth, so a verifier that emits a
+    // mismatching severity or hint code (e.g. a Warning verifier accidentally
+    // setting "PH001") is overwritten with the registered values.
     for (std::size_t i = before; i < all_diagnostics.size(); ++i) {
       all_diagnostics[i].severity = it->second.severity;
-      if (all_diagnostics[i].hint_code.empty()) {
-        all_diagnostics[i].hint_code = it->second.hint_code;
-      }
+      all_diagnostics[i].hint_code = it->second.hint_code;
     }
   }
   return all_diagnostics;

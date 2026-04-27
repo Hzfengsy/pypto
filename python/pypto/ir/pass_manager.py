@@ -310,14 +310,19 @@ class PassManager:
 
         # Compose dump instrument with any outer context's instruments and settings.
         # C++ pipeline handles pre-pipeline warnings (LOG_WARN); post-pass warnings
-        # are dumped to files by the Python callback above, so force PrePipeline
-        # for the C++ side to avoid double-execution.
+        # are dumped to files by the Python callback above. Override an outer
+        # PostPass/Both setting to PrePipeline only to avoid double-executing
+        # post-pass warnings; preserve None (explicit silence) and PostPipeline
+        # so callers' diagnostic intent isn't reset.
         outer_instruments = list(ctx.get_instruments()) if ctx else []
         level = ctx.get_verification_level() if ctx else passes.get_default_verification_level()
+        outer_phase = ctx.get_diagnostic_phase() if ctx else passes.get_default_diagnostic_phase()
+        if outer_phase == passes.DiagnosticPhase.POST_PASS:
+            inner_phase = passes.DiagnosticPhase.PRE_PIPELINE
+        else:
+            inner_phase = outer_phase
 
-        with passes.PassContext(
-            [*outer_instruments, *extra_instruments], level, passes.DiagnosticPhase.PRE_PIPELINE, disabled
-        ):
+        with passes.PassContext([*outer_instruments, *extra_instruments], level, inner_phase, disabled):
             try:
                 return self._pipeline.run(input_ir)
             finally:

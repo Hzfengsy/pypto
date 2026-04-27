@@ -15,8 +15,9 @@ import re
 
 import pypto.language as pl
 import pytest
-from pypto import backend, ir, passes
+from pypto import DataType, backend, ir, passes
 from pypto.backend import BackendType
+from pypto.ir import builder
 
 
 @pytest.fixture(autouse=True)
@@ -101,13 +102,28 @@ def test_diagnostic_carries_hint_code():
 
 
 def test_warning_has_empty_hint_code():
-    """Warning diagnostics carry an empty hint_code."""
-    # We can't easily trigger a warning without a fully built program; use the
-    # registry's run_checks on an empty-but-valid program to check the field
-    # round-trips. The default-constructed Diagnostic also has empty hint_code.
-    diag = passes.Diagnostic
-    # This is a binding-level assertion — the field is exposed read-only.
-    assert hasattr(diag, "hint_code")
+    """Warning diagnostics carry an empty hint_code.
+
+    Constructs a program with an unused variable so the UnusedVariable warning
+    actually fires, then asserts the registry stamps an empty hint_code on the
+    resulting Warning-severity diagnostic. Catches regressions where a warning
+    accidentally inherits a perf-hint code.
+    """
+    ib = builder.IRBuilder()
+    with ib.function("warn_no_hint_code") as f:
+        a = f.param("a", ir.ScalarType(DataType.INT64))
+        f.return_type(ir.ScalarType(DataType.INT64))
+        _unused = ib.let("unused", ir.ConstInt(42, DataType.INT64, ir.Span.unknown()))
+        ib.return_stmt(a)
+    program = ir.Program([f.get_result()], "prog", ir.Span.unknown())
+
+    checks = passes.DiagnosticCheckSet()
+    checks.insert(passes.DiagnosticCheck.UnusedVariable)
+    diags = passes.DiagnosticCheckRegistry.run_checks(checks, passes.DiagnosticPhase.PRE_PIPELINE, program)
+    warns = [d for d in diags if d.severity == passes.DiagnosticSeverity.Warning]
+    assert len(warns) >= 1
+    for w in warns:
+        assert w.hint_code == "", f"Warning should have empty hint_code, got {w.hint_code!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -191,14 +207,55 @@ def test_perf_hint_log_file_appends_across_runs(tmp_path):
     assert len(second) > len(first)
 
 
-def test_warning_does_not_appear_in_perf_hints_log(tmp_path):
-    """Only PerfHint-severity diagnostics flow to the file (warnings stay on stderr)."""
+def test_warning_does_not_appear_in_perf_hints_log(tmp_path, capfd):
+    """Only PerfHint-severity diagnostics flow to the file; warnings stay on stderr.
+
+    Builds a program that emits both a Warning (UnusedVariable) and a PerfHint
+    (TileInnermostDimGranularity), runs the pipeline through a ReportInstrument,
+    and asserts (a) `perf_hints.log` is created and contains only PerfHint lines
+    and (b) the warning is captured on stderr. Without both diagnostics the
+    assertion would be vacuous.
+    """
+
+    backend.set_backend_type(BackendType.Ascend950)
+
+    # Program with a small-innermost tile.load (perf hint) AND an unused var (warning).
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            x: pl.Tensor[[16, 16], pl.FP32],
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            unused: pl.Tile[[16, 16], pl.FP32] = pl.load(x, [0, 0], [16, 16])  # noqa: F841
+            t: pl.Tile[[16, 16], pl.FP32] = pl.load(x, [0, 0], [16, 16])
+            return pl.store(t, [0, 0], out)
+
+    # Enable the unused-variable warning by clearing the default disable set.
+    enabled_checks = passes.DiagnosticCheckSet()
+    enabled_checks.insert(passes.DiagnosticCheck.UnusedVariable)
+
     report = passes.ReportInstrument(str(tmp_path))
-    _run_pipeline_with_perf_hint([report])
+    ctx = passes.PassContext(
+        [report],
+        verification_level=passes.VerificationLevel.NONE,
+        diagnostic_phase=passes.DiagnosticPhase.PRE_PIPELINE,
+        disabled_diagnostics=passes.DiagnosticCheckSet(),  # warning enabled
+    )
+    with ctx:
+        passes.PassPipeline().run(Prog)
+
+    captured = capfd.readouterr()
+    combined = captured.out + captured.err
+
     log = tmp_path / "perf_hints.log"
-    if log.exists():
-        text = log.read_text()
-        assert "[warning]" not in text
+    assert log.exists(), "perf_hints.log was not created"
+    text = log.read_text()
+    assert "[perf_hint PH001]" in text
+    assert "[warning]" not in text
+    # Warning routes to stderr, not the file.
+    assert "UnusedVariableCheck" in combined
 
 
 # ---------------------------------------------------------------------------

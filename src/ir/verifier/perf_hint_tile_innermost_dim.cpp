@@ -54,10 +54,11 @@ std::optional<uint64_t> InnermostBytesOfTile(const TypePtr& type) {
   size_t bits = tile->dtype_.GetBit();
   if (bits == 0) return std::nullopt;
 
-  // Round up to bytes for sub-byte dtypes (innermost-dim granularity is a
-  // bus / cache concern measured in bytes).
-  uint64_t bytes_per_elem = (bits + 7u) / 8u;
-  return static_cast<uint64_t>(last->value_) * bytes_per_elem;
+  // Multiply by element count first, then round up to bytes — for sub-byte
+  // dtypes (int4, bool, ...) per-element rounding overestimates the row size
+  // and would mask hints that should fire. Innermost-dim granularity is a
+  // bus / cache concern measured in bytes.
+  return (static_cast<uint64_t>(last->value_) * static_cast<uint64_t>(bits) + 7u) / 8u;
 }
 
 class TileInnermostDimVisitor : public IRVisitor {
