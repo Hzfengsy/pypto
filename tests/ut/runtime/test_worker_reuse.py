@@ -18,7 +18,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from pypto.runtime import RunConfig, Worker
-from pypto.runtime.device_runner import execute_on_device
+
+# ``execute_on_device`` is imported lazily inside individual tests to keep
+# this module importable in environments where the underlying ``simpler``
+# package is not installed (e.g. unit-tests CI). ``device_runner`` eagerly
+# imports ``simpler.task_interface`` at module load.
 
 
 @pytest.fixture
@@ -131,6 +135,8 @@ class TestExecuteOnDeviceReuse:
     """Verify ``execute_on_device`` reuses an active Worker rather than constructing a new one."""
 
     def test_reuse_skips_init_and_close(self, fake_simpler_worker):
+        from pypto.runtime.device_runner import execute_on_device  # noqa: PLC0415
+
         chip_callable = MagicMock(name="chip_callable")
         orch_args = MagicMock(name="orch_args")
 
@@ -155,6 +161,8 @@ class TestExecuteOnDeviceReuse:
             assert fake_simpler_worker.close.call_count == 0
 
     def test_no_active_worker_uses_one_shot_path(self, fake_simpler_worker):
+        from pypto.runtime.device_runner import execute_on_device  # noqa: PLC0415
+
         chip_callable = MagicMock(name="chip_callable")
         orch_args = MagicMock(name="orch_args")
 
@@ -179,6 +187,8 @@ class TestExecuteOnDeviceReuse:
         assert one_shot.close.call_count == 1
 
     def test_level_mismatch_rejected(self, fake_simpler_worker):
+        from pypto.runtime.device_runner import execute_on_device  # noqa: PLC0415
+
         with pytest.raises(ValueError, match="only supports level=2"):
             execute_on_device(
                 MagicMock(),
