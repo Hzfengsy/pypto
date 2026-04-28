@@ -24,6 +24,7 @@
 #include "pypto/ir/reporter/report.h"
 #include "pypto/ir/transforms/ir_property.h"
 #include "pypto/ir/transforms/pass_context.h"
+#include "pypto/ir/transforms/utils/l0_tile_chooser.h"
 #include "pypto/ir/transforms/utils/stmt_dependency_analysis.h"
 #include "pypto/ir/verifier/diagnostic_check_registry.h"
 #include "pypto/ir/verifier/property_verifier_registry.h"
@@ -528,6 +529,48 @@ void BindPass(nb::module_& m) {
                    nb::arg("program"),
                    "Enforce the InOut-use discipline; raises pypto.Error (VerificationError) "
                    "on any violation so compilation halts rather than proceeding with unsound IR.");
+
+  // L0 tile-size chooser submodule (closed-form heuristic; consumed by the
+  // AutoTileMatmulL0 pass and exposed for testing / inspection).
+  nb::module_ l0_tile = passes.def_submodule(
+      "l0_tile_chooser",
+      "Closed-form chooser for L0 matmul tile shape (m, n, k) under L1->L0 traffic minimisation");
+
+  nb::class_<utils::L0TileConfig>(l0_tile, "L0TileConfig",
+                                  "Inputs to ChooseL0Tile: problem dims + hardware + schedule knobs")
+      .def(nb::init<>())
+      .def_rw("M", &utils::L0TileConfig::M)
+      .def_rw("N", &utils::L0TileConfig::N)
+      .def_rw("K", &utils::L0TileConfig::K)
+      .def_rw("l0a_bytes", &utils::L0TileConfig::l0a_bytes)
+      .def_rw("l0b_bytes", &utils::L0TileConfig::l0b_bytes)
+      .def_rw("l0c_bytes", &utils::L0TileConfig::l0c_bytes)
+      .def_rw("bytes_a", &utils::L0TileConfig::bytes_a)
+      .def_rw("bytes_b", &utils::L0TileConfig::bytes_b)
+      .def_rw("bytes_c", &utils::L0TileConfig::bytes_c)
+      .def_rw("min_m", &utils::L0TileConfig::min_m)
+      .def_rw("min_n", &utils::L0TileConfig::min_n)
+      .def_rw("min_k", &utils::L0TileConfig::min_k)
+      .def_rw("align_m", &utils::L0TileConfig::align_m)
+      .def_rw("align_n", &utils::L0TileConfig::align_n)
+      .def_rw("align_k", &utils::L0TileConfig::align_k)
+      .def_rw("double_buffer_a", &utils::L0TileConfig::double_buffer_a)
+      .def_rw("double_buffer_b", &utils::L0TileConfig::double_buffer_b)
+      .def_rw("double_buffer_c", &utils::L0TileConfig::double_buffer_c)
+      .def_rw("c_read", &utils::L0TileConfig::c_read)
+      .def_rw("allow_padding", &utils::L0TileConfig::allow_padding);
+
+  nb::class_<utils::L0TileResult>(l0_tile, "L0TileResult",
+                                  "Output of ChooseL0Tile: the chosen (m, n, k) plus diagnostics")
+      .def_ro("m", &utils::L0TileResult::m)
+      .def_ro("n", &utils::L0TileResult::n)
+      .def_ro("k", &utils::L0TileResult::k)
+      .def_ro("estimated_traffic_bytes", &utils::L0TileResult::estimated_traffic_bytes)
+      .def_ro("padded_compute_volume", &utils::L0TileResult::padded_compute_volume)
+      .def_ro("perf_hint", &utils::L0TileResult::perf_hint);
+
+  l0_tile.def("choose_l0_tile", &utils::ChooseL0Tile, nb::arg("config"),
+              "Pick an approximately-optimal L0 tile shape (m, n, k) by closed-form heuristic.");
 }
 
 }  // namespace python

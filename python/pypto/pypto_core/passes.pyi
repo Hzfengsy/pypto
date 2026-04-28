@@ -508,6 +508,48 @@ class stmt_dependency_analysis:
         compilation halts rather than proceeding with unsound IR.
         """
 
+class l0_tile_chooser:
+    """Closed-form chooser for L0 matmul tile shape (m, n, k)."""
+
+    class L0TileConfig:
+        """Inputs to choose_l0_tile: problem dims + hardware + schedule knobs."""
+
+        M: int
+        N: int
+        K: int
+        l0a_bytes: int
+        l0b_bytes: int
+        l0c_bytes: int
+        bytes_a: int
+        bytes_b: int
+        bytes_c: int
+        min_m: int
+        min_n: int
+        min_k: int
+        align_m: int
+        align_n: int
+        align_k: int
+        double_buffer_a: bool
+        double_buffer_b: bool
+        double_buffer_c: bool
+        c_read: bool
+        allow_padding: bool
+        def __init__(self) -> None: ...
+
+    class L0TileResult:
+        """Output of choose_l0_tile: the chosen (m, n, k) plus diagnostics."""
+
+        m: int
+        n: int
+        k: int
+        estimated_traffic_bytes: int
+        padded_compute_volume: int
+        perf_hint: str
+
+    @staticmethod
+    def choose_l0_tile(config: L0TileConfig) -> L0TileResult:
+        """Pick an approximately-optimal L0 tile shape (m, n, k)."""
+
 __all__ = [
     "IRProperty",
     "IRPropertySet",
