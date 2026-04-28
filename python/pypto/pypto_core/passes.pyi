@@ -394,16 +394,21 @@ def flatten_tile_nd_to_2d() -> Pass:
     """Create a pass that flattens ND tile ops to 2D in InCore functions."""
 
 def auto_tile_matmul_l0() -> Pass:
-    """Create a pass that auto-tiles Mat-resident matmul ops into a C-stationary L0 loop nest.
+    """Create a pass that auto-tiles Mat-resident ``tile.matmul`` into a C-stationary K-loop.
 
-    Rewrites each ``tile.matmul`` / ``tile.matmul_acc`` whose operands live in
-    ``MemorySpace.Mat`` into an ``(mo, no, ko)`` loop nest of smaller matmuls
-    over Mat-resident slices. The L0 tile shape ``(m, n, k)`` is chosen by
-    ``utils.choose_l0_tile`` from the active backend's L0 capacities. The
-    inner ``ko`` loop is marked ``ForKind.Pipeline`` with
+    Rewrites each ``tile.matmul`` whose operands live in ``MemorySpace.Mat``
+    with static 2D shape into a ``range(0, K, k)`` loop whose body branches
+    on ``ko == 0`` between ``tile.matmul`` (fresh accumulator) and
+    ``tile.matmul_acc`` (accumulating into the iter-arg). The L0 tile shape
+    ``(m, n, k)`` is chosen by ``utils.choose_l0_tile`` from the active
+    backend's L0 capacities. The K-loop is marked ``ForKind.Pipeline`` with
     ``pipeline_stages=2`` so the downstream ``LowerPipelineLoops`` pass
     produces a 2-deep ping-pong on the auto-inserted Mat→Left/Right moves.
     Already-L0-sized matmuls are left untouched.
+
+    V1 scope: only plain ``tile.matmul`` (``tile.matmul_acc`` and
+    ``tile.matmul_bias`` are deferred); only K tiling (M/N tiling and
+    ``K % k != 0`` cases emit a perf hint and skip).
     """
 
 def infer_tile_memory_space() -> Pass:

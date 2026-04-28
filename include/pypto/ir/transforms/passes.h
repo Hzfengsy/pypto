@@ -347,28 +347,33 @@ Pass OptimizeOrchTensors();
 Pass FlattenTileNdTo2D();
 
 /**
- * @brief Auto-tile Mat-resident matmul ops into a C-stationary L0 loop nest
+ * @brief Auto-tile Mat-resident matmul into a C-stationary K-loop
  *
- * For each ``tile.matmul`` / ``tile.matmul_acc`` whose operands live in
- * ``MemorySpace::Mat``, calls ``utils::ChooseL0Tile`` to select a static L0
- * tile shape ``(m, n, k)`` based on the active ``BackendHandler``'s L0
- * capacities, then rewrites the call into an ``mo / no / ko`` loop nest of
- * smaller matmuls over Mat-resident slices.
+ * For each ``tile.matmul`` whose operands live in ``MemorySpace::Mat`` with
+ * static 2D shape, queries ``utils::ChooseL0Tile`` against the active
+ * ``BackendHandler``'s L0 capacities and rewrites the call into a single
+ * ``range(0, K, k)`` loop whose body branches on ``ko == 0`` between
+ * ``tile.matmul`` (fresh accumulator) and ``tile.matmul_acc`` (accumulating
+ * into the iter-arg).  The iter-arg init is a Vec-resident ``tile.create``
+ * placeholder; ``InferTileMemorySpace`` (the next pass) inserts the Acc/Vec
+ * bridges that make the IR type-correct.
  *
- * The inner ``ko`` loop is marked with ``ForKind::Pipeline`` and an
- * ``attrs_["pipeline_stages"] = 2`` attribute when ``ceil(K/k) >= 2`` so the
- * downstream ``LowerPipelineLoops`` pass produces a 2-deep ping-pong.  When
- * the K loop has only one iteration the marker is omitted and a ``PerfHint``
- * is emitted explaining that pipelining was disabled.
+ * The K-loop is marked with ``ForKind::Pipeline`` + ``pipeline_stages=2`` so
+ * the downstream ``LowerPipelineLoops`` pass clones the body for a 2-deep
+ * ping-pong on the auto-inserted Mat→Left/Right moves.
  *
- * Already-L0-sized matmuls are left untouched.  Operand shapes that are not
- * statically known produce a ``PerfHint`` and the call is left in place
- * (defensive — this should not occur at the L1 level per the design contract).
+ * V1 scope (extensions to follow):
+ *   - Only plain ``tile.matmul``.  ``tile.matmul_acc`` (caller-provided
+ *     accumulator) and ``tile.matmul_bias`` are left untouched.
+ *   - Only K tiling (``m == M`` and ``n == N``).  Cases where the chooser
+ *     selects ``m < M`` or ``n < N`` emit a ``PerfHint`` and skip.
+ *   - Requires ``K % k == 0``.  K-boundary handling is deferred.
  *
- * Runs between ``FlattenTileNdTo2D`` and ``InferTileMemorySpace``: by the
- * time this pass runs, all tile ops have static 2D shapes; after this pass
- * runs ``InferTileMemorySpace`` auto-inserts ``tile.move`` from Mat slices to
- * ``Left`` / ``Right`` per K-loop iteration.
+ * Already-L0-sized matmuls (chooser returns ``(M, N, K)``) are left
+ * untouched.  Runs between ``FlattenTileNdTo2D`` and
+ * ``InferTileMemorySpace``: by the time this pass runs, all tile ops have
+ * static 2D shapes; ``InferTileMemorySpace`` then auto-inserts the
+ * Mat→Left/Right moves on each K-loop iteration's slices.
  *
  * Requirements:
  * - Input IR must have tile ops in 2D form (run FlattenTileNdTo2D first)

@@ -392,12 +392,14 @@ void BindPass(nb::module_& m) {
              "Merges all dimensions except the last into a single dimension.\n"
              "E.g., tile [A, B, C] becomes [A*B, C]. Only converts 3D+ tiles.");
   passes.def("auto_tile_matmul_l0", &pass::AutoTileMatmulL0,
-             "Create a pass that auto-tiles Mat-resident matmul ops into a C-stationary L0 loop nest\n\n"
-             "Rewrites each tile.matmul / tile.matmul_acc whose operands live in MemorySpace::Mat\n"
-             "into an (mo, no, ko) loop nest of smaller matmuls, with tile shape (m, n, k) chosen by\n"
-             "utils::ChooseL0Tile from the active BackendHandler's L0 capacities. The inner ko loop is\n"
-             "marked ForKind::Pipeline + pipeline_stages=2 so LowerPipelineLoops produces a 2-deep\n"
-             "ping-pong. Already-L0-sized matmuls are left untouched.");
+             "Create a pass that auto-tiles Mat-resident tile.matmul into a C-stationary K-loop\n\n"
+             "Rewrites each tile.matmul whose operands live in MemorySpace::Mat with static 2D\n"
+             "shape into a range(0, K, k) loop whose body branches on `ko == 0` between\n"
+             "tile.matmul (fresh accumulator) and tile.matmul_acc (accumulating). The K-loop is\n"
+             "marked ForKind::Pipeline + pipeline_stages=2 so LowerPipelineLoops produces a\n"
+             "2-deep ping-pong. Already-L0-sized matmuls are left untouched. V1 scope: only plain\n"
+             "tile.matmul; tile.matmul_acc / tile.matmul_bias are deferred. Only K tiling; M/N\n"
+             "tiling and K%k!=0 cases emit a PerfHint and skip.");
   passes.def("infer_tile_memory_space", &pass::InferTileMemorySpace,
              "Create a pass that infers memory_space for TileType variables in InCore functions");
   passes.def("resolve_transpose_layout", &pass::ResolveTransposeLayout,

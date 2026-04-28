@@ -154,13 +154,11 @@ class TestAutoTileMatmulL0KOnly:
     def test_pass_idempotent(self):
         """Running the pass twice produces the same result as running it once.
 
-        After the first rewrite, the only ``tile.matmul`` left is the peeled
-        first iteration — its operands are slices of [16, 256] / [256, 64],
-        which are themselves L0-sized.  A second run sees ChooseL0Tile pick
-        ``(16, 64, 256)`` for the slice problem and returns
-        ``(m=16, n=64, k=256) == (M, N, K)``, so the pass leaves the peeled
-        matmul (and the loop body's matmul_acc, which is out of v1 scope)
-        untouched."""
+        After the first rewrite, the only ``tile.matmul`` is inside the
+        K-loop's then-branch over slices of shape [16, 256] / [256, 64] which
+        are already L0-sized, so the second run sees a no-op.  We also assert
+        the first run *did* change the IR so a regression where the pass
+        becomes a no-op overall still fails the test."""
 
         @pl.program
         class Before:
@@ -182,16 +180,52 @@ class TestAutoTileMatmulL0KOnly:
                 return out
 
         once = _run_pass(Before)
+        # First run must have rewritten — otherwise the idempotency check is
+        # vacuously true.
+        with pytest.raises(ValueError, match="Structural equality"):
+            ir.assert_structural_equal(once, Before)
         twice = _run_pass(once)
         ir.assert_structural_equal(twice, once)
+
+    def test_k_not_divisible_skipped(self):
+        """When the chooser picks a ``k`` that doesn't divide ``K``, the pass
+        emits a ``PerfHint`` (PH-AT-007) and leaves the matmul untouched —
+        K-boundary handling (``valid_shape`` on the last slice) is not yet
+        implemented."""
+
+        # M=16, N=64, K=2050 (not divisible by 256 — chooser picks k=256 for
+        # 16/64 BF16 → emits PH-AT-007).
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[16, 2050], pl.BF16],
+                rhs: pl.Tensor[[2050, 64], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                lhs_mat: pl.Tile[[16, 2050], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [16, 2050], target_memory=pl.Mem.Mat
+                )
+                rhs_mat: pl.Tile[[2050, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [2050, 64], target_memory=pl.Mem.Mat
+                )
+                c: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lhs_mat, rhs_mat)
+                out = pl.store(c, [0, 0], out)
+                return out
+
+        After = _run_pass(Before)
+        ir.assert_structural_equal(After, Before)
 
 
 class TestAutoTileMatmulL0Skips:
     """Cases where the pass intentionally leaves the matmul untouched."""
 
     def test_matmul_acc_left_untouched(self):
-        """``tile.matmul_acc`` is out of scope for v1; the pass should leave
-        it identical to the input (no peeled split, no K-loop)."""
+        """``tile.matmul_acc`` is not yet rewritten by this pass; it should
+        leave the input identical (no K-loop emitted).  Threading the
+        caller-provided accumulator through a tiled K-loop requires
+        additional rewriting that's out of scope for now."""
 
         @pl.program
         class Before:
