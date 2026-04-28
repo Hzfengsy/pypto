@@ -347,6 +347,35 @@ Pass OptimizeOrchTensors();
 Pass FlattenTileNdTo2D();
 
 /**
+ * @brief Auto-tile Mat-resident matmul ops into a C-stationary L0 loop nest
+ *
+ * For each ``tile.matmul`` / ``tile.matmul_acc`` whose operands live in
+ * ``MemorySpace::Mat``, calls ``utils::ChooseL0Tile`` to select a static L0
+ * tile shape ``(m, n, k)`` based on the active ``BackendHandler``'s L0
+ * capacities, then rewrites the call into an ``mo / no / ko`` loop nest of
+ * smaller matmuls over Mat-resident slices.
+ *
+ * The inner ``ko`` loop is marked with ``ForKind::Pipeline`` and an
+ * ``attrs_["pipeline_stages"] = 2`` attribute when ``ceil(K/k) >= 2`` so the
+ * downstream ``LowerPipelineLoops`` pass produces a 2-deep ping-pong.  When
+ * the K loop has only one iteration the marker is omitted and a ``PerfHint``
+ * is emitted explaining that pipelining was disabled.
+ *
+ * Already-L0-sized matmuls are left untouched.  Operand shapes that are not
+ * statically known produce a ``PerfHint`` and the call is left in place
+ * (defensive — this should not occur at the L1 level per the design contract).
+ *
+ * Runs between ``FlattenTileNdTo2D`` and ``InferTileMemorySpace``: by the
+ * time this pass runs, all tile ops have static 2D shapes; after this pass
+ * runs ``InferTileMemorySpace`` auto-inserts ``tile.move`` from Mat slices to
+ * ``Left`` / ``Right`` per K-loop iteration.
+ *
+ * Requirements:
+ * - Input IR must have tile ops in 2D form (run FlattenTileNdTo2D first)
+ */
+Pass AutoTileMatmulL0();
+
+/**
  * @brief Infer target memory space for TileType variables in InCore functions
  *
  * Sets TileType::memory_space_ based on the producing tile operation:

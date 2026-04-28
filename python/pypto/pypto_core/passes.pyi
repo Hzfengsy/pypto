@@ -393,6 +393,19 @@ def optimize_orch_tensors() -> Pass:
 def flatten_tile_nd_to_2d() -> Pass:
     """Create a pass that flattens ND tile ops to 2D in InCore functions."""
 
+def auto_tile_matmul_l0() -> Pass:
+    """Create a pass that auto-tiles Mat-resident matmul ops into a C-stationary L0 loop nest.
+
+    Rewrites each ``tile.matmul`` / ``tile.matmul_acc`` whose operands live in
+    ``MemorySpace.Mat`` into an ``(mo, no, ko)`` loop nest of smaller matmuls
+    over Mat-resident slices. The L0 tile shape ``(m, n, k)`` is chosen by
+    ``utils.choose_l0_tile`` from the active backend's L0 capacities. The
+    inner ``ko`` loop is marked ``ForKind.Pipeline`` with
+    ``pipeline_stages=2`` so the downstream ``LowerPipelineLoops`` pass
+    produces a 2-deep ping-pong on the auto-inserted Mat→Left/Right moves.
+    Already-L0-sized matmuls are left untouched.
+    """
+
 def infer_tile_memory_space() -> Pass:
     """Create a pass that infers memory_space for TileType variables in InCore functions."""
 
@@ -593,6 +606,7 @@ __all__ = [
     "convert_tensor_to_tile_ops",
     "optimize_orch_tensors",
     "flatten_tile_nd_to_2d",
+    "auto_tile_matmul_l0",
     "infer_tile_memory_space",
     "resolve_transpose_layout",
     "resolve_backend_op_layouts",

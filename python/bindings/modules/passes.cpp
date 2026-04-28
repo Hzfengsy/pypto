@@ -391,6 +391,13 @@ void BindPass(nb::module_& m) {
              "Create a pass that flattens ND tile ops to 2D in InCore functions\n\n"
              "Merges all dimensions except the last into a single dimension.\n"
              "E.g., tile [A, B, C] becomes [A*B, C]. Only converts 3D+ tiles.");
+  passes.def("auto_tile_matmul_l0", &pass::AutoTileMatmulL0,
+             "Create a pass that auto-tiles Mat-resident matmul ops into a C-stationary L0 loop nest\n\n"
+             "Rewrites each tile.matmul / tile.matmul_acc whose operands live in MemorySpace::Mat\n"
+             "into an (mo, no, ko) loop nest of smaller matmuls, with tile shape (m, n, k) chosen by\n"
+             "utils::ChooseL0Tile from the active BackendHandler's L0 capacities. The inner ko loop is\n"
+             "marked ForKind::Pipeline + pipeline_stages=2 so LowerPipelineLoops produces a 2-deep\n"
+             "ping-pong. Already-L0-sized matmuls are left untouched.");
   passes.def("infer_tile_memory_space", &pass::InferTileMemorySpace,
              "Create a pass that infers memory_space for TileType variables in InCore functions");
   passes.def("resolve_transpose_layout", &pass::ResolveTransposeLayout,
