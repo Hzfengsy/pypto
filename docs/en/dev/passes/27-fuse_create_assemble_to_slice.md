@@ -34,7 +34,7 @@ program_fused = fuse_pass(program)
 
 For each Orchestration function (others are returned unchanged) the pass runs three phases:
 
-1. **Buffer-root analysis** — `BufferRootCollector` walks the function body and builds a `var → root` map. Function parameters are their own roots; `tensor.create` and `tensor.slice` results define new roots; `tensor.assemble` and var-aliasing assignments inherit the root of their source. The collector also threads roots through `ForStmt` / `WhileStmt` iter args (linking `iter_arg`, the corresponding `return_var`, and the loop-body uses), through tuple constructions and `TupleGetItemExpr` unpacks, and through call output parameters whose direction is `Out`/`InOut`. The result is a single buffer identity per var, even across loops, tuples, and cross-function aliasing.
+1. **Buffer-root analysis** — `BufferRootCollector` walks the function body and builds a `var → root` map. Function parameters are their own roots; `tensor.create` and `tensor.slice` results define new roots; var-aliasing assignments inherit the root of the aliased value; and the result of `tensor.assemble(target, source, offsets)` inherits the root of `target` (arg0), not `source` (arg1). The collector also threads roots through `ForStmt` / `WhileStmt` iter args (linking `iter_arg`, the corresponding `return_var`, and the loop-body uses), tracks tuple roots for tuple-returning calls via `tuple_output_roots_` and resolves `TupleGetItemExpr` from those call results, and propagates roots through call output parameters whose direction is `Out`/`InOut`. The result is a single buffer identity per var across loop-carried state, supported tuple-returning call outputs, and cross-function aliasing.
 
 2. **Pattern detection** — `AssemblePatternCollector` scans for the eligible pairs:
    - Each `tensor.create` whose root resolves to itself (i.e. the create is the buffer's origin) is recorded in `create_vars`.
@@ -141,7 +141,7 @@ def orch(
         for c in pl.range(2):
             col = c * 4
             chunk: pl.Tensor[[1, 2, 4], pl.FP32] = pl.slice(out, [1, 2, 4], [b, 0, col])
-            self.compute(x, chunk)
+            chunk = self.compute(x, chunk)
     return out
 ```
 

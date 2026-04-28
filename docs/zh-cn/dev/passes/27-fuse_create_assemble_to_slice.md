@@ -34,7 +34,7 @@ program_fused = fuse_pass(program)
 
 对每个 Orchestration 函数（其它原样返回）执行三个阶段：
 
-1. **缓冲区根分析**：`BufferRootCollector` 遍历函数体，构建 `var → root` 映射。函数参数 (Parameter) 是自身的根；`tensor.create` 与 `tensor.slice` 的结果定义新根；`tensor.assemble` 与变量别名 (Alias) 类的赋值继承其源的根。该收集器还会沿 `ForStmt` / `WhileStmt` 的 iter args 传递根（关联 `iter_arg`、对应的 `return_var`、以及循环体中的使用），沿元组 (Tuple) 构造与 `TupleGetItemExpr` 解包传递，并沿 `Out` / `InOut` 方向的函数调用输出参数传递。最终结果是即使穿过循环、元组和跨函数别名，每个 `var` 也只有一个缓冲身份。
+1. **缓冲区根分析**：`BufferRootCollector` 遍历函数体，构建 `var → root` 映射。函数参数 (Parameter) 是自身的根；`tensor.create` 与 `tensor.slice` 的结果定义新根；变量别名 (Alias) 类的赋值继承其源的根；`tensor.assemble(target, source, offsets)` 的结果则继承 `target`（第 0 个参数）的根。该收集器还会沿 `ForStmt` / `WhileStmt` 的 iter args 传递根（关联 `iter_arg`、对应的 `return_var`、以及循环体中的使用），记录“返回 tuple 的函数调用”的输出 root，并在 `TupleGetItemExpr` 从这些调用结果解包时使用，还会沿 `Out` / `InOut` 方向的函数调用输出参数传递。最终结果是即使穿过循环、特定的 tuple 调用结果解包和跨函数别名，每个 `var` 也只有一个缓冲身份。
 
 2. **模式检测**：`AssemblePatternCollector` 扫描可融合的配对：
    - 每个 `tensor.create`，若其根解析到自身（即该 create 是该缓冲的源头），记录在 `create_vars` 中。
@@ -141,7 +141,7 @@ def orch(
         for c in pl.range(2):
             col = c * 4
             chunk: pl.Tensor[[1, 2, 4], pl.FP32] = pl.slice(out, [1, 2, 4], [b, 0, col])
-            self.compute(x, chunk)
+            chunk = self.compute(x, chunk)
     return out
 ```
 
