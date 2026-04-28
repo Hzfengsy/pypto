@@ -20,6 +20,7 @@ from pypto.language.parser.diagnostics import (
     UndefinedVariableError,
     UnsupportedFeatureError,
 )
+from pypto.language.parser.diagnostics.renderer import ErrorRenderer
 
 
 class TestErrorCases:
@@ -396,6 +397,91 @@ class TestConditionMustBeBool:
                     pl.cond(1)  # type: ignore  # non-bool
                     y = pl.yield_(x_iter + 1)  # noqa: F841
                 return y  # noqa: F821
+
+
+class TestSourceLocationPreservation:
+    """Regression tests for issue #1200: every frontend diagnostic must
+    include the user's source location so the error can be navigated to."""
+
+    @staticmethod
+    def _assert_span_populated(err: pl.parser.ParserError) -> None:
+        span = err.span
+        assert span is not None, "ParserError must carry a span for location preservation"
+        assert span["filename"], f"span filename must be non-empty, got {span['filename']!r}"
+        assert span["begin_line"] > 0, f"span begin_line must be > 0, got {span['begin_line']}"
+        assert span["begin_column"] >= 0, f"span begin_column must be >= 0, got {span['begin_column']}"
+
+    def test_unsupported_type_annotation_carries_span(self):
+        """The exact failure mode reported in issue #1200."""
+        with pytest.raises(ParserTypeError) as excinfo:
+
+            @pl.function
+            def bad(x: ([64, 128], pl.FP32)) -> pl.Tensor[[64], pl.FP32]:  # type: ignore
+                return x  # type: ignore
+
+        self._assert_span_populated(excinfo.value)
+
+    def test_incomplete_type_annotation_carries_span(self):
+        """Bare `pl.Tensor` (no subscript) — must report location."""
+        with pytest.raises(ParserTypeError) as excinfo:
+
+            @pl.function
+            def bad(x: pl.Tensor) -> pl.Tensor[[64], pl.FP32]:  # type: ignore
+                return x
+
+        self._assert_span_populated(excinfo.value)
+
+    def test_parameter_tuple_annotation_carries_span(self):
+        """A tuple-as-parameter-type annotation must be located.
+
+        ``resolve_param_type`` rejects list-typed (tuple) results because
+        parameters cannot be tuples. The error must include source location.
+        """
+        with pytest.raises(ParserTypeError) as excinfo:
+
+            @pl.function
+            def bad(  # type: ignore
+                x: tuple[pl.Tensor[[64], pl.FP32], pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                return x  # type: ignore
+
+        self._assert_span_populated(excinfo.value)
+
+    def test_rendered_error_includes_location_arrow(self):
+        """End-to-end pipeline (raise → attach source_lines → render) emits
+        the `--> file:line:col` arrow that issue #1200 reported as missing."""
+        with pytest.raises(ParserTypeError) as excinfo:
+
+            @pl.function
+            def bad(x: ([64, 128], pl.FP32)) -> pl.Tensor[[64], pl.FP32]:  # type: ignore
+                return x  # type: ignore
+
+        err = excinfo.value
+        # `@pl.function` attaches source_lines via its except handler before
+        # the exception escapes, so the renderer has everything it needs.
+        rendered = ErrorRenderer(use_color=False).render(err)
+        assert "-->" in rendered, f"rendered output missing location arrow:\n{rendered}"
+        # Must be a real line:col, not the unknown-span default of `:0:0`.
+        assert ":0:0" not in rendered, f"rendered output has unknown span:\n{rendered}"
+
+    def test_pl_at_unknown_kwarg_carries_span(self):
+        """Covers the ast_parser.py path: ParserSyntaxError from pl.at()
+        keyword dispatch must include the source location of the bad kwarg."""
+        code = """
+import pypto.language as pl
+
+@pl.program
+class P:
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(self, x: pl.Tensor[[16], pl.FP32]) -> pl.Tensor[[16], pl.FP32]:
+        with pl.at(level=pl.Level.HOST, not_a_real_arg=42):
+            pass
+        return x
+"""
+        with pytest.raises(ParserSyntaxError) as excinfo:
+            pl.parse_program(code)
+
+        self._assert_span_populated(excinfo.value)
 
 
 if __name__ == "__main__":

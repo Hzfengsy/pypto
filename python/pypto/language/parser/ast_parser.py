@@ -2013,6 +2013,7 @@ class ASTParser:
         if len(call.args) > 2:
             raise ParserSyntaxError(
                 f"pl.at() takes at most 2 positional arguments, got {len(call.args)}",
+                span=self.span_tracker.get_span(call),
                 hint="Use pl.at(level) or pl.at(level, role)",
             )
 
@@ -2028,6 +2029,7 @@ class ASTParser:
         if state.level is None:
             raise ParserSyntaxError(
                 "pl.at() requires a level argument",
+                span=self.span_tracker.get_span(call),
                 hint="Use pl.at(pl.Level.HOST) or pl.at(level=pl.Level.HOST)",
             )
 
@@ -2038,11 +2040,17 @@ class ASTParser:
         """Dispatch a single pl.at() keyword argument and update state."""
         if kw.arg == "level":
             if state.level is not None:
-                raise ParserSyntaxError("pl.at() got multiple values for argument 'level'")
+                raise ParserSyntaxError(
+                    "pl.at() got multiple values for argument 'level'",
+                    span=self.span_tracker.get_span(kw.value),
+                )
             state.level = extract_enum_value(kw.value, LEVEL_MAP, "Level", "pl.Level")
         elif kw.arg == "role":
             if state.role is not None:
-                raise ParserSyntaxError("pl.at() got multiple values for argument 'role'")
+                raise ParserSyntaxError(
+                    "pl.at() got multiple values for argument 'role'",
+                    span=self.span_tracker.get_span(kw.value),
+                )
             state.role = extract_enum_value(kw.value, ROLE_MAP, "Role", "pl.Role")
         elif kw.arg == "optimizations":
             self._handle_at_optimizations_kw(kw, state)
@@ -2055,11 +2063,13 @@ class ASTParser:
         elif kw.arg is None:
             raise ParserSyntaxError(
                 "Unsupported **kwargs in pl.at()",
+                span=self.span_tracker.get_span(kw.value),
                 hint="Use pl.at(level=pl.Level.HOST, role=pl.Role.Worker)",
             )
         else:
             raise ParserSyntaxError(
                 f"Unknown keyword argument '{kw.arg}' in pl.at()",
+                span=self.span_tracker.get_span(kw.value),
                 hint="Supported arguments: level, role, optimizations, name_hint",
             )
 

@@ -196,6 +196,7 @@ class TypeResolver:
         if isinstance(resolved, list):
             raise ParserTypeError(
                 "Parameter type cannot be a tuple",
+                span=self._get_span(type_node),
                 hint="Tuple types are only supported as return types",
             )
 
@@ -203,6 +204,7 @@ class TypeResolver:
         if direction == ir.ParamDirection.InOut and isinstance(resolved, ir.ScalarType):
             raise ParserTypeError(
                 "Scalar parameters cannot have InOut direction",
+                span=self._get_span(type_node),
                 hint="Only Tensor and Tile parameters support InOut direction",
             )
 
@@ -268,11 +270,13 @@ class TypeResolver:
         if isinstance(type_node, ast.Attribute):
             raise ParserTypeError(
                 f"Incomplete type annotation: {ast.unparse(type_node)}",
+                span=self._get_span(type_node),
                 hint="Use pl.Tensor[[shape], dtype], pl.Tile[[shape], dtype], or pl.Scalar[dtype]",
             )
 
         raise ParserTypeError(
             f"Unsupported type annotation: {ast.unparse(type_node)}",
+            span=self._get_span(type_node),
             hint="Use pl.Tensor[[shape], dtype], pl.Tile[[shape], dtype], or pl.Scalar[dtype]",
         )
 
@@ -304,6 +308,7 @@ class TypeResolver:
         if type_name is None:
             raise ParserTypeError(
                 f"Unknown type in subscript: {ast.unparse(value)}",
+                span=self._get_span(value),
                 hint="Use pl.Tensor for tensor types, pl.Tile for tile types, or pl.Scalar for scalar types",
             )
 
@@ -344,7 +349,7 @@ class TypeResolver:
                     f"pl.{type_name}[[shape], dtype, pl.MemRef(...), pl.Mem.Vec], "
                     f"or pl.{type_name}[[shape], dtype, pl.MemRef(...), pl.Mem.Vec, pl.TileView(...)]"
                 )
-            raise ParserTypeError(message, hint=hint)
+            raise ParserTypeError(message, span=self._get_span(slice_value), hint=hint)
 
         shape_node = slice_value.elts[0]
         dtype_node = slice_value.elts[1]
@@ -387,6 +392,7 @@ class TypeResolver:
         if not self._is_memref_node(memref_node):
             raise ParserTypeError(
                 "Tensor 4th argument must be pl.MemRef(...)",
+                span=self._get_span(memref_node),
                 hint="Use pl.Tensor[[shape], dtype, layout, pl.MemRef(...)]",
             )
         memref = self.resolve_memref(memref_node)
@@ -415,6 +421,7 @@ class TypeResolver:
                 if memref_node is not None:
                     raise ParserTypeError(
                         "Tile annotation can contain at most one memref argument",
+                        span=self._get_span(node),
                         hint="Remove the duplicate pl.MemRef(...) or MemRefType variable argument",
                     )
                 memref_node = node
@@ -424,6 +431,7 @@ class TypeResolver:
                 if tile_view_node is not None:
                     raise ParserTypeError(
                         "Tile annotation can contain at most one pl.TileView(...)",
+                        span=self._get_span(node),
                         hint="Remove the duplicate pl.TileView(...) argument",
                     )
                 tile_view_node = node
@@ -433,6 +441,7 @@ class TypeResolver:
                 if memory_space_node is not None:
                     raise ParserTypeError(
                         "Tile annotation can contain at most one memory-space argument",
+                        span=self._get_span(node),
                         hint="Remove the duplicate pl.Mem.<space> argument",
                     )
                 memory_space_node = node
@@ -441,17 +450,20 @@ class TypeResolver:
             if self._is_layout_node(node):
                 raise ParserTypeError(
                     f"Tile does not accept layouts like {ast.unparse(node)}",
+                    span=self._get_span(node),
                     hint="Use pl.TileView(...) for tile views, or use pl.Tensor[...] for layout annotations",
                 )
 
             raise ParserTypeError(
                 f"Unsupported Tile annotation argument: {ast.unparse(node)}",
+                span=self._get_span(node),
                 hint="Use pl.TileView(...), pl.Mem.<space>, pl.MemRef(...), and/or a MemRefType variable",
             )
 
         if memref_node is not None and memory_space_node is None:
             raise ParserTypeError(
                 "Tile annotation with a memref argument must also specify explicit memory space",
+                span=self._get_span(memref_node),
                 hint="Use pl.Tile[[shape], dtype, pl.MemRef(base, offset, size), pl.Mem.Vec] or "
                 "pl.Tile[[shape], dtype, memref_var, pl.Mem.Vec]",
             )
@@ -510,6 +522,7 @@ class TypeResolver:
             if isinstance(resolved, list):
                 raise ParserTypeError(
                     "Nested tuple types are not supported",
+                    span=self._get_span(elt),
                     hint="Use a flat tuple like tuple[pl.Tensor[...], pl.Tensor[...]]",
                 )
             types.append(resolved)
@@ -542,6 +555,7 @@ class TypeResolver:
 
         raise ParserTypeError(
             f"Unknown type constructor: {ast.unparse(func)}",
+            span=self._get_span(call_node),
             hint="Use pl.Tensor[[shape], dtype], pl.Tile[[shape], dtype], or pl.Scalar[dtype]",
         )
 
@@ -579,6 +593,7 @@ class TypeResolver:
         if len(call_node.args) < 2:
             raise ParserTypeError(
                 f"{type_name} type requires shape and dtype arguments, got {len(call_node.args)}",
+                span=self._get_span(call_node),
                 hint=f"Use pl.{type_name}[[shape], dtype] format",
             )
 
@@ -601,6 +616,7 @@ class TypeResolver:
         if len(call_node.args) < 1:
             raise ParserTypeError(
                 f"Scalar type requires dtype argument, got {len(call_node.args)}",
+                span=self._get_span(call_node),
                 hint="Use pl.Scalar[dtype] format, e.g., pl.Scalar[pl.FP32]",
             )
 
@@ -627,6 +643,7 @@ class TypeResolver:
         if len(call_node.args) != 1 or not isinstance(call_node.args[0], ast.List):
             raise ParserTypeError(
                 f"Tuple type requires a list of types, got: {ast.unparse(call_node)}",
+                span=self._get_span(call_node),
                 hint="Use pl.Tuple[pl.Tensor[...], pl.Tile[...], ...] format",
             )
         return ir.TupleType(self._resolve_tuple_element_types(call_node.args[0].elts))
@@ -639,6 +656,7 @@ class TypeResolver:
             if isinstance(resolved, (list, ir.TupleType)):
                 raise ParserTypeError(
                     "Nested tuple types are not supported",
+                    span=self._get_span(elt),
                     hint="Use a flat pl.Tuple[pl.Tensor[...], pl.Tile[...], ...]",
                 )
             types.append(resolved)
@@ -683,6 +701,7 @@ class TypeResolver:
 
         raise ParserTypeError(
             f"Shape must be a list, tuple, or variable: {ast.unparse(shape_node)}",
+            span=self._get_span(shape_node),
             hint="Use a list like [64, 128] or a variable holding a list",
         )
 
@@ -776,6 +795,7 @@ class TypeResolver:
                     raise ParserTypeError(
                         f"Shape dimension must be int literal, variable, or evaluable expression: "
                         f"{ast.unparse(elt)}",
+                        span=self._get_span(elt),
                         hint="Use integer literals, variables, or expressions for shape dimensions",
                     )
         return dims
@@ -1079,11 +1099,13 @@ class TypeResolver:
         if not isinstance(node, ast.Call):
             raise ParserTypeError(
                 f"Expected pl.TensorView(...) call, got: {ast.unparse(node)}",
+                span=self._get_span(node),
                 hint="Use pl.TensorView(valid_shape=[...], stride=[...], layout=pl.TensorLayout.NZ)",
             )
         if node.args:
             raise ParserTypeError(
                 f"pl.TensorView() does not accept positional arguments, got: {ast.unparse(node)}",
+                span=self._get_span(node),
                 hint="Use keyword arguments: pl.TensorView(stride=[...], layout=pl.TensorLayout.NZ)",
             )
         tv = ir.TensorView()
@@ -1097,6 +1119,7 @@ class TypeResolver:
             else:
                 raise ParserTypeError(
                     f"Unknown TensorView keyword argument: {kw.arg!r}",
+                    span=self._get_span(kw.value),
                     hint="Supported: valid_shape, stride, layout",
                 )
         return tv
@@ -1137,11 +1160,13 @@ class TypeResolver:
         if not isinstance(node, ast.Call):
             raise ParserTypeError(
                 f"Expected pl.TileView(...) call, got: {ast.unparse(node)}",
+                span=self._get_span(node),
                 hint="Use pl.TileView(valid_shape=[...], stride=[...], ...)",
             )
         if node.args:
             raise ParserTypeError(
                 f"pl.TileView() does not accept positional arguments, got: {ast.unparse(node)}",
+                span=self._get_span(node),
                 hint="Use keyword arguments: pl.TileView(valid_shape=[...], stride=[...], ...)",
             )
         tv = ir.TileView()
@@ -1168,6 +1193,7 @@ class TypeResolver:
                 if val is None:
                     raise ParserTypeError(
                         f"TileView fractal must be an integer, got: {ast.unparse(kw.value)}",
+                        span=self._get_span(kw.value),
                     )
                 tv.fractal = val
                 has_explicit_fractal = True
@@ -1176,6 +1202,7 @@ class TypeResolver:
             else:
                 raise ParserTypeError(
                     f"Unknown TileView keyword argument: {kw.arg!r}",
+                    span=self._get_span(kw.value),
                     hint="Supported: valid_shape, stride, start_offset, blayout, slayout, fractal, pad",
                 )
         # If valid_shape was not explicitly given, inherit from tile_shape so roundtrip is stable
@@ -1211,6 +1238,7 @@ class TypeResolver:
         if not isinstance(node, ast.List):
             raise ParserTypeError(
                 f"Expected a list, got: {ast.unparse(node)}",
+                span=self._get_span(node),
                 hint="Use a list like [64, 32]",
             )
         return [self._parse_tileview_expr(elt) for elt in node.elts]
@@ -1244,6 +1272,7 @@ class TypeResolver:
                     return ir.ConstInt(value, DataType.INDEX, self._get_span(node))
                 raise ParserTypeError(
                     f"TileView dimension {name!r} is bound to {type(value).__name__}, expected DynVar or int",
+                    span=self._get_span(node),
                     hint="Use pl.dynamic() or an integer for TileView dimension variables",
                 )
             # Auto-create a dynamic variable for unknown names to support roundtrip with dynamic shapes.
@@ -1254,6 +1283,7 @@ class TypeResolver:
             return self._dyn_var_cache[name]
         raise ParserTypeError(
             f"TileView expression must be an integer constant, got: {ast.unparse(node)}",
+            span=self._get_span(node),
             hint="Use an integer literal for TileView fields",
         )
 
@@ -1269,6 +1299,7 @@ class TypeResolver:
                 return _TILELAYOUT_MAP[node.attr]
         raise ParserTypeError(
             f"Unknown TileLayout value: {ast.unparse(node)}",
+            span=self._get_span(node),
             hint="Use pl.TileLayout.none_box, pl.TileLayout.row_major, or pl.TileLayout.col_major",
         )
 
@@ -1285,6 +1316,7 @@ class TypeResolver:
                 return _PADVALUE_MAP[node.attr]
         raise ParserTypeError(
             f"Unknown PadValue value: {ast.unparse(node)}",
+            span=self._get_span(node),
             hint="Use pl.PadValue.null, pl.PadValue.zero, pl.PadValue.max, or pl.PadValue.min",
         )
 
@@ -1334,6 +1366,7 @@ class TypeResolver:
         if not isinstance(node, ast.Call):
             raise ParserTypeError(
                 f"Expected pl.MemRef(...) call, got: {ast.unparse(node)}",
+                span=self._get_span(node),
                 hint="Use pl.MemRef(base_name, byte_offset, size)",
             )
 
