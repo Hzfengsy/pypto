@@ -29,6 +29,7 @@ __all__ = [
     "load",
     "store",
     "assemble",
+    "extract",
     "scatter_update",
     "concat",
     "move",
@@ -342,6 +343,38 @@ def assemble(target: Tile, source: Tile, offset: Sequence[IntLike]) -> Tile:
         Tile wrapping the assemble operation
     """
     call_expr = _ir_ops.assemble(target.unwrap(), source.unwrap(), _normalize_intlike(offset))
+    return Tile(expr=call_expr)
+
+
+def extract(
+    src: Tile,
+    index_row: IntLike,
+    index_col: IntLike,
+    shape: Sequence[int],
+    *,
+    target_memory: MemorySpace,
+) -> Tile:
+    """Extract a sub-tile from ``src`` at ``(index_row, index_col)`` — ISA TEXTRACT.
+
+    Args:
+        src: Source tile (typically in Mat or Acc memory)
+        index_row: Starting row offset
+        index_col: Starting col offset
+        shape: Static 2D shape of the extracted sub-tile
+        target_memory: Destination memory space
+            (``Left`` / ``Right`` / ``Scale`` / ``ScaleLeft`` / ``ScaleRight`` / ``Mat``)
+
+    Returns:
+        Tile of the requested shape in ``target_memory``
+    """
+    [row, col] = _normalize_intlike([index_row, index_col])
+    call_expr = _ir_ops.extract(
+        src.unwrap(),
+        row,
+        col,
+        shape=_normalize_intlike(shape),
+        target_memory=target_memory,
+    )
     return Tile(expr=call_expr)
 
 

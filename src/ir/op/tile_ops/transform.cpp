@@ -410,6 +410,82 @@ REGISTER_OP("tile.assemble")
       return DeduceTileAssembleType(args, kwargs);
     });
 
+TypePtr DeduceTileExtractType(const std::vector<ExprPtr>& args,
+                              const std::vector<std::pair<std::string, std::any>>& kwargs) {
+  // tile.extract(src, index_row, index_col, shape) — ISA TEXTRACT Variant 1.
+  // shape carries the static destination shape (2D MakeTuple of ConstInt).
+  // target_memory kwarg drives the destination memory space.
+  CHECK(args.size() == 4) << "tile.extract requires exactly 4 arguments "
+                          << "(src, index_row, index_col, shape), but got " << args.size();
+
+  auto src_type = As<TileType>(args[0]->GetType());
+  CHECK(src_type) << "tile.extract requires src to be a TileType, but got " << args[0]->GetType()->TypeName();
+  CHECK(src_type->shape_.size() == 2)
+      << "tile.extract requires a 2D source tile, but got rank " << src_type->shape_.size();
+
+  for (size_t i = 1; i <= 2; ++i) {
+    auto idx_type = As<ScalarType>(args[i]->GetType());
+    const char* name = (i == 1) ? "index_row" : "index_col";
+    CHECK(idx_type) << "tile.extract " << name << " must be ScalarType, but got "
+                    << args[i]->GetType()->TypeName();
+    CHECK(idx_type->dtype_.IsIndexLike())
+        << "tile.extract " << name << " must have INT64/UINT64/INDEX dtype, but got "
+        << idx_type->dtype_.ToString();
+  }
+
+  auto shape_tuple_type = As<TupleType>(args[3]->GetType());
+  CHECK(shape_tuple_type) << "tile.extract shape must be TupleType, but got "
+                          << args[3]->GetType()->TypeName();
+  ValidateIndexTupleElements(shape_tuple_type, "tile.extract", "shape");
+
+  auto shape_tuple = As<MakeTuple>(args[3]);
+  CHECK(shape_tuple) << "tile.extract shape must be a literal MakeTuple of ConstInt";
+  CHECK(shape_tuple->elements_.size() == 2)
+      << "tile.extract shape must be 2D, got rank " << shape_tuple->elements_.size();
+
+  std::vector<ExprPtr> dst_shape;
+  dst_shape.reserve(2);
+  for (size_t i = 0; i < 2; ++i) {
+    auto c = As<ConstInt>(shape_tuple->elements_[i]);
+    CHECK(c) << "tile.extract shape[" << i << "] must be a compile-time ConstInt";
+    CHECK(c->value_ > 0) << "tile.extract shape[" << i << "] must be positive, got " << c->value_;
+    dst_shape.push_back(shape_tuple->elements_[i]);
+  }
+
+  // Static-bounds check when both src dim and dst dim are constants.
+  auto src_r = As<ConstInt>(src_type->shape_[0]);
+  auto dst_r = As<ConstInt>(dst_shape[0]);
+  if (src_r && dst_r) {
+    CHECK(dst_r->value_ <= src_r->value_)
+        << "tile.extract shape[0]=" << dst_r->value_ << " exceeds src rows " << src_r->value_;
+  }
+  auto src_c = As<ConstInt>(src_type->shape_[1]);
+  auto dst_c = As<ConstInt>(dst_shape[1]);
+  if (src_c && dst_c) {
+    CHECK(dst_c->value_ <= src_c->value_)
+        << "tile.extract shape[1]=" << dst_c->value_ << " exceeds src cols " << src_c->value_;
+  }
+
+  TileView tile_view;
+  tile_view.valid_shape = dst_shape;
+  tile_view.blayout = InferTileLayoutFromShape(dst_shape);
+  return std::make_shared<TileType>(dst_shape, src_type->dtype_, std::nullopt, tile_view);
+}
+
+REGISTER_OP("tile.extract")
+    .set_op_category("TileOp")
+    .set_description("Extract a sub-tile from src at (index_row, index_col) — ISA TEXTRACT Variant 1")
+    .add_argument("src", "Source tile (TileType, 2D; typically Mat or Acc memory)")
+    .add_argument("index_row", "Starting row offset (ScalarType INT64/UINT64/INDEX)")
+    .add_argument("index_col", "Starting col offset (ScalarType INT64/UINT64/INDEX)")
+    .add_argument("shape", "Static destination shape (TupleType, 2D MakeTuple of ConstInt)")
+    .set_attr<MemorySpace>("target_memory")
+    .set_output_memory_from_kwarg("target_memory", MemorySpace::Vec)
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTileExtractType(args, kwargs);
+    });
+
 TypePtr DeduceTileScatterUpdateType(const std::vector<ExprPtr>& args,
                                     const std::vector<std::pair<std::string, std::any>>& kwargs) {
   // tile.scatter_update(input, index, src) -> TileType same as input

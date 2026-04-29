@@ -2019,6 +2019,43 @@ def slice(
     return _ir_core.create_op_call("tile.slice", args, kwargs, actual_span)
 
 
+def extract(
+    src: Expr,
+    index_row: int | Expr,
+    index_col: int | Expr,
+    shape: Sequence[int | Expr] | _ir_core.MakeTuple,
+    *,
+    target_memory: MemorySpace,
+    span: Span | None = None,
+) -> Call:
+    """Extract a sub-tile from src at (index_row, index_col).
+
+    Maps to ISA TEXTRACT Variant 1 (Standard Extract). The result tile has the
+    given static ``shape`` and lives in ``target_memory``.
+
+    Args:
+        src: Source tile expression (TileType, 2D)
+        index_row: Starting row offset (int or Expr)
+        index_col: Starting col offset (int or Expr)
+        shape: Static destination shape (2-element sequence or MakeTuple of ConstInt)
+        target_memory: Destination memory space (Left/Right/Scale/ScaleLeft/ScaleRight/Mat)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression with TileType[shape, src.dtype] in target_memory
+    """
+    actual_span = _get_span_or_capture(span)
+    shape_tuple = _to_make_tuple(shape, actual_span)
+    row_expr = _normalize_expr(index_row, actual_span, int_dtype=DataType.INDEX)
+    col_expr = _normalize_expr(index_col, actual_span, int_dtype=DataType.INDEX)
+    return _ir_core.create_op_call(
+        "tile.extract",
+        [src, row_expr, col_expr, shape_tuple],
+        {"target_memory": target_memory},
+        actual_span,
+    )
+
+
 def reshape(
     tile: Expr,
     shape: Sequence[int | Expr] | _ir_core.MakeTuple,

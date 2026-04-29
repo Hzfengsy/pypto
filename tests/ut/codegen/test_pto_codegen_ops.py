@@ -1320,5 +1320,60 @@ class TestColReductionCodegen:
         assert "pto.tcolmin" in mlir, f"Expected pto.tcolmin in codegen output:\n{mlir}"
 
 
+class TestTileExtractCodegen:
+    """Tests for tile.extract PTO code generation (pto.textract)."""
+
+    def _generate_mlir(self, program_cls) -> str:
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        optimized = pm.run_passes(program_cls)
+        codegen_instance = codegen.PTOCodegen()
+        funcs = list(optimized.functions.values())
+        assert funcs, "Program has no functions"
+        # ExpandMixedKernel may wrap the kernel in a Group function plus AIC/AIV
+        # variants. PTOCodegen rejects Group; pick the first InCore-variant func.
+        target = next((f for f in funcs if ir.is_incore_type(f.func_type)), funcs[0])
+        single = ir.Program([target], target.name, optimized.span)
+        return codegen_instance.generate(single)
+
+    def test_tile_extract_acc_to_mat_emits_pto_textract(self):
+        """tile.extract from an Acc-source tile to Mat lowers to pto.textract."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[32, 128], pl.BF16],
+                y: pl.Tensor[[128, 32], pl.BF16],
+                dst: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                x_mat = pl.load(x, [0, 0], [32, 128], target_memory=pl.MemorySpace.Mat)
+                y_mat = pl.load(y, [0, 0], [128, 32], target_memory=pl.MemorySpace.Mat)
+                x_left = pl.move(x_mat, target_memory=pl.MemorySpace.Left)
+                y_right = pl.move(y_mat, target_memory=pl.MemorySpace.Right)
+                acc: pl.Tile[[32, 32], pl.FP32] = pl.matmul(x_left, y_right)
+                sub: pl.Tile[[16, 16], pl.FP32] = pl.tile.extract(
+                    acc, 0, 0, shape=[16, 16], target_memory=pl.MemorySpace.Mat
+                )
+                vec = pl.move(sub, target_memory=pl.MemorySpace.Vec)
+                return pl.store(vec, [0, 0], dst)
+
+        mlir = self._generate_mlir(Prog)
+        assert "pto.textract" in mlir, f"Expected pto.textract in:\n{mlir}"
+
+        textract_lines = [line.strip() for line in mlir.splitlines() if "pto.textract" in line]
+        assert textract_lines, "no pto.textract line emitted"
+        line = textract_lines[0]
+        assert "ins(" in line and "outs(" in line, f"DPS form expected, got: {line}"
+        ins_clause = line.split("ins(", 1)[1].split(")", 1)[0]
+        operand_count = ins_clause.split(":", 1)[0].count(",") + 1
+        assert operand_count == 3, (
+            f"pto.textract should have 3 ins operands (src, row, col), got {operand_count}: {line}"
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

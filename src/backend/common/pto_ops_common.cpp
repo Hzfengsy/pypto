@@ -1713,7 +1713,9 @@ static const SimpleOpEntry kSimpleOps[] = {
     // tile.transpose has custom codegen (MakeTileTransposeCodegenPTO): pto.ttrans needs
     // ins(%src, %tmp : tile_type, tile_type) where %tmp is a scratch workspace tile, NOT
     // the axis-index integers that tile.transpose(src, axis0, axis1) carries in the IR.
-    {"tile.extract",         "pto.textract",         3},
+    // tile.extract has custom codegen (see reg("tile.extract") below): the IR carries the
+    // shape tuple as args_[3] purely for type deduction, so the generic N-ary lowering
+    // would emit the tuple as a PTO operand — not what pto.textract expects.
     // Gather/scatter operations
     {"tile.gather",          "pto.tgather",          3},
     {"tile.gatherb",         "pto.tgatherb",         2},
@@ -2117,6 +2119,42 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
   });
   reg("tile.assemble", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
     return MakeTileAssembleCodegenPTO(op, codegen);
+  });
+  reg("tile.extract", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
+    auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
+    CHECK(op->args_.size() == 4)
+        << "tile.extract requires 4 arguments (src, index_row, index_col, shape), but got "
+        << op->args_.size();
+
+    std::string src = codegen.GetExprAsCode(op->args_[0]);
+    std::string src_type = codegen.GetExprTypeAnnotation(op->args_[0]);
+    std::string row_off = codegen.GetExprAsCode(op->args_[1]);
+    std::string col_off = codegen.GetExprAsCode(op->args_[2]);
+    // args_[3] is the shape tuple: type-deduction only, no PTO operand.
+
+    std::string result_target = codegen.GetCurrentResultTarget();
+    std::string result_type = codegen.GetCurrentResultTileBufTypeStringFromTileType();
+
+    auto existing_type = codegen.GetSSATileBufType(result_target);
+    if (!result_type.empty() && existing_type != result_type) {
+      result_target = codegen.AllocNewTileBuf(result_type, "extract_buf");
+      codegen.SetCurrentResultBuf(result_target);
+    } else if (!result_type.empty()) {
+      codegen.RegisterTileBufType(result_target, result_type);
+    }
+
+    std::ostringstream oss;
+    oss << "pto.textract ins(" << src << ", " << row_off << ", " << col_off;
+    if (!src_type.empty()) {
+      oss << " : " << src_type << ", index, index";
+    }
+    oss << ") outs(" << result_target;
+    if (!result_type.empty()) {
+      oss << " : " << result_type;
+    }
+    oss << ")";
+    codegen.Emit(oss.str());
+    return std::string("");
   });
   reg("tile.reshape", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
     auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
