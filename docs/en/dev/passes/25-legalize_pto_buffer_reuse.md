@@ -1,10 +1,10 @@
 # LegalizePTOBufferReuse Pass
 
-Splits MemRefs left over by `MemoryReuse` whose shared writers cannot be expressed as a single PTO `alloc_tile` plus existing view ops.
+Splits MemRefs left over by `MemoryReuse` whose shared writers cannot be expressed as PTO-compatible `alloc_tile` / view combinations.
 
 ## Overview
 
-Generic `MemoryReuse` decides reuse on lifetime, memory space, dtype, shape, and (for 2D tiles) `valid_shape` differences. PTO codegen is stricter: every non-view writer that shares a MemRef must produce the **same typed `alloc_tile` signature**, since each MemRef becomes exactly one `alloc_tile` declaration on the target. Differences that PTO cannot express on a single allocation must be split into distinct allocations before address assignment.
+Generic `MemoryReuse` decides reuse on lifetime, memory space, dtype, shape, and (for 2D tiles) `valid_shape` differences. PTO codegen is stricter: multiple tile SSA values may lower to distinct `pto.alloc_tile` ops that alias the same MemRef address / byte offset, but sharing is only legal when the non-view writers have **identical `TileBufSignature`s** or any differences are materializable by existing PTO view ops. If a shared MemRef would require incompatible writer signatures that PTO cannot materialize via views, it must be split into distinct allocations before address assignment.
 
 This pass detects illegal cross-type sharing and rebinds the offending writer (and its transitive view chain) onto a fresh MemRef.
 
@@ -56,7 +56,7 @@ The pass only rebinds variables and inserts new `tile.alloc` statements; it does
 The transform runs in four phases over each `Function`:
 
 1. **Collect (`MemRefUsageCollector`)** — visit every `AssignStmt` that defines a tile-typed variable. For each MemRef base pointer, record:
-   - **Writers**: non-view producers (e.g. `tile.load`, `tile.add`, `tile.tpop_from_aic`) plus the `TileBufSignature` extracted from the LHS type and the input `Var`s of the RHS call.
+   - **Writers**: non-view producers (e.g. `tile.load`, `tile.add`, `tile.tpop_from_aic`) plus the `TileBufSignature` extracted from the LHS `TileType` (`TileBufSignature::FromTileType`); the input `Var`s of the RHS call are collected separately and used downstream (e.g. for the Ascend910B `load + tpop_from_aic` hazard detection), not as part of the signature.
    - **View users**: assignments whose RHS is a legal-view op and whose source argument lives in the same MemRef. The pass also records the source→user edge in `view_edges` so transitive views can be redirected later.
    - **`tile.tpop_from_aic` set**: tracked separately for the Ascend910B hazard described below.
 
@@ -71,7 +71,7 @@ The transform runs in four phases over each `Function`:
 
 3. **Mutate (`MemRefSplitMutator`)** — clone every affected `Var` / `IterArg` with a new `TileType` whose `MemRef` is the split target; all references to the old `Var` are remapped through `var_remap_` so SSA users follow the rebinding.
 
-4. **Insert allocs (`InsertNewAllocStatements`)** — for each unique new base pointer, prepend a `tile.alloc` `AssignStmt` to the function body using `CreateAllocStatement(memref, memory_space)`. The body is wrapped in a flattened `SeqStmts`, so the new allocs appear before any user of the new MemRef.
+4. **Insert allocs (`InsertNewAllocStatements`)** — for each unique new base pointer, build a `tile.alloc` `AssignStmt` via `CreateAllocStatement(memref, memory_space)`. When the function body is already a non-empty `SeqStmts`, the pass prepends the new allocs to that sequence so they appear before any user of the new MemRef; otherwise the body is returned unchanged. In the `Default` pipeline this precondition holds because upstream passes establish the `NormalizedStmtStructure` property required by `MemoryReuse`.
 
 ### Ascend910B split-AIV `load + tpop_from_aic` hazard
 

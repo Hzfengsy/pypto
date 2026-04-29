@@ -1,10 +1,10 @@
 # LegalizePTOBufferReuse Pass
 
-拆分 `MemoryReuse` 留下的、其共享 writer 无法用单个 PTO `alloc_tile` 加既有 view op 表达的 MemRef。
+拆分 `MemoryReuse` 留下的、其共享 writer 无法用 PTO 兼容的 `alloc_tile` 与 view op 组合表达的 MemRef。
 
 ## 概述
 
-通用的 `MemoryReuse` 基于生命周期、内存空间、dtype、shape，以及（对 2D tile 的）`valid_shape` 差异判定复用。PTO codegen 更严格：每一个共享同一 MemRef 的非 view writer 必须产生**相同的 `alloc_tile` 类型签名 (signature)**，因为每个 MemRef 在目标侧仅对应一条 `alloc_tile` 声明。无法在单一分配上表达的差异必须在地址分配前被拆分到不同的分配中。
+通用的 `MemoryReuse` 基于生命周期、内存空间、dtype、shape，以及（对 2D tile 的）`valid_shape` 差异判定复用。PTO codegen 更严格：同一 MemRef 上多个 tile SSA 值可以下放为多条共享同一 MemRef 地址 / 字节偏移的 `pto.alloc_tile`，但只有当这些非 view writer 拥有**完全相同的 `TileBufSignature`**，或它们之间的差异可由既有 PTO view op materialize 时，共享才合法。否则，必须在地址分配前将该 MemRef 拆分到不同的分配中。
 
 本 Pass 检测非法的跨类型共享，并将冒犯的 writer（及其 view 链上的传递使用者）改绑到新的 MemRef。
 
@@ -56,7 +56,7 @@ program_legal = legalize_pass(program)
 变换以四个阶段在每个 `Function` 上执行：
 
 1. **收集 (`MemRefUsageCollector`)** —— 访问每个定义 tile 类型变量的 `AssignStmt`。对每个 MemRef base 指针记录：
-   - **Writers**：非 view 的产生者（如 `tile.load`、`tile.add`、`tile.tpop_from_aic`），以及从 LHS 类型与 RHS call 的输入 `Var` 列表中提取的 `TileBufSignature`。
+   - **Writers**：非 view 的产生者（如 `tile.load`、`tile.add`、`tile.tpop_from_aic`），其 `TileBufSignature` 仅由 LHS 的 `TileType` 提取（`TileBufSignature::FromTileType`）；RHS call 的输入 `Var` 列表则单独收集，用于下游分析（例如 Ascend910B `load + tpop_from_aic` hazard 检测），并不计入签名本身。
    - **View users**：RHS 是合法 view op 且其源参数与目标位于同一 MemRef 的赋值。Pass 还在 `view_edges` 中记录 source→user 的边，以便后续传递性地转向。
    - **`tile.tpop_from_aic` 集合**：单独追踪，用于下文的 Ascend910B 硬件 hazard。
 
@@ -71,7 +71,7 @@ program_legal = legalize_pass(program)
 
 3. **变换 (`MemRefSplitMutator`)** —— 克隆所有受影响的 `Var` / `IterArg`，使其新 `TileType` 指向拆分后的 `MemRef`。所有对旧 `Var` 的引用都通过 `var_remap_` 重映射，使 SSA 用户跟随这次改绑。
 
-4. **插入 alloc (`InsertNewAllocStatements`)** —— 对每个唯一的新 base 指针，使用 `CreateAllocStatement(memref, memory_space)` 在函数体前部插入一条 `tile.alloc` `AssignStmt`。函数体被包入扁平化后的 `SeqStmts`，确保新 alloc 出现在使用新 MemRef 的任何用户之前。
+4. **插入 alloc (`InsertNewAllocStatements`)** —— 对每个唯一的新 base 指针，使用 `CreateAllocStatement(memref, memory_space)` 构造一条 `tile.alloc` `AssignStmt`。当函数体本身已经是非空的 `SeqStmts` 时，Pass 会将这些新 alloc 前插到该 `SeqStmts` 开头，确保它们出现在使用新 MemRef 的任何用户之前；否则直接返回原 body 不作改动。在 `Default` 流水线中，这一前提由上游建立 `MemoryReuse` 所要求的 `NormalizedStmtStructure` 属性的 pass 保证。
 
 ### Ascend910B split-AIV `load + tpop_from_aic` hazard
 
