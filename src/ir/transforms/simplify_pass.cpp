@@ -301,11 +301,23 @@ class SimplifyMutator : public arith::IRMutatorWithAnalyzer {
       analyzer_->Bind(op->loop_var_, start_ci->value_, stop_ci->value_);
     }
 
+    // Snapshot var_remap_ around the body visit. Nested folds inside the body
+    // (Fold A on a nested IfStmt or Fold B on a nested single-trip ForStmt)
+    // record remaps from outer Vars to body-internal values; leaking those to
+    // siblings of this ForStmt or to the parent scope produces dangling
+    // references. The MaybeRebuildIterArg additions made above stay in
+    // baseline_remap (they're valid in body and after).
+    auto baseline_remap = var_remap_;
+
     auto new_body = VisitStmt(op->body_);
 
     if (bound) {
       analyzer_->Unbind(op->loop_var_);
     }
+
+    // Discard body-internal remaps — the For is being rebuilt, so the body's
+    // SSA scope is preserved and outside code shouldn't see its private vars.
+    var_remap_ = std::move(baseline_remap);
 
     // Rebuild return_vars after the body so folds discovered inside the body
     // are visible in return types.
@@ -346,12 +358,29 @@ class SimplifyMutator : public arith::IRMutatorWithAnalyzer {
   StmtPtr VisitStmt_(const IfStmtPtr& op) override {
     auto new_condition = SimplifyExpr(op->condition_);
 
+    // Snapshot var_remap_ so each branch's internal remap additions stay
+    // scoped to that branch. Without this, a remap recorded inside the
+    // then-branch (e.g. by Fold A on a nested IfStmt, or by Fold B on a
+    // nested single-trip ForStmt) would still be live when the else-branch
+    // is visited — substituting refs in else with values that name vars
+    // defined inside the then-branch's lifted body, producing IR with
+    // dangling references and type-mismatched assignments.
+    //
+    // Each branch is processed from the same baseline; its additions are
+    // captured separately. When Fold A keeps a branch, that branch's snapshot
+    // is adopted (the lifted body's defs become visible in the parent scope).
+    // When the IfStmt is rebuilt, both snapshots are discarded — branch
+    // bodies remain in their own scopes.
+    auto baseline_remap = var_remap_;
+
     // Enter constraint scope for then branch (condition is known true).
     StmtPtr new_then;
     {
       auto ctx = analyzer_->GetConstraintContext(new_condition);
       new_then = VisitStmt(op->then_body_);
     }
+    auto then_remap = std::move(var_remap_);
+    var_remap_ = baseline_remap;
 
     // Enter constraint scope for else branch (condition is known false → Not(condition)).
     std::optional<StmtPtr> new_else;
@@ -359,6 +388,8 @@ class SimplifyMutator : public arith::IRMutatorWithAnalyzer {
       auto ctx = analyzer_->GetConstraintContext(MakeNot(new_condition, new_condition->span_));
       new_else = VisitStmt(*op->else_body_);
     }
+    auto else_remap = std::move(var_remap_);
+    var_remap_ = baseline_remap;
 
     // Fold A: collapse the IfStmt when the analyzer can prove the polarity.
     // True  → keep then_body_; drop else.
@@ -379,8 +410,10 @@ class SimplifyMutator : public arith::IRMutatorWithAnalyzer {
       StmtPtr kept;
       if (always_true) {
         kept = new_then;
+        var_remap_ = std::move(then_remap);  // adopt kept branch's remaps
       } else if (new_else.has_value()) {
         kept = *new_else;
+        var_remap_ = std::move(else_remap);
       } else {
         INTERNAL_CHECK_SPAN(op->return_vars_.empty(), op->span_)
             << "Internal error: IfStmt with no else branch must have empty return_vars_";

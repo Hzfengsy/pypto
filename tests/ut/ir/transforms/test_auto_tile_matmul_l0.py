@@ -31,13 +31,10 @@ The comparison uses ``ir.assert_structural_equal`` with auto-mapping, so
 intermediate Var names may differ between After and Expected — only types and
 structural positions need to match.
 
-The pass emits IR that is intentionally not yet type-correct: the iter-arg
-init is a ``tile.create`` with ``Vec`` target while the yields are
-``Acc``-typed matmul results.  ``InferTileMemorySpace`` (the next pass in
-the pipeline) inserts the Acc↔Vec bridges that make the IR type-correct.
-For unit testing this pass in isolation, ``_run_pass`` disables the
-auto-fixture's BeforeAndAfter type-check verification, mirroring the pattern
-used by ``test_lower_pipeline_loops``.
+The pass emits an Acc-typed iter-arg init via ``tile.create(target=Acc)``
+and per-iter ``tile.extract(..., target_memory=Left|Right)`` for the Mat
+operand slices, so the produced IR is L0-typed end-to-end and roundtrips
+cleanly through the autouse print/parse fixture.
 """
 
 import pypto.language as pl
@@ -45,17 +42,25 @@ import pytest
 from pypto import ir, passes
 
 
-def _run_pass(program: ir.Program) -> ir.Program:
-    """Run AutoTileMatmulL0 with verification suppressed.
+def _run_pass(program: ir.Program, *, suppress_verification: bool = False) -> ir.Program:
+    """Run AutoTileMatmulL0.
 
-    The pass emits intermediate IR with iter-arg/yield TileView mismatches
-    that ``InferTileMemorySpace`` (next pass) will resolve.  Wrapping in a
-    ``VerificationLevel.NONE`` PassContext bypasses the autouse fixture's
-    BeforeAndAfter check and the print/parse roundtrip check, which together
-    expect type-correct IR after every pass.
+    Most tests verify their result, but the ``matmul_acc`` case threads a
+    user-supplied ``acc_init`` parameter into the new K-loop's iter-arg.
+    The DSL parser doesn't attach an Nz tile_view to function-parameter
+    Acc tiles, but ``tile.matmul_acc``'s deducer always emits one, so the
+    iter_arg-init / yield-value tile_view-presence check inside the new
+    ForStmt fails.  This is the same parser↔deducer asymmetry tracked in
+    ``KNOWN_ISSUES.md`` ("Structural equality incompatible with Acc-typed
+    iter_args …"), and it doesn't reproduce when ``acc_init`` originates
+    from ``tile.create``/``tile.matmul`` upstream (the common production
+    case).  Pass ``suppress_verification=True`` to bypass the autouse
+    BeforeAndAfter / print-parse roundtrip for that one test.
     """
-    with passes.PassContext([], passes.VerificationLevel.NONE):
-        return passes.auto_tile_matmul_l0()(program)
+    if suppress_verification:
+        with passes.PassContext([], passes.VerificationLevel.NONE):
+            return passes.auto_tile_matmul_l0()(program)
+    return passes.auto_tile_matmul_l0()(program)
 
 
 class TestAutoTileMatmulL0KOnly:
@@ -103,21 +108,25 @@ class TestAutoTileMatmulL0KOnly:
                 rhs_mat: pl.Tile[[2048, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
                     rhs, [0, 0], [2048, 64], target_memory=pl.Mem.Mat
                 )
-                # Vec-resident placeholder for the iter-arg init.
-                c_init: pl.Tile[[16, 64], pl.FP32, pl.Mem.Vec] = pl.tile.create(
-                    [16, 64], dtype=pl.FP32, target_memory=pl.Mem.Vec
+                # Acc-resident placeholder for the iter-arg init.
+                c_init: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.create(
+                    [16, 64], dtype=pl.FP32, target_memory=pl.Mem.Acc
                 )
                 # Full K-loop with ko branching on the first iteration.
                 for ko, (c_iter,) in pl.pipeline(0, 2048, 256, init_values=(c_init,), stage=2):
-                    sa: pl.Tile[[16, 256], pl.BF16, pl.Mem.Mat] = pl.tile.slice(lhs_mat, [16, 256], [0, ko])
-                    sb: pl.Tile[[256, 64], pl.BF16, pl.Mem.Mat] = pl.tile.slice(rhs_mat, [256, 64], [ko, 0])
+                    sa: pl.Tile[[16, 256], pl.BF16, pl.Mem.Left] = pl.tile.extract(
+                        lhs_mat, 0, ko, shape=[16, 256], target_memory=pl.Mem.Left
+                    )
+                    sb: pl.Tile[[256, 64], pl.BF16, pl.Mem.Right] = pl.tile.extract(
+                        rhs_mat, ko, 0, shape=[256, 64], target_memory=pl.Mem.Right
+                    )
                     if ko == 0:
                         c_first: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(sa, sb)
                         c_phi: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.yield_(c_first)
                     else:
                         c_acc: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.matmul_acc(c_iter, sa, sb)
                         c_phi: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.yield_(c_acc)
-                    c: pl.Tile[[16, 64], pl.FP32, pl.Mem.Vec] = pl.yield_(c_phi)
+                    c: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.yield_(c_phi)
                 out = pl.store(c, [0, 0], out)
                 return out
 
@@ -169,14 +178,18 @@ class TestAutoTileMatmulL0KOnly:
                 )
                 # No Vec placeholder: the iter-arg init is the caller's acc_init.
                 for ko, (c_iter,) in pl.pipeline(0, 2048, 256, init_values=(acc_init,), stage=2):
-                    sa: pl.Tile[[16, 256], pl.BF16, pl.Mem.Mat] = pl.tile.slice(lhs_mat, [16, 256], [0, ko])
-                    sb: pl.Tile[[256, 64], pl.BF16, pl.Mem.Mat] = pl.tile.slice(rhs_mat, [256, 64], [ko, 0])
+                    sa: pl.Tile[[16, 256], pl.BF16, pl.Mem.Left] = pl.tile.extract(
+                        lhs_mat, 0, ko, shape=[16, 256], target_memory=pl.Mem.Left
+                    )
+                    sb: pl.Tile[[256, 64], pl.BF16, pl.Mem.Right] = pl.tile.extract(
+                        rhs_mat, ko, 0, shape=[256, 64], target_memory=pl.Mem.Right
+                    )
                     c_acc: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.matmul_acc(c_iter, sa, sb)
                     c: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.yield_(c_acc)
                 out = pl.store(c, [0, 0], out)
                 return out
 
-        After = _run_pass(Before)
+        After = _run_pass(Before, suppress_verification=True)
         ir.assert_structural_equal(After, Expected)
 
     def test_already_l0_sized_skipped(self):
