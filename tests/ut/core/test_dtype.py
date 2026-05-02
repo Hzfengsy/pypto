@@ -33,6 +33,7 @@ from pypto import (
     DT_UINT32,
     DT_UINT64,
     DataType,
+    ir,
 )
 
 
@@ -396,6 +397,46 @@ class TestDataTypeIntegration:
             assert is_integer or is_floating or is_boolean, (
                 f"Type {dtype.to_string()} should be classified as int, float, or bool"
             )
+
+
+class TestDataTypeHashEqConsistency:
+    """Regression tests for the Python hash/eq contract: a == b ⇒ hash(a) == hash(b)."""
+
+    def test_equal_dtypes_from_static_attributes_hash_equally(self):
+        a = DataType.INDEX
+        b = DataType.INDEX
+        assert a == b
+        assert hash(a) == hash(b)
+
+    def test_dtype_returned_from_cpp_getter_hashes_consistently(self):
+        # ConstInt.dtype returns a fresh DataType wrapper from C++; the Python id()
+        # differs from DataType.INDEX, but hash must still match because the values
+        # are equal.
+        ci = ir.ConstInt(5, DataType.INDEX, ir.Span.unknown())
+        a = ci.dtype
+        b = DataType.INDEX
+        assert id(a) != id(b), "precondition: getter returns a fresh wrapper"
+        assert a == b
+        assert hash(a) == hash(b)
+
+    def test_dtype_works_in_sets_and_dicts(self):
+        ci = ir.ConstInt(0, DataType.INDEX, ir.Span.unknown())
+        # Membership against a set and dict-key lookup must succeed regardless of
+        # whether the lookup key originated from a static attribute or a getter.
+        assert ci.dtype in {DataType.INDEX}
+        assert {DataType.INDEX: "ok"}[ci.dtype] == "ok"
+
+    def test_distinct_dtypes_remain_distinct(self):
+        # Hash collisions are legal under Python's contract, so don't assert
+        # distinct hashes. Membership in a set built from one element is the
+        # behavior callers actually depend on.
+        for a, b in [
+            (DataType.INT8, DataType.INT16),
+            (DataType.FP32, DataType.INDEX),
+            (DataType.INT8, DataType.FP32),
+        ]:
+            assert a != b
+            assert a not in {b}
 
 
 if __name__ == "__main__":

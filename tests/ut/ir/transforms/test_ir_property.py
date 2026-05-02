@@ -158,6 +158,30 @@ class TestIRPropertySet:
         assert str(ps) == "{}"
 
 
+class TestIRPropertySetUnhashable:
+    """IRPropertySet is mutable via insert/remove, so it must not be hashable.
+
+    Python's hash contract requires hashable objects to have a stable hash for
+    their entire lifetime. Allowing hash on a mutable type would silently break
+    set/dict invariants when the object is mutated after insertion.
+    """
+
+    def test_hash_raises_typeerror(self):
+        ps = passes.IRPropertySet()
+        with pytest.raises(TypeError, match="unhashable"):
+            hash(ps)
+
+    def test_use_as_set_member_raises(self):
+        ps = passes.IRPropertySet()
+        with pytest.raises(TypeError, match="unhashable"):
+            _ = {ps}
+
+    def test_use_as_dict_key_raises(self):
+        ps = passes.IRPropertySet()
+        with pytest.raises(TypeError, match="unhashable"):
+            _ = {ps: "value"}
+
+
 class TestPassPropertyAccessors:
     """Test Pass property accessor methods."""
 

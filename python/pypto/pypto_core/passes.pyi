@@ -59,6 +59,10 @@ class IRPropertySet:
     def __repr__(self) -> str: ...
     def __eq__(self, other: object) -> bool: ...
     def __ne__(self, other: object) -> bool: ...
+    # Unhashable — IRPropertySet is mutable via insert/remove. Setting __hash__
+    # to None makes hash() raise TypeError, matching Python's convention for
+    # mutable value types (e.g. list, dict).
+    __hash__ = None  # type: ignore[assignment]
 
 class VerificationMode(Enum):
     """Controls when property verification runs."""
@@ -105,6 +109,8 @@ class DiagnosticCheckSet:
     def __repr__(self) -> str: ...
     def __eq__(self, other: object) -> bool: ...
     def __ne__(self, other: object) -> bool: ...
+    # Unhashable for the same reason as IRPropertySet — mutable via insert/remove.
+    __hash__ = None  # type: ignore[assignment]
 
 class DiagnosticCheckRegistry:
     """Registry of diagnostic checks (warnings + performance hints)."""

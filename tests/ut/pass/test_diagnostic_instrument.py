@@ -280,5 +280,28 @@ def test_perf_hint_visible_at_default_log_level(capfd):
     assert re.search(r"\[perf_hint PH001\]", combined), f"perf hint not in output:\n{combined}"
 
 
+# ---------------------------------------------------------------------------
+# DiagnosticCheckSet is unhashable (mutable via insert/remove)
+# ---------------------------------------------------------------------------
+
+
+def test_diagnostic_check_set_hash_raises_typeerror():
+    s = passes.DiagnosticCheckSet()
+    with pytest.raises(TypeError, match="unhashable"):
+        hash(s)
+
+
+def test_diagnostic_check_set_use_as_set_member_raises():
+    s = passes.DiagnosticCheckSet()
+    with pytest.raises(TypeError, match="unhashable"):
+        _ = {s}
+
+
+def test_diagnostic_check_set_use_as_dict_key_raises():
+    s = passes.DiagnosticCheckSet()
+    with pytest.raises(TypeError, match="unhashable"):
+        _ = {s: "value"}
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
