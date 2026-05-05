@@ -59,6 +59,7 @@ struct PassProperties {
 
 | Pass | Required | Produced | Invalidated |
 | ---- | -------- | -------- | ----------- |
+| InlineFunctions | — | InlineFunctionsEliminated | — |
 | UnrollLoops | TypeChecked | TypeChecked | — |
 | CtrlFlowTransform | TypeChecked | TypeChecked, StructuredCtrlFlow | — |
 | ConvertToSSA | TypeChecked | TypeChecked, SSAForm | NormalizedStmtStructure |
@@ -366,27 +367,27 @@ The PTO-oriented tile stage shared by `Default` and `DebugTileOptimization` is:
 1. `FlattenTileNdTo2D`
 2. `InferTileMemorySpace`
 3. `ResolveTransposeLayout`
-4. [`ResolveBackendOpLayouts`](16-resolve_backend_op_layouts.md)
+4. [`ResolveBackendOpLayouts`](17-resolve_backend_op_layouts.md)
 5. `NormalizeStmtStructure`
 6. `ExpandMixedKernel`
-7. [`InjectGMPipeBuffer`](18-inject_gm_pipe_buffer.md)
-8. [`SplitVectorKernel`](19-split_vector_kernel.md)
+7. [`InjectGMPipeBuffer`](19-inject_gm_pipe_buffer.md)
+8. [`SplitVectorKernel`](20-split_vector_kernel.md)
 9. `NormalizeReturnOrder`
-10. [`LowerPipelineLoops`](21-lower_pipeline_loops.md)
-11. [`CanonicalizeIOOrder`](22-canonicalize_io_order.md)
+10. [`LowerPipelineLoops`](22-lower_pipeline_loops.md)
+11. [`CanonicalizeIOOrder`](23-canonicalize_io_order.md)
 12. `InitMemRef`
 13. `MemoryReuse`
-14. [`LegalizePTOBufferReuse`](25-legalize_pto_buffer_reuse.md)
+14. [`LegalizePTOBufferReuse`](26-legalize_pto_buffer_reuse.md)
 15. `AllocateMemoryAddr`
 16. `FuseCreateAssembleToSlice`
-17. [`DeriveCallDirections`](28-derive_call_directions.md)
+17. [`DeriveCallDirections`](29-derive_call_directions.md)
 18. `Simplify`
 
 `DebugTileOptimization` is a debug-only strategy for inspecting this tile stage
 without the tensor-only prefix passes. Use `Default` for normal compilation and
 for non-strategy-specific tests so the maintained pipeline stays covered.
 
-[`ResolveBackendOpLayouts`](16-resolve_backend_op_layouts.md) repairs
+[`ResolveBackendOpLayouts`](17-resolve_backend_op_layouts.md) repairs
 backend-constrained elementwise tile ops using registered layout metadata.
 For the current PTO row-major elementwise ops, it rewrites `[N, 1]` vector
 operands into `[1, N] row_major` `tile.reshape` operations at the
@@ -394,7 +395,7 @@ constrained use site, where row-major is inferred from the target shape.
 It then reshapes the result back to the original vector shape when
 needed.
 
-[`NormalizeReturnOrder`](20-normalize_return_order.md) reorders `ReturnStmt::value_` in InCore functions so that
+[`NormalizeReturnOrder`](21-normalize_return_order.md) reorders `ReturnStmt::value_` in InCore functions so that
 `return[i]` corresponds to the i-th `Out`/`InOut` parameter in declaration order,
 and updates `TupleGetItemExpr` indices at call sites accordingly. This lets
 orchestration codegen map tuple element indices to output parameters with a
