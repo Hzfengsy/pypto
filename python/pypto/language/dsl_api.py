@@ -640,12 +640,21 @@ def yield_(*values: Any) -> Any | tuple[Any, ...]:
     return tuple(values)
 
 
+@overload
+def const(value: int, dtype: Any) -> int: ...
+@overload
+def const(value: float, dtype: Any) -> float: ...
 def const(value: int | float, dtype: Any) -> int | float:
     """Create a typed constant with an explicit dtype.
 
     Used by the printer to preserve non-default constant dtypes in round-trip.
     The parser intercepts pl.const() calls and creates ConstInt/ConstFloat
     with the specified dtype.
+
+    The return type mirrors the input: ``const(int, ...)`` is statically an
+    ``int`` and ``const(float, ...)`` a ``float``. This keeps a printed
+    ``pl.MemRef("base", pl.const(0, pl.INT64), size)`` type-checking cleanly,
+    since the ``byte_offset`` parameter expects an ``int``.
 
     Args:
         value: Numeric value (int or float)

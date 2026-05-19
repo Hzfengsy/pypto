@@ -9,9 +9,15 @@
 
 """MemRef wrapper type for PyPTO Language DSL.
 
-Thin subclass of ``ir.MemRef`` that adds ``PtrType`` to the accepted
-``base`` parameter so that pyright accepts ``pl.MemRef(ptr_var, 0, size)``
-when ``ptr_var`` is annotated as ``pl.Ptr`` inside ``@pl.program`` code.
+Thin subclass of ``ir.MemRef`` that widens the accepted ``base`` and
+``byte_offset`` parameters so that pyright accepts the ``pl.MemRef(...)``
+forms emitted by the IR printer inside ``@pl.program`` code:
+
+* ``base`` also accepts ``PtrType`` — for ``pl.MemRef(ptr_var, offset, size)``
+  where ``ptr_var`` is annotated as ``pl.Ptr``.
+* ``byte_offset`` also accepts ``Scalar`` — the printer renders a non-constant
+  offset as a ``Scalar`` arithmetic expression (e.g. ``pos * 128 * 4``), and a
+  constant offset as ``pl.const(0, pl.INT64)``, which is statically an ``int``.
 """
 
 from typing import Any, overload
@@ -27,26 +33,34 @@ from pypto.pypto_core.ir import (
     MemRef as _IrMemRef,
 )
 
+from .scalar import Scalar
+
+# A printed MemRef byte offset is either a constant (rendered by the printer as
+# ``pl.const(...)``, statically an ``int``), a DSL ``Scalar`` arithmetic
+# expression, or a raw IR ``Expr`` when the MemRef is built programmatically.
+_ByteOffset = int | Expr | Scalar
+
 
 class MemRef(_IrMemRef):
-    """DSL-level memory reference accepting PtrType-annotated variables as base.
+    """DSL-level memory reference accepting PtrType bases and Scalar offsets.
 
-    Identical to ``ir.MemRef`` at runtime. The only addition is that
-    the ``base`` parameter also accepts ``PtrType`` so that pyright
-    does not reject ``pl.MemRef(ptr_var, offset, size)`` when
-    ``ptr_var`` has the annotation ``pl.Ptr``.
+    Identical to ``ir.MemRef`` at runtime. The overloads only widen what
+    pyright accepts so that printed IR — which uses ``pl.Ptr``-annotated
+    base variables and ``Scalar`` arithmetic byte offsets — type-checks
+    cleanly when re-loaded as a ``@pl.program``.
+
+    Note: ``pl.MemRef(...)`` calls inside a ``@pl.program`` body are resolved
+    by the parser (``parser/type_resolver.py``), not dispatched through this
+    ``__init__``. A ``Scalar`` byte offset is therefore only ever seen by
+    pyright; it never reaches the underlying ``ir.MemRef`` constructor.
     """
 
     @overload
-    def __init__(self, base: Var, byte_offset: int, size: int, span: Span = ...) -> None: ...
+    def __init__(self, base: Var, byte_offset: _ByteOffset, size: int, span: Span = ...) -> None: ...
     @overload
-    def __init__(self, base: Var, byte_offset: Expr, size: int, span: Span = ...) -> None: ...
+    def __init__(self, base: str, byte_offset: _ByteOffset, size: int, span: Span = ...) -> None: ...
     @overload
-    def __init__(self, base: str, byte_offset: int, size: int, span: Span = ...) -> None: ...
-    @overload
-    def __init__(self, base: PtrType, byte_offset: int, size: int, span: Span = ...) -> None: ...
-    @overload
-    def __init__(self, base: PtrType, byte_offset: Expr, size: int, span: Span = ...) -> None: ...
+    def __init__(self, base: PtrType, byte_offset: _ByteOffset, size: int, span: Span = ...) -> None: ...
     @overload
     def __init__(self, addr: int, size: int, id: int, span: Span = ...) -> None: ...
     @overload
