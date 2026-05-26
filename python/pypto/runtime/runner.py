@@ -25,6 +25,7 @@ Typical usage::
 """
 
 import importlib.util
+import shlex
 import subprocess
 import sys
 from ctypes import _SimpleCData
@@ -100,8 +101,8 @@ class RunConfig:
             Output: ``<work_dir>/dfx_outputs/pmu.csv``. Mirrors
             ``--enable-pmu N``.
         enable_dep_gen: Capture PTO2 dependency edges into
-            ``<work_dir>/dfx_outputs/deps.json``. After the run
-            ``deps_to_graph`` renders ``deps_graph.html``. Mirrors
+            ``<work_dir>/dfx_outputs/deps.json``. Render to HTML on demand
+            via ``python -m simpler_setup.tools.deps_to_graph``. Mirrors
             ``--enable-dep-gen``.
         compile_profiling: If ``True``, enable compile profiling that records
             per-stage wall-clock timings (parse, passes, codegen).
@@ -583,7 +584,20 @@ def _collect_dfx_artifacts(
             )
 
     if dfx.enable_dep_gen and (dfx_dir / "deps.json").exists():
-        _convert_deps_to_graph(dfx_dir / "deps.json", dfx_dir / "deps_graph.html")
+        # ``deps_to_graph`` is an offline post-processing tool; leave the
+        # artefact in place and point the user at the rendering command.
+        # Doing it inline on hot path risks hanging the run on large graphs
+        # (Graphviz ``dot`` is O(N²~N³) and has SIGKILL'd taskqueue jobs).
+        # ``shlex.quote`` keeps the printed command copy-pasteable even when
+        # the path contains spaces or other shell metacharacters.
+        deps_path = shlex.quote(str(dfx_dir / "deps.json"))
+        print(
+            f"deps.json written to {deps_path} — render with:\n"
+            f"  python -m simpler_setup.tools.deps_to_graph {deps_path}\n"
+            f"  # for large graphs, pass --engine (default 'dot' works for <500 nodes):\n"
+            f"  python -m simpler_setup.tools.deps_to_graph {deps_path} --engine sfdp\n"
+            f"  # --engine choices: dot | sfdp | fdp | neato | circo | twopi"
+        )
 
     if dfx.enable_dump_tensor and (dfx_dir / "tensor_dump" / "tensor_dump.json").exists():
         # ``dump_viewer`` is interactive; leave the artefact in place and
@@ -596,35 +610,6 @@ def _collect_dfx_artifacts(
 
     if dfx.enable_pmu > 0 and (dfx_dir / "pmu.csv").exists():
         print(f"PMU CSV written to: {dfx_dir / 'pmu.csv'}")
-
-
-def _convert_deps_to_graph(deps_json: Path, out_html: Path) -> None:
-    """Render ``deps.json`` to an HTML graph via ``simpler_setup.tools.deps_to_graph``.
-
-    Skips silently when the converter module is unavailable in the active
-    environment (e.g. wheel build without the dev tools). Failures from
-    the subprocess surface as warnings, not exceptions — DFX collection
-    is a best-effort post-run step and must not fail the run.
-    """
-    converter_module = "simpler_setup.tools.deps_to_graph"
-    try:
-        spec = importlib.util.find_spec(converter_module)
-    except ImportError:
-        spec = None
-    if spec is None:
-        print(f"Module {converter_module} not found, skipping deps graph rendering")
-        return
-
-    result = subprocess.run(
-        [sys.executable, "-m", converter_module, str(deps_json), "-o", str(out_html)],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        print(f"deps_to_graph failed (rc={result.returncode}): {result.stderr.strip()}")
-    else:
-        print(f"Deps graph written to: {out_html}")
 
 
 def _generate_swimlane(

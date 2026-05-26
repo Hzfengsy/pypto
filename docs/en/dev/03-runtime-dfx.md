@@ -12,7 +12,7 @@ flag in `runtime/conftest.py`, so the two surfaces stay aligned.
 | `enable_l2_swimlane: bool` | `--enable-l2-swimlane` | `enable_l2_swimlane` | `l2_perf_records.json` | `swimlane_converter` → `merged_swimlane_*.json` |
 | `enable_dump_tensor: bool` | `--dump-tensor` | `enable_dump_tensor` | `tensor_dump/{tensor_dump.json,bin}` | `dump_viewer` (manual) |
 | `enable_pmu: int` | `--enable-pmu [N]` (bare = `2`) | `enable_pmu` (`0` off, `>0` event type) | `pmu.csv` | — |
-| `enable_dep_gen: bool` | `--enable-dep-gen` | `enable_dep_gen` | `deps.json` | `deps_to_graph` → `deps_graph.html` |
+| `enable_dep_gen: bool` | `--enable-dep-gen` | `enable_dep_gen` | `deps.json` | `deps_to_graph` (manual) |
 
 The four flags are **fully independent** and may be combined in any
 subset. Enabling *any* of them auto-forces `RunConfig.save_kernels=True`
@@ -41,7 +41,7 @@ run(
     config=RunConfig(
         platform="a2a3sim",
         enable_l2_swimlane=True,     # produces l2_perf_records.json
-        enable_dep_gen=True,         # produces deps.json + deps_graph.html
+        enable_dep_gen=True,         # produces deps.json (render with deps_to_graph on demand)
         enable_pmu=4,                # PMU event = MEMORY
     ),
 )
@@ -56,6 +56,35 @@ pytest tests/st/runtime/framework_and_models/test_perf_swimlane.py \
 pytest tests/st/runtime/ \
     --platform a2a3sim --enable-l2-swimlane --enable-dep-gen
 ```
+
+## Rendering `deps.json` to HTML
+
+`enable_dep_gen` only emits the raw `deps.json`; the HTML pan/zoom graph
+is produced by a separate offline tool. The tool is **not** invoked
+automatically — Graphviz layout on a multi-thousand-node graph can run
+for many minutes and, when launched on the runner's hot path, has
+caused outer schedulers (e.g. taskqueue daemons) to SIGKILL the entire
+job tree. Render on demand instead:
+
+```bash
+# Default — Graphviz `dot` engine, hierarchical layout (<500 nodes).
+python -m simpler_setup.tools.deps_to_graph <work_dir>/dfx_outputs/deps.json
+
+# Large graphs — switch to the scalable force-directed engine.
+python -m simpler_setup.tools.deps_to_graph <work_dir>/dfx_outputs/deps.json \
+    --engine sfdp
+```
+
+The output is written next to the input as `deps_graph.html` (override
+with `-o <path>`). Supported `--engine` values, mirroring Graphviz:
+`dot | sfdp | fdp | neato | circo | twopi`. `dot` is the default and
+gives the cleanest DAG-style layout up to ~500 nodes; for larger graphs
+prefer `sfdp` (O(N log N) layout, scales to 10k+ nodes). The runner
+prints this same hint at the end of every dep_gen-enabled run.
+
+Requires Graphviz on `PATH` (`apt install graphviz` /
+`brew install graphviz`). Open the resulting HTML in any browser —
+drag to pan, wheel to zoom, `f` to fit, `r` to reset.
 
 ## Implementation map
 
