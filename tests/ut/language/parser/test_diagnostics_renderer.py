@@ -91,5 +91,76 @@ class TestInlineMessage:
         assert "Missing argument for module.attr call" in rendered
 
 
+class TestRealFileSnippet:
+    """The snippet is read from the real file named by the span (issue #1612).
+
+    When a span points at an on-disk file — e.g. a @pl.jit kernel span remapped
+    to the user's source — the renderer shows that file's lines, not the
+    (possibly generated) ``source_lines`` carried on the exception.
+    """
+
+    def test_snippet_read_from_real_file(self, renderer: ErrorRenderer, tmp_path):
+        real = tmp_path / "kernel.py"
+        real.write_text("line one\nt = pl.mul(t, t)  # the real source\nline three\n")
+
+        err = ParserSyntaxError("type mismatch")
+        err.span = {
+            "filename": str(real),
+            "begin_line": 2,
+            "begin_column": 0,
+            "line": 2,
+            "column": 0,
+        }
+        # Deliberately wrong/generated source lines: linecache must take priority.
+        err.source_lines = ["t_v1 = pl.mul(t_v1, t_v1)"]
+
+        rendered = renderer.render(err)
+
+        assert str(real) in rendered  # header points at the real file
+        assert "the real source" in rendered  # snippet is the real file's line
+        assert "t_v1" not in rendered  # not the generated source_lines
+
+    def test_falls_back_to_source_lines_for_synthetic_filename(self, renderer: ErrorRenderer):
+        """A synthetic filename (no on-disk file) falls back to source_lines."""
+        err = ParserSyntaxError("type mismatch")
+        err.span = {
+            "filename": "<jit:kernel>",
+            "begin_line": 1,
+            "begin_column": 0,
+            "line": 1,
+            "column": 0,
+        }
+        err.source_lines = ["t_v1 = pl.mul(t_v1, t_v1)"]
+
+        rendered = renderer.render(err)
+
+        assert "t_v1 = pl.mul(t_v1, t_v1)" in rendered
+
+    def test_real_file_snippet_when_source_lines_missing(self, renderer: ErrorRenderer, tmp_path):
+        """A remapped span with no source_lines still renders the real snippet.
+
+        render() must not gate the code context on error.source_lines, else
+        compile/pass errors that carry only a remapped span (the case #1612
+        targets) would show the header but no snippet.
+        """
+        real = tmp_path / "kernel.py"
+        real.write_text("line one\nt = pl.mul(t, t)  # the real source\nline three\n")
+
+        err = ParserSyntaxError("type mismatch")
+        err.span = {
+            "filename": str(real),
+            "begin_line": 2,
+            "begin_column": 0,
+            "line": 2,
+            "column": 0,
+        }
+        err.source_lines = None  # no captured source — only the remapped span
+
+        rendered = renderer.render(err)
+
+        assert str(real) in rendered  # header points at the real file
+        assert "the real source" in rendered  # snippet still rendered via linecache
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

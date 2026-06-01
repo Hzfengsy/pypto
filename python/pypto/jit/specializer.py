@@ -114,6 +114,14 @@ class SpecializeContext:
             uses this to resolve module-level int/float/bool constants (e.g.
             ``BATCH``, ``HIDDEN`` imported from a config module) by inlining
             them at the use site.
+        orig_file: Path to the user's real source file (``inspect.getsourcefile``),
+            or ``None`` when the function has no on-disk source (REPL / exec).
+            Used to map generated diagnostics back to the user's ``.py`` (#1612).
+        orig_start_line: 1-based file line of the function's first source line
+            (its first decorator), i.e. the line ``inspect.getsourcelines``
+            starts at. Anchors the generated→original line remap.
+        orig_col_offset: Indentation (in columns) stripped by ``textwrap.dedent``
+            from the original source — added back to recover original columns.
     """
 
     func_name: str
@@ -126,6 +134,9 @@ class SpecializeContext:
     scalar_dtypes: dict[str, DataType]
     dep_names: list[str] = field(default_factory=list)
     py_globals: dict[str, Any] = field(default_factory=dict)
+    orig_file: str | None = None
+    orig_start_line: int = 1
+    orig_col_offset: int = 0
 
     @property
     def dynamic_dims(self) -> set[tuple[str, int]]:
@@ -1231,6 +1242,22 @@ def _has_incore_scope(func_def: ast.FunctionDef) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _dfs_stmts(node: ast.AST) -> list[ast.stmt]:
+    """Statement descendants of ``node`` in pre-order (DFS).
+
+    Used to correlate the transformed AST with the reparsed generated AST when
+    building the source map (#1612): both share statement count and order, so
+    zipping their pre-order statement lists pairs each generated statement with
+    its originating user statement.
+    """
+    result: list[ast.stmt] = []
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, ast.stmt):
+            result.append(child)
+            result.extend(_dfs_stmts(child))
+    return result
+
+
 class Specializer:
     """Transform a collection of SpecializeContext objects into @pl.program source.
 
@@ -1267,6 +1294,14 @@ class Specializer:
         self._dep_param_names: dict[str, list[str]] = {
             ctx.func_name: list(ctx.param_names) for ctx in contexts
         }
+        # generated-program absolute line → (orig_file, orig_line, orig_col),
+        # built by specialize() so diagnostics map back to the user's .py (#1612).
+        self._source_map: dict[int, tuple[str, int, int]] = {}
+        # (ctx, original (lineno, col_offset) per transformed statement in DFS
+        # order) per function — captured BEFORE ast.fix_missing_locations so
+        # synthesized statements read as (0, 0), and zipped against the reparsed
+        # generated statements in _build_source_map after assembly.
+        self._fn_origin: list[tuple[SpecializeContext, list[tuple[int, int]]]] = []
 
     @property
     def rename_map(self) -> dict[str, str]:
@@ -1276,12 +1311,24 @@ class Specializer:
         """
         return dict(self._rename_map)
 
+    @property
+    def source_map(self) -> dict[int, tuple[str, int, int]]:
+        """Map generated-program line → ``(orig_file, orig_line, orig_col)``.
+
+        Statement-granular; only entries for functions with on-disk source and
+        a clean structural match appear. Empty until ``specialize()`` runs.
+        Passed to ``pl.parse(..., source_map=...)`` so IR spans (and thus parse
+        and compile error diagnostics) point at the user's real source (#1612).
+        """
+        return dict(self._source_map)
+
     def specialize(self) -> str:
         """Generate @pl.program source code string.
 
         Returns:
             Python source string ready to pass to ``pl.parse()``.
         """
+        self._fn_origin = []
         lines: list[str] = [
             "import pypto.language as pl",
             "",
@@ -1307,11 +1354,55 @@ class Specializer:
                 lines.append("    " + ml)
             lines.append("")
 
-        return "\n".join(lines)
+        src = "\n".join(lines)
+        self._source_map = self._build_source_map(src)
+        return src
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _build_source_map(self, src: str) -> dict[int, tuple[str, int, int]]:
+        """Map each generated-program line to the user's original source location.
+
+        Reparses the assembled program to recover absolute line numbers (which
+        equal the spans ``SpanTracker`` will emit), then zips each function's
+        reparsed statements against the original (dedented) positions captured
+        per statement in :meth:`_specialize_function`. Per-statement granularity:
+        a multi-line user statement collapses to its start line; synthesized
+        statements (captured lineno 0) are left unmapped so their spans keep the
+        generated coordinates. See issue #1612.
+        """
+        out: dict[int, tuple[str, int, int]] = {}
+        try:
+            prog = ast.parse(src)
+        except SyntaxError:
+            # Malformed generated source is a specializer bug; let pl.parse
+            # surface it with full diagnostics rather than crashing here.
+            return out
+        classdef = next((n for n in prog.body if isinstance(n, ast.ClassDef)), None)
+        if classdef is None:
+            return out
+        gen_funcs = {n.name: n for n in classdef.body if isinstance(n, ast.FunctionDef)}
+        for ctx, orig_positions in self._fn_origin:
+            gen_func = gen_funcs.get(ctx.func_name)
+            if ctx.orig_file is None or gen_func is None:
+                continue
+            gen_stmts = _dfs_stmts(gen_func)
+            # Reparsing the unparsed transform must preserve statement count and
+            # DFS order; if it somehow diverges, skip this function rather than
+            # emit a wrong mapping (its spans then fall back to generated coords).
+            if len(gen_stmts) != len(orig_positions):
+                continue
+            for gen_stmt, (orig_line, orig_col) in zip(gen_stmts, orig_positions, strict=True):
+                if orig_line <= 0:
+                    continue  # synthesized statement — no original location
+                out[gen_stmt.lineno] = (
+                    ctx.orig_file,
+                    orig_line + ctx.orig_start_line - 1,
+                    orig_col + ctx.orig_col_offset,
+                )
+        return out
 
     def _specialize_function(self, ctx: SpecializeContext) -> list[str]:
         """Generate lines for a single @pl.function method."""
@@ -1413,6 +1504,17 @@ class Specializer:
             lineno=1,
             col_offset=0,
         )
+        # Capture each statement's original (dedented) position in DFS order
+        # BEFORE fix_missing_locations runs (#1612). Surviving/expanded statements
+        # carry their original linenos; synthesized statements (loop bridges, the
+        # empty-body `pass`, transformer-built nodes) have no lineno yet and read
+        # as (0, 0) — fix_missing_locations would otherwise backfill them with the
+        # function's lineno=1, which would mis-map them to the decorator line.
+        # specialize() zips this against the reassembled program's statements.
+        orig_positions = [
+            (getattr(s, "lineno", 0), getattr(s, "col_offset", 0)) for s in _dfs_stmts(new_func)
+        ]
+        self._fn_origin.append((ctx, orig_positions))
         ast.fix_missing_locations(new_func)
 
         body_src = ast.unparse(new_func)
@@ -1543,7 +1645,7 @@ def build_specialize_context(
         SpecializeContext ready for use in Specializer.
     """
     try:
-        source = inspect.getsource(func)
+        raw_lines, orig_start_line = inspect.getsourcelines(func)
     except OSError as e:
         raise OSError(
             f"@pl.jit cannot retrieve source code for '{func.__name__}'. "
@@ -1551,7 +1653,15 @@ def build_specialize_context(
             "Interactive shells, Jupyter notebooks, and exec/eval-generated "
             f"functions are not supported. (Original error: {e})"
         ) from e
-    source = textwrap.dedent(source)
+    raw_source = "".join(raw_lines)
+    source = textwrap.dedent(raw_source)
+
+    # Real-source anchors for diagnostic provenance (#1612). The generated
+    # source is re-derived via ast.unparse, so spans default to the synthesized
+    # text; these let the specializer map statements back to the user's .py.
+    src_file = inspect.getsourcefile(func)
+    orig_file = src_file if (src_file and not src_file.startswith("<")) else None
+    orig_col_offset = (len(raw_lines[0]) - len(raw_lines[0].lstrip())) if raw_lines else 0
 
     param_names = [p for p in inspect.signature(func).parameters if p != "self"]
 
@@ -1566,6 +1676,9 @@ def build_specialize_context(
         scalar_dtypes=scalar_dtypes,
         dep_names=dep_names,
         py_globals=getattr(func, "__globals__", {}),
+        orig_file=orig_file,
+        orig_start_line=orig_start_line,
+        orig_col_offset=orig_col_offset,
     )
 
 
