@@ -83,6 +83,42 @@ def _generate_orch_result(program) -> "codegen.OrchestrationResult":
     raise ValueError("No orchestration function found in program")
 
 
+def _out_of_scope_tensor_refs(code: str) -> list[str]:
+    """Return tensor identifiers passed to ``add_input/output/inout/no_dep`` that
+    are not declared at the current or an enclosing C++ brace level.
+
+    A lightweight stand-in for ``g++`` that catches the
+    ``'<name>' was not declared in this scope`` class of orchestration codegen
+    bugs (issue #1697) without invoking a real C++ compiler: it walks brace
+    scopes, records the tensor identifiers declared in each, and flags any
+    ``add_*`` argument that references a name only visible in a sibling/closed
+    block.
+    """
+    decl_re = re.compile(r"\b(?:const\s+Tensor\s*&|Tensor|TaskOutputTensors|Arg)\s+(\w+)")
+    use_re = re.compile(r"\badd_(?:input|output|inout|no_dep)\(\s*(\w+)\s*\)")
+    scopes: list[set[str]] = [set()]
+    bad: list[str] = []
+    for raw in code.splitlines():
+        line = raw.strip()
+        # Declarations and add_* uses are each emitted on their own line (never
+        # sharing a line with a scope brace), so resolve them against the current
+        # scope set first.
+        for m in decl_re.finditer(line):
+            scopes[-1].add(m.group(1))
+        for m in use_re.finditer(line):
+            name = m.group(1)
+            if not any(name in s for s in scopes):
+                bad.append(name)
+        # Apply braces in source order so a ``} else {`` line closes the prior
+        # block then opens a fresh one (counting separately would mis-nest it).
+        for ch in line:
+            if ch == "{":
+                scopes.append(set())
+            elif ch == "}" and len(scopes) > 1:
+                scopes.pop()
+    return bad
+
+
 class TestOrchestration:
     """Test orchestration codegen format."""
 
@@ -816,14 +852,122 @@ class TestOrchestration:
         # inout_t is InOut (written in place) but not part of the return tuple.
         assert "params_t0.add_inout(ext_inout_t)" in code
 
-        # Each tuple result aliases to its OWN arg — not shifted onto inout_t.
-        assert "const Tensor& o1 = ext_ta;" in code
-        assert "const Tensor& o2 = ext_tb;" in code
-        assert "const Tensor& o3 = ext_tc;" in code
-        # The scrambled (shifted-by-one) bindings must NOT appear.
-        assert "const Tensor& o1 = ext_inout_t;" not in code
-        assert "const Tensor& o2 = ext_ta;" not in code
-        assert "const Tensor& o3 = ext_tb;" not in code
+        # Each tuple result is the in-place arg it writes, so it remaps to that
+        # arg (no per-output ``const Tensor&`` alias is minted). The consumer
+        # ``combine`` reads ta/tb/tc — each result mapped to its OWN arg, NOT
+        # shifted onto inout_t (issue #1573).
+        ia = code.index("params_t1.add_input(ext_ta)")
+        ib = code.index("params_t1.add_input(ext_tb)")
+        ic = code.index("params_t1.add_input(ext_tc)")
+        assert ia < ib < ic, code
+        # The scrambled (shifted-by-one) mapping must NOT appear: combine must
+        # not read inout_t, and no const-ref output alias is emitted.
+        assert "add_input(ext_inout_t)" not in code
+        assert all(f"const Tensor& o{i}" not in code for i in (1, 2, 3)), code
+
+    @staticmethod
+    def _manual_cross_scope_code(create_inside: bool) -> str:
+        """Orchestration code for a tensor written inside a ``pl.manual_scope``
+        and read by a task placed after it, with the ``pl.create_tensor`` placed
+        either before or inside the scope (issue #1697)."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class CrossScopeProgram:
+            @pl.function(type=pl.FunctionType.AIV)
+            def producer(
+                self,
+                x: pl.Tensor[[16, 256], pl.FP32],
+                buf: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+            ) -> pl.Tensor[[16, 256], pl.FP32]:
+                t: pl.Tile[[16, 256], pl.FP32] = pl.load(x, [0, 0], [16, 256])
+                out: pl.Tensor[[16, 256], pl.FP32] = pl.store(t, [0, 0], buf)
+                return out
+
+            @pl.function(type=pl.FunctionType.AIV)
+            def consumer(
+                self,
+                buf: pl.Tensor[[16, 256], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+            ) -> pl.Tensor[[16, 256], pl.FP32]:
+                t: pl.Tile[[16, 256], pl.FP32] = pl.load(buf, [0, 0], [16, 256])
+                r: pl.Tensor[[16, 256], pl.FP32] = pl.store(t, [0, 0], out)
+                return r
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main_before(
+                self,
+                x: pl.Tensor[[16, 256], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+            ) -> pl.Tensor[[16, 256], pl.FP32]:
+                buf: pl.Tensor[[16, 256], pl.FP32] = pl.create_tensor([16, 256], dtype=pl.FP32)
+                with pl.manual_scope():
+                    buf, _ptid = pl.submit(self.producer, x, buf)
+                out = self.consumer(buf, out)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main_inside(
+                self,
+                x: pl.Tensor[[16, 256], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+            ) -> pl.Tensor[[16, 256], pl.FP32]:
+                with pl.manual_scope():
+                    buf: pl.Tensor[[16, 256], pl.FP32] = pl.create_tensor([16, 256], dtype=pl.FP32)
+                    buf, _ptid = pl.submit(self.producer, x, buf)
+                out = self.consumer(buf, out)
+                return out
+
+        which = "main_inside" if create_inside else "main_before"
+        program = passes.materialize_runtime_scopes()(
+            passes.derive_call_directions()(
+                PassManager.get_strategy(OptimizationStrategy.Default).run_passes(CrossScopeProgram)
+            )
+        )
+        for func in program.functions.values():
+            if func.func_type == ir.FunctionType.Orchestration and func.name == which:
+                return codegen.generate_orchestration(program, func).code
+        raise AssertionError(f"orchestration function {which} not found")
+
+    @staticmethod
+    def _assert_cross_scope_resolves(code: str) -> None:
+        """A tensor written inside a manual_scope and read after it must resolve:
+        no add_* may name an out-of-scope identifier, the buffer is declared in
+        the enclosing scope, and the after-scope reader references it directly
+        (issue #1697 — remap to the canonical name, not a per-SSA alias)."""
+        assert _out_of_scope_tensor_refs(code) == [], code
+        manual_open = code.index("PTO2_SCOPE(PTO2ScopeMode::MANUAL)")
+        manual_close = code.index("}", manual_open)
+        # The buffer AND the alloc handle backing it are declared in the
+        # enclosing scope, ahead of the block — if only ``const Tensor& buf`` were
+        # hoisted while ``TaskOutputTensors alloc_0 = ...`` stayed inside, ``buf``
+        # would reference an out-of-scope handle and the .cpp would not compile.
+        assert code.index("TaskOutputTensors alloc_") < manual_open, code
+        assert code.index("alloc_tensors(") < manual_open, code
+        decl = code.index("const Tensor& buf = ")
+        assert decl < manual_open, code
+        # The after-scope consumer reads ``buf`` directly — no const-ref alias
+        # is minted for the producer's SSA output.
+        assert "add_input(buf)" in code[manual_close:], code
+        assert "const Tensor& buf__" not in code, code
+
+    def test_manual_scope_tensor_created_before_read_after(self):
+        """Regression for #1697: a tensor created BEFORE a ``pl.manual_scope``,
+        written by a submit inside it, and read by a task after it. The output
+        previously minted ``const Tensor& buf__ssa_v1 = buf;`` at the deep block
+        indent; the after-scope ``add_input(buf__ssa_v1)`` then named an
+        out-of-scope identifier and the orchestration ``.cpp`` failed to compile.
+        The output is now remapped to read ``buf`` directly."""
+        self._assert_cross_scope_resolves(self._manual_cross_scope_code(create_inside=False))
+
+    def test_manual_scope_tensor_created_inside_read_after(self):
+        """Companion to #1697: the same after-scope read when the
+        ``pl.create_tensor`` is INSIDE the manual scope. Its ``alloc_tensors``
+        declaration (a storage reservation with no scheduling dependency) is
+        hoisted to the enclosing scope, so the after-scope reader still resolves
+        ``buf``."""
+        self._assert_cross_scope_resolves(self._manual_cross_scope_code(create_inside=True))
 
     def test_tensor_create(self):
         """Test tensor.create generates TensorCreateInfo with shape/dtype."""
@@ -1829,7 +1973,11 @@ class TestOrchestration:
         # OutputExisting (→ add_output) rather than promoting to InOut.
         assert "params_t0.add_output(ret0__out)" in code
         assert "params_t1.add_output(ret0__out_1)" in code
-        assert "const Tensor& first = ret0__out;" in code
+        # ``first`` is kernel_add's in-place output buffer ret0__out, so it
+        # remaps to ret0__out (no ``const Tensor& first = ...`` alias is minted);
+        # the second call reads that buffer directly.
+        assert "params_t1.add_input(ret0__out)" in code
+        assert "const Tensor& first" not in code
         assert "const Tensor& second" not in code
 
     def test_unused_alias_not_emitted(self):
@@ -5144,8 +5292,14 @@ class TestTupleReturnNameHintCollision:
 
         input_a = ir.Var("input_a", tensor_type, span)
         input_b = ir.Var("input_b", tensor_type, span)
-        first_out = ir.Var("first_out", tensor_type, span)
-        second_out = ir.Var("second_out", tensor_type, span)
+        # Distinct Out tensors per call, so the two tuple results' element->call
+        # attachment is observable in the consumer's inputs under emit-name
+        # remap (the alias-decl form this test predates is no longer emitted).
+        out_a1 = ir.Var("out_a1", tensor_type, span)
+        out_a2 = ir.Var("out_a2", tensor_type, span)
+        out_b1 = ir.Var("out_b1", tensor_type, span)
+        out_b2 = ir.Var("out_b2", tensor_type, span)
+        final_out = ir.Var("final_out", tensor_type, span)
         kernel_a_input = ir.Var("input_a", tensor_type, span)
         kernel_a_first = ir.Var("first_out", tensor_type, span)
         kernel_a_second = ir.Var("second_out", tensor_type, span)
@@ -5212,7 +5366,7 @@ class TestTupleReturnNameHintCollision:
 
         call_a = ir.Call(
             ir.GlobalVar("kernel_a"),
-            [input_a, first_out, second_out],
+            [input_a, out_a1, out_a2],
             {},
             {
                 "arg_directions": [
@@ -5226,7 +5380,7 @@ class TestTupleReturnNameHintCollision:
         )
         call_b = ir.Call(
             ir.GlobalVar("kernel_b"),
-            [input_b, first_out, second_out],
+            [input_b, out_b1, out_b2],
             {},
             {
                 "arg_directions": [
@@ -5240,7 +5394,7 @@ class TestTupleReturnNameHintCollision:
         )
         call_consume = ir.Call(
             ir.GlobalVar("kernel_consume"),
-            [first_a, second_a, first_b, second_b, first_out],
+            [first_a, second_a, first_b, second_b, final_out],
             {},
             {
                 "arg_directions": [
@@ -5273,8 +5427,11 @@ class TestTupleReturnNameHintCollision:
             [
                 (input_a, ir.ParamDirection.In),
                 (input_b, ir.ParamDirection.In),
-                (first_out, ir.ParamDirection.Out),
-                (second_out, ir.ParamDirection.Out),
+                (out_a1, ir.ParamDirection.Out),
+                (out_a2, ir.ParamDirection.Out),
+                (out_b1, ir.ParamDirection.Out),
+                (out_b2, ir.ParamDirection.Out),
+                (final_out, ir.ParamDirection.Out),
             ],
             [tensor_type],
             orch_body,
@@ -5289,18 +5446,22 @@ class TestTupleReturnNameHintCollision:
 
         code = codegen.generate_orchestration(program, orch).code
 
-        assert "const Tensor& first_a = ext_first_out;" in code, code
-        assert "const Tensor& second_a = ext_second_out;" in code, code
-        assert "const Tensor& first_b = ext_first_out;" in code, code
-        assert "const Tensor& second_b = ext_second_out;" in code, code
-
-        task_0 = code.index("// Task 0: kernel_a")
-        task_1 = code.index("// Task 1: kernel_b")
-        task_2 = code.index("// Task 2: kernel_consume")
-        # With name_hint-keyed tuple metadata, first_a/second_a are attached
-        # to the second call because tmp_first and tmp_second share name_hint.
-        assert code.index("const Tensor& first_a", task_0) < task_1, code
-        assert task_1 < code.index("const Tensor& first_b", task_1) < task_2, code
+        # tmp_first and tmp_second share the name_hint "ret__tmp_v0"; the tuple
+        # metadata must still attach each call's elements to that call. Each
+        # element is the in-place Out arg of its call, so it remaps to that arg
+        # (no ``const Tensor& first_a = ...`` alias is minted). The consumer
+        # reading first_a/second_a/first_b/second_b therefore reads call_a's
+        # outs then call_b's outs, in order — not cross-contaminated.
+        i_a1 = code.index("// Task 2: kernel_consume")
+        consume = code[i_a1:]
+        a1 = consume.index("add_input(ext_out_a1)")
+        a2 = consume.index("add_input(ext_out_a2)")
+        b1 = consume.index("add_input(ext_out_b1)")
+        b2 = consume.index("add_input(ext_out_b2)")
+        assert a1 < a2 < b1 < b2, code
+        # No per-element const-ref alias survives the remap.
+        for name in ("first_a", "second_a", "first_b", "second_b"):
+            assert f"const Tensor& {name} " not in code, code
 
         declared_names = re.findall(
             r"^\s*(?:const\s+Tensor&|Tensor)\s+([A-Za-z_]\w*)\s*=",

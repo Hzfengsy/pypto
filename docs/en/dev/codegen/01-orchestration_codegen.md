@@ -164,24 +164,37 @@ scale_conv.u64 = orch_args.scalar(0);
 float scale = scale_conv.val;
 ```
 
-### Alias Generation
+### Output Aliasing (emit-name remap)
 
-When an InCore call returns a value with a different name than the `Out` argument, the codegen emits a C++ reference alias:
+A kernel/submit output is the in-place `Out`/`InOut` arg it writes — the *same
+physical tensor*. So when the result Var has a different name than that arg, the
+codegen does **not** mint a `const Tensor& result = ext_output;` rename; it
+remaps the result Var's emit name to the source, and every downstream reference
+resolves directly to the source name. (This is the same strategy
+`tensor.assemble` uses, applied uniformly.)
 
 ```python
 # Python IR
 result = self.kernel_add(a, b, output)  # result ≠ output
+consumer = self.kernel_use(result)
 ```
 
 ```cpp
-// Generated C++
+// Generated C++ — `result` is remapped to ext_output; the consumer reads it directly
 Arg params_t0;
 params_t0.add_output(ext_output);
 rt_submit_aiv_task(0, params_t0);
-const Tensor& result = ext_output;  // alias — result refers to ext_output
+
+Arg params_t1;
+params_t1.add_input(ext_output);  // `result` -> ext_output (no alias decl)
 ```
 
-If the return name matches the `Out`/`InOut` arg name, no alias is needed.
+Excluded from remap: a phi/loop-carry reassignment (it rebinds an lvalue the
+enclosing `if`/loop owns) keeps its `<name> = <src>;` form; and a tensor whose
+source is not valid in the reader's C++ scope (a manual-scope-local source —
+see *Cross-scope tensors and `manual_scope`* below) keeps the decl path. A
+runtime-allocated output bound to `task_<n>_outs.get_ref(k)` likewise keeps its
+`const Tensor&` binding.
 
 ### Core Type Inference
 
@@ -454,6 +467,35 @@ on entry and restores it on exit, so a binding produced inside a scope does not
 leak to an enclosing scope where its identifier would be out of C++ scope. Loop
 / branch carries are declared *before* their body's `PTO2_SCOPE`, so they
 correctly survive the block.
+
+**Cross-scope tensors and `manual_scope`.** A `manual_scope` is a *scheduling*
+region, not a storage/value scope: a tensor it touches flows transparently to
+tasks placed *after* the `PTO2_SCOPE(MANUAL) { ... }` block. So nothing an
+after-scope reader names may be a manual-scope-local C++ identifier — otherwise
+it dies at the closing brace and the reader's `add_input(...)` references an
+out-of-scope name (the `.cpp` then fails to C++-compile, issue #1697). Two
+mechanisms enforce this, both gated on whether a name is *enclosing-scope-valid*
+(reserved before the block, or a hoisted in-scope buffer — i.e. not scope-local):
+
+- **Output remap.** A caller-allocated kernel/submit output that aliases an
+  enclosing-scope source is *not* given its own `const Tensor&` decl — its emit
+  name is remapped to the source, so every reference (in-scope and after-scope)
+  resolves to the enclosing name directly. This is the strategy `tensor.assemble`
+  already uses, and since the output is the same physical tensor as its source
+  (an in-place write), a shared name is exactly correct. A phi/loop-carry
+  reassignment is excluded — it rebinds an lvalue the enclosing `if`/loop owns.
+
+- **Allocation hoisting.** A buffer *created* inside the block
+  (`pl.create_tensor` → `alloc_tensors`) is a storage reservation with no
+  scheduling dependency, so its declaration is hoisted to the enclosing scope.
+  Codegen buffers each `PTO2_SCOPE(MANUAL)` body and flushes the hoisted
+  `alloc_tensors` decls ahead of the block header. The batch is enclosing-scope-
+  valid by construction (a create whose shape references a scope-local value is
+  excluded and stays put).
+
+Together these make a tensor created before *or* inside the scope and read after
+it resolve to a single enclosing-scope `const Tensor& buf = ...;` — the
+after-scope task simply does `add_input(buf)`, with no per-SSA-version alias.
 
 ### Array carry for `pl.parallel` TaskId iter_args
 

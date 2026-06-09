@@ -163,24 +163,33 @@ scale_conv.u64 = orch_args.scalar(0);
 float scale = scale_conv.val;
 ```
 
-### 别名生成
+### 输出别名（emit 名重映射）
 
-当 InCore 调用的返回值名称与 `Out` 参数名称不同时，代码生成器会发出 C++ 引用别名：
+kernel/submit 的输出就是它原地写入的 `Out`/`InOut` 参数——即*同一物理张量*。因此当
+结果 Var 的名字与该参数不同时，代码生成器**不**再生成 `const Tensor& result =
+ext_output;` 这样的重命名，而是把结果 Var 的 emit 名重映射到源，下游所有引用都直接
+解析到源名。（这正是 `tensor.assemble` 采用的策略，现统一应用。）
 
 ```python
 # Python IR
 result = self.kernel_add(a, b, output)  # result ≠ output
+consumer = self.kernel_use(result)
 ```
 
 ```cpp
-// 生成的 C++
+// 生成的 C++ —— result 被重映射到 ext_output，消费者直接读取它
 Arg params_t0;
 params_t0.add_output(ext_output);
 rt_submit_aiv_task(0, params_t0);
-const Tensor& result = ext_output;  // 别名 — result 引用 ext_output
+
+Arg params_t1;
+params_t1.add_input(ext_output);  // result -> ext_output（无别名声明）
 ```
 
-如果返回名称与 `Out`/`InOut` 参数名称匹配，则不需要别名。
+不参与重映射的情形：phi/循环 carry 的重赋值（它重新绑定外层 `if`/循环所拥有的左值）
+保留 `<name> = <src>;` 形式；源在读取者的 C++ 作用域中无效的张量（manual scope 局部
+的源——见下文*跨作用域张量与 `manual_scope`*）保留声明路径；绑定到
+`task_<n>_outs.get_ref(k)` 的运行时分配输出同样保留其 `const Tensor&` 绑定。
 
 ### 核心类型推断
 
@@ -444,6 +453,29 @@ array-carry iter_arg 则按元素逐槽生成带守卫的填充。
 MANUAL）在进入时快照 `manual_task_id_map_`、退出时恢复，因此在某作用域内产生的
 绑定不会泄漏到外层作用域（否则其标识符会超出 C++ 作用域）。循环 / 分支的 carry
 在其 body 的 `PTO2_SCOPE` *之前*声明，因此能正确地在块结束后存活。
+
+**跨作用域张量与 `manual_scope`。** `manual_scope` 是一个*调度*区域，而非存储/取值
+作用域：它所触及的张量会透明地流向 `PTO2_SCOPE(MANUAL) { ... }` 块*之后*的 task。
+因此块后读取者所命名的任何标识符都不能是 manual scope 内的局部 C++ 标识符——否则它会
+在右花括号处失效，读取者的 `add_input(...)` 将引用一个超出作用域的名字（`.cpp` 随即
+无法通过 C++ 编译，issue #1697）。两种机制保证这一点，二者都以名字是否*在外层作用域
+有效*（在块之前保留，或为已提升的块内缓冲——即非作用域局部）为判据：
+
+- **输出重映射（remap）。** 一个由调用方分配、且别名为外层作用域源的 kernel/submit
+  输出，*不*单独生成 `const Tensor&` 声明——其 emit 名被重映射到源，于是所有引用
+  （块内与块后）都直接解析到外层名字。这正是 `tensor.assemble` 已采用的策略；由于该
+  输出与其源是同一物理张量（原地写），共享名字恰好正确。phi/循环 carry 的重赋值被排除
+  ——它重新绑定的是外层 `if`/循环所拥有的左值。
+
+- **分配提升（allocation hoisting）。** 在块*内部*创建的缓冲（`pl.create_tensor`
+  → `alloc_tensors`）只是存储预留、没有调度依赖，因此其声明被提升到外层作用域。codegen
+  会缓冲每个 `PTO2_SCOPE(MANUAL)` 块体，并把提升后的 `alloc_tensors` 声明刷写到块头
+  之前。该批次按构造即在外层作用域有效（形状引用了作用域局部值的 create 会被排除并保持
+  原位）。
+
+二者结合后，无论张量在块之前还是块内部创建、并在块后被读取，都会解析到外层作用域中唯一的
+`const Tensor& buf = ...;`——块后 task 只需 `add_input(buf)`，不再产生任何按 SSA 版本
+的别名。
 
 ### `pl.parallel` TaskId iter_arg 的 array carry
 
