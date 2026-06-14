@@ -189,6 +189,10 @@ class LowerPipelineMutator : public IRMutator {
 
     auto start_const = TryGetConstInt(op->start_);
     auto stop_const = TryGetConstInt(op->stop_);
+    // Cross-core loops are skewed/demoted to Sequential by the earlier
+    // SkewCrossCorePipeline pass, so by here only same-core pipeline loops
+    // (GM->L1, L1->L0, nested matmul stage loops) remain Pipeline-marked. They
+    // are replicated for ping-pong via the uniform unroll path below.
     if (start_const.has_value() && stop_const.has_value()) {
       return LowerStatic(op, inner_body, factor, *start_const, *stop_const, step);
     }

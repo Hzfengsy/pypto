@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
@@ -3334,6 +3335,7 @@ class OutWindowExternalizer {
       }
     }
 
+    if (!result.has_value()) return std::nullopt;
     auto allowed_params = CollectAllowedVars(func->params_);
     if (!ExprsReferenceOnlyVarsIn(result->window_shape, allowed_params) ||
         !ExprsReferenceOnlyVarsIn(result->callsite_offsets, allowed_params)) {

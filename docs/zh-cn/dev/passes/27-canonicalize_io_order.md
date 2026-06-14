@@ -1,6 +1,6 @@
 # CanonicalizeIOOrder Pass
 
-仅限于 **`ForKind::Pipeline` 循环体内部** 的 `SeqStmts`，沿**硬件单元阶段阶梯**重排语句 —— 受 SSA 依赖图约束 —— 使每个阶段在 `LowerPipelineLoops` 产生的各克隆间聚集。聚集让相邻迭代的 tile 同时活跃，正是 ping-pong（双缓冲）得以成立的前提。该阶梯既覆盖核内 MTE/计算阶段（标量 → load → compute → store），也覆盖跨核 AIC↔AIV 往返（跨核 push → pop → 消费侧计算），从而让融合的 cube/vector 流水线跨 `tpush`/`tpop` 边界软流水（issue #1610）。非流水线循环则保持不变。
+仅限于 **`ForKind::Pipeline` 循环体内部** 的 `SeqStmts`，沿**同核硬件单元阶段阶梯**（标量 → load → compute → store）重排语句 —— 受 SSA 依赖图约束 —— 使每个阶段在 `LowerPipelineLoops` 产生的各克隆间聚集。聚集让相邻迭代的 tile 同时活跃，正是 ping-pong（双缓冲）得以成立的前提。跨核（cube/vector）流水线由 [`SkewCrossCorePipeline`](25-skew_cross_core_pipeline.md) 在上游软流水，到达本 pass 时已是 `ForKind::Sequential`，故此处不含跨核处理。非流水线循环则保持不变。
 
 ## 概述
 
@@ -17,23 +17,9 @@
 
 上拉标量计算正是 load 聚集的关键：若不区分类别，每个克隆的地址运算 assign 会被归为普通 compute、按原始位置排序，从而在兄弟 load 之间穿插，把 load 钉在原始克隆里。把标量计算作为最高优先级类别后，所有兄弟克隆的地址运算先发射，所有依赖的 load 同时就绪，load 自然聚集。
 
-### 跨核流水（AIC↔AIV）
+### 跨核（AIC↔AIV）—— 由上游处理
 
-同样的聚集可推广到融合的 cube/vector kernel：其 `pl.pipeline` 循环已被 `ExpandMixedKernel` 拆为带跨核 `tpush`/`tpop` 搬移的逐引擎 AIC/AIV body。flash-attention 的一个 AIC 克隆是 `QK matmul → tpush_to_aiv → tpop_from_aiv → SV matmul`。为跨核 push/pop 设独立阶段，并区分生产者（`QK`）与消费者（`SV`）计算后，`F` 份克隆体从逐克隆串行
-
-```text
-QK0, tpush0, tpop0, SV0,   QK1, tpush1, tpop1, SV1
-```
-
-重排为按阶段聚集
-
-```text
-QK0, QK1,   tpush0, tpush1,   tpop0, tpop1,   SV0, SV1
-```
-
-于是 `raw_scores0`/`raw_scores1`（QK 与 tpush 之间）同时活跃 ⇒ 两块 score 缓冲；两个 pop 结果（tpop 与 SV 之间）同时活跃 ⇒ 两块结果缓冲 —— 两侧都能 ping-pong。
-
-**为何关键在于排序而非指令重叠。** 昇腾是事件/依赖驱动执行，而非按指令顺序：发射 `QK0 QK1 tpush0 tpush1` 会把四个任务一起下发，`tpush0` 在 `QK0` 完成后即可执行 —— 聚集*不会*延迟消费侧。重排的目的在于**绕过 `MemoryReuse`**。把同一阶段的生产者与消费者交错（`QK0, tpush0, QK1, tpush1`）会让 `raw_scores0` 在 `tpush0` 处死亡、早于 `raw_scores1` 在 `QK1` 处诞生；生命周期不重叠使 `MemoryReuse` 把二者合并为一块缓冲，进而注入一条*伪* WAR 依赖（`QK1` 必须等 `tpush0`），把流水线串行化。聚集保持生命周期重叠，迫使分配独立 MemRef。
+跨核（cube/vector）pipeline 循环由 [`SkewCrossCorePipeline`](25-skew_cross_core_pipeline.md) 软流水：它在 `LowerPipelineLoops` *之前*运行，把每个跨核循环改写为 `ForKind::Sequential`。因此它们永远不会以 `ForKind::Pipeline` body 进入本 pass，`CanonicalizeIOOrder` 也**不含任何跨核处理** —— 这里 `tpush`/`tpop` 只是普通 tile 计算，不会被重排进任何跨核阶段。本 pass 只对剩余的同核 pipeline 循环（GM→L1、L1→L0、嵌套 matmul）聚集**同核**阶段（标量 → load → compute → store）以实现 ping-pong。
 
 **前置条件**: SSAForm、SplitIncoreOrch、IncoreTileOps、TileOps2D、TileMemoryInferred、NormalizedStmtStructure。
 
@@ -58,26 +44,14 @@ result = passes.canonicalize_io_order()(program)
 | ---- | ------ | -------- | ---- |
 | `ScalarCompute` | 0（最先发射） | 标量 | LHS 为 `ScalarType` 的 `AssignStmt`（如 `off = i * 64`） |
 | `Load` | 1 | MTE 入口（GM→L1/L0） | `tile.load` / `tile.read` / L1→L0 的 `tile.extract` |
-| `TileCompute` | 2 | CUBE/Vec（生产者） | 跨核往返*之前*的计算（如 QK matmul 循环、tile.move） |
-| `CrossCorePush` | 3 | 跨核出口 | `EvalStmt(Call("tile.tpush_to_aiv" / "tile.tpush_to_aic", …))` |
-| `CrossCorePop` | 4 | 跨核入口 | `AssignStmt(_, Call("tile.tpop_from_aiv" / "tile.tpop_from_aic", …))` |
-| `ConsumerCompute` | 5 | CUBE/Vec（消费者） | 跨核 pop *下游*的计算（如 SV matmul 循环、`tfree`、`set_validshape`） |
-| `Store` | 6（最后发射） | MTE 出口（L1/L0→GM） | `tile.store` / `tile.write`（AssignStmt 或 EvalStmt） |
+| `TileCompute` | 2 | CUBE/Vec 计算 | 其余一切（matmul 循环、elementwise、`tile.move`、`tpush`/`tpop` —— 见下注） |
+| `Store` | 3（最后发射） | MTE 出口（L1/L0→GM） | `tile.store` / `tile.write`（AssignStmt 或 EvalStmt） |
 
 `tile.read` 虽然产出标量，但仍归为 `Load` —— 它是针对 tile 的 I/O，与 `tile.load` 同属 load 层。LHS 类型检查仅在 RHS 不是已识别的 I/O op 时生效。
 
-**生产者计算 vs 消费者计算。** `tpop` 没有 SSA 参数（它按 `id`/`split` 从 GM 环形缓冲弹出），故依赖图本身无法判断消费其结果的计算属于往返之后的阶段。本 Pass 沿 SSA 边正向传播“位于跨核 pop 下游”这一标记，并把此类 `TileCompute` 降为 `ConsumerCompute`。
+跨核 `tpush`/`tpop` 不带任何特殊类别 —— 它们落入 `TileCompute`，在兄弟语句间保持程序顺序（跨核软流水由上游的 [`SkewCrossCorePipeline`](25-skew_cross_core_pipeline.md) 完成；见上文「跨核（AIC↔AIV）」）。
 
-**仅供消费侧的 setup 算子。** 若某 *setup* 算子的使用者**全部**属于消费侧，同样降为 `ConsumerCompute`，使其紧挨消费者、而非被上拉进生产者簇——上拉会把其缓冲生命周期拉长到整个跨核往返，迫使 `MemoryReuse` 为每个克隆分配各自的缓冲：
-
-- `tile.create`（如夹在 `tpush` 与其 `tpop` 之间的 SV 累加器初始化）——上拉会加剧 L0C/Acc 压力。
-- 落入 L0（Left/Right）的 `tile.move`（如 SV matmul 的 V 操作数搬运）——上拉会把狭小的 L0 切分成每克隆独立的缓冲。下沉则让相邻克隆**共用一块 L0 缓冲**，以放弃一点消费侧 ping-pong（仅在 L0 尚有余量时才可实现）换取更小的 L0 占用——这是更合理的默认，因为通常是 L0 容量而非跨迭代重叠才是瓶颈。生产侧的 scores/result ping-pong（`raw_scores` 的 Acc tile 与 pop 出的 tile）不受影响——它们不是 setup 算子。
-
-**为何生产侧 `tpush` 不像 `Store` 那样下沉。** 二者都是出口，但*生产侧* `tpush`（C2V 的 scores 发送）必须在其生产者允许的最早时刻发射、好让对端核尽快开工；它排在生产者 `TileCompute` *之后*（使兄弟生产者先聚集）、却在 pop *之前* —— 不像 GM store 那样被推到最底部。
-
-**消费侧 `tpush`。** 若某 `tpush` 本身位于跨核 pop 下游（AIV 在 softmax 之后回送结果的 V2C 发送），则*不*上拉到 `CrossCorePush`，而是降为 `ConsumerCompute`、留在其所属阶段。把这种发送上拉到兄弟消费侧计算（如尾随的 `row_sum`）之前，会缩短被发送 tile 的生命周期，使后续分配在异步跨核传输仍在读取该缓冲时就复用它——这一隐患会在更严格的运行时上卡住 AICPU stream sync（#1610）。
-
-每一步在 `ready`（所有前驱已发射）的语句中，发射 `(category, original_index)` 最小者。Store 因 `Store` 是最大类别而自然排在最后 —— 只有当没有其他可发射时才会被选中。（下方示例不含跨核 op，故只有 scalar/load/compute/store 阶段参与；跨核 tpush/tpop 示例见上文「跨核流水」。）
+每一步在 `ready`（所有前驱已发射）的语句中，发射 `(category, original_index)` 最小者。Store 因 `Store` 是最大类别而自然排在最后 —— 只有当没有其他可发射时才会被选中。
 
 示例 —— 输入 `[scalar_0, load_0, compute_0, store_0, scalar_1, load_1, compute_1, store_1]`，每个克隆的 load 读其 scalar、每个 compute 读其 load、每个 store 读其 scalar 与 compute：
 
@@ -151,7 +125,7 @@ for i in pl.range(0, 8, 4):
 
 ## 相关
 
-- [`LowerPipelineLoops`](25-lower_pipeline_loops.md) —— 上游复制区域生成者；保留 `ForKind::Pipeline` 标记供本 Pass 识别
-- [`MaterializeTensorStrides`](27-materialize_tensor_strides.md) —— 接入默认流水线后紧随本 Pass 运行；在 `InitMemRef` 消费前补全隐式 `TensorView` stride
-- [`MemoryReuse`](29-memory_reuse.md) —— 在本 Pass 之后运行；受益于复制区域中同时活跃的 tile
+- [`LowerPipelineLoops`](26-lower_pipeline_loops.md) —— 上游复制区域生成者；保留 `ForKind::Pipeline` 标记供本 Pass 识别
+- [`MaterializeTensorStrides`](28-materialize_tensor_strides.md) —— 接入默认流水线后紧随本 Pass 运行；在 `InitMemRef` 消费前补全隐式 `TensorView` stride
+- [`MemoryReuse`](30-memory_reuse.md) —— 在本 Pass 之后运行；受益于复制区域中同时活跃的 tile
 - RFC #1026 / PR #1029 —— InOut-use 规约 + 依赖分析工具

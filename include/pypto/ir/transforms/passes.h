@@ -259,6 +259,28 @@ Pass MaterializeCommDomainScopes();
 Pass UnrollLoops();
 
 /**
+ * @brief Skew cross-core (cube/vector) ``pl.pipeline`` loops; runs immediately
+ *        before ``LowerPipelineLoops``.
+ *
+ * For a mixed-core pipeline loop whose body has both a cross-core ``tile.tpush_*``
+ * and ``tile.tpop_*`` (``F > 1``), rewrites it to overlap the two cores:
+ *   - Single round-trip, producer role (one tpush + one tpop, the tpush's
+ *     backward slice does not feed the body via SSA): run the producer one
+ *     iteration ahead — produce(start) prologue, a ``ForKind::Sequential`` steady
+ *     loop pairing produce(k+step) with consume(k), and a consume(last) epilogue.
+ *   - Consumer role or multi-round-trip: demote to a plain ``ForKind::Sequential``
+ *     loop (order-preserving; cross-core overlap comes from the peer's producer
+ *     skew). Demotion avoids reordering the in-order cross-core FIFO.
+ *
+ * The output carries no ``pipeline_stages`` marker and ``ForKind::Sequential``, so
+ * the downstream ``LowerPipelineLoops`` skips it and ``CanonicalizeIOOrder`` does
+ * not re-sort the hand-ordered skew. Every NON-cross-core pipeline loop (same-core
+ * GM->L1 / L1->L0 / nested matmul stage loops) is left intact for
+ * ``LowerPipelineLoops`` to replicate.
+ */
+Pass SkewCrossCorePipeline();
+
+/**
  * @brief Lower ``pl.pipeline(N, stage=F)`` loops at the tile level
  *
  * Triggers on ``ForStmt`` nodes with ``kind_ == ForKind::Pipeline`` and

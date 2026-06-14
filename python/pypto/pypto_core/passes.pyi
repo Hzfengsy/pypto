@@ -370,6 +370,21 @@ def interchange_chunk_loops() -> Pass:
 def unroll_loops() -> Pass:
     """Create a loop unrolling pass that expands ForKind.Unroll loops at compile time."""
 
+def skew_cross_core_pipeline() -> Pass:
+    """Create the cross-core pipeline skew pass; runs immediately before ``lower_pipeline_loops``.
+
+    For a mixed cube/vector ``pl.pipeline`` loop (``F > 1``) whose body has both a
+    cross-core ``tile.tpush_*`` and ``tile.tpop_*``: a single-round-trip producer-role
+    loop runs the producer one iteration ahead (produce(start) prologue + a
+    ``ForKind.Sequential`` steady loop pairing produce(k+step)/consume(k) +
+    consume(last) epilogue); a consumer-role or multi-round-trip loop demotes to a
+    plain ``ForKind.Sequential`` loop (order-preserving — cross-core overlap comes
+    from the peer's producer skew). The output is Sequential with no
+    ``pipeline_stages`` marker, so ``lower_pipeline_loops`` and ``canonicalize_io_order``
+    leave it untouched. Non-cross-core pipeline loops are left intact for
+    ``lower_pipeline_loops``.
+    """
+
 def lower_pipeline_loops() -> Pass:
     """Create a tile-level lowering pass for ``pl.pipeline(N, stage=F)`` loops.
 
@@ -794,6 +809,7 @@ __all__ = [
     "create_function_pass",
     "create_program_pass",
     "stmt_dependency_analysis",
+    "skew_cross_core_pipeline",
     "lower_pipeline_loops",
     "canonicalize_io_order",
 ]

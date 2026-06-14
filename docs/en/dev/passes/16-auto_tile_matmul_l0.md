@@ -4,7 +4,7 @@ L0 tiling for `tile.matmul` / `tile.matmul_acc` ops with a Mat right operand (an
 
 ## Overview
 
-Mat-resident matmuls produced upstream by `ConvertTensorToTileOps` + [`FlattenTileNdTo2D`](15-flatten_tile_nd_to_2d.md) carry full `(M, N, K)` operand shapes — almost always larger than the cube unit's L0a/L0b/L0c capacity. This pass picks an L0-fitting `(m, n, k)` and rewrites the matmul into a K-loop whose body extracts `[m, k]` and `[k, n]` slabs into `Left` / `Right` and accumulates into an `Acc`-resident iter-arg. The loop is marked `ForKind::Pipeline` with `pipeline_stages=2` so the downstream [`LowerPipelineLoops`](25-lower_pipeline_loops.md) pass produces a 2-deep ping-pong on the per-iter operand extracts.
+Mat-resident matmuls produced upstream by `ConvertTensorToTileOps` + [`FlattenTileNdTo2D`](15-flatten_tile_nd_to_2d.md) carry full `(M, N, K)` operand shapes — almost always larger than the cube unit's L0a/L0b/L0c capacity. This pass picks an L0-fitting `(m, n, k)` and rewrites the matmul into a K-loop whose body extracts `[m, k]` and `[k, n]` slabs into `Left` / `Right` and accumulates into an `Acc`-resident iter-arg. The loop is marked `ForKind::Pipeline` with `pipeline_stages=2` so the downstream [`LowerPipelineLoops`](26-lower_pipeline_loops.md) pass produces a 2-deep ping-pong on the per-iter operand extracts.
 
 **Pipeline position**: After [`FlattenTileNdTo2D`](15-flatten_tile_nd_to_2d.md), before [`InferTileMemorySpace`](18-infer_tile_memory_space.md). All tile ops are already 2D and memory spaces have not yet been inferred.
 
@@ -167,4 +167,4 @@ The pass emits `PerfHint` diagnostics rather than failing when it declines to re
 
 - [`FlattenTileNdTo2D`](15-flatten_tile_nd_to_2d.md) — upstream pass; produces the static-2D Mat-resident tile shapes this pass consumes
 - [`InferTileMemorySpace`](18-infer_tile_memory_space.md) — downstream pass; bridges Vec/Acc accumulators that this pass deliberately leaves alone
-- [`LowerPipelineLoops`](25-lower_pipeline_loops.md) — consumes the `ForKind::Pipeline` + `pipeline_stages=2` produced here
+- [`LowerPipelineLoops`](26-lower_pipeline_loops.md) — consumes the `ForKind::Pipeline` + `pipeline_stages=2` produced here

@@ -34,13 +34,13 @@
 #include "pypto/ir/memref.h"
 #include "pypto/ir/program.h"
 #include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/tensor_view_semantics.h"
-#include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
 
 namespace pypto {
@@ -318,7 +318,7 @@ bool AutoDepsLoopCarryDebugEnabled() {
 
 void DebugLog(const std::string& message) {
   if (!AutoDepsLoopCarryDebugEnabled()) return;
-  std::cerr << "[auto-deps-loop-debug] " << message << std::endl;
+  std::cerr << "[auto-deps-loop-debug] " << message << '\n';
 }
 
 std::string DebugVar(const VarPtr& var) {
@@ -471,7 +471,7 @@ class StorageRootAnalysis : public IRVisitor {
       if (ExceedsRootAlternativeLimit(merged)) {
         RegisterUnsupportedLocation(op->return_vars_[i]);
       } else {
-        RegisterVarLocation(op->return_vars_[i], std::move(merged));
+        RegisterVarLocation(op->return_vars_[i], merged);
       }
     }
   }
@@ -479,11 +479,11 @@ class StorageRootAnalysis : public IRVisitor {
   void VisitStmt_(const ForStmtPtr& op) override {
     std::vector<StorageLocation> init_locations;
     init_locations.reserve(op->iter_args_.size());
-    for (size_t i = 0; i < op->iter_args_.size(); ++i) {
-      auto location = ResolveExpr(op->iter_args_[i]->initValue_);
+    for (const auto& iter_arg : op->iter_args_) {
+      auto location = ResolveExpr(iter_arg->initValue_);
       init_locations.push_back(location);
       if (HasLocation(location)) {
-        RegisterVarLocation(op->iter_args_[i], std::move(location));
+        RegisterVarLocation(iter_arg, location);
       }
     }
     IRVisitor::VisitStmt_(op);
@@ -503,7 +503,7 @@ class StorageRootAnalysis : public IRVisitor {
       if (ExceedsRootAlternativeLimit(location)) {
         RegisterUnsupportedLocation(op->return_vars_[i]);
       } else if (HasLocation(location)) {
-        RegisterVarLocation(op->return_vars_[i], std::move(location));
+        RegisterVarLocation(op->return_vars_[i], location);
       }
     }
   }
@@ -511,11 +511,11 @@ class StorageRootAnalysis : public IRVisitor {
   void VisitStmt_(const WhileStmtPtr& op) override {
     std::vector<StorageLocation> init_locations;
     init_locations.reserve(op->iter_args_.size());
-    for (size_t i = 0; i < op->iter_args_.size(); ++i) {
-      auto location = ResolveExpr(op->iter_args_[i]->initValue_);
+    for (const auto& iter_arg : op->iter_args_) {
+      auto location = ResolveExpr(iter_arg->initValue_);
       init_locations.push_back(location);
       if (HasLocation(location)) {
-        RegisterVarLocation(op->iter_args_[i], std::move(location));
+        RegisterVarLocation(iter_arg, location);
       }
     }
     IRVisitor::VisitStmt_(op);
@@ -535,7 +535,7 @@ class StorageRootAnalysis : public IRVisitor {
       if (ExceedsRootAlternativeLimit(location)) {
         RegisterUnsupportedLocation(op->return_vars_[i]);
       } else if (HasLocation(location)) {
-        RegisterVarLocation(op->return_vars_[i], std::move(location));
+        RegisterVarLocation(op->return_vars_[i], location);
       }
     }
   }
@@ -636,7 +636,7 @@ class StorageRootAnalysis : public IRVisitor {
     return shaped->memref_.value();
   }
 
-  void RegisterVarLocation(const VarPtr& var, StorageLocation location) {
+  void RegisterVarLocation(const VarPtr& var, const StorageLocation& location) {
     if (!var || !HasLocation(location)) return;
     if (ExceedsRootAlternativeLimit(location)) {
       RegisterUnsupportedLocation(var);

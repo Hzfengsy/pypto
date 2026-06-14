@@ -46,6 +46,7 @@
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
+#include "pypto/ir/kind_traits.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/program.h"
 #include "pypto/ir/scalar_expr.h"
@@ -496,7 +497,7 @@ void InjectGMSlotBufferInPlace(std::vector<FunctionPtr>& functions) {
     if (func->func_type_ != FunctionType::Orchestration) continue;
     if (!func->body_) continue;
 
-    std::unordered_set<std::string> mod_callees = needs_gm_param;
+    const std::unordered_set<std::string>& mod_callees = needs_gm_param;
     if (mod_callees.empty()) continue;
 
     int counter = 0;

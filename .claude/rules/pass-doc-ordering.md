@@ -37,20 +37,21 @@ Developers read pass docs sequentially to understand the compilation pipeline. I
 | 22 | `22-inject_gm_pipe_buffer.md` | Runs immediately after `ExpandMixedKernel` (backend-gated, Ascend910B) |
 | 23 | `23-split_vector_kernel.md` | 23rd pass |
 | 24 | `24-normalize_return_order.md` | 24th pass |
-| 25 | `25-lower_pipeline_loops.md` | 25th pass |
-| 26 | `26-canonicalize_io_order.md` | 26th pass |
-| 27 | `27-materialize_tensor_strides.md` | 27th pass (RFC #1300 P3 — wired into Default starting from P6) |
-| 28 | `28-init_memref.md` | 28th pass |
-| 29 | `29-memory_reuse.md` | 29th pass |
-| 30 | `30-legalize_pto_buffer_reuse.md` | 30th pass |
-| 31 | `31-allocate_memory_addr.md` | 31st pass |
-| 32 | `32-fold_no_op_reshape.md` | 32nd pass |
-| 33 | `33-fuse_create_assemble_to_slice.md` | 33rd pass |
-| 34 | `34-derive_call_directions.md` | 34th pass (two-phase: arg directions + manual-scope lowering) |
-| 35 | `35-auto_derive_task_dependencies.md` | 35th pass (default MANUAL-scope compiler deps; opt-in AUTO-scope analysis/emission via compile-time switch) |
-| 36 | `36-expand_manual_phase_fence.md` | 36th pass (manual-scope phase-fence TaskId dep compression; runs after AutoDeriveTaskDependencies) |
-| 37 | `37-materialize_comm_domain_scopes.md` | 37th pass (distributed: WindowBuffer + CommDomainScopeStmt wrappers in each host_orch body; runs immediately before the final Simplify) |
-| 38 | `38-materialize_runtime_scopes.md` | Last pass (after the final Simplify; inserts AUTO RuntimeScopeStmt so orchestration codegen emits PTO2_SCOPE 1:1) |
+| 25 | `25-skew_cross_core_pipeline.md` | 25th pass (cross-core cube/vector software-pipeline skew; runs immediately before LowerPipelineLoops) |
+| 26 | `26-lower_pipeline_loops.md` | 26th pass |
+| 27 | `27-canonicalize_io_order.md` | 27th pass |
+| 28 | `28-materialize_tensor_strides.md` | 28th pass (RFC #1300 P3 — wired into Default starting from P6) |
+| 29 | `29-init_memref.md` | 29th pass |
+| 30 | `30-memory_reuse.md` | 30th pass |
+| 31 | `31-legalize_pto_buffer_reuse.md` | 31st pass |
+| 32 | `32-allocate_memory_addr.md` | 32nd pass |
+| 33 | `33-fold_no_op_reshape.md` | 33rd pass |
+| 34 | `34-fuse_create_assemble_to_slice.md` | 34th pass |
+| 35 | `35-derive_call_directions.md` | 35th pass (two-phase: arg directions + manual-scope lowering) |
+| 36 | `36-auto_derive_task_dependencies.md` | 36th pass (default MANUAL-scope compiler deps; opt-in AUTO-scope analysis/emission via compile-time switch) |
+| 37 | `37-expand_manual_phase_fence.md` | 37th pass (manual-scope phase-fence TaskId dep compression; runs after AutoDeriveTaskDependencies) |
+| 38 | `38-materialize_comm_domain_scopes.md` | 38th pass (distributed: WindowBuffer + CommDomainScopeStmt wrappers in each host_orch body; runs immediately before the final Simplify) |
+| 39 | `39-materialize_runtime_scopes.md` | Last pass (after the final Simplify; inserts AUTO RuntimeScopeStmt so orchestration codegen emits PTO2_SCOPE 1:1) |
 | 91 | `91-utility_passes.md` | Not in Default strategy |
 | 99 | `99-verifier.md` | Infrastructure (not a pipeline pass) |
 

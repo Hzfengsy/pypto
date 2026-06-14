@@ -384,6 +384,13 @@ void BindPass(nb::module_& m) {
   passes.def("interchange_chunk_loops", &pass::InterchangeChunkLoops,
              "Create a pass that interchanges chunk loops and inserts InCore scopes");
   passes.def("unroll_loops", &pass::UnrollLoops, "Create a loop unrolling pass");
+  passes.def("skew_cross_core_pipeline", &pass::SkewCrossCorePipeline,
+             "Skew cross-core (cube/vector) ``pl.pipeline`` loops; runs immediately before\n"
+             "lower_pipeline_loops. A single-round-trip producer-role loop runs the producer\n"
+             "one iteration ahead (prologue + Sequential steady loop + epilogue); a consumer-role\n"
+             "or multi-round-trip loop demotes to a plain Sequential loop (order-preserving).\n"
+             "Output is Sequential with no pipeline marker, so lower_pipeline_loops and\n"
+             "canonicalize_io_order leave it alone. Non-cross-core loops are untouched.");
   passes.def("lower_pipeline_loops", &pass::LowerPipelineLoops,
              "Lower ``pl.pipeline(N, stage=F)`` loops at the tile level (triggers on F > 1):\n"
              "replicate the body F times per outer iteration with a bare-SeqStmts remainder\n"

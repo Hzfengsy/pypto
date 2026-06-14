@@ -1,6 +1,6 @@
 # CanonicalizeIOOrder Pass
 
-Scoped to `SeqStmts` **inside a `ForKind::Pipeline` body**, reorders statements along a **hardware-unit stage ladder** — subject to the SSA dependency graph — so that each stage clusters across the replicated clones produced by `LowerPipelineLoops`. Clustering keeps sibling-iteration tiles co-live, which is what enables ping-pong (double-buffering). The ladder covers the intra-core MTE/compute stages (scalar → load → compute → store) **and** the cross-core AIC↔AIV round-trip (cross-core push → pop → consumer compute), so fused cube/vector pipelines software-pipeline across the `tpush`/`tpop` boundary (issue #1610). Loops that are not pipelined are left untouched.
+Scoped to `SeqStmts` **inside a `ForKind::Pipeline` body**, reorders statements along a **same-core hardware-unit stage ladder** (scalar → load → compute → store) — subject to the SSA dependency graph — so that each stage clusters across the replicated clones produced by `LowerPipelineLoops`. Clustering keeps sibling-iteration tiles co-live, which is what enables ping-pong (double-buffering). Cross-core (cube/vector) pipelines are software-pipelined upstream by [`SkewCrossCorePipeline`](25-skew_cross_core_pipeline.md) and reach this pass as `ForKind::Sequential`, so there is no cross-core handling here. Loops that are not pipelined are left untouched.
 
 ## Overview
 
@@ -17,23 +17,9 @@ The result is `[scalars…, loads…, tile compute…, stores…]` whenever the 
 
 Lifting scalar compute is what unlocks the load cluster: without it, each clone's address-arithmetic assign would be classified as ordinary compute and rank by original position — interleaving between sibling loads and pinning them in their original groups. With scalar compute as the highest-priority category, all sibling clones' address arithmetic emits first, all dependent loads become ready together, and the loads naturally cluster.
 
-### Cross-core pipelining (AIC↔AIV)
+### Cross-core (AIC↔AIV) — handled upstream
 
-The same clustering generalizes to a fused cube/vector kernel, whose `pl.pipeline` loop `ExpandMixedKernel` has split into a per-engine AIC/AIV body with cross-core `tpush`/`tpop` moves. A flash-attention AIC clone is `QK matmul → tpush_to_aiv → tpop_from_aiv → SV matmul`. Giving the cross-core push/pop their own stages and separating producer (`QK`) from consumer (`SV`) compute regroups the `F`-clone body from the per-clone-serial
-
-```text
-QK0, tpush0, tpop0, SV0,   QK1, tpush1, tpop1, SV1
-```
-
-into stage-clustered
-
-```text
-QK0, QK1,   tpush0, tpush1,   tpop0, tpop1,   SV0, SV1
-```
-
-so `raw_scores0`/`raw_scores1` (between QK and tpush) stay co-live ⇒ two score buffers, and the two popped results (between tpop and SV) stay co-live ⇒ two result buffers — ping-pong on both.
-
-**Why ordering, not instruction overlap, is the lever.** Ascend executes event/dependency-driven, not in instruction order: emitting `QK0 QK1 tpush0 tpush1` issues all four tasks, and `tpush0` runs as soon as `QK0` finishes — clustering does *not* delay the consumer. The reorder's purpose is to **bypass `MemoryReuse`**. Interleaving a stage's producer and consumer (`QK0, tpush0, QK1, tpush1`) makes `raw_scores0` die at `tpush0` before `raw_scores1` is born at `QK1`; the disjoint live ranges let `MemoryReuse` coalesce them into one buffer, which injects a *false* WAR dependency (`QK1` must wait for `tpush0`) that serializes the pipeline. Clustering keeps the live ranges overlapping, forcing distinct MemRefs.
+Cross-core (cube/vector) pipeline loops are software-pipelined by [`SkewCrossCorePipeline`](25-skew_cross_core_pipeline.md), which runs *before* `LowerPipelineLoops` and rewrites every cross-core loop to `ForKind::Sequential`. They therefore never reach this pass as a `ForKind::Pipeline` body, and `CanonicalizeIOOrder` has **no cross-core handling** — `tpush`/`tpop` are ordinary tile compute here, not reordered into any cross-core tier. This pass only clusters the **same-core** stages (scalar → load → compute → store) of the remaining same-core pipeline loops (GM→L1, L1→L0, nested matmul) for ping-pong.
 
 **Requires**: SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure.
 
@@ -58,26 +44,14 @@ A priority-aware stable topological sort applied to every `SeqStmts` of two or m
 | -------- | -------- | ------------- | -------- |
 | `ScalarCompute` | 0 (emit first) | scalar | `AssignStmt` whose LHS is a `ScalarType` (e.g. `off = i * 64`) |
 | `Load` | 1 | MTE ingress (GM→L1/L0) | `AssignStmt(_, Call("tile.load", …))` / `tile.read` / L1→L0 `tile.extract` |
-| `TileCompute` | 2 | CUBE/Vec (producer) | Compute *before* a cross-core round-trip (e.g. the QK matmul loop, tile.move) |
-| `CrossCorePush` | 3 | cross-core egress | `EvalStmt(Call("tile.tpush_to_aiv" / "tile.tpush_to_aic", …))` |
-| `CrossCorePop` | 4 | cross-core ingress | `AssignStmt(_, Call("tile.tpop_from_aiv" / "tile.tpop_from_aic", …))` |
-| `ConsumerCompute` | 5 | CUBE/Vec (consumer) | Compute *downstream of* a cross-core pop (e.g. the SV matmul loop, `tfree`, `set_validshape`) |
-| `Store` | 6 (emit last) | MTE egress (L1/L0→GM) | `tile.store` / `tile.write` (AssignStmt or EvalStmt) |
+| `TileCompute` | 2 | CUBE/Vec compute | Everything else (matmul loops, elementwise, `tile.move`, `tpush`/`tpop` — see note) |
+| `Store` | 3 (emit last) | MTE egress (L1/L0→GM) | `tile.store` / `tile.write` (AssignStmt or EvalStmt) |
 
 `tile.read` is classified as `Load` even though it produces a scalar — it's I/O against a tile and belongs in the load tier alongside `tile.load`. The LHS-type check only applies once the RHS is determined not to be a recognized I/O op.
 
-**Producer vs consumer compute.** `tpop` has no SSA argument (it pops the GM ring buffer keyed by `id`/`split`), so the dependency graph alone cannot tell that the compute consuming its result belongs to the post-round-trip stage. The pass propagates a "downstream of a cross-core pop" bit forward over the SSA edges and demotes such `TileCompute` to `ConsumerCompute`.
+Cross-core `tpush`/`tpop` carry no special category — they fall through to `TileCompute` and keep their program order among siblings (cross-core software-pipelining is done upstream by [`SkewCrossCorePipeline`](25-skew_cross_core_pipeline.md); see *Cross-core (AIC↔AIV)* above).
 
-**Consumer-only setup ops.** A *setup* op whose uses are **all** consumer-stage is also demoted to `ConsumerCompute` so it sits next to its consumer rather than being hoisted into the producer cluster — hoisting would stretch its buffer's live-range across the whole cross-core round-trip, forcing `MemoryReuse` to give each clone its own buffer:
-
-- A `tile.create` (e.g. the SV-accumulator init between a `tpush` and its `tpop`) — hoisting inflates L0C/Acc pressure.
-- A `tile.move` into L0 (Left/Right) (e.g. the V operand prep for the SV matmul) — hoisting partitions the tiny L0 space into a distinct per-clone buffer. Deferring lets sibling clones **share one L0 buffer**, trading a marginal consumer-side ping-pong (only realizable when L0 has spare capacity) for a smaller L0 footprint — the right default since L0 capacity, not cross-iteration overlap, is usually the binding constraint. The producer-side scores/result ping-pong (the `raw_scores` Acc tiles and the popped tiles) is unaffected — those are not setup ops.
-
-**Why a producer-phase `tpush` is not sunk like `Store`.** Both are egress, but a *producer-phase* `tpush` (the C2V scores send) must fire as early as its producer allows so the peer core can start; it ranks *after* producer `TileCompute` (so sibling producers cluster first) but *before* the pops — it is not deferred to the bottom like a GM store.
-
-**Consumer-phase `tpush`.** A `tpush` that is itself downstream of a cross-core pop (the AIV's V2C result send, after the softmax) is *not* hoisted to `CrossCorePush` — it is demoted to `ConsumerCompute` so it stays with its phase. Hoisting such a push ahead of sibling consumer compute (e.g. a trailing `row_sum`) shortens the pushed tile's live-range, letting a later allocation reuse its buffer while the asynchronous cross-core transfer is still reading it — a hazard that stalls the AICPU stream sync on stricter runtimes (#1610).
-
-At each step, among statements whose predecessors are all already emitted (`ready`), the pass emits the one with the smallest `(category, original_index)`. Stores naturally sort last because `Store` is the largest category — they are only emitted once nothing else is ready. (The worked example below has no cross-core ops, so only the scalar/load/compute/store tiers participate; see *Cross-core pipelining* above for a tpush/tpop example.)
+At each step, among statements whose predecessors are all already emitted (`ready`), the pass emits the one with the smallest `(category, original_index)`. Stores naturally sort last because `Store` is the largest category — they are only emitted once nothing else is ready.
 
 Worked example — input `[scalar_0, load_0, compute_0, store_0, scalar_1, load_1, compute_1, store_1]` with each clone's load reading its scalar, each compute reading its load, each store reading both its scalar and compute:
 
@@ -151,7 +125,7 @@ All four `off_k` lift first to unblock the loads. All four `tile_x_k` are now co
 
 ## Related
 
-- [`LowerPipelineLoops`](25-lower_pipeline_loops.md) — upstream producer of replicated regions that benefit from this pass; leaves `ForKind::Pipeline` as the scope marker this pass consumes
-- [`MaterializeTensorStrides`](27-materialize_tensor_strides.md) — runs immediately after this pass (when inserted into the default pipeline); fills implicit `TensorView` strides before `InitMemRef` consumes them
-- [`MemoryReuse`](29-memory_reuse.md) — runs after this pass; benefits from the co-live tiles in replicated regions
+- [`LowerPipelineLoops`](26-lower_pipeline_loops.md) — upstream producer of replicated regions that benefit from this pass; leaves `ForKind::Pipeline` as the scope marker this pass consumes
+- [`MaterializeTensorStrides`](28-materialize_tensor_strides.md) — runs immediately after this pass (when inserted into the default pipeline); fills implicit `TensorView` strides before `InitMemRef` consumes them
+- [`MemoryReuse`](30-memory_reuse.md) — runs after this pass; benefits from the co-live tiles in replicated regions
 - RFC #1026 / PR #1029 — InOut-use discipline + dependency analysis utility

@@ -152,6 +152,7 @@ class PassManager:
             ("InjectGMPipeBuffer", lambda: passes.inject_gm_pipe_buffer()),
             ("SplitVectorKernel", lambda: passes.split_vector_kernel()),
             ("NormalizeReturnOrder", lambda: passes.normalize_return_order()),
+            ("SkewCrossCorePipeline", lambda: passes.skew_cross_core_pipeline()),
             ("LowerPipelineLoops", lambda: passes.lower_pipeline_loops()),
             ("CanonicalizeIOOrder", lambda: passes.canonicalize_io_order()),
             # MaterializeTensorStrides fills empty stride slots on every

@@ -237,6 +237,16 @@ inline const PassProperties kNormalizeReturnOrderProperties{
 
 // -- Pipeline lowering + IO-order canonicalization passes (tile-level, before InitMemRef) ------
 
+// SkewCrossCorePipeline runs immediately before LowerPipelineLoops and rewrites
+// cross-core (cube/vector) pipeline loops into prologue/steady/epilogue skew or a
+// Sequential demotion; same tile-level property set as the unroll pass
+// (structural rewrite, no property added or removed).
+inline const PassProperties kSkewCrossCorePipelineProperties{
+    .required = {IRProperty::SSAForm, IRProperty::SplitIncoreOrch, IRProperty::IncoreTileOps,
+                 IRProperty::TileOps2D, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure},
+    .produced = {IRProperty::SSAForm, IRProperty::SplitIncoreOrch, IRProperty::IncoreTileOps,
+                 IRProperty::TileOps2D, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure}};
+
 inline const PassProperties kLowerPipelineLoopsProperties{
     .required = {IRProperty::SSAForm, IRProperty::SplitIncoreOrch, IRProperty::IncoreTileOps,
                  IRProperty::TileOps2D, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure},

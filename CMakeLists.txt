@@ -187,6 +187,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/split_chunked_loops_pass.cpp
     src/ir/transforms/interchange_chunk_loops_pass.cpp
     src/ir/transforms/unroll_loops_pass.cpp
+    src/ir/transforms/skew_cross_core_pipeline_pass.cpp
     src/ir/transforms/lower_pipeline_loops_pass.cpp
     src/ir/transforms/canonicalize_io_order_pass.cpp
     src/ir/transforms/structural_equal.cpp
