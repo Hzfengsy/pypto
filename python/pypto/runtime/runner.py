@@ -159,6 +159,21 @@ class RunConfig:
             counts.
         aicpu_thread_num: Optional per-invocation override of the AICPU
             thread count. Same precedence rules as ``block_dim``.
+        ring_task_window: Optional per-invocation override of the runtime
+            ring's task-slot window (number of in-flight tasks). Forwarded to
+            ``CallConfig.runtime_env.ring_task_window``. Must be a power of two
+            ``>= 4``. ``None`` (default) leaves the field unset so the runtime
+            falls back to its ``PTO2_RING_TASK_WINDOW`` env var or compile-time
+            default.
+        ring_heap: Optional per-invocation override of the per-ring output-heap
+            size in **bytes**. Forwarded to ``CallConfig.runtime_env.ring_heap``.
+            Must be a power of two ``>= 1024``. ``None`` defers to the runtime's
+            ``PTO2_RING_HEAP`` env var or compile-time default.
+        ring_dep_pool: Optional per-invocation override of the per-ring
+            dependency-edge pool capacity. Forwarded to
+            ``CallConfig.runtime_env.ring_dep_pool``. Must be in
+            ``[4, INT32_MAX]``. ``None`` defers to the runtime's
+            ``PTO2_RING_DEP_POOL`` env var or compile-time default.
         distributed_config: Optional L3 distributed-execution config, consumed
             only on the ``@pl.jit`` path. When set, it is forwarded to
             ``ir.compile()`` (via :func:`~pypto.jit.decorator._run_config_compile_kwargs`)
@@ -200,6 +215,9 @@ class RunConfig:
     golden_data_dir: str | None = None
     block_dim: int | None = None
     aicpu_thread_num: int | None = None
+    ring_task_window: int | None = None
+    ring_heap: int | None = None
+    ring_dep_pool: int | None = None
     distributed_config: "DistributedConfig | None" = None
     analyze_auto_scopes_for_deps: bool = False
 
@@ -227,6 +245,42 @@ class RunConfig:
         # ``<work_dir>/dfx_outputs/`` directory survives the run.
         if self.any_dfx_enabled() and not self.save_kernels:
             self.save_kernels = True
+
+        # Validate ring-sizing overrides early so callers get a clear error here
+        # rather than a deep failure inside the runtime's CallConfig::validate().
+        self._validate_ring_overrides()
+
+    def _validate_ring_overrides(self) -> None:
+        """Validate the per-task ring-sizing overrides.
+
+        Mirrors the constraints enforced by the runtime's
+        ``RuntimeEnv::validate()``. ``None`` means "unset" and is always
+        allowed (the runtime falls back to env var / compile-time default).
+        """
+
+        def _is_int(v: object) -> bool:
+            # bool is an int subtype; reject it so True/False can't masquerade
+            # as a ring size. Guards the pow2 bitwise ops below from TypeError
+            # on floats and keeps the failure a clear ValueError.
+            return isinstance(v, int) and not isinstance(v, bool)
+
+        def _is_pow2(v: int) -> bool:
+            return v > 0 and (v & (v - 1)) == 0
+
+        if self.ring_task_window is not None and not (
+            _is_int(self.ring_task_window) and _is_pow2(self.ring_task_window) and self.ring_task_window >= 4
+        ):
+            raise ValueError(f"ring_task_window must be a power of 2 >= 4, got {self.ring_task_window!r}")
+        if self.ring_heap is not None and not (
+            _is_int(self.ring_heap) and _is_pow2(self.ring_heap) and self.ring_heap >= 1024
+        ):
+            raise ValueError(
+                f"ring_heap must be a power of 2 >= 1024 (bytes per ring), got {self.ring_heap!r}"
+            )
+        if self.ring_dep_pool is not None and not (
+            _is_int(self.ring_dep_pool) and 4 <= self.ring_dep_pool <= 2**31 - 1
+        ):
+            raise ValueError(f"ring_dep_pool must be in [4, INT32_MAX], got {self.ring_dep_pool!r}")
 
     def any_dfx_enabled(self) -> bool:
         """Return ``True`` when at least one DFX flag is enabled.
@@ -533,6 +587,16 @@ def _build_call_config(
     cfg.enable_pmu = run_config.enable_pmu
     cfg.enable_dep_gen = run_config.enable_dep_gen
     cfg.enable_scope_stats = run_config.enable_scope_stats
+
+    # Per-task ring sizing: leave the runtime_env field at its 0 default when
+    # unset so the runtime applies its own PTO2_RING_* / compile-time fallback.
+    if run_config.ring_task_window is not None:
+        cfg.runtime_env.ring_task_window = run_config.ring_task_window
+    if run_config.ring_heap is not None:
+        cfg.runtime_env.ring_heap = run_config.ring_heap
+    if run_config.ring_dep_pool is not None:
+        cfg.runtime_env.ring_dep_pool = run_config.ring_dep_pool
+
     if dfx_dir is not None:
         cfg.output_prefix = str(dfx_dir)
     return cfg
