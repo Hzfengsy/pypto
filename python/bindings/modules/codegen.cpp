@@ -69,6 +69,15 @@ void BindCodegen(nb::module_& m) {
                      "Returns:\n"
                      "    OrchestrationResult with generated code and function metadata");
 
+  nb::class_<BuiltinNextLevelSpec>(codegen_module, "BuiltinNextLevelSpec",
+                                   "Materialization spec for a compiler-generated builtin chip callable")
+      .def_ro("op_name", &BuiltinNextLevelSpec::op_name, "Internal builtin op name")
+      .def_ro("variant", &BuiltinNextLevelSpec::variant, "Callable key and next_levels subdirectory name")
+      .def_ro("entry_symbol", &BuiltinNextLevelSpec::entry_symbol, "Sanitized C ABI entry symbol")
+      .def_ro("template_dir", &BuiltinNextLevelSpec::template_dir, "Package resource template directory")
+      .def_ro("template_vars", &BuiltinNextLevelSpec::template_vars,
+              "Template variables supplied by the builtin op codegen handler");
+
   // DistributedCodegen - Distributed C++ code generator for Linqu runtime
   nb::class_<DistributedCodegen>(codegen_module, "DistributedCodegen",
                                  "Distributed codegen for Linqu hierarchy runtime C++ code")
@@ -78,7 +87,9 @@ void BindCodegen(nb::module_& m) {
            "Args:\n"
            "    program: The IR Program (after OutlineHierarchyScopes)\n\n"
            "Returns:\n"
-           "    Complete C++ source code as a string");
+           "    Complete C++ source code as a string")
+      .def("get_builtin_next_level_specs", &DistributedCodegen::GetBuiltinNextLevelSpecs,
+           "Return builtin chip-callable variants requested during the last generate() call.");
 
   codegen_module.def("infer_function_core_type", &InferFunctionCoreType, nb::arg("func"),
                      "Infer the core type (CUBE or VECTOR) of a function from its operations.\n\n"

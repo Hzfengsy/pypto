@@ -66,6 +66,7 @@ class KernelCompiler(_SimplerKernelCompiler):
                     include_dirs.append(str(runtime_base_dir / p))
         else:
             include_dirs.append(str(runtime_base_dir / "runtime"))
+        include_dirs.append(str(self.project_root / "src" / "common"))
         include_dirs.append(str(self.project_root / "src" / "common" / "task_interface"))
 
         return include_dirs

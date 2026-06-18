@@ -36,6 +36,7 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
 from pypto import codegen
+from pypto.backend import pto_backend
 from pypto.pypto_core import passes  # match the import path used by ut/conftest.py
 
 SIZE = 64
@@ -63,6 +64,14 @@ def _lower(program) -> str:
     program = passes.materialize_comm_domain_scopes()(program)
     cg = codegen.DistributedCodegen()
     return cg.generate(program)
+
+
+def _lower_host_collectives(program):
+    program = passes.materialize_comm_domain_scopes()(program)
+    program = passes.lower_host_tensor_collectives()(program)
+    cg = codegen.DistributedCodegen()
+    code = cg.generate(program)
+    return code, cg
 
 
 # ---------------------------------------------------------------------------
@@ -476,6 +485,118 @@ def test_two_groups_handle_routing_is_per_dispatch_not_state_bleed():
     # Each dispatch's trailing ctx scalar follows the same routing.
     scalars = re.findall(r"\.add_scalar\((__comm_d\d+)\[\w+\]\.device_ctx\)", code)
     assert scalars == ["__comm_d0", "__comm_d1"], (scalars, code)
+
+
+def test_host_allreduce_builtin_codegen_uses_next_level_callable_key():
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[SIZE], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(SIZE * 4)
+            signal_buf = pld.alloc_window_buffer(pld.world_size() * 4)
+            data = pld.window(data_buf, [SIZE], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [pld.world_size()], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            self.chip_orch(data, device=0)
+            return 0
+
+    generated, cg = _lower_host_collectives(Prog)
+
+    assert 'callables["builtin.tensor.allreduce__sum__fp32"]' in generated, generated
+    assert "orch.submit_next_level" in generated, generated
+    assert "_ta_1_config = CallConfig()" in generated, generated
+    assert "_ta_1_config.block_dim = 1" in generated, generated
+    assert "_ta_1_config.aicpu_thread_num = config.aicpu_thread_num" in generated, generated
+    assert (
+        'orch.submit_next_level(callables["builtin.tensor.allreduce__sum__fp32"], _ta_1, _ta_1_config'
+        in generated
+    ), generated
+    assert ".add_scalar(__comm_d0[" in generated and "].domain_size)" in generated, generated
+    assert ".add_scalar((64))" not in generated, generated
+    assert "distributed_collectives" not in generated, generated
+    assert "pld_collectives" not in generated, generated
+    assert "data = data" not in generated, generated
+
+    specs = cg.get_builtin_next_level_specs()
+    assert len(specs) == 1
+    spec = specs[0]
+    assert spec.op_name == "builtin.tensor.allreduce"
+    assert spec.variant == "builtin.tensor.allreduce__sum__fp32"
+    assert spec.entry_symbol == "builtin_tensor_allreduce__sum__fp32"
+    assert spec.template_dir == ":pypto.runtime.builtins.collectives.allreduce"
+    assert spec.template_vars == {"op_cpp": "ReduceOp::kSum", "dtype_cpp": "float"}
+
+
+def test_host_allreduce_builtin_variant_is_recorded_once():
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[SIZE], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(SIZE * 4)
+            signal_buf = pld.alloc_window_buffer(pld.world_size() * 4)
+            data = pld.window(data_buf, [SIZE], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [pld.world_size()], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            return 0
+
+    generated, cg = _lower_host_collectives(Prog)
+
+    assert generated.count('callables["builtin.tensor.allreduce__sum__fp32"]') == 2, generated
+    assert len(cg.get_builtin_next_level_specs()) == 1
+
+
+def test_backend_materializes_builtin_next_level_files(tmp_path):
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[SIZE], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(SIZE * 4)
+            signal_buf = pld.alloc_window_buffer(pld.world_size() * 4)
+            data = pld.window(data_buf, [SIZE], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [pld.world_size()], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            return 0
+
+    program = passes.materialize_comm_domain_scopes()(Prog)
+    program = passes.lower_host_tensor_collectives()(program)
+    files = pto_backend.generate(program, str(tmp_path), skip_ptoas=True)
+
+    base = "next_levels/builtin.tensor.allreduce__sum__fp32"
+    assert f"{base}/kernel_config.py" in files
+    assert f"{base}/orchestration/builtin_tensor_allreduce__sum__fp32.cpp" in files
+    assert f"{base}/kernels/aiv/builtin_tensor_allreduce__sum__fp32_kernel.cpp" in files
+
+    entry_cpp = files[f"{base}/orchestration/builtin_tensor_allreduce__sum__fp32.cpp"]
+    assert "builtin_tensor_allreduce__sum__fp32" in entry_cpp
+    assert "submit_allreduce_kernel<ReduceOp::kSum, float>" in entry_cpp
+
+    kernel_config = files[f"{base}/kernel_config.py"]
+    assert '"function_name": "aicpu_orchestration_entry"' in kernel_config
+    assert '"signature": [_D.INOUT, _D.INOUT]' in kernel_config
+    assert '"block_dim": 1' in kernel_config
+
+    kernel_cpp = files[f"{base}/kernels/aiv/builtin_tensor_allreduce__sum__fp32_kernel.cpp"]
+    assert "platform_comm/comm_context.h" in kernel_cpp
+    assert "data_tensor->ndims" in kernel_cpp
 
 
 if __name__ == "__main__":

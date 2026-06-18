@@ -62,6 +62,34 @@ class OrchestrationResult:
         """Kernel name to tensor-arg ArgDirection name list (scalars excluded), in task-payload order."""
         ...
 
+class BuiltinNextLevelSpec:
+    """Builtin chip-callable variant requested by distributed host codegen."""
+
+    @property
+    def op_name(self) -> str:
+        """Internal builtin op name, e.g. ``builtin.tensor.allreduce``."""
+        ...
+
+    @property
+    def variant(self) -> str:
+        """Runtime callable key and ``next_levels/<variant>`` directory name."""
+        ...
+
+    @property
+    def entry_symbol(self) -> str:
+        """C ABI-safe entry symbol name."""
+        ...
+
+    @property
+    def template_dir(self) -> str:
+        """Package-resource template directory handle."""
+        ...
+
+    @property
+    def template_vars(self) -> dict[str, str]:
+        """Template variables supplied by the builtin op codegen handler."""
+        ...
+
 class DistributedCodegen:
     """Distributed codegen for Linqu hierarchy runtime C++ code."""
 
@@ -77,6 +105,10 @@ class DistributedCodegen:
         Returns:
             Complete C++ source code as a string
         """
+
+    def get_builtin_next_level_specs(self) -> list[BuiltinNextLevelSpec]:
+        """Return builtin ``next_levels`` variants referenced by the generated host orchestration."""
+        ...
 
 def generate_orchestration(program: Program, func: Function) -> OrchestrationResult:
     """Generate C++ orchestration code for a function.
@@ -119,6 +151,7 @@ def collect_vars_from_shape_expr(expr: Expr) -> list[Var]:
 
 __all__ = [
     "PTOCodegen",
+    "BuiltinNextLevelSpec",
     "DistributedCodegen",
     "OrchestrationResult",
     "collect_vars_from_shape_expr",

@@ -12,8 +12,10 @@
 #include "pypto/codegen/distributed/distributed_codegen.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <set>
 #include <sstream>
@@ -26,9 +28,11 @@
 #include "pypto/codegen/distributed/distributed_op_registry.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/comm.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
+#include "pypto/ir/op_registry.h"
 #include "pypto/ir/program.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/stmt.h"
@@ -48,6 +52,16 @@ constexpr const char kCommDomainHandlePrefix[] = "__";
 
 std::string HandleVarForScope(const ir::CommDomainScopeStmtPtr& scope) {
   return std::string(kCommDomainHandlePrefix) + scope->name_hint_;
+}
+
+std::string BuiltinEntrySymbol(const std::string& variant) {
+  std::string result = variant;
+  for (auto& c : result) {
+    if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_') {
+      c = '_';
+    }
+  }
+  return result;
 }
 }  // namespace
 
@@ -70,6 +84,8 @@ std::string DistributedCodegen::Generate(const ir::ProgramPtr& program) {
   host_orch_var_defs_.clear();
   unwrap_hoisted_var_refs_ = false;
   tuple_element_tensors_.clear();
+  emitted_builtin_variants_.clear();
+  builtin_next_level_specs_.clear();
 
   comm_domain_stack_.clear();
 
@@ -135,6 +151,34 @@ ir::CommDomainScopeStmtPtr DistributedCodegen::ScopeForWindowBuffer(const ir::Wi
                            "(MaterializeCommDomainScopes pass must run before DistributedCodegen, and the "
                            "dispatch must lexically sit inside its enclosing comm-domain scope)";
   return nullptr;  // unreachable
+}
+
+bool DistributedCodegen::MarkBuiltinEmitted(const std::string& variant) {
+  return emitted_builtin_variants_.insert(variant).second;
+}
+
+std::string DistributedCodegen::NextTaskArgsVar() { return "_ta_" + std::to_string(task_args_counter_++); }
+
+void DistributedCodegen::RecordBuiltinNextLevel(const ir::CallPtr& call, const std::string& variant,
+                                                std::map<std::string, std::string> template_vars) {
+  INTERNAL_CHECK(call && call->op_) << "Internal error: builtin next-level record needs a valid Call";
+  const auto& op_name = call->op_->name_;
+  const auto& entry = ir::OpRegistry::GetInstance().GetEntry(op_name);
+  const auto& template_dir = entry.GetTemplateDir();
+  INTERNAL_CHECK_SPAN(template_dir.has_value(), call->span_)
+      << "Internal error: builtin op '" << op_name << "' must declare template_dir";
+
+  BuiltinNextLevelSpec spec;
+  spec.op_name = op_name;
+  spec.variant = variant;
+  spec.entry_symbol = BuiltinEntrySymbol(variant);
+  spec.template_dir = template_dir.value();  // NOLINT(bugprone-unchecked-optional-access)
+  spec.template_vars = std::move(template_vars);
+  builtin_next_level_specs_.push_back(std::move(spec));
+}
+
+std::string DistributedCodegen::GetCommDomainHandleVar(const ir::WindowBufferPtr& wb) const {
+  return HandleVarForScope(ScopeForWindowBuffer(wb));
 }
 
 // ========================================================================
@@ -209,7 +253,7 @@ void DistributedCodegen::EmitImports() {
   // harmless to import for comm-less L3 programs.
   emitter_.EmitLine(
       "from simpler.task_interface import "
-      "CommBufferSpec, ContinuousTensor, DataType, TaskArgs, TensorArgType");
+      "CallConfig, CommBufferSpec, ContinuousTensor, DataType, TaskArgs, TensorArgType");
   emitter_.EmitLine("from pypto.runtime.tensor_arg import make_tensor_arg");
 }
 
@@ -500,6 +544,18 @@ void DistributedCodegen::VisitStmt_(const ir::AssignStmtPtr& op) {
     emitter_.EmitLine("tensors[\"" + var_name + "\"] = tensors[\"" + it->second + "\"]");
     declared_vars_.insert(var_name);
     current_target_var_ = "";
+    return;
+  }
+
+  const auto value_call = ir::As<ir::Call>(op->value_);
+  const bool distributed_tensor_alias =
+      ir::As<ir::DistributedTensorType>(op->var_->GetType()) &&
+      ir::As<ir::DistributedTensorType>(op->value_->GetType()) &&
+      (!value_call || (value_call->op_ && value_call->op_->name_ == "pld.tensor.window"));
+  if (distributed_tensor_alias) {
+    declared_vars_.insert(var_name);
+    current_target_var_ = "";
+    current_expr_value_ = "";
     return;
   }
 

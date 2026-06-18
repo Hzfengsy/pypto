@@ -30,6 +30,8 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
+from importlib import resources
+from importlib.abc import Traversable
 from typing import Any
 
 from pypto.compile_profiling import CompileProfiler, StageRecord
@@ -1155,6 +1157,7 @@ def _generate_with_distributed(
     cg = _codegen_core.DistributedCodegen()
     orch_code = cg.generate(transformed_program)
     result_files["orchestration/host_orch.py"] = orch_code
+    result_files.update(_materialize_builtin_next_levels(cg.get_builtin_next_level_specs()))
 
     # 2. Each chip-level Orchestration → next_levels/{name}/...
     for func in transformed_program.functions.values():
@@ -1188,6 +1191,61 @@ def _generate_with_distributed(
     if required_callbacks:
         result_files["sub_workers/__required__.json"] = json.dumps(sorted(required_callbacks), indent=2)
 
+    return result_files
+
+
+def _resolve_builtin_template_dir(template_dir: str) -> Traversable:
+    """Resolve an OpRegistry ``template_dir`` package-resource handle."""
+    if not template_dir.startswith(":"):
+        raise ValueError(f"builtin template_dir must be a package-resource handle, got {template_dir!r}")
+    package = template_dir[1:]
+    return resources.files(package)
+
+
+def _render_builtin_template(template: Traversable, variables: dict[str, str]) -> str:
+    content = template.read_text(encoding="utf-8")
+    for key, value in variables.items():
+        content = content.replace("{{" + key + "}}", value)
+    return content
+
+
+def _builtin_template_output_path(template_name: str, variables: dict[str, str]) -> str:
+    entry = variables["entry"]
+    kernel_name = variables["kernel_name"]
+    if template_name == "entry.cpp.in":
+        return f"orchestration/{entry}.cpp"
+    if template_name == "kernel.cpp.in":
+        return f"kernels/aiv/{kernel_name}.cpp"
+    if template_name == "kernel_config.py.in":
+        return "kernel_config.py"
+    if template_name.endswith(".in"):
+        return template_name[:-3]
+    return template_name
+
+
+def _materialize_builtin_next_levels(specs: list[Any]) -> dict[str, str]:
+    """Render builtin chip-callable templates into the distributed ``next_levels`` layout."""
+    result_files: dict[str, str] = {}
+    for spec in specs:
+        template_root = _resolve_builtin_template_dir(spec.template_dir)
+        templates_dir = template_root / "templates"
+        if not templates_dir.is_dir():
+            raise FileNotFoundError(f"builtin template_dir {spec.template_dir!r} has no templates/ directory")
+
+        variables = {
+            "variant": spec.variant,
+            "entry": spec.entry_symbol,
+            "kernel_name": spec.entry_symbol + "_kernel",
+            "template_package": spec.template_dir[1:],
+        }
+        variables.update(spec.template_vars)
+        for template in sorted(templates_dir.iterdir(), key=lambda item: item.name):
+            if not template.is_file() or not template.name.endswith(".in"):
+                continue
+            rel_path = _builtin_template_output_path(template.name, variables)
+            result_files[f"next_levels/{spec.variant}/{rel_path}"] = _render_builtin_template(
+                template, variables
+            )
     return result_files
 
 

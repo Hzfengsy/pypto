@@ -325,6 +325,7 @@ def compile_single_kernel(
             core_type=core_type,
             pto_isa_root=pto_isa_root,
             runtime_name=runtime_name,
+            extra_include_dirs=kernel.get("extra_include_dirs"),
         )
         _save_binary(raw, output_file)
 

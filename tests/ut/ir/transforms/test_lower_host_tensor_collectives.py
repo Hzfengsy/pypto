@@ -45,6 +45,33 @@ def _collect_for_stmts(stmt: ir.Stmt) -> list[ir.ForStmt]:
     return found
 
 
+def _collect_assign_stmts(stmt: ir.Stmt) -> list[ir.AssignStmt]:
+    found: list[ir.AssignStmt] = []
+
+    def walk(s: ir.Stmt) -> None:
+        if isinstance(s, ir.AssignStmt):
+            found.append(s)
+        if isinstance(s, ir.SeqStmts):
+            for child in s.stmts:
+                walk(child)
+        if isinstance(s, ir.ScopeStmt):
+            walk(s.body)
+
+    walk(stmt)
+    return found
+
+
+def _assert_alias_keeps_window_buffer(alias: ir.AssignStmt) -> None:
+    lhs_type = alias.var.type
+    rhs = alias.value
+    assert isinstance(rhs, ir.Var)
+    rhs_type = rhs.type
+    assert isinstance(lhs_type, ir.DistributedTensorType)
+    assert isinstance(rhs_type, ir.DistributedTensorType)
+    assert lhs_type.window_buffer is not None
+    assert lhs_type.window_buffer is rhs_type.window_buffer
+
+
 def test_host_allreduce_lowers_to_builtin_world_size_loop():
     @pl.program
     class P:
@@ -87,6 +114,78 @@ def test_host_allreduce_lowers_to_builtin_world_size_loop():
     assert call.attrs["dtype"] == pl.FP32
     assert call.attrs["device"] is builtin_loops[0].loop_var
     assert list(call.arg_directions) == [ir.ArgDirection.InOut, ir.ArgDirection.InOut]
+
+
+def test_host_allreduce_assign_result_var_carries_window_buffer():
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(1024)
+            signal_buf = pld.alloc_window_buffer(16)
+            data = pld.window(data_buf, [256], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [4], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            self.chip_orch(data, device=0)
+            return 0
+
+    program = passes.materialize_comm_domain_scopes()(P)
+    result = passes.lower_host_tensor_collectives()(program)
+    host = _get_func(result, "host_orch")
+
+    allreduce_aliases = [
+        stmt
+        for stmt in _collect_assign_stmts(host.body)
+        if isinstance(stmt.value, ir.Var)
+        and isinstance(stmt.var.type, ir.DistributedTensorType)
+        and isinstance(stmt.value.type, ir.DistributedTensorType)
+        and stmt.var.name_hint == "data"
+    ]
+    assert len(allreduce_aliases) == 1
+    _assert_alias_keeps_window_buffer(allreduce_aliases[0])
+
+
+def test_host_allreduce_chained_assign_uses_remapped_result_var():
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(1024)
+            signal_buf = pld.alloc_window_buffer(16)
+            data = pld.window(data_buf, [256], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [4], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            self.chip_orch(data, device=0)
+            return 0
+
+    program = passes.materialize_comm_domain_scopes()(P)
+    result = passes.lower_host_tensor_collectives()(program)
+    host = _get_func(result, "host_orch")
+
+    allreduce_aliases = [
+        stmt
+        for stmt in _collect_assign_stmts(host.body)
+        if isinstance(stmt.value, ir.Var)
+        and isinstance(stmt.var.type, ir.DistributedTensorType)
+        and isinstance(stmt.value.type, ir.DistributedTensorType)
+        and stmt.var.name_hint == "data"
+    ]
+    assert len(allreduce_aliases) == 2
+    for alias in allreduce_aliases:
+        _assert_alias_keeps_window_buffer(alias)
 
 
 def test_host_allreduce_resolves_non_innermost_comm_domain_scope():

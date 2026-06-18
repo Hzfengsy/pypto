@@ -12,6 +12,7 @@
 #include <any>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -55,6 +56,19 @@ namespace {
   INTERNAL_CHECK_SPAN(dist_type->window_buffer_.has_value(), expr->span_)
       << "LowerHostTensorCollectives: allreduce args must have materialized WindowBuffer back-references";
   return *dist_type->window_buffer_;
+}
+
+[[nodiscard]] VarPtr MintAllReduceResultVar(const VarPtr& old_var, const ExprPtr& src) {
+  auto lhs_type = As<DistributedTensorType>(old_var->GetType());
+  INTERNAL_CHECK_SPAN(lhs_type, old_var->span_)
+      << "LowerHostTensorCollectives: pld.tensor.allreduce result Var should have DistributedTensorType";
+  auto src_type = As<DistributedTensorType>(src->GetType());
+  INTERNAL_CHECK_SPAN(src_type && src_type->window_buffer_.has_value(), old_var->span_)
+      << "LowerHostTensorCollectives: pld.tensor.allreduce src must carry a materialized WindowBuffer";
+  auto new_type = std::make_shared<const DistributedTensorType>(
+      lhs_type->shape_, lhs_type->dtype_, lhs_type->memref_, lhs_type->tensor_view_,
+      std::make_optional(src_type->window_buffer_.value()));
+  return std::make_shared<Var>(old_var->name_hint_, new_type, old_var->span_);
 }
 
 [[nodiscard]] bool ScopeContainsSlot(const CommDomainScopeStmtPtr& scope, const WindowBufferPtr& wb) {
@@ -126,7 +140,11 @@ class LowerHostTensorCollectivesMutator : public IRMutator {
   StmtPtr VisitStmt_(const EvalStmtPtr& op) override {
     auto call = As<Call>(op->expr_);
     if (IsTensorAllReduce(call)) {
-      return LowerAllReduce(call, op->span_, op->leading_comments_);
+      auto visited_call = As<Call>(VisitExpr(op->expr_));
+      INTERNAL_CHECK_SPAN(IsTensorAllReduce(visited_call), op->span_)
+          << "LowerHostTensorCollectives: pld.tensor.allreduce EvalStmt rewrote to a non-allreduce "
+             "expression";
+      return LowerAllReduce(visited_call, op->span_, op->leading_comments_);
     }
     return IRMutator::VisitStmt_(op);
   }
@@ -136,9 +154,15 @@ class LowerHostTensorCollectivesMutator : public IRMutator {
     if (!IsTensorAllReduce(call)) {
       return IRMutator::VisitStmt_(op);
     }
+    auto visited_call = As<Call>(VisitExpr(op->value_));
+    INTERNAL_CHECK_SPAN(IsTensorAllReduce(visited_call), op->span_)
+        << "LowerHostTensorCollectives: pld.tensor.allreduce AssignStmt rewrote to a non-allreduce "
+           "expression";
     std::vector<StmtPtr> stmts;
-    stmts.push_back(LowerAllReduce(call, op->span_, op->leading_comments_));
-    stmts.push_back(std::make_shared<AssignStmt>(op->var_, call->args_[0], op->span_));
+    stmts.push_back(LowerAllReduce(visited_call, op->span_, op->leading_comments_));
+    auto result_var = MintAllReduceResultVar(op->var_, visited_call->args_[0]);
+    var_remap_[op->var_.get()] = result_var;
+    stmts.push_back(std::make_shared<AssignStmt>(result_var, visited_call->args_[0], op->span_));
     return std::make_shared<SeqStmts>(std::move(stmts), op->span_);
   }
 

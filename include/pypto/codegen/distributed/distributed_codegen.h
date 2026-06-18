@@ -33,6 +33,14 @@
 namespace pypto {
 namespace codegen {
 
+struct BuiltinNextLevelSpec {
+  std::string op_name;
+  std::string variant;
+  std::string entry_symbol;
+  std::string template_dir;
+  std::map<std::string, std::string> template_vars;
+};
+
 /**
  * @brief Distributed code generator for simpler runtime Python orchestration
  *
@@ -71,6 +79,44 @@ class DistributedCodegen : public CodegenBase {
   /// the fall-through path. Mirrors the manual ``declared_vars_.insert(...)``
   /// performed by in-class emitters such as :func:`EmitTensorCreate`.
   void MarkDeclared(const std::string& var_name) { declared_vars_.insert(var_name); }
+
+  /// Return builtin chip-callable variants requested while emitting the HOST
+  /// orchestrator. Python's backend materializes these specs under
+  /// ``next_levels/<variant>/`` so runtime assembly can keep scanning the
+  /// existing chip-callable layout.
+  [[nodiscard]] const std::vector<BuiltinNextLevelSpec>& GetBuiltinNextLevelSpecs() const {
+    return builtin_next_level_specs_;
+  }
+
+  /// Mark a builtin variant as seen in this codegen run. Returns true only for
+  /// the first sighting, letting registered op handlers de-duplicate
+  /// ``next_levels/<variant>/`` materialization.
+  [[nodiscard]] bool MarkBuiltinEmitted(const std::string& variant);
+
+  /// Record a materializable builtin next-level callable variant.
+  void RecordBuiltinNextLevel(const ir::CallPtr& call, const std::string& variant,
+                              std::map<std::string, std::string> template_vars);
+
+  /// Return a fresh TaskArgs variable name for registered distributed op
+  /// codegen functions that emit their own submit path.
+  [[nodiscard]] std::string NextTaskArgsVar();
+
+  /// Resolve a dispatch call's ``device=`` attr to a Python rank expression.
+  [[nodiscard]] std::string ResolveRankExpr(const ir::CallPtr& call) const;
+
+  /// Return the emitted Python handle variable for the comm domain that owns
+  /// ``wb``.
+  [[nodiscard]] std::string GetCommDomainHandleVar(const ir::WindowBufferPtr& wb) const;
+
+  /// Format a DistributedTensor's shape as a Python tuple literal.
+  [[nodiscard]] std::string FormatShapeTuple(const std::vector<ir::ExprPtr>& shape);
+
+  /// Return a Python-safe identifier derived from an IR/runtime name hint.
+  [[nodiscard]] std::string SanitizeName(const std::string& name) const;
+
+  /// Map a PyPTO :class:`DataType` to the matching ``simpler.task_interface.DataType``
+  /// enum name (e.g. FP32 -> "FLOAT32", INT32 -> "INT32").
+  [[nodiscard]] static std::string DataTypeToSimplerEnum(const DataType& dtype);
 
  protected:
   // Statement visitors
@@ -184,28 +230,9 @@ class DistributedCodegen : public CodegenBase {
   [[nodiscard]] std::string ParamDirectionToTensorArgType(ir::ParamDirection dir) const;
   [[nodiscard]] std::vector<ir::FunctionPtr> SortFunctionsByRoleAndLevel() const;
   void ClassifyFunctions();
-  [[nodiscard]] std::string SanitizeName(const std::string& name) const;
   std::string FormatArgs(const std::vector<ir::ExprPtr>& args);
   [[nodiscard]] bool IsSubWorker(const ir::FunctionPtr& func) const;
   [[nodiscard]] static std::string DataTypeToPythonDType(const DataType& dtype);
-
-  /// Map a PyPTO :class:`DataType` to the matching ``simpler.task_interface.DataType``
-  /// enum name (e.g. FP32 -> "FLOAT32", INT32 -> "INT32"). Used by N7
-  /// DistributedTensor formal emission when constructing
-  /// ``ContinuousTensor.make(..., dtype=DataType.FLOAT32, child_memory=True)``.
-  [[nodiscard]] static std::string DataTypeToSimplerEnum(const DataType& dtype);
-
-  /// Resolve a dispatch call's ``device=`` attr to a Python rank expression.
-  /// Returns the empty string if the call carries no ``device=`` attr (the
-  /// comm-less L3 dispatch path). For ``device=ConstInt(k)`` returns ``"k"``;
-  /// for ``device=Var(r)`` returns ``SanitizeName(r->name_hint_)``.
-  [[nodiscard]] std::string ResolveRankExpr(const ir::CallPtr& call) const;
-
-  /// Format a DistributedTensor's shape as a Python tuple literal, e.g.
-  /// ``(64,)`` / ``(M, N)``. ConstInt dims are emitted as literals;
-  /// Var dims are emitted via ``SanitizeName``. Always trailing-comma for
-  /// rank-1 tuples to keep the literal a tuple.
-  [[nodiscard]] std::string FormatShapeTuple(const std::vector<ir::ExprPtr>& shape);
 
   /// Look up the innermost open CommDomainScopeStmt whose ``slots_`` contain
   /// ``wb`` (by shared_ptr identity — ``MaterializeCommDomainScopes`` shares
@@ -261,6 +288,9 @@ class DistributedCodegen : public CodegenBase {
   // HOST orchestrator AssignStmt defs, populated before comm-domain emission.
   std::unordered_map<const ir::Var*, ir::ExprPtr> host_orch_var_defs_;
   bool unwrap_hoisted_var_refs_{false};
+
+  std::unordered_set<std::string> emitted_builtin_variants_;
+  std::vector<BuiltinNextLevelSpec> builtin_next_level_specs_;
 };
 
 }  // namespace codegen

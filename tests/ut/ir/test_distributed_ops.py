@@ -22,6 +22,8 @@ After the MemRef-mirror redesign:
   ``None`` at parse time and filled in by the comm-collection pass later.
 """
 
+from importlib import resources
+
 import pytest
 from pypto import DataType, ir
 from pypto.ir.op.distributed import tensor_ops as dist_tensor_ops
@@ -287,6 +289,13 @@ def test_builtin_tensor_allreduce_is_internal_only():
             {"op": int(ir.ReduceOp.Sum), "dtype": DataType.FP32},
             span,
         )
+
+
+def test_builtin_tensor_allreduce_template_resource_exists():
+    template_root = resources.files("pypto.runtime.builtins.collectives.allreduce")
+    assert (template_root / "templates" / "entry.cpp.in").is_file()
+    assert (template_root / "templates" / "kernel.cpp.in").is_file()
+    assert (template_root / "templates" / "kernel_config.py.in").is_file()
 
 
 # ---------------------------------------------------------------------------
