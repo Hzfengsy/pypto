@@ -448,7 +448,7 @@ call 上）。Codegen 会按这个顺序合并两组列表，并按 Var identity
 `SubmitToCallView` 合成的 `manual_dep_edges` 或普通 call 上的
 `attrs["compiler_manual_dep_edges"]` 中的每个显式依赖条目都是 TaskId
 `VarPtr`（`Scalar[TASK_ID]` 或 `Array[N, TASK_ID]`）。每个条目在 codegen 时通过
-`manual_task_id_map_` 解析为以下三种来源之一：
+`manual_task_id_map_` 解析为以下来源之一：
 
 | Producer 种类 | codegen 发出的 C++ |
 | ------------- | ------------------ |
@@ -471,6 +471,13 @@ array-carry iter_arg 则按元素逐槽生成带守卫的填充。
 MANUAL）在进入时快照 `manual_task_id_map_`、退出时恢复，因此在某作用域内产生的
 绑定不会泄漏到外层作用域（否则其标识符会超出 C++ 作用域）。循环 / 分支的 carry
 在其 body 的 `PTO2_SCOPE` *之前*声明，因此能正确地在块结束后存活。
+
+当后续 sibling scope 或父 scope 通过 `compiler_manual_dep_edges` 引用在更早的嵌套
+scope 或 sibling scope 中创建的 producer TaskId 时，codegen 只提升这个 TaskId 绑定：
+先在 producer 的 `PTO2_SCOPE` 前声明
+`PTO2TaskId <name> = PTO2TaskId::invalid();`，在块内执行
+`<name> = task_<n>_outs.task_id();`，再在外层 C++ 作用域里生成后续带 guard 的
+`set_dependencies(...)` 条目。普通 scope-local TaskId 仍然保持局部。
 
 **跨作用域张量与 `manual_scope`。** `manual_scope` 是一个*调度*区域，而非存储/取值
 作用域：它所触及的张量会透明地流向 `PTO2_SCOPE(MANUAL) { ... }` 块*之后*的 task。

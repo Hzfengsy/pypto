@@ -463,7 +463,7 @@ Every kernel task launch inside a manual scope is a `Submit`; the
 `manual_dep_edges` — a `vector<VarPtr>` of `Scalar[TASK_ID]` variables.
 Compiler-derived edges arrive as `attrs["compiler_manual_dep_edges"]` on
 plain calls. Each entry resolves at codegen time through
-`manual_task_id_map_` to one of three forms:
+`manual_task_id_map_` to one of the following forms:
 
 | Producer kind | C++ source emitted by codegen |
 | ------------- | ----------------------------- |
@@ -489,6 +489,14 @@ on entry and restores it on exit, so a binding produced inside a scope does not
 leak to an enclosing scope where its identifier would be out of C++ scope. Loop
 / branch carries are declared *before* their body's `PTO2_SCOPE`, so they
 correctly survive the block.
+
+When a later sibling or parent scope references a producer TaskId created in an
+earlier nested or sibling scope through `compiler_manual_dep_edges`, codegen
+hoists only that TaskId binding: it declares a
+`PTO2TaskId <name> = PTO2TaskId::invalid();` sentinel before the producer
+`PTO2_SCOPE`, assigns `<name> = task_<n>_outs.task_id();` inside the block, and
+then emits the later guarded `set_dependencies(...)` entry from the enclosing
+C++ scope. Ordinary scope-local TaskIds still stay local.
 
 **Cross-scope tensors and `manual_scope`.** A `manual_scope` is a *scheduling*
 region, not a storage/value scope: a tensor it touches flows transparently to

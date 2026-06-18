@@ -56,6 +56,7 @@ enum class AccessKind { Read, Write, ReadWrite };
 enum class RegionKind { Unknown, Full, Box };
 
 constexpr size_t kMaxStaticRootAlternatives = 4;
+constexpr size_t kMinWindowedTaskIdTempDeps = 1;
 
 struct AccessRegion {
   RegionKind kind = RegionKind::Unknown;
@@ -83,11 +84,17 @@ struct StorageAccess {
   StorageAlternative location;
   AccessKind kind = AccessKind::Read;
   VarPtr task_id_var;
+  bool task_id_var_is_direct = false;
   bool dynamic_producer = false;
 };
 
 struct AccessSummary {
   std::vector<StorageAccess> accesses;
+};
+
+struct LoopCarryTaskIdMapping {
+  VarPtr target;
+  bool direct_task_id = false;
 };
 
 bool IsTensorType(const TypePtr& type) { return As<TensorType>(type) != nullptr; }
@@ -363,9 +370,43 @@ bool IsTaskIdVar(const VarPtr& var) {
   return scalar_ty && scalar_ty->dtype_ == DataType::TASK_ID;
 }
 
+bool IsTaskIdArrayType(const TypePtr& type) {
+  auto array_ty = As<ArrayType>(type);
+  return array_ty && array_ty->dtype_ == DataType::TASK_ID;
+}
+
+bool IsTaskIdArrayVar(const VarPtr& var) { return IsTaskIdArrayType(var ? var->GetType() : TypePtr{}); }
+
+std::optional<int64_t> ConstIntValue(const ExprPtr& expr) {
+  auto value = As<ConstInt>(expr);
+  if (!value) return std::nullopt;
+  return value->value_;
+}
+
+std::optional<int64_t> TaskIdArrayExtent(const TypePtr& type) {
+  auto array_ty = As<ArrayType>(type);
+  if (!array_ty || array_ty->dtype_ != DataType::TASK_ID) return std::nullopt;
+  return ConstIntValue(array_ty->extent());
+}
+
 void AppendUnique(std::vector<VarPtr>* vars, const VarPtr& candidate) {
   if (!vars || !candidate || ContainsVar(*vars, candidate)) return;
   vars->push_back(candidate);
+}
+
+void AppendAllUnique(std::vector<VarPtr>* vars, const std::vector<VarPtr>& candidates) {
+  if (!vars) return;
+  for (const auto& candidate : candidates) {
+    AppendUnique(vars, candidate);
+  }
+}
+
+bool HasCompleteDynamicCoverage(const std::unordered_set<int64_t>& slots, int64_t extent) {
+  if (extent <= 0 || static_cast<int64_t>(slots.size()) != extent) return false;
+  for (const auto slot : slots) {
+    if (slot < 0 || slot >= extent) return false;
+  }
+  return true;
 }
 
 std::vector<std::pair<std::string, std::any>> StripCompilerManualDepEdges(
@@ -395,6 +436,28 @@ bool HasHazard(AccessKind current, AccessKind prior) {
   const bool prior_reads = prior == AccessKind::Read || prior == AccessKind::ReadWrite;
   return (current_reads && prior_writes) || (current_writes && prior_reads) ||
          (current_writes && prior_writes);
+}
+
+bool IsStaticSingleTripLoop(const ForStmtPtr& op) {
+  if (!op) return false;
+  auto start = ConstIntValue(op->start_);
+  auto stop = ConstIntValue(op->stop_);
+  auto step = ConstIntValue(op->step_);
+  if (!start.has_value() || !stop.has_value() || !step.has_value() || *step == 0) return false;
+  if (*step > 0) {
+    return *start < *stop && (*stop - *start + *step - 1) / *step == 1;
+  }
+  return *start > *stop && (*start - *stop + (-*step) - 1) / (-*step) == 1;
+}
+
+std::optional<int64_t> StaticPositiveTripCount(const ForStmtPtr& op) {
+  if (!op) return std::nullopt;
+  auto start = ConstIntValue(op->start_);
+  auto stop = ConstIntValue(op->stop_);
+  auto step = ConstIntValue(op->step_);
+  if (!start.has_value() || !stop.has_value() || !step.has_value() || *step <= 0) return std::nullopt;
+  if (*start >= *stop) return 0;
+  return (*stop - *start + *step - 1) / *step;
 }
 
 class StorageRootAnalysis : public IRVisitor {
@@ -756,6 +819,8 @@ class SubmitTaskIdCollector : public IRVisitor {
 
     if (auto call = As<Call>(op->value_)) {
       RecordTaskTupleProducer(op->var_, call);
+      RecordTaskIdArrayProducer(op->var_, call);
+      RecordTaskIdScalarProducer(op->var_, call);
     } else if (auto submit = As<Submit>(op->value_)) {
       RecordTaskTupleProducer(op->var_, submit);
     }
@@ -789,8 +854,36 @@ class SubmitTaskIdCollector : public IRVisitor {
 
   const std::unordered_map<const Expr*, VarPtr>& task_id_by_expr() const { return task_id_by_expr_; }
   const std::unordered_map<uint64_t, VarPtr>& task_id_by_var_id() const { return task_id_by_var_id_; }
+  const std::unordered_map<uint64_t, std::vector<VarPtr>>& task_ids_by_var_id() const {
+    return task_ids_by_var_id_;
+  }
+  const std::unordered_map<uint64_t, std::unordered_map<uint64_t, std::unordered_set<int64_t>>>&
+  task_id_dynamic_slots_by_var_id() const {
+    return task_id_dynamic_slots_by_var_id_;
+  }
+  const std::unordered_map<uint64_t, int64_t>& task_id_array_extent_by_var_id() const {
+    return task_id_array_extent_by_var_id_;
+  }
+  const std::unordered_map<uint64_t, std::vector<VarPtr>>& task_ids_by_array_var_id() const {
+    return task_ids_by_array_var_id_;
+  }
 
  private:
+  struct TaskIdExprLineage {
+    std::vector<VarPtr> task_ids;
+    std::unordered_map<uint64_t, std::unordered_set<int64_t>> dynamic_array_slots;
+  };
+
+  struct TaskIdArrayLineage {
+    std::vector<VarPtr> full_array_task_ids;
+    std::unordered_map<int64_t, std::vector<VarPtr>> static_slots;
+    std::unordered_map<int64_t, std::unordered_map<uint64_t, std::unordered_set<int64_t>>>
+        static_dynamic_slots;
+    std::unordered_set<int64_t> unknown_static_slots;
+    bool has_unknown_dynamic_update = false;
+    std::optional<int64_t> extent;
+  };
+
   VarPtr CanonicalTaskIdForExpr(const ExprPtr& expr) const {
     auto var = AsVarLike(expr);
     if (!var) return nullptr;
@@ -800,6 +893,85 @@ class SubmitTaskIdCollector : public IRVisitor {
 
     if (IsTaskIdVar(var)) return var;
     return nullptr;
+  }
+
+  TaskIdExprLineage TaskIdsForExpr(const ExprPtr& expr) const {
+    TaskIdExprLineage out;
+    if (!expr) return out;
+
+    if (auto task_id = CanonicalTaskIdForExpr(expr)) {
+      AppendUnique(&out.task_ids, task_id);
+      return out;
+    }
+
+    if (auto var = AsVarLike(expr)) {
+      auto ids_it = task_ids_by_var_id_.find(var->UniqueId());
+      if (ids_it != task_ids_by_var_id_.end()) {
+        AppendAllUnique(&out.task_ids, ids_it->second);
+      }
+      auto slots_it = task_id_dynamic_slots_by_var_id_.find(var->UniqueId());
+      if (slots_it != task_id_dynamic_slots_by_var_id_.end()) {
+        out.dynamic_array_slots = slots_it->second;
+      }
+      if (!out.task_ids.empty() || !out.dynamic_array_slots.empty()) return out;
+    }
+
+    auto call = As<Call>(expr);
+    if (!call || call->op_->name_ != "array.get_element" || call->args_.size() != 2) return out;
+
+    auto array_var = AsVarLike(call->args_[0]);
+    auto index = ConstIntValue(call->args_[1]);
+    if (!array_var || !index.has_value()) return out;
+
+    auto lineage_it = array_lineage_by_var_id_.find(array_var->UniqueId());
+    if (lineage_it == array_lineage_by_var_id_.end()) return out;
+
+    auto slot_it = lineage_it->second.static_slots.find(*index);
+    if (slot_it != lineage_it->second.static_slots.end()) {
+      AppendAllUnique(&out.task_ids, slot_it->second);
+    }
+    const auto expanded_it = task_ids_by_array_var_id_.find(array_var->UniqueId());
+    const bool has_dynamic_array_task_ids =
+        !lineage_it->second.full_array_task_ids.empty() ||
+        (expanded_it != task_ids_by_array_var_id_.end() && !expanded_it->second.empty());
+    if (has_dynamic_array_task_ids) {
+      out.dynamic_array_slots[array_var->UniqueId()].insert(*index);
+    }
+    return out;
+  }
+
+  std::vector<VarPtr> ExpandTaskIdArray(const VarPtr& array_var) const {
+    std::vector<VarPtr> out;
+    if (!array_var || !IsTaskIdArrayVar(array_var)) return out;
+
+    auto lineage_it = array_lineage_by_var_id_.find(array_var->UniqueId());
+    if (lineage_it == array_lineage_by_var_id_.end()) return out;
+
+    const auto& lineage = lineage_it->second;
+    if (!lineage.has_unknown_dynamic_update && lineage.unknown_static_slots.empty()) {
+      AppendAllUnique(&out, lineage.full_array_task_ids);
+    }
+    for (const auto& [_, task_ids] : lineage.static_slots) {
+      AppendAllUnique(&out, task_ids);
+    }
+    std::unordered_map<uint64_t, std::unordered_set<int64_t>> covered_source_slots;
+    for (const auto& [_, source_slots] : lineage.static_dynamic_slots) {
+      for (const auto& [source_id, slots] : source_slots) {
+        for (const auto slot : slots) {
+          covered_source_slots[source_id].insert(slot);
+        }
+      }
+    }
+    for (const auto& [source_id, slots] : covered_source_slots) {
+      auto source_it = array_lineage_by_var_id_.find(source_id);
+      if (source_it == array_lineage_by_var_id_.end() || !source_it->second.extent.has_value()) continue;
+      if (!HasCompleteDynamicCoverage(slots, source_it->second.extent.value())) continue;
+      if (lineage.has_unknown_dynamic_update || !lineage.unknown_static_slots.empty()) continue;
+      if (source_it->second.has_unknown_dynamic_update || !source_it->second.unknown_static_slots.empty())
+        continue;
+      AppendAllUnique(&out, source_it->second.full_array_task_ids);
+    }
+    return out;
   }
 
   void PropagateLoopCarriedTaskIds(const std::vector<IterArgPtr>& iter_args,
@@ -819,30 +991,164 @@ class SubmitTaskIdCollector : public IRVisitor {
         task_id_by_var_id_[return_vars[i]->UniqueId()] = task_id;
       }
     }
+
+    PropagateLoopCarriedTaskIdArrays(iter_args, return_vars, yield);
+  }
+
+  void PropagateLoopCarriedTaskIdArrays(const std::vector<IterArgPtr>& iter_args,
+                                        const std::vector<VarPtr>& return_vars, const YieldStmtPtr& yield) {
+    if (!yield) return;
+
+    const size_t count = std::min({iter_args.size(), return_vars.size(), yield->value_.size()});
+    for (size_t i = 0; i < count; ++i) {
+      auto yielded_array = AsVarLike(yield->value_[i]);
+      if (!yielded_array || !IsTaskIdArrayVar(yielded_array)) continue;
+
+      auto lineage_it = array_lineage_by_var_id_.find(yielded_array->UniqueId());
+      if (lineage_it == array_lineage_by_var_id_.end()) continue;
+
+      if (iter_args[i] && IsTaskIdArrayVar(iter_args[i])) {
+        array_lineage_by_var_id_[iter_args[i]->UniqueId()] = lineage_it->second;
+        RecordTaskIdArrayExtent(iter_args[i]);
+        task_ids_by_array_var_id_[iter_args[i]->UniqueId()] = ExpandTaskIdArray(iter_args[i]);
+      }
+      if (return_vars[i] && IsTaskIdArrayVar(return_vars[i])) {
+        array_lineage_by_var_id_[return_vars[i]->UniqueId()] = lineage_it->second;
+        RecordTaskIdArrayExtent(return_vars[i]);
+        task_ids_by_array_var_id_[return_vars[i]->UniqueId()] = ExpandTaskIdArray(return_vars[i]);
+      }
+    }
+  }
+
+  void RecordTaskIdArrayProducer(const VarPtr& var, const CallPtr& call) {
+    if (!var || !IsTaskIdArrayVar(var) || !call) return;
+
+    const std::string& op_name = call->op_->name_;
+    if (op_name == "array.create") {
+      TaskIdArrayLineage lineage;
+      lineage.extent = TaskIdArrayExtent(var->GetType());
+      array_lineage_by_var_id_[var->UniqueId()] = std::move(lineage);
+      RecordTaskIdArrayExtent(var);
+      task_ids_by_array_var_id_[var->UniqueId()] = {};
+      return;
+    }
+
+    if (op_name != "array.update_element" || call->args_.size() != 3) return;
+
+    TaskIdArrayLineage lineage;
+    if (auto base_array = AsVarLike(call->args_[0])) {
+      auto base_it = array_lineage_by_var_id_.find(base_array->UniqueId());
+      if (base_it != array_lineage_by_var_id_.end()) {
+        lineage = base_it->second;
+      }
+    }
+    if (!lineage.extent.has_value()) {
+      lineage.extent = TaskIdArrayExtent(var->GetType());
+    }
+
+    auto value_lineage = TaskIdsForExpr(call->args_[2]);
+    auto index = ConstIntValue(call->args_[1]);
+    if (index.has_value()) {
+      if (value_lineage.task_ids.empty()) {
+        lineage.static_slots.erase(*index);
+      } else {
+        lineage.static_slots[*index] = value_lineage.task_ids;
+      }
+      if (value_lineage.dynamic_array_slots.empty()) {
+        lineage.static_dynamic_slots.erase(*index);
+      } else {
+        lineage.static_dynamic_slots[*index] = std::move(value_lineage.dynamic_array_slots);
+      }
+      if (value_lineage.task_ids.empty() &&
+          lineage.static_dynamic_slots.find(*index) == lineage.static_dynamic_slots.end()) {
+        lineage.unknown_static_slots.insert(*index);
+      } else {
+        lineage.unknown_static_slots.erase(*index);
+      }
+    } else {
+      if (!value_lineage.task_ids.empty() && value_lineage.dynamic_array_slots.empty()) {
+        AppendAllUnique(&lineage.full_array_task_ids, value_lineage.task_ids);
+      } else {
+        lineage.has_unknown_dynamic_update = true;
+      }
+    }
+
+    array_lineage_by_var_id_[var->UniqueId()] = std::move(lineage);
+    RecordTaskIdArrayExtent(var);
+    task_ids_by_array_var_id_[var->UniqueId()] = ExpandTaskIdArray(var);
+  }
+
+  void RecordTaskIdScalarProducer(const VarPtr& var, const CallPtr& call) {
+    if (!var || !IsTaskIdVar(var) || !call) return;
+
+    auto lineage = TaskIdsForExpr(call);
+    if (!lineage.task_ids.empty()) {
+      task_ids_by_var_id_[var->UniqueId()] = lineage.task_ids;
+      if (lineage.task_ids.size() == 1) {
+        task_id_by_var_id_[var->UniqueId()] = lineage.task_ids.front();
+      }
+    }
+    if (!lineage.dynamic_array_slots.empty()) {
+      task_id_dynamic_slots_by_var_id_[var->UniqueId()] = std::move(lineage.dynamic_array_slots);
+    }
+  }
+
+  void RecordTaskIdArrayExtent(const VarPtr& var) {
+    if (!var) return;
+    auto lineage_it = array_lineage_by_var_id_.find(var->UniqueId());
+    if (lineage_it != array_lineage_by_var_id_.end() && lineage_it->second.extent.has_value()) {
+      task_id_array_extent_by_var_id_[var->UniqueId()] = lineage_it->second.extent.value();
+    } else {
+      task_id_array_extent_by_var_id_.erase(var->UniqueId());
+    }
   }
 
   std::unordered_map<const Var*, ExprPtr> task_expr_by_tuple_;
   std::unordered_map<const Var*, std::unordered_map<int, VarPtr>> tuple_get_by_tuple_;
   std::unordered_map<const Expr*, VarPtr> task_id_by_expr_;
   std::unordered_map<uint64_t, VarPtr> task_id_by_var_id_;
+  std::unordered_map<uint64_t, std::vector<VarPtr>> task_ids_by_var_id_;
+  std::unordered_map<uint64_t, std::unordered_map<uint64_t, std::unordered_set<int64_t>>>
+      task_id_dynamic_slots_by_var_id_;
+  std::unordered_map<uint64_t, int64_t> task_id_array_extent_by_var_id_;
+  std::unordered_map<uint64_t, TaskIdArrayLineage> array_lineage_by_var_id_;
+  std::unordered_map<uint64_t, std::vector<VarPtr>> task_ids_by_array_var_id_;
 };
 
 class AutoDepMutator : public IRMutator {
  public:
-  AutoDepMutator(ProgramPtr program, const StorageRootAnalysis* storage,
-                 const std::unordered_map<const Expr*, VarPtr>* task_id_by_expr,
-                 const std::unordered_map<uint64_t, VarPtr>* task_id_by_var_id, bool analyze_auto_scopes,
-                 bool analyze_whole_body_as_auto_scope)
+  AutoDepMutator(
+      ProgramPtr program, const StorageRootAnalysis* storage,
+      const std::unordered_map<const Expr*, VarPtr>* task_id_by_expr,
+      const std::unordered_map<uint64_t, VarPtr>* task_id_by_var_id,
+      const std::unordered_map<uint64_t, std::vector<VarPtr>>* task_ids_by_var_id,
+      const std::unordered_map<uint64_t, std::unordered_map<uint64_t, std::unordered_set<int64_t>>>*
+          task_id_dynamic_slots_by_var_id,
+      const std::unordered_map<uint64_t, int64_t>* task_id_array_extent_by_var_id,
+      const std::unordered_map<uint64_t, std::vector<VarPtr>>* task_ids_by_array_var_id,
+      bool analyze_auto_scopes, bool analyze_whole_body_as_auto_scope)
       : program_(std::move(program)),
         storage_(storage),
         task_id_by_expr_(task_id_by_expr),
         task_id_by_var_id_(task_id_by_var_id),
+        task_ids_by_var_id_(task_ids_by_var_id),
+        task_id_dynamic_slots_by_var_id_(task_id_dynamic_slots_by_var_id),
+        task_id_array_extent_by_var_id_(task_id_array_extent_by_var_id),
+        task_ids_by_array_var_id_(task_ids_by_array_var_id),
         analyze_auto_scopes_(analyze_auto_scopes),
-        analyze_whole_body_as_auto_scope_(analyze_whole_body_as_auto_scope) {}
+        analyze_whole_body_as_auto_scope_(analyze_whole_body_as_auto_scope) {
+    if (!task_id_by_expr_) return;
+    for (const auto& [_, task_id] : *task_id_by_expr_) {
+      if (task_id) submit_task_id_var_ids_.insert(task_id->UniqueId());
+    }
+  }
 
   StmtPtr AnalyzeBody(const StmtPtr& body) {
     INTERNAL_CHECK(body != nullptr) << "Internal error: AutoDepMutator received null function body";
     if (!analyze_whole_body_as_auto_scope_ || As<RuntimeScopeStmt>(body)) {
+      if (analyze_auto_scopes_ && !analyze_whole_body_as_auto_scope_ && !As<RuntimeScopeStmt>(body)) {
+        return AnalyzeCrossScopeContainerBody(body);
+      }
       return VisitStmt(body);
     }
     return AnalyzeRuntimeScopeBody(body, /*manual=*/false, /*name_hint=*/"", body->span_,
@@ -854,9 +1160,22 @@ class AutoDepMutator : public IRMutator {
  protected:
   StmtPtr VisitStmt_(const ForStmtPtr& op) override {
     if (prior_stack_.empty()) return IRMutator::VisitStmt_(op);
+    if (IsStaticSingleTripLoop(op)) {
+      auto result = IRMutator::VisitStmt_(op);
+      if (auto new_for = As<ForStmt>(result)) {
+        RemapSingleTripLoopAccessTaskIds(new_for);
+      }
+      return result;
+    }
+    const auto static_trip_count = StaticPositiveTripCount(op);
     ++loop_depth_;
     auto result = IRMutator::VisitStmt_(op);
     --loop_depth_;
+    if (static_trip_count.has_value() && *static_trip_count > 0) {
+      if (auto new_for = As<ForStmt>(result)) {
+        RemapFixedTripLoopAccessTaskIds(new_for);
+      }
+    }
     return result;
   }
 
@@ -900,13 +1219,21 @@ class AutoDepMutator : public IRMutator {
     auto new_body = VisitStmt(body);
     INTERNAL_CHECK_SPAN(new_body, span) << "RuntimeScopeStmt body mutated to null";
     const bool fallback = fallback_stack_.back();
+    auto scope_accesses = std::move(prior_stack_.back());
     fallback_stack_.pop_back();
     scope_manual_stack_.pop_back();
     prior_stack_.pop_back();
+    if (!fallback && !prior_stack_.empty()) {
+      for (auto& access : scope_accesses) {
+        prior_stack_.back().push_back(std::move(access));
+      }
+    }
     if (fallback) {
       DebugLog("fallback_runtime_scope name_hint=" + name_hint);
+      // The virtual whole-body region has no runtime scope boundary to fall back to.
+      // Keep representable local edges; the fallback already prevents access export.
+      if (is_virtual_whole_body) return new_body;
       auto stripped_body = StripCompilerDeps(new_body);
-      if (is_virtual_whole_body) return stripped_body;
       return std::make_shared<const RuntimeScopeStmt>(false, name_hint, std::move(stripped_body), span,
                                                       std::move(leading_comments), std::move(attrs));
     }
@@ -918,6 +1245,119 @@ class AutoDepMutator : public IRMutator {
                                                       std::move(leading_comments), std::move(attrs));
     }
     return original_scope ? original_scope : body;
+  }
+
+  StmtPtr AnalyzeCrossScopeContainerBody(const StmtPtr& body) {
+    prior_stack_.emplace_back();
+    auto new_body = VisitStmt(body);
+    prior_stack_.pop_back();
+    return new_body;
+  }
+
+  void RemapSingleTripLoopAccessTaskIds(const ForStmtPtr& op) {
+    if (prior_stack_.empty() || !op) return;
+    auto yield = GetTrailingYield(op->body_);
+    if (!yield) return;
+
+    auto remap = BuildLoopCarryTaskIdRemap(op, yield);
+    if (remap.empty()) return;
+
+    for (auto& access : prior_stack_.back()) {
+      if (!access.task_id_var) continue;
+      auto it = remap.find(access.task_id_var->UniqueId());
+      if (it != remap.end()) {
+        access.task_id_var = it->second.target;
+        access.task_id_var_is_direct = it->second.direct_task_id;
+      }
+    }
+  }
+
+  void RemapFixedTripLoopAccessTaskIds(const ForStmtPtr& op) {
+    if (prior_stack_.empty() || !op) return;
+    auto yield = GetTrailingYield(op->body_);
+    if (!yield) return;
+
+    auto remap = BuildLoopCarryTaskIdRemap(op, yield);
+    if (remap.empty()) return;
+
+    for (auto& access : prior_stack_.back()) {
+      if (!access.dynamic_producer || !access.task_id_var) continue;
+      auto it = remap.find(access.task_id_var->UniqueId());
+      if (it != remap.end()) {
+        access.task_id_var = it->second.target;
+        access.task_id_var_is_direct = it->second.direct_task_id;
+      } else if (auto return_var = LoopReturnVarForAccess(op, access)) {
+        access.task_id_var = return_var;
+        access.task_id_var_is_direct = false;
+      } else {
+        continue;
+      }
+      access.dynamic_producer = false;
+    }
+  }
+
+  VarPtr LoopReturnVarForAccess(const ForStmtPtr& op, const StorageAccess& access) const {
+    if (!storage_ || !op) return nullptr;
+    for (const auto& return_var : op->return_vars_) {
+      if (!return_var) continue;
+      auto resolved = storage_->ResolveExprStatus(return_var);
+      if (resolved.status != LocationStatus::Known) continue;
+      for (const auto& alternative : resolved.location.alternatives) {
+        if (!storage_->MayAlias(access.location.root, alternative.root)) continue;
+        if (!RegionsMayOverlap(access.location.region, alternative.region)) continue;
+        return return_var;
+      }
+    }
+    return nullptr;
+  }
+
+  std::unordered_map<uint64_t, LoopCarryTaskIdMapping> BuildLoopCarryTaskIdRemap(
+      const ForStmtPtr& op, const YieldStmtPtr& yield) const {
+    std::unordered_map<uint64_t, LoopCarryTaskIdMapping> remap;
+    if (!op || !yield) return remap;
+    const bool debug_loop_carry = AutoDepsLoopCarryDebugEnabled();
+    if (debug_loop_carry) {
+      DebugLog("loop_carry_remap return_vars=" + std::to_string(op->return_vars_.size()) + " yield_values=" +
+               std::to_string(yield->value_.size()) + " iter_args=" + std::to_string(op->iter_args_.size()));
+    }
+
+    auto add_mapping = [&](const VarPtr& source, const VarPtr& target) {
+      if (!source || !target) return;
+      const bool direct_task_id = IsTaskIdVar(source) || IsTaskIdVar(target);
+      auto insert_mapping = [&](uint64_t id, const VarPtr& mapped_target, bool mapped_direct) {
+        auto existing = remap.find(id);
+        if (existing != remap.end() && existing->second.direct_task_id && !mapped_direct) return;
+        remap[id] = LoopCarryTaskIdMapping{mapped_target, mapped_direct};
+      };
+
+      insert_mapping(source->UniqueId(), target, direct_task_id);
+      if (debug_loop_carry) {
+        DebugLog("loop_carry_map source=" + DebugVar(source) + " target=" + DebugVar(target) +
+                 " direct=" + (direct_task_id ? std::string("true") : "false"));
+      }
+      if (auto canonical = CanonicalTaskId(source)) {
+        insert_mapping(canonical->UniqueId(), target, direct_task_id);
+        if (debug_loop_carry) {
+          DebugLog("loop_carry_map canonical=" + DebugVar(canonical) + " target=" + DebugVar(target) +
+                   " direct=" + (direct_task_id ? std::string("true") : "false"));
+        }
+      }
+    };
+
+    const size_t yield_count = std::min(op->return_vars_.size(), yield->value_.size());
+    for (size_t i = 0; i < yield_count; ++i) {
+      const auto& return_var = op->return_vars_[i];
+      if (!return_var) continue;
+      add_mapping(AsVarLike(yield->value_[i]), return_var);
+    }
+
+    const size_t iter_arg_count = std::min(op->return_vars_.size(), op->iter_args_.size());
+    for (size_t i = 0; i < iter_arg_count; ++i) {
+      const auto& return_var = op->return_vars_[i];
+      if (!return_var) continue;
+      add_mapping(op->iter_args_[i], return_var);
+    }
+    return remap;
   }
 
   ExprPtr VisitExpr_(const CallPtr& op) override {
@@ -941,12 +1381,12 @@ class AutoDepMutator : public IRMutator {
 
   ExprPtr AnalyzeCallLike(const CallPtr& call, const Expr* identity_key,
                           const std::vector<std::pair<std::string, std::any>>& output_attrs) {
-    if (prior_stack_.empty()) return call;
+    if (prior_stack_.empty() || scope_manual_stack_.empty()) return call;
     if (IsBuiltinOp(call->op_->name_)) return call;
 
     VarPtr task_id = LookupTaskId(identity_key);
+    const bool in_manual_scope = !scope_manual_stack_.empty() && scope_manual_stack_.back();
     if (!task_id) {
-      const bool in_manual_scope = !scope_manual_stack_.empty() && scope_manual_stack_.back();
       if (!in_manual_scope || IsTaskIdVar(current_assign_lhs_)) {
         task_id = current_assign_lhs_;
       }
@@ -966,7 +1406,7 @@ class AutoDepMutator : public IRMutator {
       if (debug_loop_carry) {
         DebugLog("fallback_reason=summary_unknown_location call=" + call->op_->name_);
       }
-      fallback_stack_.back() = true;
+      MarkCurrentScopeFallback();
       return call;
     }
     auto& accesses = summary.accesses;
@@ -974,46 +1414,56 @@ class AutoDepMutator : public IRMutator {
 
     std::vector<VarPtr> compiler_edges;
     for (const auto& access : accesses) {
-      for (const auto& prior : prior_stack_.back()) {
-        if (!storage_ || !storage_->MayAlias(access.location.root, prior.location.root)) continue;
-        if (!RegionsMayOverlap(access.location.region, prior.location.region)) continue;
-        if (!HasHazard(access.kind, prior.kind)) continue;
-        VarPtr prior_edge = CanonicalTaskId(prior.task_id_var);
-        if (!prior_edge) prior_edge = prior.task_id_var;
-        const bool covered_by_user_edge = ContainsVar(user_edges, prior_edge);
-        if (debug_loop_carry) {
-          DebugLog("hazard call=" + call->op_->name_ + " prior_task_id=" + DebugVar(prior.task_id_var) +
-                   " prior_edge=" + DebugVar(prior_edge) +
-                   " covered_by_user_edge=" + (covered_by_user_edge ? std::string("true") : "false") +
-                   " dynamic_producer=" + (prior.dynamic_producer ? std::string("true") : "false") +
-                   " current_task_id=" + DebugVar(task_id));
-        }
-        if (prior.dynamic_producer) {
-          if (covered_by_user_edge && loop_depth_ == 0) continue;
+      for (auto frame_it = prior_stack_.rbegin(); frame_it != prior_stack_.rend(); ++frame_it) {
+        for (const auto& prior : *frame_it) {
+          if (!storage_ || !storage_->MayAlias(access.location.root, prior.location.root)) continue;
+          if (!RegionsMayOverlap(access.location.region, prior.location.region)) continue;
+          if (!HasHazard(access.kind, prior.kind)) continue;
+          VarPtr prior_edge =
+              prior.task_id_var_is_direct ? prior.task_id_var : CanonicalTaskId(prior.task_id_var);
+          if (!prior_edge) prior_edge = prior.task_id_var;
+          const bool covered_by_user_edge =
+              (ContainsVar(user_edges, prior_edge) &&
+               !(prior.dynamic_producer &&
+                 HasIncompleteDynamicTaskIdUserCoverage(raw_user_edges, prior_edge))) ||
+              (prior.dynamic_producer && (HasCompleteDynamicTaskIdUserCoverage(raw_user_edges, prior_edge) ||
+                                          HasWindowedTaskIdTempUserCoverage(user_edges)));
           if (debug_loop_carry) {
-            DebugLog("fallback_reason=dynamic_prior_producer_requires_scope_lift call=" + call->op_->name_ +
-                     " prior_task_id=" + DebugVar(prior.task_id_var));
+            DebugLog("hazard call=" + call->op_->name_ + " prior_task_id=" + DebugVar(prior.task_id_var) +
+                     " prior_edge=" + DebugVar(prior_edge) +
+                     " covered_by_user_edge=" + (covered_by_user_edge ? std::string("true") : "false") +
+                     " dynamic_producer=" + (prior.dynamic_producer ? std::string("true") : "false") +
+                     " direct_task_id=" + (prior.task_id_var_is_direct ? std::string("true") : "false") +
+                     " current_task_id=" + DebugVar(task_id));
           }
-          fallback_stack_.back() = true;
-          return call;
-        }
-        if (covered_by_user_edge) continue;
-        if (!prior.task_id_var) {
-          if (debug_loop_carry) {
-            DebugLog("fallback_reason=" +
-                     std::string(prior.dynamic_producer ? "dynamic_prior_producer_missing_task_id"
-                                                        : "missing_prior_task_id") +
-                     " call=" + call->op_->name_ + " user_edges=" + DebugVarList(user_edges));
+          if (covered_by_user_edge) continue;
+          if (prior.dynamic_producer) {
+            if (debug_loop_carry) {
+              DebugLog("fallback_reason=dynamic_prior_producer_requires_scope_lift call=" + call->op_->name_ +
+                       " prior_task_id=" + DebugVar(prior.task_id_var));
+            }
+            MarkCurrentScopeFallback();
+            return call;
           }
-          fallback_stack_.back() = true;
-          return call;
+          if (!prior.task_id_var) {
+            if (debug_loop_carry) {
+              DebugLog("fallback_reason=" +
+                       std::string(prior.dynamic_producer ? "dynamic_prior_producer_missing_task_id"
+                                                          : "missing_prior_task_id") +
+                       " call=" + call->op_->name_ + " user_edges=" + DebugVarList(user_edges));
+            }
+            MarkCurrentScopeFallback();
+            return call;
+          }
+          AppendUnique(&compiler_edges, prior_edge);
         }
-        AppendUnique(&compiler_edges, prior_edge);
       }
     }
 
     for (auto& access : accesses) {
-      access.task_id_var = task_id;
+      access.task_id_var =
+          task_id ? task_id : (in_manual_scope ? nullptr : ProducerTaskIdForAccess(call, access));
+      access.task_id_var_is_direct = access.task_id_var && IsTaskIdVar(access.task_id_var);
       access.dynamic_producer = loop_depth_ > 0;
       prior_stack_.back().push_back(std::move(access));
     }
@@ -1028,6 +1478,11 @@ class AutoDepMutator : public IRMutator {
   }
 
  private:
+  void MarkCurrentScopeFallback() {
+    if (fallback_stack_.empty()) return;
+    fallback_stack_.back() = true;
+  }
+
   class CompilerDepStripper : public IRMutator {
    protected:
     ExprPtr VisitExpr_(const CallPtr& op) override {
@@ -1079,13 +1534,152 @@ class AutoDepMutator : public IRMutator {
     return IsTaskIdVar(var) ? var : nullptr;
   }
 
+  std::vector<VarPtr> CanonicalTaskIds(const VarPtr& var) const {
+    std::vector<VarPtr> canonical;
+    if (!var) return canonical;
+    if (task_ids_by_var_id_) {
+      auto it = task_ids_by_var_id_->find(var->UniqueId());
+      if (it != task_ids_by_var_id_->end()) {
+        AppendAllUnique(&canonical, it->second);
+        return canonical;
+      }
+    }
+    if (auto scalar = CanonicalTaskId(var)) {
+      canonical.push_back(scalar);
+      return canonical;
+    }
+    if (task_ids_by_array_var_id_ && IsTaskIdArrayVar(var)) {
+      auto it = task_ids_by_array_var_id_->find(var->UniqueId());
+      if (it != task_ids_by_array_var_id_->end()) {
+        AppendAllUnique(&canonical, it->second);
+      }
+    }
+    return canonical;
+  }
+
   std::vector<VarPtr> CanonicalizeTaskIds(const std::vector<VarPtr>& vars) const {
     std::vector<VarPtr> canonical;
     canonical.reserve(vars.size());
+    std::unordered_map<uint64_t, std::unordered_set<int64_t>> dynamic_array_slots;
     for (const auto& var : vars) {
-      AppendUnique(&canonical, CanonicalTaskId(var));
+      bool has_dynamic_slots = false;
+      if (task_id_dynamic_slots_by_var_id_ && var) {
+        auto slots_it = task_id_dynamic_slots_by_var_id_->find(var->UniqueId());
+        if (slots_it != task_id_dynamic_slots_by_var_id_->end()) {
+          has_dynamic_slots = true;
+          for (const auto& [array_id, slots] : slots_it->second) {
+            for (const auto slot : slots) {
+              dynamic_array_slots[array_id].insert(slot);
+            }
+          }
+        }
+      }
+      if (has_dynamic_slots) continue;
+      if (IsTaskIdVar(var)) AppendUnique(&canonical, var);
+      AppendAllUnique(&canonical, CanonicalTaskIds(var));
+    }
+    for (const auto& [array_id, slots] : dynamic_array_slots) {
+      if (!task_ids_by_array_var_id_ || !task_id_array_extent_by_var_id_) continue;
+      auto extent_it = task_id_array_extent_by_var_id_->find(array_id);
+      if (extent_it == task_id_array_extent_by_var_id_->end()) continue;
+      if (!HasCompleteDynamicCoverage(slots, extent_it->second)) continue;
+      auto expanded_it = task_ids_by_array_var_id_->find(array_id);
+      if (expanded_it == task_ids_by_array_var_id_->end()) continue;
+      AppendAllUnique(&canonical, expanded_it->second);
     }
     return canonical;
+  }
+
+  bool HasCompleteDynamicTaskIdUserCoverage(const std::vector<VarPtr>& raw_user_edges,
+                                            const VarPtr& prior_edge) const {
+    if (!prior_edge || !task_id_dynamic_slots_by_var_id_ || !task_id_array_extent_by_var_id_ ||
+        !task_ids_by_array_var_id_) {
+      return false;
+    }
+
+    std::unordered_map<uint64_t, std::unordered_set<int64_t>> dynamic_array_slots;
+    for (const auto& edge : raw_user_edges) {
+      if (!edge) continue;
+      auto slots_it = task_id_dynamic_slots_by_var_id_->find(edge->UniqueId());
+      if (slots_it == task_id_dynamic_slots_by_var_id_->end()) continue;
+      for (const auto& [array_id, slots] : slots_it->second) {
+        for (const auto slot : slots) {
+          dynamic_array_slots[array_id].insert(slot);
+        }
+      }
+    }
+
+    for (const auto& [array_id, slots] : dynamic_array_slots) {
+      auto extent_it = task_id_array_extent_by_var_id_->find(array_id);
+      if (extent_it == task_id_array_extent_by_var_id_->end()) continue;
+      if (!HasCompleteDynamicCoverage(slots, extent_it->second)) continue;
+
+      auto expanded_it = task_ids_by_array_var_id_->find(array_id);
+      if (expanded_it == task_ids_by_array_var_id_->end()) continue;
+      if (ContainsVar(expanded_it->second, prior_edge)) return true;
+    }
+    return false;
+  }
+
+  bool HasIncompleteDynamicTaskIdUserCoverage(const std::vector<VarPtr>& raw_user_edges,
+                                              const VarPtr& prior_edge) const {
+    if (!prior_edge || !task_id_dynamic_slots_by_var_id_ || !task_id_array_extent_by_var_id_ ||
+        !task_ids_by_array_var_id_) {
+      return false;
+    }
+
+    std::unordered_map<uint64_t, std::unordered_set<int64_t>> dynamic_array_slots;
+    for (const auto& edge : raw_user_edges) {
+      if (!edge) continue;
+      auto slots_it = task_id_dynamic_slots_by_var_id_->find(edge->UniqueId());
+      if (slots_it == task_id_dynamic_slots_by_var_id_->end()) continue;
+      for (const auto& [array_id, slots] : slots_it->second) {
+        for (const auto slot : slots) {
+          dynamic_array_slots[array_id].insert(slot);
+        }
+      }
+    }
+
+    for (const auto& [array_id, slots] : dynamic_array_slots) {
+      auto extent_it = task_id_array_extent_by_var_id_->find(array_id);
+      if (extent_it == task_id_array_extent_by_var_id_->end()) continue;
+      if (HasCompleteDynamicCoverage(slots, extent_it->second)) continue;
+
+      auto expanded_it = task_ids_by_array_var_id_->find(array_id);
+      if (expanded_it == task_ids_by_array_var_id_->end()) continue;
+      if (ContainsVar(expanded_it->second, prior_edge)) return true;
+    }
+    return false;
+  }
+
+  bool HasWindowedTaskIdTempUserCoverage(const std::vector<VarPtr>& user_edges) const {
+    size_t temp_count = 0;
+    for (const auto& edge : user_edges) {
+      if (!edge || !IsTaskIdVar(edge)) continue;
+      if (submit_task_id_var_ids_.find(edge->UniqueId()) != submit_task_id_var_ids_.end()) continue;
+      ++temp_count;
+      if (temp_count >= kMinWindowedTaskIdTempDeps) return true;
+    }
+    return false;
+  }
+
+  VarPtr ProducerTaskIdForAccess(const CallPtr& call, const StorageAccess& access) const {
+    if (access.kind == AccessKind::Read) return nullptr;
+    auto dirs = call->GetArgDirections();
+    if (dirs.size() != call->args_.size()) return nullptr;
+    for (size_t i = 0; i < dirs.size(); ++i) {
+      if (dirs[i] != ArgDirection::OutputExisting && dirs[i] != ArgDirection::InOut) continue;
+      auto var = AsVarLike(call->args_[i]);
+      if (!var) continue;
+      auto resolved = storage_ ? storage_->ResolveExprStatus(call->args_[i]) : ResolvedLocation{};
+      if (resolved.status != LocationStatus::Known) continue;
+      for (const auto& alternative : resolved.location.alternatives) {
+        if (!storage_ || !storage_->MayAlias(access.location.root, alternative.root)) continue;
+        if (!RegionsMayOverlap(access.location.region, alternative.region)) continue;
+        return var;
+      }
+    }
+    return nullptr;
   }
 
   AccessSummary SummarizeAccesses(const CallPtr& call, const std::vector<VarPtr>& user_edges,
@@ -1155,6 +1749,12 @@ class AutoDepMutator : public IRMutator {
   const StorageRootAnalysis* storage_;
   const std::unordered_map<const Expr*, VarPtr>* task_id_by_expr_;
   const std::unordered_map<uint64_t, VarPtr>* task_id_by_var_id_;
+  const std::unordered_map<uint64_t, std::vector<VarPtr>>* task_ids_by_var_id_;
+  const std::unordered_map<uint64_t, std::unordered_map<uint64_t, std::unordered_set<int64_t>>>*
+      task_id_dynamic_slots_by_var_id_;
+  const std::unordered_map<uint64_t, int64_t>* task_id_array_extent_by_var_id_;
+  const std::unordered_map<uint64_t, std::vector<VarPtr>>* task_ids_by_array_var_id_;
+  std::unordered_set<uint64_t> submit_task_id_var_ids_;
   bool analyze_auto_scopes_ = false;
   bool analyze_whole_body_as_auto_scope_ = false;
   std::vector<std::vector<StorageAccess>> prior_stack_;
@@ -1190,6 +1790,8 @@ Pass AutoDeriveTaskDependencies(bool analyze_auto_scopes) {
                                                     func->func_type_ == FunctionType::Orchestration &&
                                                     func->GetAttr<bool>("auto_scope", true);
       AutoDepMutator mutator(program, &storage, &task_ids.task_id_by_expr(), &task_ids.task_id_by_var_id(),
+                             &task_ids.task_ids_by_var_id(), &task_ids.task_id_dynamic_slots_by_var_id(),
+                             &task_ids.task_id_array_extent_by_var_id(), &task_ids.task_ids_by_array_var_id(),
                              analyze_auto_scopes, analyze_whole_body_as_auto_scope);
       auto new_body = mutator.AnalyzeBody(func->body_);
       if (new_body.get() == func->body_.get()) continue;

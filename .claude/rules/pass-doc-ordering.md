@@ -47,7 +47,7 @@ Developers read pass docs sequentially to understand the compilation pipeline. I
 | 32 | `32-fold_no_op_reshape.md` | 32nd pass |
 | 33 | `33-fuse_create_assemble_to_slice.md` | 33rd pass |
 | 34 | `34-derive_call_directions.md` | 34th pass (two-phase: arg directions + manual-scope lowering) |
-| 35 | `35-auto_derive_task_dependencies.md` | 35th pass (default MANUAL-scope compiler deps; opt-in AUTO-scope analysis/emission via compile-time switch) |
+| 35 | `35-auto_derive_task_dependencies.md` | 35th pass (manual-scope compiler deps; opt-in AUTO-scope analysis/emission via compile-time switch; default behavior unchanged) |
 | 36 | `36-expand_manual_phase_fence.md` | 36th pass (manual-scope phase-fence TaskId dep compression; runs after AutoDeriveTaskDependencies) |
 | 37 | `37-materialize_comm_domain_scopes.md` | 37th pass (distributed: WindowBuffer + CommDomainScopeStmt wrappers in each host_orch body; runs immediately before LowerHostTensorCollectives) |
 | 38 | `38-lower_host_tensor_collectives.md` | 38th pass (host-level tensor collectives -> internal builtin chip dispatches; runs after comm-domain scopes) |
