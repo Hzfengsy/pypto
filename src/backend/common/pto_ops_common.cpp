@@ -2883,12 +2883,15 @@ static std::string MakeGetCodegenPTO(const CallPtr& op, codegen::CodegenBase& co
          "(dst, peer, src, stage, dst_offsets, src_offsets, shape), got "
       << op->args_.size();
 
-  // dst: local DistributedTensor destination — reuses the local tensor_view
-  // created by EmitMakeTensorViews (no peer arithmetic, like wait's signal).
+  // dst: local destination — DistributedTensor (window-bound) or plain Tensor.
+  // Both reuse the local tensor_view created by EmitMakeTensorViews (no peer
+  // arithmetic, like wait's signal). TGET only requires dst to be a writable
+  // local GM region; window membership is not needed on the destination side.
   auto dst_var = AsVarLike(op->args_[0]);
   CHECK(dst_var) << "pld.tile.get dst must be a Var-like expression";
-  auto dst_dist = As<ir::DistributedTensorType>(dst_var->GetType());
-  CHECK(dst_dist) << "pld.tile.get dst must be DistributedTensorType, got " << dst_var->GetType()->TypeName();
+  auto dst_tt = AsTensorTypeLike(dst_var->GetType());
+  CHECK(dst_tt) << "pld.tile.get dst must be a Tensor or DistributedTensor, got "
+                << dst_var->GetType()->TypeName();
 
   // src: remote (peer-addressed) DistributedTensor source.
   auto src_binding = ResolveDistTensorBinding(op->args_[2], codegen, "pld.tile.get");
@@ -2896,9 +2899,9 @@ static std::string MakeGetCodegenPTO(const CallPtr& op, codegen::CodegenBase& co
   CHECK(peer_scalar) << "pld.tile.get peer must be ScalarType at codegen, got "
                      << op->args_[1]->GetType()->TypeName();
 
-  const auto& dst_shape = dst_dist->shape_;
+  const auto& dst_shape = dst_tt->shape_;
   const size_t rank = dst_shape.size();
-  const std::string dtype_str = codegen.GetTypeString(dst_dist->dtype_);
+  const std::string dtype_str = codegen.GetTypeString(dst_tt->dtype_);
 
   std::vector<std::string> dst_offsets;
   std::vector<std::string> src_offsets;
@@ -2934,7 +2937,7 @@ static std::string MakeGetCodegenPTO(const CallPtr& op, codegen::CodegenBase& co
 
   // dst: local tensor_view + full-slice partition_view.
   std::string dst_local_view = codegen.GetOrCreateTensorView(dst_var);
-  std::string dst_view_type = codegen.GetTensorViewTypeString(dst_dist.get());
+  std::string dst_view_type = codegen.GetTensorViewTypeString(dst_tt.get());
   std::string dst_pview = EmitPartitionViewPTO(dst_var->name_hint_ + "_local", dst_local_view, dst_view_type,
                                                partition_type, dst_offsets, size_ssa, codegen);
 

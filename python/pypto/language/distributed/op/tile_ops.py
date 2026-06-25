@@ -163,7 +163,7 @@ def put(
 
 
 def get(
-    dst: DistributedTensor,
+    dst: DistributedTensor | Tensor,
     peer: IntLike,
     src: DistributedTensor,
     stage: Tile,
@@ -179,10 +179,14 @@ def get(
     dst_expr = _unwrap(dst)
     src_expr = _unwrap(src)
     stage_expr = _unwrap(stage)
-    for role, expr in (("dst", dst_expr), ("src", src_expr)):
-        if not isinstance(expr, Expr) or not isinstance(expr.type, _ir.DistributedTensorType):
-            got = _ir.python_print_type(expr.type) if isinstance(expr, Expr) else type(expr).__name__
-            raise TypeError(f"pld.tile.get expects a DistributedTensor {role} (window-bound); got {got}")
+    if not isinstance(dst_expr, Expr) or not isinstance(
+        dst_expr.type, (_ir.TensorType, _ir.DistributedTensorType)
+    ):
+        got = _ir.python_print_type(dst_expr.type) if isinstance(dst_expr, Expr) else type(dst_expr).__name__
+        raise TypeError(f"pld.tile.get expects a Tensor or DistributedTensor dst; got {got}")
+    if not isinstance(src_expr, Expr) or not isinstance(src_expr.type, _ir.DistributedTensorType):
+        got = _ir.python_print_type(src_expr.type) if isinstance(src_expr, Expr) else type(src_expr).__name__
+        raise TypeError(f"pld.tile.get expects a DistributedTensor src (window-bound); got {got}")
     has_region = dst_offsets is not None or src_offsets is not None or shape is not None
     if has_region and (dst_offsets is None or src_offsets is None or shape is None):
         raise ValueError("pld.tile.get dst_offsets, src_offsets, and shape must be provided together")

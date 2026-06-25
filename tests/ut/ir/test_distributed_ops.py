@@ -1107,20 +1107,35 @@ def test_get_rejects_unexpected_kwargs():
         )
 
 
-def test_get_rejects_plain_tensor_dst():
-    """Negative: a plain pl.Tensor dst is refused — must be window-bound."""
+def test_get_accepts_plain_tensor_dst():
+    """Positive: plain pl.Tensor dst is accepted — TGET only needs a writable
+    local GM region to receive into."""
     span = ir.Span.unknown()
     plain = ir.Var("x", ir.TensorType([ir.ConstInt(16, DataType.INT64, span)], DataType.FP16), span)
     peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
     src = _make_distributed_tensor_var("src", [16], DataType.FP16, span)
 
-    with pytest.raises(Exception, match="DistributedTensor"):
-        ir.create_op_call(
-            "pld.tensor.get",
-            [plain, peer, src],
-            {},
-            span,
-        )
+    call = ir.create_op_call(
+        "pld.tensor.get",
+        [plain, peer, src],
+        {},
+        span,
+    )
+    assert isinstance(call.type, ir.UnknownType)
+
+
+def test_tile_get_accepts_plain_tensor_dst():
+    """Positive: plain pl.Tensor dst is accepted by pld.tile.get — TGET only
+    needs a writable local GM region to receive into."""
+    span = ir.Span.unknown()
+    plain = ir.Var("x", ir.TensorType([ir.ConstInt(16, DataType.INT64, span)], DataType.FP16), span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    src = _make_distributed_tensor_var("src", [16], DataType.FP16, span)
+    stage = _make_tile_var("stage", [1, 16], DataType.FP16, span)
+
+    call = dist_tile_ops.get(plain, peer, src, stage, span=span)
+
+    assert isinstance(call.type, ir.UnknownType)
 
 
 def test_get_rejects_plain_tensor_src():

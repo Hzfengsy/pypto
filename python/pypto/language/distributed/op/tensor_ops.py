@@ -26,10 +26,13 @@ Layout mirrors the ``tile.alloc`` / ``MemRef`` / ``TileType`` triple:
   rewrites it to a ``tile.create`` VEC staging tile plus a ``pld.tile.put``
   call so the stage participates in memory allocation/lowering before backend
   codegen.
-* ``get`` is a synchronous cross-rank bulk read: both ``dst`` and ``src`` are
-  window-bound :class:`pld.DistributedTensor` (GM/tensor-level) views — the
-  VEC staging tile that TGET bounces through is synthesised at codegen, so it
-  stays a tensor-level op rather than a tile-level one.
+* ``get`` is a synchronous cross-rank bulk read: ``dst`` may be a window-bound
+  :class:`pld.DistributedTensor` or a plain :class:`pl.Tensor` — TGET only
+  needs a writable local GM region on the destination side; ``src`` must be a
+  window-bound :class:`pld.DistributedTensor` (the peer needs a window slot to
+  read from). ``ConvertTensorToTileOps`` rewrites it to a ``tile.create`` VEC
+  staging tile plus a ``pld.tile.get`` call so the stage participates in memory
+  allocation/lowering before backend codegen.
 
 ``alloc_window_buffer`` is intercepted at the AssignStmt level by the parser
 so the buffer's ``name`` kwarg can be derived from the LHS — the body of that
@@ -203,7 +206,7 @@ def put(
 
 
 def get(
-    dst: DistributedTensor,
+    dst: DistributedTensor | Tensor,
     peer: IntLike,
     src: DistributedTensor,
     dst_offsets: Sequence[IntLike] | None = None,
@@ -224,7 +227,10 @@ def get(
     provided together.
 
     Args:
-        dst: Local window-bound :class:`pld.DistributedTensor` destination.
+        dst: Local destination — either a window-bound
+            :class:`pld.DistributedTensor` or a plain :class:`pl.Tensor`.
+            TGET only needs a writable local GM region to receive into;
+            window membership is not required on the destination side.
         peer: Peer rank index.
         src: Peer rank's window-bound :class:`pld.DistributedTensor` source.
         dst_offsets: Optional offsets into the local ``dst`` slice.
@@ -235,7 +241,16 @@ def get(
     Returns:
         The underlying IR Call.
     """
-    dst_expr, src_expr = _unwrap_distributed_tensors("pld.tensor.get", dst=dst, src=src)
+    dst_expr = _unwrap(dst)
+    src_expr = _unwrap(src)
+    if not isinstance(dst_expr, Expr) or not isinstance(
+        dst_expr.type, (_ir.TensorType, _ir.DistributedTensorType)
+    ):
+        got = _ir.python_print_type(dst_expr.type) if isinstance(dst_expr, Expr) else type(dst_expr).__name__
+        raise TypeError(f"pld.tensor.get expects a Tensor or DistributedTensor dst; got {got}")
+    if not isinstance(src_expr, Expr) or not isinstance(src_expr.type, _ir.DistributedTensorType):
+        got = _ir.python_print_type(src_expr.type) if isinstance(src_expr, Expr) else type(src_expr).__name__
+        raise TypeError(f"pld.tensor.get expects a DistributedTensor src (window-bound); got {got}")
     has_region = dst_offsets is not None or src_offsets is not None or shape is not None
     if has_region and (dst_offsets is None or src_offsets is None or shape is None):
         raise ValueError("pld.tensor.get dst_offsets, src_offsets, and shape must be provided together")

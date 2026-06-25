@@ -9,12 +9,16 @@ storage is a slice of a symmetric, per-rank communication window allocated by
 `pld.alloc_window_buffer`. Verifiers in this family generally reject plain
 `TensorType` (strict kind-trait matching — `As<DistributedTensorType>` does
 not match a plain `TensorType`), so a non-window-bound tensor can never be fed
-into a cross-rank slot by accident. **One documented exception:**
+into a cross-rank slot by accident. **Two documented exceptions:**
 `pld.tensor.put` (and its lowered `pld.tile.put`) accepts a plain `Tensor` on
 the `src` side via `AsTensorTypeLike` — TPUT only needs a readable local GM
 region for the source, so kernels can push directly from host-backed inputs
 without first staging through a window buffer; `dst` still requires a
 window-bound `DistributedTensor`.
+`pld.tensor.get` (and its lowered `pld.tile.get`) accepts a plain `Tensor` on
+the `dst` side via `AsTensorTypeLike` — TGET only needs a writable local GM
+region to receive into, so kernels can TGET directly into host-backed output
+tensors; `src` still requires a window-bound `DistributedTensor`.
 
 There are **seven ops** and **four ABI enums**:
 
@@ -40,12 +44,14 @@ The namespace encodes the IR level the op lives at, not an arbitrary grouping:
 - **`pld.tile.remote_store`** consumes a *tile* (the symmetric write companion
   of `remote_load`), so it is a sibling of `tile.store` and lives in
   `pld.tile`.
-- **`pld.tensor.get`** reads and writes *tensor* (GM) operands — both `dst` and
-  `src` are window-bound `DistributedTensor` views. The VEC staging tile that
-  TGET bounces through is materialised by `ConvertTensorToTileOps` as an
-  internal `pld.tile.get`, never on the DSL surface. It is therefore a sibling
-  of `pld.tensor.alloc_window_buffer` / `pld.tensor.window`, **not** of the
-  tile-producing `remote_load`.
+- **`pld.tensor.get`** reads and writes *tensor* (GM) operands — `dst` may be a
+  window-bound `DistributedTensor` or a plain `Tensor` (TGET only needs a
+  writable local GM region to receive into) while `src` must be a window-bound
+  `DistributedTensor` (the peer needs a window slot to read from). The VEC
+  staging tile that TGET bounces through is materialised by
+  `ConvertTensorToTileOps` as an internal `pld.tile.get`, never on the DSL
+  surface. It is therefore a sibling of `pld.tensor.alloc_window_buffer` /
+  `pld.tensor.window`, **not** of the tile-producing `remote_load`.
 - **`pld.tensor.put`** reads and writes *tensor* (GM) operands — `dst` is a
   window-bound `DistributedTensor` (the peer needs a window slot to receive
   into) while `src` accepts either a window-bound `DistributedTensor` or a
@@ -177,16 +183,18 @@ pld.tensor.get(dst, peer, src, dst_offsets, src_offsets, shape) -> Unknown
 ```
 
 Synchronously reads the `peer` rank's slice of the window-bound `src` into the
-local window-bound `dst`. Both operands are GM-level `DistributedTensor`
-views; the VEC staging tile is materialised by `ConvertTensorToTileOps` as an
-internal `tile.create + pld.tile.get`, so it flows through PyPTO's memory
-allocator and never appears on the DSL surface.
+local `dst`. `dst` may be a window-bound `DistributedTensor` or a plain
+`Tensor`; `src` must be a window-bound `DistributedTensor`. The VEC staging
+tile is materialised by `ConvertTensorToTileOps` as an internal
+`tile.create + pld.tile.get`, so it flows through PyPTO's memory allocator and
+never appears on the DSL surface.
 
 With no offsets/shape this reads the full peer `src` slice into the full local
 `dst` slice. Supplying `dst_offsets`, `src_offsets`, and `shape` narrows the
 transfer to matching subregions; all three must be provided together.
 
-Verifier: `dst` / `src` must both be `DistributedTensorType`; `peer` must be a
+Verifier: `dst` must be either `TensorType` or `DistributedTensorType` (matched
+via `AsTensorTypeLike`); `src` must be `DistributedTensorType`; `peer` must be a
 `ScalarType`; `dst` and `src` must share element type, rank, and **positive
 static** dimensions. Full-slice `get` requires identical shape; subregion `get`
 allows different full slice extents as long as the explicit transfer region is

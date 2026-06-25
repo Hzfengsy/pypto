@@ -30,12 +30,16 @@
  * Side-effect-only: the op produces :class:`UnknownType`, mirroring
  * ``pld.tensor.put`` and the sync primitives.
  *
- * Verifier (strict per kind-trait rules - ``As<DistributedTensorType>`` does
- * NOT match a plain :class:`TensorType`):
+ * Verifier:
  *
- * * ``dst`` / ``src`` must have :class:`DistributedTensorType` - refuse plain
- *   :class:`TensorType` so non-window-bound tensors cannot participate in a
- *   cross-rank read.
+ * * ``dst`` accepts either :class:`DistributedTensorType` *or* plain
+ *   :class:`TensorType` (matched via :func:`AsTensorTypeLike`). The TGET
+ *   primitive only requires dst to be a writable local GM region; it does not
+ *   need a window. This lets kernels TGET directly into host-backed output
+ *   tensors without first allocating a window buffer.
+ * * ``src`` must have :class:`DistributedTensorType` - the source of a
+ *   cross-rank read must be window-bound (the remote peer needs a window
+ *   slot to read from).
  * * ``peer`` must be a :class:`ScalarType` expression (rank index).
  * * ``dst`` and ``src`` must share element type, rank, and positive static
  *   dimensions.
@@ -71,8 +75,8 @@ void ValidateGetContract(const ExprPtr& dst, const ExprPtr& peer, const ExprPtr&
   CHECK(peer) << op_name << " peer argument must not be null";
   CHECK(src) << op_name << " src argument must not be null";
 
-  auto dst_type = As<DistributedTensorType>(dst->GetType());
-  CHECK(dst_type) << op_name << " dst must be a DistributedTensor (window-bound), got "
+  auto dst_type = AsTensorTypeLike(dst->GetType());
+  CHECK(dst_type) << op_name << " dst must be a Tensor or DistributedTensor, got "
                   << dst->GetType()->TypeName();
 
   CHECK(IsA<ScalarType>(peer->GetType()))
@@ -164,7 +168,7 @@ TypePtr DeduceGetType(const std::vector<ExprPtr>& args,
 
   ValidateGetContract(args[0], args[1], args[2], "pld.tensor.get", args.size() == 3);
   if (args.size() == 6) {
-    auto dst_type = As<DistributedTensorType>(args[0]->GetType());
+    auto dst_type = AsTensorTypeLike(args[0]->GetType());
     auto src_type = As<DistributedTensorType>(args[2]->GetType());
     ValidateGetRegionArgs(args, 3, dst_type->shape_, src_type->shape_, "pld.tensor.get");
   }
@@ -186,7 +190,7 @@ TypePtr DeduceGetTileType(const std::vector<ExprPtr>& args,
 
   auto stage_type = As<TileType>(args[3]->GetType());
   CHECK(stage_type) << "pld.tile.get stage must be a TileType, got " << args[3]->GetType()->TypeName();
-  auto dst_type = As<DistributedTensorType>(args[0]->GetType());
+  auto dst_type = AsTensorTypeLike(args[0]->GetType());
   CHECK(stage_type->dtype_ == dst_type->dtype_)
       << "pld.tile.get stage dtype must match dst dtype, got stage=" << stage_type->dtype_.ToString()
       << " dst=" << dst_type->dtype_.ToString();
@@ -230,13 +234,14 @@ TypePtr DeduceGetTileType(const std::vector<ExprPtr>& args,
 REGISTER_OP("pld.tensor.get")
     .set_description(
         "Cross-rank get: synchronously read the `peer` rank's slice of the window-bound "
-        "DistributedTensor `src` into the local window-bound DistributedTensor `dst`. "
+        "DistributedTensor `src` into the local destination `dst` "
+        "(window-bound DistributedTensor or plain Tensor). "
         "Semantically equivalent to remote_load + store. Supports full-slice and explicit "
         "subregion forms. ConvertTensorToTileOps lowers this to tile.create + pld.tile.get; "
         "PTO emission then produces CommRemoteOffset(ctx, peer) + addptr + make_tensor_view + "
         "partition_view (src) + partition_view (dst) + explicit VEC staging tile + TGET.")
     .set_op_category("DistributedOp")
-    .add_argument("dst", "Local window-bound DistributedTensor destination")
+    .add_argument("dst", "Local destination — DistributedTensor (window-bound) or plain Tensor")
     .add_argument("peer", "Peer rank index (ScalarType)")
     .add_argument("src", "Remote (peer) window-bound DistributedTensor source (same dtype as dst)")
     .no_memory_spec()
@@ -251,7 +256,7 @@ REGISTER_OP("pld.tile.get")
         "Tile-level form of pld.tensor.get with an explicit VEC staging tile. "
         "Created by ConvertTensorToTileOps; not user-facing.")
     .set_op_category("DistributedOp")
-    .add_argument("dst", "Local window-bound DistributedTensor destination")
+    .add_argument("dst", "Local destination — DistributedTensor (window-bound) or plain Tensor")
     .add_argument("peer", "Peer rank index (ScalarType)")
     .add_argument("src", "Remote (peer) window-bound DistributedTensor source (same dtype as dst)")
     .add_argument("stage", "VEC staging TileType (rows x cols == prod(transfer shape))")
