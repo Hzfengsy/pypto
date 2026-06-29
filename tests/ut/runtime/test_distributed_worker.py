@@ -27,7 +27,12 @@ from pypto.ir.distributed_compiled_program import DistributedConfig
 from pypto.pypto_core import DataType
 from pypto.pypto_core.ir import ParamDirection
 from pypto.runtime import DeviceTensor
-from pypto.runtime.distributed_runner import DistributedWorker, _assemble_chip_callables, _submit_chip
+from pypto.runtime.distributed_runner import (
+    DistributedWorker,
+    _assemble_chip_callables,
+    _clear_dfx_dispatch_dirs,
+    _submit_chip,
+)
 
 
 def _param(name: str, shape: list[int], direction: ParamDirection = ParamDirection.In) -> _ParamInfo:
@@ -842,11 +847,14 @@ class _RecordingOrch:
     """Records the ``output_prefix`` observed at each ``submit_next_level``.
 
     Captures the prefix *at submit time* (not after) so tests can prove
-    ``_submit_chip`` applied the per-rank suffix before the task was queued.
+    ``_submit_chip`` applied the per-dispatch suffix before the task was queued.
     """
 
     def __init__(self) -> None:
         self.calls: list[tuple[Any, int, str]] = []
+        # ``_submit_chip`` reads/writes this per-card dispatch counter on the
+        # orch; declare it so the attribute is known to the type checker.
+        self._dfx_dispatch_idx: dict[int, int] = {}
 
     def submit_next_level(self, callable_id: Any, task_args: Any, config: Any, *, worker: int) -> str:
         self.calls.append((callable_id, worker, config.output_prefix))
@@ -854,14 +862,15 @@ class _RecordingOrch:
 
 
 class TestSubmitChip:
-    """``_submit_chip`` namespaces per-rank DFX ``output_prefix`` then restores it."""
+    """``_submit_chip`` namespaces per-dispatch DFX ``output_prefix`` then restores it."""
 
     def test_suffixes_prefix_at_submit_and_restores(self):
         orch = _RecordingOrch()
         cfg = _SpyDfxConfig(output_prefix="/work/dfx_outputs")
         ret = _submit_chip(orch, "chip_a", "ta", cfg, 3)
-        # Suffix was visible to the runtime at submit time...
-        assert orch.calls == [("chip_a", 3, "/work/dfx_outputs/rank3")]
+        # Card + the card's 0th dispatch was visible to the runtime at submit
+        # time...
+        assert orch.calls == [("chip_a", 3, "/work/dfx_outputs/rank3/d0")]
         # ...and the shared config is restored afterward.
         assert cfg.output_prefix == "/work/dfx_outputs"
         assert ret == "submitted"
@@ -871,12 +880,42 @@ class TestSubmitChip:
         cfg = _SpyDfxConfig(output_prefix="/work/dfx_outputs")
         for r in (0, 1, 2):
             _submit_chip(orch, "chip", "ta", cfg, r)
+        # Each card's first dispatch is ``d0``.
         assert [c[2] for c in orch.calls] == [
-            "/work/dfx_outputs/rank0",
-            "/work/dfx_outputs/rank1",
-            "/work/dfx_outputs/rank2",
+            "/work/dfx_outputs/rank0/d0",
+            "/work/dfx_outputs/rank1/d0",
+            "/work/dfx_outputs/rank2/d0",
         ]
         assert cfg.output_prefix == "/work/dfx_outputs"
+
+    def test_multiple_dispatches_same_card_get_distinct_dirs(self):
+        # The bug this fix targets: several dispatches to ONE card must not
+        # share a dir (the runtime rewrites fixed-name artifacts per run, so a
+        # shared dir means all-but-the-last are clobbered). Each gets ``d{k}``.
+        orch = _RecordingOrch()
+        cfg = _SpyDfxConfig(output_prefix="/work/dfx_outputs")
+        _submit_chip(orch, "chip_a", "ta", cfg, 0)
+        _submit_chip(orch, "chip_b", "ta", cfg, 0)  # different program, same card
+        _submit_chip(orch, "chip_a", "ta", cfg, 0)  # repeat dispatch, same card
+        assert [c[2] for c in orch.calls] == [
+            "/work/dfx_outputs/rank0/d0",
+            "/work/dfx_outputs/rank0/d1",
+            "/work/dfx_outputs/rank0/d2",
+        ]
+        assert cfg.output_prefix == "/work/dfx_outputs"
+
+    def test_counter_resets_when_orch_dispatch_idx_cleared(self):
+        # ``orch_fn`` clears ``_dfx_dispatch_idx`` at the top of every run, so a
+        # given card's dispatch numbering matches across the swimlane two-pass.
+        orch = _RecordingOrch()
+        cfg = _SpyDfxConfig(output_prefix="/work/dfx_outputs")
+        _submit_chip(orch, "chip", "ta", cfg, 0)  # pass 1: d0
+        orch._dfx_dispatch_idx = {}  # what orch_fn does between passes
+        _submit_chip(orch, "chip", "ta", cfg, 0)  # pass 2: d0 again
+        assert [c[2] for c in orch.calls] == [
+            "/work/dfx_outputs/rank0/d0",
+            "/work/dfx_outputs/rank0/d0",
+        ]
 
     def test_dfx_off_forwards_unchanged(self):
         orch = _RecordingOrch()
@@ -891,6 +930,34 @@ class TestSubmitChip:
         _submit_chip(orch, "chip", "ta", cfg, -1)
         assert orch.calls == [("chip", -1, "/work/dfx_outputs")]
         assert cfg.output_prefix == "/work/dfx_outputs"
+
+
+class TestClearDfxDispatchDirs:
+    """``_clear_dfx_dispatch_dirs`` drops stale ``rank*/d{k}`` dirs before a run."""
+
+    def test_removes_only_dispatch_dirs(self, tmp_path):
+        # A prior run left rank0/{d0,d1,d2} and rank1/d0; the current run will
+        # only write d0, so the stale d1/d2 must be cleared. A sibling non-d{k}
+        # dir (e.g. a future diagnostic) is preserved.
+        dfx = tmp_path / "dfx_outputs"
+        for d in ("rank0/d0", "rank0/d1", "rank0/d2", "rank1/d0", "rank0/keepme"):
+            (dfx / d).mkdir(parents=True)
+            (dfx / d / "l2_swimlane_records.json").write_text("{}", encoding="utf-8")
+
+        _clear_dfx_dispatch_dirs(dfx)
+
+        # All d{k} dirs gone...
+        assert not (dfx / "rank0" / "d0").exists()
+        assert not (dfx / "rank0" / "d1").exists()
+        assert not (dfx / "rank0" / "d2").exists()
+        assert not (dfx / "rank1" / "d0").exists()
+        # ...but the non-dispatch dir and the rank dirs themselves remain.
+        assert (dfx / "rank0" / "keepme").is_dir()
+        assert (dfx / "rank0").is_dir()
+
+    def test_missing_base_is_noop(self, tmp_path):
+        # No dfx_outputs yet (first dispatch) -> nothing to clear, no error.
+        _clear_dfx_dispatch_dirs(tmp_path / "dfx_outputs")
 
 
 if __name__ == "__main__":
