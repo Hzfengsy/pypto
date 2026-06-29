@@ -641,11 +641,19 @@ class ASTParser:
         ``pl.aiv_shard`` / ``pl.aic_gather`` read the innermost entry to inherit
         the split mode from the enclosing ``for ... in pl.split_aiv(mode=...)``
         scope instead of taking it as an explicit argument.
+
+        Also pushes a ``"split_aiv"`` sentinel onto :attr:`_loop_kind_stack` for
+        the duration of the body parse. A ``pl.split_aiv`` loop lowers to a scope,
+        not a ``ForStmt``, so ``break`` / ``continue`` inside it have no loop to
+        target; the sentinel makes :meth:`_validate_loop_control` reject them
+        instead of letting them silently bind to an enclosing Python loop.
         """
         self._split_aiv_mode_stack.append(mode)
+        self._loop_kind_stack.append("split_aiv")
         try:
             yield
         finally:
+            self._loop_kind_stack.pop()
             self._split_aiv_mode_stack.pop()
 
     def parse_function(
@@ -4084,6 +4092,17 @@ class ASTParser:
             "AIV sub-core count (hardware-fixed at 2), 'mode' is required, and the loop "
             "variable binds the AIV lane index (equivalent to pl.tile.get_subblock_idx())."
         )
+        # A pl.split_aiv loop must not be nested inside another pl.split_aiv body:
+        # one split_aiv body already represents the two AIV lanes, so re-partitioning
+        # them is not a meaningful (or lowerable) pattern. _split_aiv_mode_stack is
+        # non-empty exactly while parsing inside an enclosing split_aiv body.
+        if self._split_aiv_mode_stack:
+            raise ParserSyntaxError(
+                "nested 'for ... in pl.split_aiv(...)' is not allowed: a split_aiv body already "
+                "represents the two AIV lanes, so it cannot contain another split_aiv loop",
+                span=self.span_tracker.get_span(stmt),
+                hint=split_aiv_hint,
+            )
         if not isinstance(stmt.target, ast.Name):
             raise ParserSyntaxError(
                 "for ... in pl.split_aiv(...) must use a single loop variable",
@@ -4181,8 +4200,11 @@ class ASTParser:
             return
 
         # Bare top-level form (not inside an InCore scope): open a dedicated
-        # InCore scope marking the explicit AIV-split body.
-        incore_attrs: list[tuple[str, Any]] = [("split_aiv", True)]
+        # InCore scope marking the explicit AIV-split body. This path builds the
+        # InCore scope directly (not via _parse_scope_body), so merge any
+        # forward-sticky pl.dump_tag tensors onto it here — mirrors the pl.spmd
+        # for-form (see _parse_spmd_for_loop).
+        incore_attrs = self._merge_forward_sticky_dump([("split_aiv", True)], ir.ScopeKind.InCore)
         with self.builder.scope(
             ir.ScopeKind.InCore,
             span,
@@ -4854,6 +4876,13 @@ class ASTParser:
                 f"'{keyword}' not supported in unrolled loops",
                 span=span,
                 hint=f"'{keyword}' can only be used in sequential (pl.range) or while loops",
+            )
+        if current_kind == "split_aiv":
+            raise InvalidOperationError(
+                f"'{keyword}' not supported inside a 'for ... in pl.split_aiv(...)' body",
+                span=span,
+                hint=f"'{keyword}' can only be used in sequential (pl.range) or while loops; a "
+                "pl.split_aiv body is a scope over the two AIV lanes, not a loop",
             )
 
     def parse_expression(self, expr: ast.expr) -> ir.Expr:

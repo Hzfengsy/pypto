@@ -19,7 +19,7 @@ statement. Unlike ``pl.spmd``, it does NOT wrap the InCore body in a Spmd scope.
 import pypto.language as pl
 import pytest
 from pypto import ir
-from pypto.language.parser.diagnostics.exceptions import ParserSyntaxError
+from pypto.language.parser.diagnostics.exceptions import InvalidOperationError, ParserSyntaxError
 
 
 class TestSplitAivForLoopParsing:
@@ -153,6 +153,77 @@ class TestSplitAivForLoopParsing:
                 for aiv_id in pl.split_aiv(2):  # type: ignore[call-arg]
                     _ = aiv_id
                 return a
+
+    def test_split_aiv_rejects_nested(self):
+        """A pl.split_aiv loop cannot be nested inside another split_aiv body."""
+        with pytest.raises(ParserSyntaxError, match="nested.*pl.split_aiv"):
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def bad(
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                    for aiv2 in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                        offset = (aiv_id + aiv2) * 128
+                        t: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [offset, 0], [128, 128])
+                        out = pl.store(t, [offset, 0], out)
+                return out
+
+    def test_split_aiv_rejects_break(self):
+        """break inside a split_aiv body is rejected — the body is a scope, not a loop."""
+        with pytest.raises(InvalidOperationError, match="'break' not supported inside"):
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def bad(
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                    offset = aiv_id * 128
+                    t: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [offset, 0], [128, 128])
+                    out = pl.store(t, [offset, 0], out)
+                    break
+                return out
+
+    def test_split_aiv_rejects_continue(self):
+        """continue inside a split_aiv body is rejected — the body is a scope, not a loop."""
+        with pytest.raises(InvalidOperationError, match="'continue' not supported inside"):
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def bad(
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                    offset = aiv_id * 128
+                    t: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [offset, 0], [128, 128])
+                    out = pl.store(t, [offset, 0], out)
+                    continue
+                return out
+
+    def test_split_aiv_bare_form_merges_dump_tag(self):
+        """Forward-sticky pl.dump_tag tensors are merged onto the bare split_aiv InCore scope."""
+
+        @pl.program
+        class TestProgram:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                pl.dump_tag(a)
+                for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                    offset = aiv_id * 128
+                    t: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [offset, 0], [128, 128])
+                    out = pl.store(t, [offset, 0], out)
+                return out
+
+        main_func = list(TestProgram.functions.values())[0]
+        incore = self._unique_descendant(main_func.body, ir.InCoreScopeStmt)
+        assert "dump_vars" in incore.attrs
+        assert {v.name_hint for v in incore.attrs["dump_vars"]} == {"a"}
 
     def test_split_aiv_rejects_loop_kwarg(self):
         """A loop-carried kwarg (init_values=) makes no sense for the split body."""
@@ -435,6 +506,46 @@ class TestSplitAivFlattenInsideCoreGroup:
         incore = self._unique_descendant(main_func.body, ir.InCoreScopeStmt)
         assert incore.split == ir.SplitMode.LEFT_RIGHT
         assert incore.attrs["split_aiv"] is True
+
+    def test_rejects_multiple_split_aiv_per_core_group_scope(self):
+        """Two sibling split_aiv loops flattened onto one CORE_GROUP InCore scope are
+        rejected: one InCore scope represents the two AIV lanes, so a second stamp
+        would overwrite the scope mode and duplicate the split_aiv attr."""
+        with pytest.raises(ParserSyntaxError, match="Multiple pl.split_aiv"):
+
+            @pl.function(type=pl.FunctionType.Opaque)
+            def bad(
+                a: pl.Tensor[[64, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                        offset = aiv_id * 32
+                        t: pl.Tile[[32, 64], pl.FP32] = pl.load(a, [offset, 0], [32, 64])
+                        out = pl.store(t, [offset, 0], out)
+                    for aiv2 in pl.split_aiv(2, mode=pl.SplitMode.LEFT_RIGHT):
+                        offset2 = aiv2 * 32
+                        t2: pl.Tile[[64, 32], pl.FP32] = pl.load(a, [0, offset2], [64, 32])
+                        out = pl.store(t2, [0, offset2], out)
+                return out
+
+    def test_rejects_nested_split_aiv_inside_core_group(self):
+        """A split_aiv loop nested inside another split_aiv body (both under a
+        CORE_GROUP scope) is rejected by the nested-split_aiv guard."""
+        with pytest.raises(ParserSyntaxError, match="nested.*pl.split_aiv"):
+
+            @pl.function(type=pl.FunctionType.Opaque)
+            def bad(
+                a: pl.Tensor[[64, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                        for aiv2 in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                            offset = (aiv_id + aiv2) * 32
+                            t: pl.Tile[[32, 64], pl.FP32] = pl.load(a, [offset, 0], [32, 64])
+                            out = pl.store(t, [offset, 0], out)
+                return out
 
 
 if __name__ == "__main__":

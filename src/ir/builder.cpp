@@ -317,6 +317,18 @@ void IRBuilder::MarkCurrentScopeSplitAiv(SplitMode split) {
          "open scope is "
       << ScopeKindToString(scope_ctx->GetScopeKind())
       << ". Place the split_aiv loop as a direct child of the pl.at(level=pl.Level.CORE_GROUP) scope.";
+  // One InCore scope represents the two AIV lanes, so multiple sibling
+  // `for ... in pl.split_aiv(...)` loops flattened into the same scope is not a
+  // meaningful pattern. Reject a second stamp on an already-marked scope: without
+  // this guard the SetSplit below would silently overwrite the scope's split mode
+  // (earlier ops parsed under one axis while the function advertises another) and
+  // AddAttr would append a duplicate ("split_aiv", true).
+  for (const auto& attr : scope_ctx->GetAttrs()) {
+    CHECK(attr.first != "split_aiv")
+        << "Multiple pl.split_aiv(...) loops in one pl.at(...) InCore scope are not supported: the "
+           "scope is already marked split_aiv. One InCore scope represents the two AIV lanes — use a "
+           "single 'for aiv_id in pl.split_aiv(...)' loop per pl.at(level=pl.Level.CORE_GROUP) scope.";
+  }
   scope_ctx->SetSplit(split);
   scope_ctx->AddAttr({"split_aiv", true});
 }
