@@ -789,6 +789,63 @@ def test_transpose_hazard_per_region():
         _lower(program)
 
 
+def test_explicit_aiv_shard_region_passed_through_not_double_sharded():
+    """A region whose body already carries a user-authored tile.aiv_shard (the
+    user sharded the cube tile manually and wrote the vector compute on the
+    per-lane half) must be spliced through UNCHANGED: the scope wrapper is
+    dropped but the body is NOT re-routed through the affinity-gated halving.
+
+    Regression: re-halving such a body double-sharded the explicit aiv_shard
+    (the downstream Acc->Vec move was misread as a fresh C->V boundary and
+    rewritten to a second aiv_shard), orphaning a halved Acc memref that never
+    got an allocation and crashing PTO codegen.
+    """
+    span = ir.Span.unknown()
+    a_left = ir.Var("a_left", _tile([128, 128], mem=MS.Left), span)
+    b_right = ir.Var("b_right", _tile([128, 128], mem=MS.Right), span)
+    out_0 = ir.Var("out_0", _tensor([128, 128]), span)
+
+    matmul = T.matmul(a_left, b_right, span=span)  # cube Acc tile, full width, OUTSIDE the region
+    qk = ir.Var("qk", matmul.type, span)
+
+    aiv_id_call = T.get_subblock_idx(span=span)
+    aiv_id = ir.Var("aiv_id", aiv_id_call.type, span)
+    shard = T.aiv_shard(qk, split=1, span=span)  # USER's explicit C->V shard -> this lane's half
+    qk_h = ir.Var("qk_h", shard.type, span)
+    sc = T.muls(qk_h, 2.0, span=span)  # vector compute on the half
+    sc_var = ir.Var("sc", sc.type, span)
+    store = T.store(sc_var, [0, 0], out_0, span=span)
+    out_store = ir.Var("out_store", store.type, span)
+    region = ir.SplitAivScopeStmt(
+        split=ir.SplitMode.UP_DOWN,
+        body=ir.SeqStmts(
+            [
+                ir.AssignStmt(aiv_id, aiv_id_call, span),
+                ir.AssignStmt(qk_h, shard, span),
+                ir.AssignStmt(sc_var, sc, span),
+                ir.AssignStmt(out_store, store, span),
+            ],
+            span,
+        ),
+        span=span,
+    )
+    program = _explicit_region_program(
+        [ir.AssignStmt(qk, matmul, span), region, ir.ReturnStmt([out_store], span)],
+        [(a_left, _IN), (b_right, _IN), (out_0, _OUT)],
+        [out_0.type],
+    )
+    after = _lower(program)
+    assert _count_split_aiv_scopes(after) == 0  # scope wrapper dropped
+    fattrs = _func_attrs(after)
+    assert fattrs.get("split_aiv") is True
+    assert fattrs.get("split_aiv_region_validated") is True
+    text = ir.python_print(after)
+    # Exactly ONE aiv_shard survives (the user's) — NOT a second, double-shard one.
+    assert text.count("aiv_shard") == 1
+    # The user's lane index binding is preserved; no duplicate subblock_idx injected.
+    assert text.count("get_subblock_idx") == 1
+
+
 def test_auto_path_unchanged():
     """The AUTO whole-function pl.split path is untouched: it still inserts
     aiv_shard, halves the vector region, stamps split_aiv — and crucially does NOT

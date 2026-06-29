@@ -13,6 +13,12 @@ so that pass only stamps attributes (its split_aiv arm) — its former per-op
 halving driver was deleted, and the halving machinery now lives solely in
 `split_axis_utils`, shared by this pass.
 
+This pass is also the **sole consumer of the first-class `SplitAivScopeStmt`
+region node** (`for aiv_id in pl.split_aiv(...)`). The region survives parse →
+SSA → `ResolveBackendOpLayouts` as a structural node; here each region is
+lowered in place and the scope wrapper is **erased**, so no `SplitAivScopeStmt`
+reaches `ExpandMixedKernel` (pass 22) or codegen.
+
 ## Why this pass exists
 
 A mixed `InCore` function written with `pl.split` describes cube and vector
@@ -77,6 +83,44 @@ untouched, so `ExpandMixedKernel` converts it to a plain AIV function and strips
 its `split` attr exactly as before — preserving its prior (un-split) behavior.
 Were it lowered here, it would carry `split_aiv` without a `split` mode after
 that strip, and `SplitVectorKernel` would reject it.
+
+## Explicit `SplitAivScopeStmt` region path
+
+In addition to the AUTO whole-function path above, an `InCore` function whose
+body still carries one or more `SplitAivScopeStmt` regions takes a separate
+**region path** (`LowerExplicitRegionFunction`), checked **before** the AUTO
+path. Each region carries its own `split_` mode, so this handles the multi-mode
+case the single function-level mode cannot. Region-local `tile_vars` /
+`var_replacements` maps keep a halved var from leaking into a sibling region or
+an out-of-region full-width op. Statements **outside** any region are emitted
+full-width. After all regions are lowered, the scope wrappers are dropped and the
+function is stamped `split_aiv` + `split_aiv_region_validated` (the latter signals
+[`ExpandMixedKernel`](22-expand_mixed_kernel.md) to skip its single-func-mode
+transpose check — pass 21 validates each region's transpose hazard with the
+correct per-region split axis instead).
+
+Two region body shapes are handled:
+
+- **Full-width body** (no explicit boundary op): the region body holds full-width
+  vector compute. The region path injects a per-region `subblock_idx`, routes the
+  vector ops through the shared `split_axis::ProcessStmts` halving machinery
+  (region-scoped), and validates the per-region transpose hazard. This is the
+  paradigm the auto-converged form produces.
+- **Explicit boundary body** (`tile.aiv_shard` / `tile.aic_gather` already
+  present): the user manually sharded the cube tile and wrote the vector compute
+  on the per-lane half, so the body is **already** in half-width form. The region
+  path detects this (`RegionBodyHasExplicitBoundary`) and **splices the body
+  through unchanged** — no re-halving, no duplicate `subblock_idx`. Re-running the
+  halving here would double-shard (a downstream Acc→Vec move would be misread as a
+  fresh cube→vector boundary and rewritten to a second `aiv_shard`), orphaning a
+  halved Acc memref with no allocation and crashing PTO codegen. `ExpandMixedKernel`
+  folds the explicit boundary into `tpush`/`tpop` exactly as for a hand-authored
+  split_aiv kernel.
+
+Because the region is built via the generic `BeginScope`/`EndScope` and is
+non-outlined, it can be **nested** inside a `pl.range` / `pl.pipeline` loop or an
+`if`; the region path recurses into compound statements to find and lower every
+region while preserving the surrounding control flow.
 
 ## Split-axis dispatch
 

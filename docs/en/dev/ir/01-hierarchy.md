@@ -207,6 +207,7 @@ field from the `Stmt` base class. See [Leading comments on statements](#leading-
 | **ClusterScopeStmt** | `name_hint_`, `body_` | Cluster region; outlined to `Function(Group)` |
 | **HierarchyScopeStmt** | `name_hint_`, `body_`, `level_`, `role_` (optional) | Pipeline-stage region for a given Level/Role |
 | **SpmdScopeStmt** | `name_hint_`, `body_`, `core_num_` (integer-typed `Expr`), `sync_start_` | SPMD launch region; outlined to `Function(Spmd)` |
+| **SplitAivScopeStmt** | `name_hint_`, `body_`, `split_` (`SplitMode`, never `None`), `count_` (= 2) | Explicit AIV-split region (`pl.split_aiv`); nestable; consumed and erased by `LowerAutoVectorSplit` (pass 21) |
 | **RuntimeScopeStmt** | `name_hint_`, `body_`, `manual_` | Orchestrator runtime region (`PTO2_SCOPE`); `manual_=true` selects manual dependency mode |
 | **YieldStmt** | `values_` | Yield values in loop iteration |
 | **EvalStmt** | `expr_` | Evaluate expression for side effects |
@@ -330,6 +331,10 @@ hier = ir.HierarchyScopeStmt(level=ir.Level.HOST, role=ir.Role.SubWorker,
 spmd = ir.SpmdScopeStmt(core_num=ir.ConstInt(8, DataType.INDEX, span),
                         sync_start=False, name_hint="", body=body, span=span)
 
+# for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):  (explicit AIV-split region)
+split_aiv = ir.SplitAivScopeStmt(split=ir.SplitMode.UP_DOWN, count=2,
+                                 name_hint="", body=body, span=span)
+
 # with pl.manual_scope(): (orchestrator runtime region with manual dep mode)
 runtime = ir.RuntimeScopeStmt(manual=True, name_hint="", body=body, span=span)
 
@@ -362,6 +367,20 @@ runtime = ir.RuntimeScopeStmt(manual=True, name_hint="", body=body, span=span)
   - `OutlineClusterScopes` extracts `ClusterScopeStmt` into `Function(Group)`
     and standalone `SpmdScopeStmt` into `Function(Spmd)`
   - `OutlineHierarchyScopes` extracts `HierarchyScopeStmt`
+  - `SplitAivScopeStmt` is **non-outlined**: it is transparent to SSA and to the
+    outliners (it survives inside an outlined `Function(InCore)` body), then is
+    consumed and **erased** by `LowerAutoVectorSplit` (pass 21). It never reaches
+    `ExpandMixedKernel` (pass 22) or codegen — those see only the per-op
+    `aiv_shard` / `aic_gather` / `tpush` / `tpop` markers. A PTO codegen guard
+    fails loudly if a `SplitAivScopeStmt` ever survives that far.
+  - `SplitAivScopeStmt` is **nestable**: built via the generic
+    `BeginScope`/`EndScope`, it emits into any parent context (a `pl.range` /
+    `pl.pipeline` loop or an `if`). Sibling regions may carry **different**
+    `split_` modes (multi-mode); pass-21 halving is region-scoped, so each region
+    halves independently and out-of-region vector compute stays full-width. A
+    top-level `for aiv_id in pl.split_aiv(...)` is wrapped by the parser in an
+    enclosing `InCoreScopeStmt` (so `OutlineIncoreScopes` can outline it), i.e.
+    `InCoreScopeStmt{ body: SplitAivScopeStmt{...} }`.
   - Inside `RuntimeScopeStmt(manual=true)` blocks, the parser emits a
     `Submit` node for each `pl.submit(kernel, ..., deps=[tid1, tid2])`
     call and populates its first-class `deps_` field directly from the
@@ -581,7 +600,7 @@ Functions stored in sorted map for deterministic ordering. GlobalVar names must 
 | **Unary Ops** | 5 | Abs, Neg, Not, BitNot, Cast |
 | **Call/Access** | 2 | Call, TupleGetItemExpr |
 | **Operations** | 2 | Op, GlobalVar |
-| **Statements** | 15 | AssignStmt, IfStmt, ForStmt, WhileStmt, ReturnStmt, InCoreScopeStmt, ClusterScopeStmt, HierarchyScopeStmt, SpmdScopeStmt, YieldStmt, EvalStmt, SeqStmts, BreakStmt, ContinueStmt, InlineStmt |
+| **Statements** | 16 | AssignStmt, IfStmt, ForStmt, WhileStmt, ReturnStmt, InCoreScopeStmt, ClusterScopeStmt, HierarchyScopeStmt, SpmdScopeStmt, SplitAivScopeStmt, YieldStmt, EvalStmt, SeqStmts, BreakStmt, ContinueStmt, InlineStmt |
 | **Types** | 6 | ScalarType, TensorType, TileType, TupleType, PipeType, UnknownType |
 | **Functions** | 2 | Function, Program |
 

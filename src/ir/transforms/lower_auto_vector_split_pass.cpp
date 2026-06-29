@@ -136,6 +136,33 @@ CallPtr MakeReshapeOpCall(const std::string& op_name, const ExprPtr& source, int
   return OpRegistry::GetInstance().Create(op_name, {source}, std::move(kwargs), span);
 }
 
+// Whether a region body already carries a user-authored explicit boundary op
+// (tile.aiv_shard / tile.aic_gather). When it does, the body is in EXPLICIT
+// half-width form already: the user manually sharded the cube tile and wrote the
+// vector compute on the per-lane half. Re-running the affinity-gated halving over
+// such a body would double-shard (a downstream Acc->Vec move would be misread as
+// a fresh C->V boundary and rewritten to a second aiv_shard) and inject a
+// duplicate subblock index. So the region path passes these bodies through
+// unchanged (scope wrapper dropped); ExpandMixedKernel folds the explicit
+// boundary into tpush/tpop exactly as for a hand-authored split_aiv kernel.
+class ExplicitSplitBoundaryFinder : public IRVisitor {
+ public:
+  bool found_ = false;
+
+ protected:
+  void VisitExpr_(const CallPtr& op) override {
+    if (op && op->op_ && (IsOp(op, "tile.aiv_shard") || IsOp(op, "tile.aic_gather"))) found_ = true;
+    IRVisitor::VisitExpr_(op);
+  }
+};
+
+bool RegionBodyHasExplicitBoundary(const StmtPtr& body) {
+  if (!body) return false;
+  ExplicitSplitBoundaryFinder finder;
+  finder.VisitStmt(body);
+  return finder.found_;
+}
+
 // Affinity-gated lowering of a flat statement list.
 //
 // tile_vars / var_replacements thread the per-var halved-extent tracking and the
@@ -160,6 +187,21 @@ std::vector<StmtPtr> LowerStmts(const std::vector<StmtPtr>& stmts, SplitMode mod
     if (auto reg = As<SplitAivScopeStmt>(stmt)) {
       SplitMode rmode = reg->split_;
       int rdim = SplitDimension(rmode);
+
+      // EXPLICIT boundary form (user wrote tile.aiv_shard / tile.aic_gather
+      // inside the region): the body is already half-width and carries its own
+      // lane index. Drop the scope wrapper and splice the body unchanged — no
+      // re-halving, no duplicate subblock_idx. Still run the per-region transpose
+      // hazard check so a transpose that swaps the split axis is rejected with a
+      // region-scoped diagnostic. ExpandMixedKernel folds the explicit boundary
+      // into tpush/tpop just as for a hand-authored split_aiv kernel.
+      if (RegionBodyHasExplicitBoundary(reg->body_)) {
+        auto passthrough = transform_utils::FlattenToStmts(reg->body_);
+        ValidateTransposeSplitHazard(passthrough, rdim, reg->span_);
+        for (auto& s : passthrough) result.push_back(s);
+        continue;
+      }
+
       std::unordered_map<const Var*, TileInfo> r_tile_vars;
       std::unordered_map<const Var*, VarPtr> r_var_repl;
       auto inj = InjectSubblockIdxIntoStmts(transform_utils::FlattenToStmts(reg->body_),

@@ -348,5 +348,205 @@ class TestSplitParityRuntime:
         assert result.passed, f"LEFT_RIGHT (VR={vr},VC={vc}) failed: {result.error}"
 
 
+# ---------------------------------------------------------------------------
+# First-class ``pl.split_aiv`` region parity: nesting (in pl.range / pl.pipeline)
+# and multi-mode (two sibling regions with different SplitModes).
+#
+# These exercise the nestable ``SplitAivScopeStmt`` IR node end-to-end. The
+# region is consumed and erased by LowerAutoVectorSplit (pass 21); the cube ops
+# (load Mat -> move Left/Right -> matmul -> Acc) live OUTSIDE the loop and the
+# region shards the Acc tile via ``pl.aiv_shard`` (the C->V boundary).
+# ExpandMixedKernel folds the shard into the cross-core tpush/tpop machinery,
+# producing one AIC lane and one AIV lane.
+#
+# Inputs are constant (a=1.0, b=2.0) so each output element is deterministic:
+# ``(a @ b) = K * 1 * 2 = 128``. Pinned to a2a3 (the split_aiv / GM-pipe-buffer
+# path is 910B-gated); the loop-nested / multi-mode region survives Default and
+# matches the torch golden.
+# ---------------------------------------------------------------------------
+
+SA = 64
+
+
+def _build_split_aiv_nested_range_program() -> Any:
+    """``for aiv_id in pl.split_aiv(...)`` nested inside a ``pl.range`` loop."""
+
+    @pl.program
+    class SplitAivNestedRange:
+        @pl.function(type=pl.FunctionType.Opaque)
+        def main(
+            self,
+            a: pl.Tensor[[SA, SA], pl.FP32],
+            b: pl.Tensor[[SA, SA], pl.FP32],
+            out: pl.Out[pl.Tensor[[SA, SA], pl.FP32]],
+        ) -> pl.Tensor[[SA, SA], pl.FP32]:
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="qk"):
+                a_l1 = pl.load(a, [0, 0], [SA, SA], target_memory=pl.MemorySpace.Mat)
+                b_l1 = pl.load(b, [0, 0], [SA, SA], target_memory=pl.MemorySpace.Mat)
+                a_left = pl.move(a_l1, target_memory=pl.MemorySpace.Left)
+                b_right = pl.move(b_l1, target_memory=pl.MemorySpace.Right)
+                qk = pl.matmul(a_left, b_right)  # Acc tile [SA, SA]
+                for _i in pl.range(2):
+                    for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                        qk_h = pl.aiv_shard(qk)  # this lane's half [SA/2, SA] Vec
+                        sc = pl.mul(qk_h, 2.0)
+                        offset = aiv_id * (SA // 2)
+                        out = pl.store(sc, [offset, 0], out)
+            return out
+
+    return SplitAivNestedRange
+
+
+def _build_split_aiv_nested_pipeline_program() -> Any:
+    """``for aiv_id in pl.split_aiv(...)`` nested inside a ``pl.pipeline`` loop."""
+
+    @pl.program
+    class SplitAivNestedPipeline:
+        @pl.function(type=pl.FunctionType.Opaque)
+        def main(
+            self,
+            a: pl.Tensor[[SA, SA], pl.FP32],
+            b: pl.Tensor[[SA, SA], pl.FP32],
+            out: pl.Out[pl.Tensor[[SA, SA], pl.FP32]],
+        ) -> pl.Tensor[[SA, SA], pl.FP32]:
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="qk"):
+                a_l1 = pl.load(a, [0, 0], [SA, SA], target_memory=pl.MemorySpace.Mat)
+                b_l1 = pl.load(b, [0, 0], [SA, SA], target_memory=pl.MemorySpace.Mat)
+                a_left = pl.move(a_l1, target_memory=pl.MemorySpace.Left)
+                b_right = pl.move(b_l1, target_memory=pl.MemorySpace.Right)
+                qk = pl.matmul(a_left, b_right)
+                for _i in pl.pipeline(2, stage=2):
+                    for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                        qk_h = pl.aiv_shard(qk)
+                        sc = pl.mul(qk_h, 2.0)
+                        offset = aiv_id * (SA // 2)
+                        out = pl.store(sc, [offset, 0], out)
+            return out
+
+    return SplitAivNestedPipeline
+
+
+def _build_split_aiv_multi_mode_program() -> Any:
+    """Two sibling ``pl.split_aiv`` regions with DIFFERENT modes in one kernel.
+
+    The UP_DOWN region shards on rows (dim0) writing ``out_ud = (a @ b) * 2``;
+    the LEFT_RIGHT region shards on cols (dim1) writing ``out_lr = (a @ b) * 3``.
+    Each region carries its own mode (region-scoped pass-21 halving), so they
+    halve independently with no cross-region leak.
+    """
+
+    @pl.program
+    class SplitAivMultiMode:
+        @pl.function(type=pl.FunctionType.Opaque)
+        def main(
+            self,
+            a: pl.Tensor[[SA, SA], pl.FP32],
+            b: pl.Tensor[[SA, SA], pl.FP32],
+            out_ud: pl.Out[pl.Tensor[[SA, SA], pl.FP32]],
+            out_lr: pl.Out[pl.Tensor[[SA, SA], pl.FP32]],
+        ) -> tuple[pl.Tensor[[SA, SA], pl.FP32], pl.Tensor[[SA, SA], pl.FP32]]:
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="qk"):
+                a_l1 = pl.load(a, [0, 0], [SA, SA], target_memory=pl.MemorySpace.Mat)
+                b_l1 = pl.load(b, [0, 0], [SA, SA], target_memory=pl.MemorySpace.Mat)
+                a_left = pl.move(a_l1, target_memory=pl.MemorySpace.Left)
+                b_right = pl.move(b_l1, target_memory=pl.MemorySpace.Right)
+                qk = pl.matmul(a_left, b_right)
+                for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                    qk_h = pl.aiv_shard(qk)
+                    sc = pl.mul(qk_h, 2.0)
+                    offu = aiv_id * (SA // 2)
+                    out_ud = pl.store(sc, [offu, 0], out_ud)
+                qk2 = pl.matmul(a_left, b_right)
+                for aiv2 in pl.split_aiv(2, mode=pl.SplitMode.LEFT_RIGHT):
+                    qk_h2 = pl.aiv_shard(qk2)
+                    sc2 = pl.mul(qk_h2, 3.0)
+                    offl = aiv2 * (SA // 2)
+                    out_lr = pl.store(sc2, [0, offl], out_lr)
+            return out_ud, out_lr
+
+    return SplitAivMultiMode
+
+
+class _SplitAivNestedCase(PTOTestCase):
+    """Single-output ``pl.split_aiv`` region nested in a loop: out = (a @ b) * 2."""
+
+    __test__ = False
+
+    def __init__(self, kind: str, *, platform: str | None = None, config: RunConfig | None = None):
+        self._kind = kind  # "range" | "pipeline"
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return f"split_aiv_nested_{self._kind}_parity"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("a", [SA, SA], DataType.FP32, init_value=1.0),
+            TensorSpec("b", [SA, SA], DataType.FP32, init_value=2.0),
+            TensorSpec("out", [SA, SA], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        if self._kind == "range":
+            return _build_split_aiv_nested_range_program()
+        return _build_split_aiv_nested_pipeline_program()
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        tensors["out"][:] = torch.matmul(tensors["a"], tensors["b"]) * 2.0
+
+
+class _SplitAivMultiModeCase(PTOTestCase):
+    """Two sibling regions, different modes: out_ud = (a@b)*2, out_lr = (a@b)*3."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config: RunConfig | None = None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "split_aiv_multi_mode_parity"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("a", [SA, SA], DataType.FP32, init_value=1.0),
+            TensorSpec("b", [SA, SA], DataType.FP32, init_value=2.0),
+            TensorSpec("out_ud", [SA, SA], DataType.FP32, is_output=True),
+            TensorSpec("out_lr", [SA, SA], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        return _build_split_aiv_multi_mode_program()
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        matmul = torch.matmul(tensors["a"], tensors["b"])
+        tensors["out_ud"][:] = matmul * 2.0
+        tensors["out_lr"][:] = matmul * 3.0
+
+
+class TestSplitAivRegionParityRuntime:
+    """Runtime parity for the nestable first-class ``pl.split_aiv`` region node."""
+
+    @pytest.mark.platforms("a2a3")
+    @pytest.mark.parametrize("platform", [pytest.param("a2a3", id="a2a3")])
+    def test_split_aiv_nested_in_range_parity(self, test_runner, platform):
+        case = _SplitAivNestedCase("range", platform=platform)
+        result = test_runner.run(case)
+        assert result.passed, f"split_aiv nested-in-range parity failed: {result.error}"
+
+    @pytest.mark.platforms("a2a3")
+    @pytest.mark.parametrize("platform", [pytest.param("a2a3", id="a2a3")])
+    def test_split_aiv_nested_in_pipeline_parity(self, test_runner, platform):
+        case = _SplitAivNestedCase("pipeline", platform=platform)
+        result = test_runner.run(case)
+        assert result.passed, f"split_aiv nested-in-pipeline parity failed: {result.error}"
+
+    @pytest.mark.platforms("a2a3")
+    @pytest.mark.parametrize("platform", [pytest.param("a2a3", id="a2a3")])
+    def test_split_aiv_multi_mode_parity(self, test_runner, platform):
+        case = _SplitAivMultiModeCase(platform=platform)
+        result = test_runner.run(case)
+        assert result.passed, f"split_aiv multi-mode parity failed: {result.error}"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v", *sys.argv[1:]]))

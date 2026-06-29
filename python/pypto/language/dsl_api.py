@@ -805,13 +805,16 @@ def spmd(
 
 
 class SplitAivContext:
-    """Loop iterator for the explicit AIV-split scope.
+    """Loop iterator for the explicit AIV-split region.
 
-    The parser recognizes ``for aiv_id in pl.split_aiv(2, mode=...):`` and opens
-    a single bare ``InCoreScopeStmt`` marking an explicit AIV-split body (it
-    carries the requested ``SplitMode`` and a ``("split_aiv", True)`` attr). The
-    loop variable is bound to ``pl.tile.get_subblock_idx()`` — the AIV lane /
-    sub-core index.
+    The parser recognizes ``for aiv_id in pl.split_aiv(2, mode=...):`` and builds
+    a first-class :class:`~pypto.pypto_core.ir.SplitAivScopeStmt` region node
+    carrying the requested ``SplitMode``. Unlike the legacy whole-InCore-scope
+    split, this region is a structural node that may be nested anywhere in an
+    InCore body — inside a ``pl.range`` / ``pl.pipeline`` loop or an ``if``. The
+    loop variable is bound to ``pl.tile.get_subblock_idx()`` (the AIV lane /
+    sub-core index) at the region head. The node is consumed and erased by
+    LowerAutoVectorSplit (pass 21); it never reaches codegen.
     """
 
     def __init__(self, n: int, mode: ir.SplitMode) -> None:
@@ -826,25 +829,33 @@ class SplitAivContext:
         # rather than silently yielding zero iterations (mirrors SpmdContext).
         raise RuntimeError(
             "pl.split_aiv(...) loop form is only valid inside a @pl.program / "
-            "@pl.function body; the parser replaces the for-loop with an explicit "
-            "AIV-split InCoreScopeStmt. If you're seeing this, the surrounding "
+            "@pl.function body; the parser replaces the for-loop with a first-class "
+            "SplitAivScopeStmt region node. If you're seeing this, the surrounding "
             "function was not decorated."
         )
 
 
 def split_aiv(n: int, *, mode: ir.SplitMode) -> SplitAivContext:
-    """Open an explicit AIV-split scope as an SPMD-style loop.
+    """Open an explicit AIV-split region as an SPMD-style loop.
 
     Usage::
 
         for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
             ...  # body runs per AIV lane; aiv_id = pl.tile.get_subblock_idx()
 
-    The loop opens exactly ONE bare ``InCore`` scope (unlike ``pl.spmd``, which
-    wraps an InCore body in a Spmd scope). The scope carries the requested
-    ``SplitMode`` (same mechanism as ``pl.split``) plus a ``("split_aiv", True)``
-    attr so later passes can identify the explicit-split body. The loop variable
+    The loop builds a first-class :class:`~pypto.pypto_core.ir.SplitAivScopeStmt`
+    region carrying the requested ``SplitMode``. Because it is a structural node
+    (not a whole-InCore-scope flag), it is **nestable**: the region may appear
+    inside a ``pl.range`` / ``pl.pipeline`` loop or an ``if``, and sibling regions
+    may carry **different** modes (multi-mode), each halved independently. A
+    top-level ``for aiv_id in pl.split_aiv(...)`` is wrapped in an enclosing
+    ``InCore`` scope so OutlineIncoreScopes can outline it. The loop variable
     binds the AIV lane index (equivalent to ``pl.tile.get_subblock_idx()``).
+
+    The region survives parse -> SSA -> ResolveBackendOpLayouts as a structural
+    node (printer emits ``for aiv_id in pl.split_aiv(...):`` so parse->print->parse
+    is a fixpoint), then is consumed and erased by LowerAutoVectorSplit (pass 21);
+    it never reaches ExpandMixedKernel or codegen.
 
     Args:
         n: The AIV sub-core count. Positional; hardware-fixed at 2 (the two AIV
@@ -853,7 +864,7 @@ def split_aiv(n: int, *, mode: ir.SplitMode) -> SplitAivContext:
             ``pl.SplitMode.LEFT_RIGHT``). No silent default.
 
     Returns:
-        Loop iterator for the explicit AIV-split scope.
+        Loop iterator for the explicit AIV-split region.
 
     Examples:
         >>> for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):

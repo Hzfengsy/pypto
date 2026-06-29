@@ -30,10 +30,10 @@ Developers read pass docs sequentially to understand the compilation pipeline. I
 | 15 | `15-canonicalize_tile_slice.md` | Runs immediately after `AutoTileMatmulL0` (lowers Mat/Vec `tile.slice` → `tile.extract`) |
 | 16 | `16-infer_tile_memory_space.md` | 16th pass |
 | 17 | `17-resolve_backend_op_layouts.md` | 17th pass |
-| 18 | `18-lower_auto_vector_split.md` | Live auto-split lowering path; converts AUTO `pl.split` mixed InCore functions into the explicit `split_aiv` form (aiv_shard/aic_gather + halved vector sub-region). Runs immediately before `ExpandMixedKernel` |
-| 19 | `19-expand_mixed_kernel.md` | 19th pass |
+| 18 | `18-lower_auto_vector_split.md` | Live auto-split lowering path; converts AUTO `pl.split` mixed InCore functions into the explicit `split_aiv` form (aiv_shard/aic_gather + halved vector sub-region). ALSO the sole consumer of the first-class `SplitAivScopeStmt` region node (`pl.split_aiv`, nestable/multi-mode): lowers each region in place (region-scoped halving; explicit-boundary bodies passed through unchanged) and erases the scope wrapper. Runs immediately before `ExpandMixedKernel` |
+| 19 | `19-expand_mixed_kernel.md` | 19th pass (no `SplitAivScopeStmt` survives to here; its single-func-mode transpose check is skipped for functions stamped `split_aiv_region_validated` by pass 18) |
 | 20 | `20-inject_gm_pipe_buffer.md` | Runs immediately after `ExpandMixedKernel` (backend-gated, Ascend910B) |
-| 21 | `21-split_vector_kernel.md` | 21st pass (after the convergence refactor: only stamps attrs for split_aiv functions + handles the no-split dual-AIV path; the per-op halving driver was deleted — moved to LowerAutoVectorSplit + split_axis_utils) |
+| 21 | `21-split_vector_kernel.md` | 21st pass (after the convergence refactor: only stamps attrs for split_aiv functions + handles the no-split dual-AIV path; the per-op halving driver was deleted — moved to LowerAutoVectorSplit + split_axis_utils. Single-func-mode assertion relaxed for multi-mode `split_aiv` functions: stamps the mode-agnostic `dual_aiv_dispatch` and trusts the per-op `split` ints from pass 18) |
 | 22 | `22-stamp_tfree_split.md` | 22nd pass (copies each cross-core tpop's split/pipe-id onto its matching tfree op; runs right after SplitVectorKernel finalizes split, before SkewCrossCorePipeline clones tpop/tfree pairs) |
 | 23 | `23-normalize_return_order.md` | 23rd pass |
 | 24 | `24-skew_cross_core_pipeline.md` | 24th pass (cross-core cube/vector software-pipeline skew; runs immediately before LowerPipelineLoops) |
