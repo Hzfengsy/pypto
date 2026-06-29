@@ -3953,17 +3953,16 @@ class ASTParser:
     _SPLIT_AIV_SUBCORE_NUM = 2
 
     def _parse_split_aiv_for_loop(self, stmt: ast.For, iter_call: ast.Call) -> None:
-        """Parse ``for aiv_id in pl.split_aiv(2, mode=...): body`` into a single
-        explicit-split ``InCoreScopeStmt``.
+        """Parse ``for aiv_id in pl.split_aiv(2, mode=...): body`` into a
+        first-class ``SplitAivScopeStmt`` region.
 
-        Unlike :meth:`_parse_spmd_for_loop` (which wraps an InCore body in a Spmd
-        scope), this opens exactly ONE bare InCore scope marking an explicit
-        AIV-split body. The scope carries the requested ``SplitMode`` on
-        ``ScopeStmt::split_`` (same mechanism as ``pl.split``) plus a bool attr
-        ``("split_aiv", True)`` so later passes / the verifier can identify the
-        explicit-split body. The loop variable is bound to
+        The region is a structural node that may appear anywhere in an InCore
+        body — including inside a ``pl.range`` / ``pl.pipeline`` loop or an
+        ``if`` — and carries the requested ``SplitMode`` on
+        ``SplitAivScopeStmt::split_``. The loop variable is bound to
         ``pl.tile.get_subblock_idx()`` (the AIV lane / sub-core index) as the
-        first statement of the scope body.
+        first statement of the region body. ``LowerAutoVectorSplit`` (pass 21)
+        consumes and erases the node; it never reaches codegen.
         """
         split_aiv_hint = (
             "Use 'for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):' — n is the "
@@ -4050,59 +4049,56 @@ class ASTParser:
                 hint=split_aiv_hint,
             )
 
-        span = self.span_tracker.get_span(stmt)
-        # The explicit-split marker rides on the InCore scope as a bool attr so
-        # later passes / the verifier can identify the AIV-split body; the
-        # SplitMode threads onto ScopeStmt::split_ via the builder's split= kwarg.
+        # Build a first-class SplitAivScopeStmt region. The region body begins
+        # with ``aiv_id = pl.tile.get_subblock_idx()`` and carries the requested
+        # SplitMode on the node; LowerAutoVectorSplit (pass 21) consumes it.
         #
-        # FLATTEN: a split_aiv loop that is ALREADY inside an InCore (CORE_GROUP)
-        # scope must NOT open a nested InCore sub-scope. OutlineIncoreScopes would
-        # outline that nested scope as a separate tile-I/O sub-function, which
-        # breaks ConvertTensorToTileOps / InferTileMemorySpace. Instead, stamp the
-        # split mode + ("split_aiv", True) attr onto the enclosing open InCore
-        # scope and emit the body inline (the cube + vector ops live together in
-        # one fused-mixed InCore function, the form that compiles end-to-end).
+        # FLATTEN: when already inside an InCore (CORE_GROUP) scope — directly or
+        # through an intervening pl.range/pl.pipeline/if — emit the region in
+        # place; it nests inside the open context. OutlineIncoreScopes outlines
+        # the enclosing InCore function and the nested region survives.
         if self._is_inside_scope(ir.ScopeKind.InCore):
-            self.builder.mark_current_scope_split_aiv(split_mode)
-            # A fresh var scope keeps the loop var / body bindings tidy; leak_vars
-            # pushes them up to the enclosing scope so subsequent statements stay
-            # visible (matches the bare-form leak behavior below).
-            self.scope_manager.enter_scope("split_aiv_for")
-            loop_var = self.builder.var(loop_var_name, ir.ScalarType(DataType.INDEX), span=span)
-            self.scope_manager.define_var(loop_var_name, loop_var)
-            self.builder.assign(loop_var, ir_op.tile.get_subblock_idx(span=span), span=span)
-            with self._split_aiv_mode_context(split_mode):
-                self._parse_body_siblings(stmt.body)
-            self._discard_tail_block_comments(stmt.body, upper_line=stmt.end_lineno)
-            self.scope_manager.exit_scope(leak_vars=True)
+            self._emit_split_aiv_region(stmt, loop_var_name, split_mode)
             return
 
-        # Bare top-level form (not inside an InCore scope): open a dedicated
-        # InCore scope marking the explicit AIV-split body. This path builds the
-        # InCore scope directly (not via _parse_scope_body), so merge any
-        # forward-sticky pl.dump_tag tensors onto it here — mirrors the pl.spmd
-        # for-form (see _parse_spmd_for_loop).
-        incore_attrs = self._merge_forward_sticky_dump([("split_aiv", True)], ir.ScopeKind.InCore)
-        with self.builder.scope(
-            ir.ScopeKind.InCore,
-            span,
-            split=split_mode,
-            attrs=incore_attrs,
-        ):
+        # Bare top-level form (no enclosing InCore): a top-level split_aiv must
+        # live inside a core function, so synthesize an InCore wrapper first and
+        # nest the region inside it (keeps it eligible for OutlineIncoreScopes —
+        # else the region would have no enclosing InCore to outline). Merge any
+        # forward-sticky pl.dump_tag tensors onto the wrapper (mirrors the other
+        # InCore-creating paths); the split mode + split_aiv marker ride the
+        # nested SplitAivScopeStmt region node, not the InCore wrapper.
+        span = self.span_tracker.get_span(stmt)
+        incore_attrs = self._merge_forward_sticky_dump(None, ir.ScopeKind.InCore)
+        with self.builder.scope(ir.ScopeKind.InCore, span, attrs=incore_attrs):
             with self._scope_kind_context(ir.ScopeKind.InCore):
+                self._emit_split_aiv_region(stmt, loop_var_name, split_mode)
+
+    def _emit_split_aiv_region(self, stmt: ast.For, loop_var_name: str, split_mode: ir.SplitMode) -> None:
+        """Emit a first-class ``SplitAivScopeStmt`` region at the current point.
+
+        Opens a ``ScopeKind.SplitAiv`` scope carrying ``split_mode`` and binds
+        ``aiv_id = pl.tile.get_subblock_idx()`` as its first statement, then
+        parses the loop body inside it. Used by both arms of
+        :meth:`_parse_split_aiv_for_loop` (inside-InCore and the bare,
+        InCore-wrapped form).
+        """
+        span = self.span_tracker.get_span(stmt)
+        with self.builder.scope(ir.ScopeKind.SplitAiv, span, split=split_mode):
+            with self._scope_kind_context(ir.ScopeKind.SplitAiv):
+                # A fresh var scope keeps the loop var / body bindings tidy;
+                # leak_vars pushes them up so subsequent statements stay visible.
                 self.scope_manager.enter_scope("split_aiv_for")
                 # Bind `aiv_id = pl.tile.get_subblock_idx()` as the first
-                # statement of the explicit-split InCore body.
+                # statement of the region body.
                 loop_var = self.builder.var(loop_var_name, ir.ScalarType(DataType.INDEX), span=span)
                 self.scope_manager.define_var(loop_var_name, loop_var)
                 self.builder.assign(loop_var, ir_op.tile.get_subblock_idx(span=span), span=span)
                 # Expose the split mode to ``pl.aiv_shard`` / ``pl.aic_gather``
-                # calls in the body, which inherit it from this scope.
+                # calls in the body, which inherit it from this region.
                 with self._split_aiv_mode_context(split_mode):
                     self._parse_body_siblings(stmt.body)
                 self._discard_tail_block_comments(stmt.body, upper_line=stmt.end_lineno)
-                # Leak vars to parent so post-store rebindings remain visible to
-                # subsequent statements (matches the pl.spmd for-form).
                 self.scope_manager.exit_scope(leak_vars=True)
 
     def _merge_forward_sticky_dump(

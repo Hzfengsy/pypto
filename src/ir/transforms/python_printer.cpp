@@ -260,6 +260,7 @@ class IRPythonPrinter : public IRVisitor {
   void VisitStmt_(const ClusterScopeStmtPtr& op) override;
   void VisitStmt_(const HierarchyScopeStmtPtr& op) override;
   void VisitStmt_(const SpmdScopeStmtPtr& op) override;
+  void VisitStmt_(const SplitAivScopeStmtPtr& op) override;
   void VisitStmt_(const RuntimeScopeStmtPtr& op) override;
   void VisitStmt_(const CommDomainScopeStmtPtr& op) override;
   void VisitStmt_(const SeqStmtsPtr& op) override;
@@ -276,6 +277,10 @@ class IRPythonPrinter : public IRVisitor {
  private:
   std::ostringstream stream_;
   int indent_level_ = 0;
+  // Nesting depth inside a printed SplitAivScopeStmt region. While > 0, the
+  // redundant op-level ``split=`` kwarg on aiv_shard/aic_gather is suppressed
+  // (the region's mode is the authoritative carrier; the parser re-stamps it).
+  int split_aiv_scope_depth_ = 0;
   std::string prefix_;                    // Prefix for type names (e.g., "pl" or "ir")
   bool concise_;                          // When true, omit intermediate type annotations
   ProgramPtr current_program_ = nullptr;  // Track when printing within Program (for self.method() calls)
@@ -1001,6 +1006,15 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
     // it on print so the round-trip parser can re-derive the name from the
     // assignment LHS without tripping the no-user-kwargs check.
     if (IsOp(op, "pld.tensor.alloc_window_buffer") && key == "name") continue;
+    // Inside a live SplitAivScopeStmt region the per-op ``split=`` int on
+    // aiv_shard/aic_gather is redundant: the region node's mode is the
+    // authoritative carrier and the parser re-stamps it from the enclosing
+    // ``pl.split_aiv(..., mode=...)``. Suppress it so the printed body reparses
+    // (the parser rejects an explicit ``split=`` on these ops). Outside a region
+    // (lowered form) it prints as usual.
+    if (split_aiv_scope_depth_ > 0 && key == "split" &&
+        (IsOp(op, "tile.aiv_shard") || IsOp(op, "tile.aic_gather")))
+      continue;
     if (need_comma) {
       stream_ << ", ";
     }
@@ -1898,6 +1912,39 @@ void IRPythonPrinter::VisitStmt_(const SpmdScopeStmtPtr& op) {
   stream_ << "):\n";
   IncreaseIndent();
   PrintStmtBlock(op->body_);
+  DecreaseIndent();
+}
+
+void IRPythonPrinter::VisitStmt_(const SplitAivScopeStmtPtr& op) {
+  // Round-trips as `for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.X): <body>`.
+  // The region body begins with `aiv_id = tile.get_subblock_idx()`; that binding
+  // is materialized as the loop variable and skipped in the body.
+  auto body_seq = As<SeqStmts>(op->body_);
+  auto first_assign = body_seq ? (body_seq->stmts_.empty() ? nullptr : As<AssignStmt>(body_seq->stmts_[0]))
+                               : As<AssignStmt>(op->body_);
+  auto first_call = first_assign ? As<Call>(first_assign->value_) : nullptr;
+  auto first_op = first_call ? As<Op>(first_call->op_) : nullptr;
+  const bool has_idx_binding = first_op && IsOp(first_op, "tile.get_subblock_idx");
+  // DCE-safe: if the `aiv_id` binding was stripped, synthesize a name and print
+  // the full body so the round-trip stays valid.
+  const std::string var_name = has_idx_binding ? GetVarName(first_assign->var_.get()) : "aiv_id";
+  stream_ << "for " << var_name << " in " << prefix_ << ".split_aiv(" << op->count_ << ", mode=" << prefix_
+          << ".SplitMode." << SplitModeToPythonString(op->split_) << "):\n";
+  IncreaseIndent();
+  ++split_aiv_scope_depth_;
+  const size_t start = has_idx_binding ? 1 : 0;
+  if (body_seq && body_seq->stmts_.size() > start) {
+    for (size_t i = start; i < body_seq->stmts_.size(); ++i) {
+      if (ShouldSuppressPlaceholder(body_seq->stmts_, i)) continue;
+      PrintStmtBlock(body_seq->stmts_[i]);
+      if (i + 1 < body_seq->stmts_.size()) stream_ << "\n";
+    }
+  } else if (!body_seq && !has_idx_binding) {
+    PrintStmtBlock(op->body_);
+  } else {
+    stream_ << GetIndent() << "pass\n";
+  }
+  --split_aiv_scope_depth_;
   DecreaseIndent();
 }
 

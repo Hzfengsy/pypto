@@ -300,36 +300,11 @@ void IRBuilder::BeginScope(ScopeKind scope_kind, const Span& span, std::optional
       << "Hierarchy scope requires a level at " << span.to_string();
   CHECK(scope_kind != ScopeKind::Runtime || manual.has_value())
       << "Runtime scope requires manual flag at " << span.to_string();
+  CHECK(scope_kind != ScopeKind::SplitAiv || split.has_value())
+      << "SplitAiv scope requires a split mode at " << span.to_string();
   context_stack_.push_back(std::make_unique<ScopeContext>(scope_kind, span, level, role, split,
                                                           std::move(name_hint), std::move(core_num),
                                                           sync_start, manual, std::move(attrs)));
-}
-
-void IRBuilder::MarkCurrentScopeSplitAiv(SplitMode split) {
-  CHECK(!context_stack_.empty() && CurrentContext()->GetType() == BuildContext::Type::SCOPE)
-      << "pl.split_aiv must appear directly inside a pl.at(...) scope (e.g. "
-         "'with pl.at(level=pl.Level.CORE_GROUP): ... for aiv_id in pl.split_aiv(2, mode=...)'), "
-         "not nested within an intervening loop or conditional.";
-  auto* scope_ctx = static_cast<ScopeContext*>(CurrentContext());
-  CHECK(scope_ctx->GetScopeKind() == ScopeKind::InCore)
-      << "pl.split_aiv must appear directly inside a pl.at(...) InCore scope, but the enclosing "
-         "open scope is "
-      << ScopeKindToString(scope_ctx->GetScopeKind())
-      << ". Place the split_aiv loop as a direct child of the pl.at(level=pl.Level.CORE_GROUP) scope.";
-  // One InCore scope represents the two AIV lanes, so multiple sibling
-  // `for ... in pl.split_aiv(...)` loops flattened into the same scope is not a
-  // meaningful pattern. Reject a second stamp on an already-marked scope: without
-  // this guard the SetSplit below would silently overwrite the scope's split mode
-  // (earlier ops parsed under one axis while the function advertises another) and
-  // AddAttr would append a duplicate ("split_aiv", true).
-  for (const auto& attr : scope_ctx->GetAttrs()) {
-    CHECK(attr.first != "split_aiv")
-        << "Multiple pl.split_aiv(...) loops in one pl.at(...) InCore scope are not supported: the "
-           "scope is already marked split_aiv. One InCore scope represents the two AIV lanes — use a "
-           "single 'for aiv_id in pl.split_aiv(...)' loop per pl.at(level=pl.Level.CORE_GROUP) scope.";
-  }
-  scope_ctx->SetSplit(split);
-  scope_ctx->AddAttr({"split_aiv", true});
 }
 
 StmtPtr IRBuilder::EndScope(const Span& end_span) {
