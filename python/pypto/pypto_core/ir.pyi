@@ -2129,6 +2129,9 @@ class ScopeKind(enum.Enum):
     """Comm-domain scope (with orch.allocate_domain(...) wrapper for host_orch
     window buffers)."""
 
+    SplitAiv = 7
+    """Explicit AIV-split region (pl.split_aiv, nestable in loops/conditionals)."""
+
 class SplitMode(enum.Enum):
     """Split mode for cross-core data transfer."""
 
@@ -2222,8 +2225,8 @@ class ScopeStmt(Stmt):
     (a ``list[Var]`` of TaskId producers populated by ``pl.at(..., deps=[...])``)."""
 
     def __init__(self, *args: object, **kwargs: object) -> None:
-        """ScopeStmt is abstract — construct an InCoreScopeStmt,
-        ClusterScopeStmt, HierarchyScopeStmt, or SpmdScopeStmt instead."""
+        """ScopeStmt is abstract — construct an InCoreScopeStmt, ClusterScopeStmt,
+        HierarchyScopeStmt, SplitAivScopeStmt, or SpmdScopeStmt instead."""
 
 class InCoreScopeStmt(ScopeStmt):
     """InCore scope: AICore sub-graph region."""
@@ -2290,6 +2293,19 @@ class SpmdScopeStmt(ScopeStmt):
         Accepts either a Python ``int`` (auto-wrapped as ``ConstInt``) or any
         ``Expr`` of integer type.
         """
+
+class SplitAivScopeStmt(ScopeStmt):
+    """Explicit AIV-split region: `for aiv_id in pl.split_aiv(2, mode=...)`.
+
+    Halves vector compute across the 2 AIV subblocks. Erased by
+    LowerAutoVectorSplit (pass 21); never reaches codegen.
+    """
+
+    split: Final[SplitMode]
+    count: Final[int]
+    def __init__(
+        self, split: SplitMode, count: int = 2, name_hint: str = "", *, body: Stmt, span: Span
+    ) -> None: ...
 
 class RuntimeScopeStmt(ScopeStmt):
     """Runtime orchestration scope: a PTO2_SCOPE wrapper at codegen.
@@ -3779,6 +3795,7 @@ class IRVisitor:
     def visit_cluster_scope_stmt(self, op: ClusterScopeStmt) -> None: ...
     def visit_hierarchy_scope_stmt(self, op: HierarchyScopeStmt) -> None: ...
     def visit_spmd_scope_stmt(self, op: SpmdScopeStmt) -> None: ...
+    def visit_split_aiv_scope_stmt(self, op: SplitAivScopeStmt) -> None: ...
     def visit_runtime_scope_stmt(self, op: RuntimeScopeStmt) -> None: ...
     def visit_comm_domain_scope_stmt(self, op: CommDomainScopeStmt) -> None: ...
     def visit_seq_stmts(self, op: SeqStmts) -> None: ...
@@ -3860,6 +3877,7 @@ class IRMutator:
     def visit_cluster_scope_stmt(self, op: ClusterScopeStmt) -> Stmt: ...
     def visit_hierarchy_scope_stmt(self, op: HierarchyScopeStmt) -> Stmt: ...
     def visit_spmd_scope_stmt(self, op: SpmdScopeStmt) -> Stmt: ...
+    def visit_split_aiv_scope_stmt(self, op: SplitAivScopeStmt) -> Stmt: ...
     def visit_runtime_scope_stmt(self, op: RuntimeScopeStmt) -> Stmt: ...
     def visit_comm_domain_scope_stmt(self, op: CommDomainScopeStmt) -> Stmt: ...
     def visit_seq_stmts(self, op: SeqStmts) -> Stmt: ...

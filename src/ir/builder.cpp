@@ -382,6 +382,13 @@ StmtPtr IRBuilder::EndScope(const Span& end_span) {
                                                          std::move(name_hint), body, combined_span,
                                                          std::vector<std::string>{}, std::move(attrs));
       break;
+    case ScopeKind::SplitAiv:
+      CHECK(split.has_value()) << "SplitAiv scope requires a split mode (pl.split_aiv(..., mode=...)) at "
+                               << combined_span.to_string();
+      scope_stmt = std::make_shared<const SplitAivScopeStmt>(*split, /*count=*/2, std::move(name_hint), body,
+                                                             combined_span, std::vector<std::string>{},
+                                                             std::move(attrs));
+      break;
     case ScopeKind::Runtime:
       CHECK(manual.has_value()) << "Runtime scope requires manual flag";
       scope_stmt = std::make_shared<const RuntimeScopeStmt>(

@@ -309,6 +309,13 @@ void IRVisitor::VisitStmt_(const SpmdScopeStmtPtr& op) {
   VisitStmt(op->body_);
 }
 
+void IRVisitor::VisitStmt_(const SplitAivScopeStmtPtr& op) {
+  // split_/count_ are plain leaf fields (no Expr to visit).
+  VisitScopeAttrs(op);
+  INTERNAL_CHECK_SPAN(op->body_, op->span_) << "SplitAivScopeStmt has null body";
+  VisitStmt(op->body_);
+}
+
 void IRVisitor::VisitStmt_(const RuntimeScopeStmtPtr& op) {
   INTERNAL_CHECK_SPAN(op->body_, op->span_) << "RuntimeScopeStmt has null body";
   VisitStmt(op->body_);

@@ -998,6 +998,20 @@ StmtPtr IRMutator::VisitStmt_(const SpmdScopeStmtPtr& op) {
   return op;
 }
 
+StmtPtr IRMutator::VisitStmt_(const SplitAivScopeStmtPtr& op) {
+  INTERNAL_CHECK_SPAN(op->body_, op->span_) << "SplitAivScopeStmt has null body";
+  auto new_body = StmtFunctor<StmtPtr>::VisitStmt(op->body_);
+  INTERNAL_CHECK_SPAN(new_body, op->span_) << "SplitAivScopeStmt body mutated to null";
+  auto [new_attrs, attrs_changed] = MutateScopeAttrs(op->attrs_);
+  if (new_body.get() != op->body_.get() || attrs_changed) {
+    auto result = MutableCopy(op);  // split_/count_ copied automatically
+    result->body_ = std::move(new_body);
+    if (attrs_changed) result->attrs_ = std::move(new_attrs);
+    return result;
+  }
+  return op;
+}
+
 StmtPtr IRMutator::VisitStmt_(const RuntimeScopeStmtPtr& op) {
   INTERNAL_CHECK_SPAN(op->body_, op->span_) << "RuntimeScopeStmt has null body";
   auto new_body = StmtFunctor<StmtPtr>::VisitStmt(op->body_);

@@ -111,6 +111,7 @@ class IRVisitor : public IRFunctor<void> {
   /// SSA Var liveness) see Var refs stashed on the scope.
   void VisitScopeAttrs(const ScopeStmtPtr& op);
   void VisitStmt_(const SpmdScopeStmtPtr& op) override;
+  void VisitStmt_(const SplitAivScopeStmtPtr& op) override;
   void VisitStmt_(const RuntimeScopeStmtPtr& op) override;
   void VisitStmt_(const CommDomainScopeStmtPtr& op) override;
   void VisitStmt_(const SeqStmtsPtr& op) override;

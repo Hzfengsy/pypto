@@ -227,6 +227,7 @@ class IRSerializer::Impl {
     SERIALIZE_FIELDS(ClusterScopeStmt);
     SERIALIZE_FIELDS(HierarchyScopeStmt);
     SERIALIZE_FIELDS(SpmdScopeStmt);
+    SERIALIZE_FIELDS(SplitAivScopeStmt);
     SERIALIZE_FIELDS(RuntimeScopeStmt);
     SERIALIZE_FIELDS(CommDomainScopeStmt);
     SERIALIZE_FIELDS(SeqStmts);

@@ -279,6 +279,10 @@ std::vector<StmtPtr> FilterDeadCodeImpl(const std::vector<StmtPtr>& stmts,
         auto copy = MutableCopy(spmd);
         copy->body_ = new_body;
         new_scope = copy;
+      } else if (auto split_aiv = std::dynamic_pointer_cast<const SplitAivScopeStmt>(stmt)) {
+        auto copy = MutableCopy(split_aiv);
+        copy->body_ = new_body;
+        new_scope = copy;
       } else if (auto runtime = std::dynamic_pointer_cast<const RuntimeScopeStmt>(stmt)) {
         auto copy = MutableCopy(runtime);
         copy->body_ = new_body;
@@ -443,6 +447,11 @@ StmtPtr RebuildScopeWithBody(const std::shared_ptr<const ScopeStmt>& scope_stmt,
   }
   if (auto spmd = std::dynamic_pointer_cast<const SpmdScopeStmt>(scope_stmt)) {
     auto copy = MutableCopy(spmd);
+    copy->body_ = new_body;
+    return copy;
+  }
+  if (auto split_aiv = std::dynamic_pointer_cast<const SplitAivScopeStmt>(scope_stmt)) {
+    auto copy = MutableCopy(split_aiv);
     copy->body_ = new_body;
     return copy;
   }

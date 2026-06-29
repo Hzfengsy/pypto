@@ -846,6 +846,22 @@ static IRNodePtr DeserializeSpmdScopeStmt(const msgpack::object& fields_obj, msg
                                          DeserializeScopeAttrs(fields_obj, ctx, zone));
 }
 
+static IRNodePtr DeserializeSplitAivScopeStmt(const msgpack::object& fields_obj, msgpack::zone& zone,
+                                              DeserializerContext& ctx) {
+  auto span = ctx.DeserializeSpan(GET_FIELD_OBJ("span"));
+  auto split_obj = GET_FIELD_OBJ("split");
+  CHECK_SPAN(split_obj.type == msgpack::type::POSITIVE_INTEGER, span)
+      << "SplitAivScopeStmt 'split' must be an integer SplitMode code";
+  SplitMode split = static_cast<SplitMode>(split_obj.as<uint64_t>());
+  CHECK_SPAN(split != SplitMode::None, span) << "SplitAivScopeStmt 'split' must not be None";
+  int count = static_cast<int>(GET_FIELD_OBJ("count").as<int64_t>());
+  auto name_hint = DeserializeScopeNameHint(fields_obj, ctx);
+  auto body = std::static_pointer_cast<const Stmt>(ctx.DeserializeNode(GET_FIELD_OBJ("body"), zone));
+  return std::make_shared<SplitAivScopeStmt>(split, count, std::move(name_hint), body, span,
+                                             DeserializeLeadingComments(fields_obj),
+                                             DeserializeScopeAttrs(fields_obj, ctx, zone));
+}
+
 // Deserialize RuntimeScopeStmt (pl.manual_scope MANUAL wrapper / AUTO PTO2_SCOPE
 // wrapper added by MaterializeRuntimeScopes). Submit nodes live inside this, so
 // serializing a manual_scope program requires it.
@@ -1187,6 +1203,7 @@ static TypeRegistrar _in_core_scope_stmt_registrar("InCoreScopeStmt", Deserializ
 static TypeRegistrar _cluster_scope_stmt_registrar("ClusterScopeStmt", DeserializeClusterScopeStmt);
 static TypeRegistrar _hierarchy_scope_stmt_registrar("HierarchyScopeStmt", DeserializeHierarchyScopeStmt);
 static TypeRegistrar _spmd_scope_stmt_registrar("SpmdScopeStmt", DeserializeSpmdScopeStmt);
+static TypeRegistrar _split_aiv_scope_stmt_registrar("SplitAivScopeStmt", DeserializeSplitAivScopeStmt);
 static TypeRegistrar _runtime_scope_stmt_registrar("RuntimeScopeStmt", DeserializeRuntimeScopeStmt);
 static TypeRegistrar _comm_domain_scope_stmt_registrar("CommDomainScopeStmt", DeserializeCommDomainScopeStmt);
 static TypeRegistrar _seq_stmts_registrar("SeqStmts", DeserializeSeqStmts);
