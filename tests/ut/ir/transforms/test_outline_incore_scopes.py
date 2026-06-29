@@ -1459,6 +1459,91 @@ class TestOutlineNoDepArgs:
         assert outlined.attrs["split"] == pl.SplitMode.UP_DOWN.value
         assert outlined.attrs["split_aiv"] is True
 
+    @staticmethod
+    def _count_regions(node):
+        count = 0
+
+        def walk(n):
+            nonlocal count
+            if isinstance(n, ir.SplitAivScopeStmt):
+                count += 1
+            if isinstance(n, ir.SeqStmts):
+                for s in n.stmts:
+                    walk(s)
+            elif isinstance(n, ir.IfStmt):
+                walk(n.then_body)
+                if n.else_body is not None:
+                    walk(n.else_body)
+            elif hasattr(n, "body") and n.body is not None:
+                walk(n.body)
+
+        walk(node)
+        return count
+
+    def test_split_aiv_preserved_in_outlined_func(self):
+        """OutlineIncoreScopes outlines the enclosing InCore scope but preserves
+        the nested ``SplitAivScopeStmt`` region inside the outlined function body
+        (SplitAiv is never an outline target — it is lowered in place at pass 21).
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                b: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                    offset = aiv_id * 128
+                    tile_a: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [offset, 0], [128, 128])
+                    tile_b: pl.Tile[[128, 128], pl.FP32] = pl.load(b, [offset, 0], [128, 128])
+                    out = pl.store(pl.add(tile_a, tile_b), [offset, 0], out)
+                return out
+
+        with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)]):
+            Before = passes.convert_to_ssa()(Before)
+            After = passes.outline_incore_scopes()(Before)
+
+        outlined = next(f for gv, f in After.functions.items() if f.func_type == ir.FunctionType.InCore)
+        # The region node survives inside the outlined InCore function body.
+        assert self._count_regions(outlined.body) == 1
+        # The orchestration parent no longer holds the region (it was outlined).
+        orch = next(f for gv, f in After.functions.items() if f.func_type == ir.FunctionType.Orchestration)
+        assert self._count_regions(orch.body) == 0
+
+    def test_split_aiv_aiv_id_not_outlined_param(self):
+        """``aiv_id`` is bound inside the region body (``tile.get_subblock_idx``),
+        so the outliner's def/use analysis must treat it as locally-defined — the
+        outlined function signature must gain NO ``aiv_id`` parameter."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                b: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                    offset = aiv_id * 128
+                    tile_a: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [offset, 0], [128, 128])
+                    tile_b: pl.Tile[[128, 128], pl.FP32] = pl.load(b, [offset, 0], [128, 128])
+                    out = pl.store(pl.add(tile_a, tile_b), [offset, 0], out)
+                return out
+
+        with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)]):
+            Before = passes.convert_to_ssa()(Before)
+            After = passes.outline_incore_scopes()(Before)
+
+        outlined = next(f for gv, f in After.functions.items() if f.func_type == ir.FunctionType.InCore)
+        param_names = [p.name_hint for p in outlined.params]
+        assert not any("aiv_id" in name for name in param_names), (
+            f"aiv_id must not be promoted to an outlined param, got params {param_names}"
+        )
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

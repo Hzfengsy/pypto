@@ -106,6 +106,29 @@ class PostStoreAliasCollector : public IRVisitor {
 };
 
 /**
+ * @brief Find the SplitMode of the first nested SplitAivScopeStmt region.
+ *
+ * The explicit ``pl.split_aiv`` form is a first-class node in the InCore body,
+ * not a scope attr (the old ``MarkCurrentScopeSplitAiv`` marker was removed).
+ * OutlineIncoreScopes uses this to bridge the node into the function-level
+ * ``split_aiv`` marker (mode-agnostic bool + a coarse representative ``split``
+ * mode) the downstream contract (passes 11-24) expects. The authoritative
+ * per-region mode is ``node->split_``, consumed at LowerAutoVectorSplit (21).
+ */
+class FirstSplitAivModeFinder : public IRVisitor {
+ public:
+  std::optional<SplitMode> mode;
+
+ protected:
+  void VisitStmt_(const SplitAivScopeStmtPtr& op) override {
+    if (!mode.has_value()) {
+      mode = op->split_;
+    }
+    // No need to descend into the region body for the representative mode.
+  }
+};
+
+/**
  * @brief Mutator that converts EvalStmt(Call(tile.store, ...)) into
  *        AssignStmt(target_var, Call(tile.store, ...)) for specified
  *        store targets.
@@ -440,6 +463,10 @@ class ScopeOutliner : public IRMutator {
   StmtPtr VisitStmt_(const ClusterScopeStmtPtr& op) override { return VisitScopeKind(op); }
   StmtPtr VisitStmt_(const HierarchyScopeStmtPtr& op) override { return VisitScopeKind(op); }
   StmtPtr VisitStmt_(const SpmdScopeStmtPtr& op) override { return VisitScopeKind(op); }
+  // SplitAiv is never an outline target (target is always InCore), so this
+  // descends into the body via VisitScopeKind's non-target branch, preserving
+  // the nested SplitAivScopeStmt inside the outlined InCore function body.
+  StmtPtr VisitStmt_(const SplitAivScopeStmtPtr& op) override { return VisitScopeKind(op); }
 
  private:
   /// True when `name` is already claimed by this function (`known_names_`) or,
@@ -853,20 +880,31 @@ class ScopeOutliner : public IRMutator {
         outlined_attrs.emplace_back("windowize", true);
       }
     };
-    // Propagate the manual AIV-split marker (pl.split(..., split_aiv=True)) from
-    // the scope onto the outlined function. ExpandMixedKernel copies it to both
-    // the AIC and AIV lanes; SplitVectorKernel reads it to bypass its automatic
-    // per-op halving for hand-written split_aiv kernels.
-    auto append_split_aiv_attr = [&]() {
-      if (op->HasAttr("split_aiv") && op->GetAttr<bool>("split_aiv", false)) {
-        outlined_attrs.emplace_back("split_aiv", true);
+    // Bridge the first-class SplitAivScopeStmt region into the function-level
+    // AIV-split markers the downstream contract (passes 11-24) expects. The
+    // explicit ``pl.split_aiv`` form is a node in the body, not a scope attr
+    // (the old MarkCurrentScopeSplitAiv marker was deleted). When the InCore
+    // body contains a region, stamp the mode-agnostic ``split_aiv=true`` bool
+    // (ExpandMixedKernel copies it to both lanes; SplitVectorKernel reads it to
+    // bypass its automatic per-op halving). Also stamp a coarse representative
+    // ``split`` mode from the region node — but only when the scope itself
+    // carries no AUTO cross-core transfer split (``incore->split_``), which has
+    // a separate meaning. The authoritative per-region mode is ``node->split_``
+    // (consumed at pass 21).
+    auto append_split_aiv_attr = [&](std::optional<SplitMode> incore_split) {
+      FirstSplitAivModeFinder finder;
+      finder.VisitStmt(op->body_);
+      if (!finder.mode.has_value()) return;
+      outlined_attrs.emplace_back("split_aiv", true);
+      if (!incore_split.has_value() || incore_split.value() == SplitMode::None) {
+        outlined_attrs.emplace_back("split", static_cast<int>(finder.mode.value()));
       }
     };
     if (auto incore = As<InCoreScopeStmt>(op)) {
       append_split_attr(incore->split_);
       append_slot_num_attr();
       append_windowize_attr();
-      append_split_aiv_attr();
+      append_split_aiv_attr(incore->split_);
     } else if (auto spmd = As<SpmdScopeStmt>(op)) {
       outlined_attrs.emplace_back("core_num", spmd->core_num_);
       if (spmd->sync_start_) {
@@ -1411,6 +1449,7 @@ class ScopeKindAbsenceVerifier : public IRVisitor {
   void VisitStmt_(const ClusterScopeStmtPtr& op) override { CheckKind(op); }
   void VisitStmt_(const HierarchyScopeStmtPtr& op) override { CheckKind(op); }
   void VisitStmt_(const SpmdScopeStmtPtr& op) override { CheckKind(op); }
+  void VisitStmt_(const SplitAivScopeStmtPtr& op) override { CheckKind(op); }
 
  private:
   std::vector<Diagnostic>& diagnostics_;

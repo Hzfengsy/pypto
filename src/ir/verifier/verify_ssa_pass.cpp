@@ -266,6 +266,11 @@ StmtPtr SSAVerifier::GetLastStmt(const StmtPtr& stmt) {
   if (auto scope = As<RuntimeScopeStmt>(stmt)) {
     return GetLastStmt(scope->body_);
   }
+  // A SplitAivScopeStmt is likewise SSA-transparent (non-boundary, lowered in
+  // place by pass 21); look through it to find the trailing yield.
+  if (auto scope = As<SplitAivScopeStmt>(stmt)) {
+    return GetLastStmt(scope->body_);
+  }
 
   return stmt;
 }
@@ -273,6 +278,11 @@ StmtPtr SSAVerifier::GetLastStmt(const StmtPtr& stmt) {
 void SSAVerifier::CheckNoMidBodyYield(const std::string& scope_kind, const StmtPtr& body) {
   // Transparent through a RuntimeScopeStmt (see GetLastStmt) — check its body.
   if (auto scope = As<RuntimeScopeStmt>(body)) {
+    CheckNoMidBodyYield(scope_kind, scope->body_);
+    return;
+  }
+  // Transparent through a SplitAivScopeStmt as well (see GetLastStmt).
+  if (auto scope = As<SplitAivScopeStmt>(body)) {
     CheckNoMidBodyYield(scope_kind, scope->body_);
     return;
   }

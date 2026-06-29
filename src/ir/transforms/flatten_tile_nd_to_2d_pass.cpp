@@ -1740,6 +1740,8 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
         result.push_back(rewrite(hier));
       } else if (auto spmd = As<SpmdScopeStmt>(stmt)) {
         result.push_back(rewrite(spmd));
+      } else if (auto split_aiv = As<SplitAivScopeStmt>(stmt)) {
+        result.push_back(rewrite(split_aiv));
       } else if (auto runtime_scope = As<RuntimeScopeStmt>(stmt)) {
         result.push_back(rewrite(runtime_scope));
       } else {

@@ -474,7 +474,8 @@ class SSAConverter {
     if (kind == ObjectKind::EvalStmt) return ConvertEval(As<EvalStmt>(s));
     if (kind == ObjectKind::InCoreScopeStmt || kind == ObjectKind::ClusterScopeStmt ||
         kind == ObjectKind::HierarchyScopeStmt || kind == ObjectKind::SpmdScopeStmt ||
-        kind == ObjectKind::RuntimeScopeStmt || kind == ObjectKind::CommDomainScopeStmt) {
+        kind == ObjectKind::RuntimeScopeStmt || kind == ObjectKind::SplitAivScopeStmt ||
+        kind == ObjectKind::CommDomainScopeStmt) {
       return ConvertScope(As<ScopeStmt>(s));
     }
     return s;
@@ -1068,8 +1069,10 @@ class SSAConverter {
     //
     // ``RuntimeScopeStmt`` is a thin ``pl.scope()`` codegen wrapper, not a
     // boundary — its body shares SSA state with the enclosing function and
-    // stays fully transparent.
-    const bool is_outline_boundary = !As<RuntimeScopeStmt>(op);
+    // stays fully transparent. ``SplitAivScopeStmt`` is likewise transparent:
+    // it is never outlined and is lowered in place by LowerAutoVectorSplit
+    // (pass 21), so its body shares SSA state with the enclosing function.
+    const bool is_outline_boundary = !As<RuntimeScopeStmt>(op) && !As<SplitAivScopeStmt>(op);
     std::unordered_set<const Var*> saved_future_needs;
     if (is_outline_boundary) {
       saved_future_needs = future_needs_;
@@ -1110,6 +1113,7 @@ class SSAConverter {
       return result;
     }
     if (auto runtime_scope = As<RuntimeScopeStmt>(op)) return rewrite(runtime_scope);
+    if (auto split_aiv = As<SplitAivScopeStmt>(op)) return rewrite(split_aiv);
     if (auto comm_domain = As<CommDomainScopeStmt>(op)) return rewrite(comm_domain);
     INTERNAL_UNREACHABLE_SPAN(op->span_) << "Unknown ScopeStmt subclass: " << op->TypeName();
     return op;
