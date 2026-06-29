@@ -77,7 +77,8 @@ enum class IRProperty : uint64_t {
   ReturnParamsExplicit,             ///< InCore/Group/Spmd tensor returns reference function params by
                                     ///< pointer identity, so the return->param map is a lookup (#1702)
   UnrollResolved,                   ///< No ForKind::Unroll survives; produced by UnrollLoops
-  AivSplitValid,                    ///< Split-mode AIV/AIC functions have no vector reduce on the split axis
+  AivSplitValid,                    ///< SplitAivScopeStmt regions are structurally valid: no cube compute
+                                    ///< or split-axis reduce inside a region, boundary ops only inside one
   kCount                            ///< Sentinel (must be last)
 };
 

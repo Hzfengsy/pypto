@@ -7,16 +7,19 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Unit tests for the AivSplitValid property verifier.
+"""Unit tests for the structural AivSplitValid property verifier.
 
-The verifier closes the gap left by SplitVectorKernel's split_aiv bypass: the
-AUTO path rejects a vector reduce over the split axis inline, but the EXPLICIT
-``split_aiv`` path skips that rewrite. A split_aiv AIV/AIC function whose body
-reduces over the split axis is a partial-reduction miscompile (each AIV lane
-holds only half the tile), so the verifier flags it as an Error.
+The verifier is keyed on the first-class ``SplitAivScopeStmt`` region (live
+between OutlineIncoreScopes and LowerAutoVectorSplit). Per region it checks:
+  (a) no cube compute inside a region (each AIV lane holds only half the tile);
+  (b) no AIV reduce over the split axis inside a region (partial reduction);
+  (c) the ``tile.aiv_shard`` / ``tile.aic_gather`` boundary ops appear only
+      inside a region.
+Full-width vector compute *outside* a region is legal (multi-mode goal) and is
+deliberately NOT flagged.
 
-These tests hand-build minimal split_aiv functions and run the verifier
-directly through ``PropertyVerifierRegistry`` (no full pipeline needed).
+These tests hand-build minimal functions and run the verifier directly through
+``PropertyVerifierRegistry`` (no full pipeline needed).
 """
 
 import pytest
@@ -47,66 +50,63 @@ def _errors(program) -> list:
     return [d for d in _verify(program) if d.severity == passes.DiagnosticSeverity.Error]
 
 
-def _make_reduce_func(
-    reduce_kind: str,
-    *,
-    split_mode,
-    split_aiv: bool,
-    func_type=ir.FunctionType.AIV,
-):
-    """Build a minimal kernel: load [16, 128] -> reduce -> store.
-
-    ``reduce_kind`` selects the reduce op:
-      - ``"col"``  -> tile.col_max (reduces axis 0)
-      - ``"row"``  -> tile.row_max (reduces the last axis, dim 1 for a 2D tile)
-    """
+def _program(body: ir.Stmt) -> ir.Program:
+    """Wrap a body statement in a minimal AIV function + program."""
     span = ir.Span.unknown()
     data = ir.Var("data", _tile([16, 128]), span)
-
-    if reduce_kind == "col":
-        reduce_call = T.col_max(data, span)
-    elif reduce_kind == "row":
-        tmp = ir.Var("tmp", _tile([16, 128]), span)
-        reduce_call = T.row_max(data, tmp, span)
-    else:
-        raise ValueError(f"unknown reduce_kind: {reduce_kind}")
-
-    reduced = ir.Var("reduced", reduce_call.type, span)
     out_0 = ir.Var("out_0", ir.TensorType([16, 128], FP32), span)
-    store = T.store(data, [0, 0], out_0, span=span)
-    out_store = ir.Var("out_store", store.type, span)
-
-    body = ir.SeqStmts(
-        [
-            ir.AssignStmt(reduced, reduce_call, span),
-            ir.AssignStmt(out_store, store, span),
-            ir.ReturnStmt([out_store], span),
-        ],
-        span,
-    )
-    attrs = {"split": split_mode}
-    if split_aiv:
-        attrs["split_aiv"] = True
     func = ir.Function(
         "split_aiv",
         [(data, _IN), (out_0, _OUT)],
         [out_0.type],
         body,
         span,
-        func_type,
-        attrs=attrs,
+        ir.FunctionType.AIV,
     )
     return ir.Program([func], "test_aiv_split", span)
 
 
+def _region(split_mode, inner_stmts: list[ir.Stmt]) -> ir.SplitAivScopeStmt:
+    span = ir.Span.unknown()
+    return ir.SplitAivScopeStmt(split=split_mode, body=ir.SeqStmts(inner_stmts, span), span=span)
+
+
 # ---------------------------------------------------------------------------
-# Reduce ON the split axis -> Error
+# (a) Cube compute inside a region -> Error
 # ---------------------------------------------------------------------------
 
 
-def test_up_down_col_reduce_on_split_axis_rejected():
-    """UP_DOWN splits dim 0; col_max reduces dim 0 -> partial reduction -> Error."""
-    program = _make_reduce_func("col", split_mode=ir.SplitMode.UP_DOWN, split_aiv=True)
+def test_cube_in_region_fails():
+    """A cube op (tile.matmul, Acc output) inside a region cannot be vector-split."""
+    span = ir.Span.unknown()
+    lhs = ir.Var("lhs", _tile([16, 128], MS.Left), span)
+    rhs = ir.Var("rhs", _tile([128, 64], MS.Right), span)
+    mm = T.matmul(lhs, rhs, span)
+    res = ir.Var("res", mm.type, span)
+    region = _region(ir.SplitMode.UP_DOWN, [ir.AssignStmt(res, mm, span)])
+    program = _program(ir.SeqStmts([region], span))
+
+    errors = _errors(program)
+    assert len(errors) == 1
+    assert errors[0].rule_name == "AivSplitValid"
+    assert "cube op" in errors[0].message
+    assert "tile.matmul" in errors[0].message
+
+
+# ---------------------------------------------------------------------------
+# (b) Reduce over the split axis inside a region -> Error
+# ---------------------------------------------------------------------------
+
+
+def test_reduce_on_split_axis_fails():
+    """UP_DOWN splits dim 0; tile.col_max reduces dim 0 inside a region -> Error."""
+    span = ir.Span.unknown()
+    data = ir.Var("d", _tile([16, 128]), span)
+    cm = T.col_max(data, span)
+    res = ir.Var("res", cm.type, span)
+    region = _region(ir.SplitMode.UP_DOWN, [ir.AssignStmt(res, cm, span)])
+    program = _program(ir.SeqStmts([region], span))
+
     errors = _errors(program)
     assert len(errors) == 1
     assert errors[0].rule_name == "AivSplitValid"
@@ -114,54 +114,57 @@ def test_up_down_col_reduce_on_split_axis_rejected():
     assert "tile.col_max" in errors[0].message
 
 
-def test_left_right_row_reduce_on_split_axis_rejected():
-    """LEFT_RIGHT splits dim 1; row_max reduces the last axis (1) -> Error."""
-    program = _make_reduce_func("row", split_mode=ir.SplitMode.LEFT_RIGHT, split_aiv=True)
+# ---------------------------------------------------------------------------
+# (c) Boundary op outside any region -> Error
+# ---------------------------------------------------------------------------
+
+
+def test_boundary_outside_region_fails():
+    """tile.aiv_shard at top level (no enclosing region) -> Error."""
+    span = ir.Span.unknown()
+    data = ir.Var("d", _tile([16, 128]), span)
+    shard = T.aiv_shard(data, split=int(ir.SplitMode.UP_DOWN.value), span=span)
+    res = ir.Var("res", shard.type, span)
+    program = _program(ir.SeqStmts([ir.AssignStmt(res, shard, span)], span))
+
     errors = _errors(program)
     assert len(errors) == 1
-    assert "tile.row_max" in errors[0].message
+    assert errors[0].rule_name == "AivSplitValid"
+    assert "tile.aiv_shard" in errors[0].message
+    assert "must appear inside a pl.split_aiv region" in errors[0].message
 
 
-def test_aic_function_also_checked():
-    """The gate covers AIC functions too, not just AIV."""
-    program = _make_reduce_func(
-        "col", split_mode=ir.SplitMode.UP_DOWN, split_aiv=True, func_type=ir.FunctionType.AIC
+# ---------------------------------------------------------------------------
+# Valid region -> no error
+# ---------------------------------------------------------------------------
+
+
+def test_valid_region_passes():
+    """A region with vector compute + a boundary op inside it is valid."""
+    span = ir.Span.unknown()
+    data = ir.Var("d", _tile([16, 128]), span)
+    shard = T.aiv_shard(data, split=int(ir.SplitMode.UP_DOWN.value), span=span)
+    sharded = ir.Var("sharded", shard.type, span)
+    add = T.add(sharded, sharded, span)
+    res = ir.Var("res", add.type, span)
+    region = _region(
+        ir.SplitMode.UP_DOWN,
+        [ir.AssignStmt(sharded, shard, span), ir.AssignStmt(res, add, span)],
     )
-    assert len(_errors(program)) == 1
+    program = _program(ir.SeqStmts([region], span))
 
-
-# ---------------------------------------------------------------------------
-# Reduce on the NON-split axis -> no false positive
-# ---------------------------------------------------------------------------
-
-
-def test_up_down_row_reduce_off_split_axis_passes():
-    """UP_DOWN splits dim 0; row_max reduces dim 1 (flash-attn row_max) -> OK."""
-    program = _make_reduce_func("row", split_mode=ir.SplitMode.UP_DOWN, split_aiv=True)
     assert _errors(program) == []
 
 
-def test_left_right_col_reduce_off_split_axis_passes():
-    """LEFT_RIGHT splits dim 1; col_max reduces dim 0 -> OK."""
-    program = _make_reduce_func("col", split_mode=ir.SplitMode.LEFT_RIGHT, split_aiv=True)
+def test_fullwidth_vector_outside_region_passes():
+    """Full-width vector compute outside any region is legal (multi-mode goal)."""
+    span = ir.Span.unknown()
+    data = ir.Var("d", _tile([16, 128]), span)
+    add = T.add(data, data, span)
+    res = ir.Var("res", add.type, span)
+    program = _program(ir.SeqStmts([ir.AssignStmt(res, add, span)], span))
+
     assert _errors(program) == []
-
-
-# ---------------------------------------------------------------------------
-# Not applicable -> verifier does nothing
-# ---------------------------------------------------------------------------
-
-
-def test_non_split_aiv_function_not_checked():
-    """A function without the split_aiv marker is out of scope (verifier is a no-op)."""
-    program = _make_reduce_func("col", split_mode=ir.SplitMode.UP_DOWN, split_aiv=False)
-    assert _verify(program) == []
-
-
-def test_split_aiv_without_split_mode_not_checked():
-    """split_aiv marker but SplitMode.NONE -> gate requires a real split mode."""
-    program = _make_reduce_func("col", split_mode=ir.SplitMode.NONE, split_aiv=True)
-    assert _verify(program) == []
 
 
 if __name__ == "__main__":

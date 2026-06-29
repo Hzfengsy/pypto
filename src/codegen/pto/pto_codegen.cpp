@@ -1320,6 +1320,17 @@ void PTOCodegen::EmitExtraAllocTiles() {
 // Statement visitors
 // ========================================================================
 
+void PTOCodegen::VisitStmt(const ir::StmtPtr& stmt) {
+  // Defensive: the first-class SplitAivScopeStmt region is consumed and erased
+  // by LowerAutoVectorSplit (pass 21), ~19 passes before codegen. There is no
+  // ScopeStmt handler here, so a survivor would be silently unwrapped by the
+  // base visitor — losing the region semantics. Fail loudly instead.
+  INTERNAL_CHECK_SPAN(!ir::As<ir::SplitAivScopeStmt>(stmt), stmt->span_)
+      << "Internal error: SplitAivScopeStmt reached PTO codegen; it must be lowered and erased by "
+         "LowerAutoVectorSplit (pass 21).";
+  ir::IRVisitor::VisitStmt(stmt);
+}
+
 void PTOCodegen::VisitStmt_(const AssignStmtPtr& op) {
   auto call = As<ir::Call>(op->value_);
   const bool is_set_validshape = ir::IsOp(call, "tile.set_validshape");

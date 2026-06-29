@@ -90,8 +90,13 @@ inline const PassProperties kLowerCompositeOpsProperties{};
 
 // -- Outlining pass -----------------------------------------------------------
 
+// OutlineIncoreScopes opens the AivSplitValid verification window: it preserves
+// the first-class SplitAivScopeStmt regions inside each outlined InCore function,
+// so the structural region verifier can run from here until LowerAutoVectorSplit
+// erases the node (pass 21).
 inline const PassProperties kOutlineIncoreScopesProperties{
-    .required = {IRProperty::SSAForm}, .produced = {IRProperty::SSAForm, IRProperty::SplitIncoreOrch}};
+    .required = {IRProperty::SSAForm},
+    .produced = {IRProperty::SSAForm, IRProperty::SplitIncoreOrch, IRProperty::AivSplitValid}};
 
 // -- Cluster outlining pass ---------------------------------------------------
 
@@ -184,11 +189,18 @@ inline const PassProperties kResolveBackendOpLayoutsProperties{
 // ExpandMixedKernel's required set: it rewrites the still-mixed InCore body in
 // place without changing the structural property set (and is a no-op for
 // functions with no split mode or already in explicit split_aiv form).
+//
+// This pass closes the AivSplitValid verification window: it consumes and erases
+// the first-class SplitAivScopeStmt regions (so the structural region verifier
+// can no longer run afterwards), hence it requires AivSplitValid on entry and
+// invalidates it on exit.
 inline const PassProperties kLowerAutoVectorSplitProperties{
     .required = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::SplitIncoreOrch,
-                 IRProperty::TileOps2D, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure},
+                 IRProperty::TileOps2D, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure,
+                 IRProperty::AivSplitValid},
     .produced = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::SplitIncoreOrch,
-                 IRProperty::TileOps2D, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure}};
+                 IRProperty::TileOps2D, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure},
+    .invalidated = {IRProperty::AivSplitValid}};
 
 // -- Mixed kernel expansion pass ----------------------------------------------
 
@@ -207,8 +219,7 @@ inline const PassProperties kInjectGMPipeBufferProperties{
 
 inline const PassProperties kSplitVectorKernelProperties{
     .required = {IRProperty::SSAForm, IRProperty::MixedKernelExpanded},
-    .produced = {IRProperty::SSAForm, IRProperty::VectorKernelSplit, IRProperty::AivSplitValid,
-                 IRProperty::NormalizedStmtStructure}};
+    .produced = {IRProperty::SSAForm, IRProperty::VectorKernelSplit, IRProperty::NormalizedStmtStructure}};
 
 // -- Memory / codegen passes --------------------------------------------------
 

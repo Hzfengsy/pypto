@@ -17,9 +17,11 @@
 #include "pypto/core/error.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
+#include "pypto/ir/op_registry.h"
 #include "pypto/ir/program.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/visitor.h"
+#include "pypto/ir/transforms/utils/core_affinity.h"
 #include "pypto/ir/transforms/utils/split_axis_utils.h"
 #include "pypto/ir/verifier/verifier.h"
 
@@ -28,44 +30,87 @@ namespace ir {
 
 namespace {
 
-// Flags any vector reduce op that collapses the split axis of a split-mode
-// AIV/AIC function. Reduce ops are plain Calls with a non-null op_; Submits
-// (GlobalVar callee, no op_) are naturally skipped by IsReduceOnSplitAxis, so
-// no SubmitPtr override is needed (see pass-submit-awareness.md). One walk per
-// function body, O(1) per Call → O(N) per function.
-class ReduceOnSplitAxisVerifier : public IRVisitor {
+// Structural verifier for the first-class SplitAivScopeStmt region (live between
+// OutlineIncoreScopes and LowerAutoVectorSplit). It keys every check on the node
+// itself — tracking region nesting via VisitStmt_(SplitAivScopeStmtPtr) — rather
+// than on a function-level split_aiv attr, so multi-mode / nested / sub-region
+// functions are checked region by region.
+//
+// Checks performed:
+//   (a) No cube compute inside a region — each AIV lane only holds half the
+//       tile, so cube ops (matmul/mmad family) cannot be vector-split.
+//   (b) No AIV reduce that collapses the split axis inside a region — that
+//       produces a partial per-lane reduction (a miscompile).
+//   (c) tile.aiv_shard / tile.aic_gather (the AIV-split boundary) must appear
+//       inside a region, never at top level.
+//
+// Check (d) ("no bare vector compute outside a region") is DELIBERATELY OMITTED:
+// full-width vector compute outside a region is now legal (multi-mode goal).
+//
+// The checked ops (matmul, reduces, aiv_shard/aic_gather) are always plain Calls
+// with a non-null op_; Submits carry a GlobalVar callee and no op_, so no
+// SubmitPtr override is needed (see pass-submit-awareness.md).
+class SplitAivStructuralVerifier : public IRVisitor {
  public:
-  ReduceOnSplitAxisVerifier(std::vector<Diagnostic>& diagnostics, std::string func_name, int split_dim)
-      : diagnostics_(diagnostics), func_name_(std::move(func_name)), split_dim_(split_dim) {}
+  explicit SplitAivStructuralVerifier(std::vector<Diagnostic>& diagnostics) : diagnostics_(diagnostics) {}
+
+  void VisitStmt_(const SplitAivScopeStmtPtr& op) override {
+    INTERNAL_CHECK_SPAN(op->body_, op->span_) << "Internal error: SplitAivScopeStmt has null body";
+    int prev_split_dim = cur_split_dim_;
+    ++depth_;
+    cur_split_dim_ = split_axis::SplitDimension(op->split_);
+    IRVisitor::VisitStmt(op->body_);
+    --depth_;
+    cur_split_dim_ = prev_split_dim;
+  }
 
   void VisitExpr_(const CallPtr& op) override {
-    if (op && split_axis::IsReduceOnSplitAxis(op, split_dim_)) {
-      diagnostics_.emplace_back(
-          DiagnosticSeverity::Error, "AivSplitValid", 0,
-          "Function '" + func_name_ + "': reduce op '" + op->op_->name_ +
-              "' reduces over the split axis (dim " + std::to_string(split_dim_) +
-              "); each AIV lane holds only half of the tile, so this produces a partial "
-              "reduction. Reduce over the non-split axis, or gather the lanes back to a full "
-              "tile (tile.aic_gather) before reducing.",
-          op->span_);
+    if (op && op->op_) {
+      const bool boundary = IsOp(op, "tile.aiv_shard") || IsOp(op, "tile.aic_gather");
+      if (depth_ > 0) {
+        // (a) Cube compute cannot live inside a vector-split region.
+        if (!boundary && core_affinity::ClassifyCallAffinity(op) == core_affinity::CoreAffinity::CUBE) {
+          Err(op->span_, "cube op '" + op->op_->name_ +
+                             "' inside a pl.split_aiv region cannot be vector-split (each AIV lane "
+                             "holds only half the tile); move it outside the region, or gather the "
+                             "lanes back to a full tile (tile.aic_gather) first.");
+        }
+        // (b) A reduce over the split axis yields a partial per-lane result.
+        if (split_axis::IsReduceOnSplitAxis(op, cur_split_dim_)) {
+          Err(op->span_, "reduce op '" + op->op_->name_ + "' reduces over the split axis (dim " +
+                             std::to_string(cur_split_dim_) +
+                             ") inside a pl.split_aiv region, producing a partial reduction; reduce "
+                             "the non-split axis, or gather the lanes back (tile.aic_gather) before "
+                             "reducing.");
+        }
+      } else if (boundary) {
+        // (c) The AIV-split boundary op escaped its region.
+        Err(op->span_, "'" + op->op_->name_ +
+                           "' must appear inside a pl.split_aiv region (it marks the AIV-split "
+                           "boundary and is only meaningful there).");
+      }
     }
     IRVisitor::VisitExpr_(op);
   }
 
  private:
+  void Err(const Span& span, const std::string& message) {
+    diagnostics_.emplace_back(DiagnosticSeverity::Error, "AivSplitValid", 0, message, span);
+  }
+
   std::vector<Diagnostic>& diagnostics_;
-  std::string func_name_;
-  int split_dim_;
+  int depth_ = 0;           ///< Region nesting depth (>0 means inside a split_aiv region).
+  int cur_split_dim_ = -1;  ///< Split axis of the innermost enclosing region (-1 outside any region).
 };
 
 }  // namespace
 
-// Verifies IRProperty::AivSplitValid: a split-mode AIV/AIC function must not
-// contain a vector reduce over its split axis. The AUTO SplitVectorKernel path
-// catches this inline (IsReduceOnSplitAxis throws during per-op halving), but
-// the EXPLICIT split_aiv path bypasses that rewrite, so this verifier closes
-// the gap. Gating on the split_aiv marker keeps the check scoped to exactly the
-// bypassed subset; the AUTO path is already guaranteed clean.
+// Verifies IRProperty::AivSplitValid as a structural property of the first-class
+// SplitAivScopeStmt region. The node is live only between OutlineIncoreScopes
+// (which produces the property) and LowerAutoVectorSplit (which consumes/erases
+// the node and invalidates the property), so the verifier walks every function
+// body in that window and applies the region-scoped checks above. No
+// function-attr / split-mode gate — the node itself is the source of truth.
 class AivSplitValidPropertyVerifierImpl : public PropertyVerifier {
  public:
   [[nodiscard]] std::string GetName() const override { return "AivSplitValid"; }
@@ -74,12 +119,7 @@ class AivSplitValidPropertyVerifierImpl : public PropertyVerifier {
     if (!program) return;
     for (const auto& [gv, func] : program->functions_) {
       if (!func || !func->body_) continue;
-      if (func->func_type_ != FunctionType::AIC && func->func_type_ != FunctionType::AIV) continue;
-      if (!func->HasAttr("split_aiv") || !func->GetAttr<bool>("split_aiv", false)) continue;
-      auto mode = func->GetSplitMode();
-      if (!mode.has_value() || mode.value() == SplitMode::None) continue;
-
-      ReduceOnSplitAxisVerifier verifier(diagnostics, func->name_, split_axis::SplitDimension(mode.value()));
+      SplitAivStructuralVerifier verifier(diagnostics);
       verifier.VisitStmt(func->body_);
     }
   }

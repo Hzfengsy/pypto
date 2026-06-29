@@ -149,12 +149,14 @@ PropertyVerifierPtr CreateMixedKernelExpandedPropertyVerifier();
 /**
  * @brief Factory function for creating AivSplitValid property verifier
  *
- * Verifies that no split-mode AIV/AIC function (one carrying the explicit
- * ``split_aiv`` marker plus a non-None split mode) contains a vector reduce op
- * that collapses the split axis. Each AIV lane holds only half the tile, so a
- * reduction over the split axis yields a partial result — a miscompile. The
- * AUTO SplitVectorKernel path catches this inline; this verifier closes the
- * gap for the EXPLICIT ``split_aiv`` path, which bypasses that rewrite.
+ * Structural verifier for the first-class ``SplitAivScopeStmt`` region (live
+ * between OutlineIncoreScopes and LowerAutoVectorSplit). Keyed on the node, it
+ * checks, per region: (a) no cube compute inside a region (each AIV lane holds
+ * only half the tile, so cube ops cannot be vector-split); (b) no AIV reduce
+ * over the split axis inside a region (partial per-lane reduction); (c) the
+ * ``tile.aiv_shard`` / ``tile.aic_gather`` boundary ops appear only inside a
+ * region. Full-width vector compute outside a region is legal (multi-mode), so
+ * "bare vector compute outside a region" is intentionally not checked.
  * @return Shared pointer to AivSplitValid PropertyVerifier
  */
 PropertyVerifierPtr CreateAivSplitValidPropertyVerifier();
