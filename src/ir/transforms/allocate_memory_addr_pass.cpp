@@ -85,8 +85,7 @@ class ReserveBufferCollector : public IRVisitor {
   [[nodiscard]] const std::vector<ReserveBufferInfo>& GetReserveBuffers() const { return reserve_buffers_; }
 
   void VisitExpr_(const CallPtr& op) override {
-    auto ir_op = std::dynamic_pointer_cast<const Op>(op->op_);
-    if (ir_op && IsOp(ir_op, "system.reserve_buffer")) {
+    if (IsOp(op, "system.reserve_buffer")) {
       const int size = op->GetKwarg<int>("size", -1);
       const int base = op->GetKwarg<int>("base", -1);
       INTERNAL_CHECK_SPAN(size > 0, op->span_)

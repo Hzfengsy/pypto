@@ -42,8 +42,7 @@ std::optional<MemorySpace> GetFirstTileArgMemory(const CallPtr& call) {
 CVDirection ClassifyMoveDirection(const CallPtr& call) {
   if (!call || !call->op_) return CVDirection::NONE;
 
-  auto op = std::dynamic_pointer_cast<const Op>(call->op_);
-  if (!op || !IsOp(op, "tile.move")) return CVDirection::NONE;
+  if (!IsOp(call, "tile.move")) return CVDirection::NONE;
 
   auto src_memory = GetFirstTileArgMemory(call);
   if (!src_memory.has_value()) return CVDirection::NONE;

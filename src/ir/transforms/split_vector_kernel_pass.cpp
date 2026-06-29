@@ -580,7 +580,7 @@ StmtPtr ProcessStmt(const StmtPtr& stmt, SplitMode mode, int split_int, int spli
           new_args[0] = HalveTupleElement(call->args_[0], split_dim);
         } else if (IsOp(call, "tile.reshape") && call->args_.size() >= 2) {
           new_args[1] = HalveTupleElement(call->args_[1], split_dim);
-        } else if (op_name == "tile.set_validshape" && call->args_.size() == 3) {
+        } else if (IsOp(call, "tile.set_validshape") && call->args_.size() == 3) {
           // args = (tile, valid_row, valid_col). Halving the result type alone
           // leaves the split-dim valid operand at its full pre-split extent, so
           // a full/overflowing operand exceeds the halved physical box (PTOAS
