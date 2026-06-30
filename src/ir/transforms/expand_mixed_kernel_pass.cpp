@@ -941,6 +941,21 @@ std::unordered_map<const Var*, const Var*> BuildGmOriginMap(const std::vector<St
     }
   };
 
+  // Origin of the positional yield value `i` at the trailing YieldStmt of
+  // `body` (the loop-exit / branch value producer). Returns nullptr when `body`
+  // has no positional yield `i` or the yielded value is not an origin-known
+  // Var — leaving the consumer unmapped (conservative). Shared by For/While
+  // (loop return_var) and If (phi return_var): a return var IS the yielded
+  // value, so its origin must follow the yield, not the iter_arg's init.
+  auto yield_origin = [&](const StmtPtr& body, size_t i) -> const Var* {
+    YieldStmtPtr y = transform_utils::GetLastYieldStmt(body);
+    if (!y || i >= y->value_.size()) return nullptr;
+    auto v = std::dynamic_pointer_cast<const Var>(y->value_[i]);
+    if (!v) return nullptr;
+    auto it = origin_map.find(v.get());
+    return (it != origin_map.end()) ? it->second : nullptr;
+  };
+
   std::function<void(const std::vector<StmtPtr>&)> walk_origins;
   walk_origins = [&](const std::vector<StmtPtr>& ss) {
     for (const auto& stmt : ss) {
@@ -954,14 +969,17 @@ std::unordered_map<const Var*, const Var*> BuildGmOriginMap(const std::vector<St
         }
         propagate_from_expr(lhs, assign->value_);
       } else if (auto for_stmt = std::dynamic_pointer_cast<const ForStmt>(stmt)) {
+        // iter_args inherit their init origin so in-body uses resolve; the
+        // post-loop return_var is the trailing yielded value, so key its origin
+        // off the yield (unresolved if the loop rebinds the carried tensor to an
+        // unknown / different origin).
         for (const auto& ia : for_stmt->iter_args_) {
           propagate_from_expr(ia.get(), ia->initValue_);
         }
         walk_origins(FlattenBody(for_stmt->body_));
-        for (size_t i = 0; i < for_stmt->return_vars_.size() && i < for_stmt->iter_args_.size(); ++i) {
-          auto ia_it = origin_map.find(for_stmt->iter_args_[i].get());
-          if (ia_it != origin_map.end()) {
-            origin_map[for_stmt->return_vars_[i].get()] = ia_it->second;
+        for (size_t i = 0; i < for_stmt->return_vars_.size(); ++i) {
+          if (const Var* o = yield_origin(for_stmt->body_, i)) {
+            origin_map[for_stmt->return_vars_[i].get()] = o;
           }
         }
       } else if (auto while_stmt = std::dynamic_pointer_cast<const WhileStmt>(stmt)) {
@@ -969,10 +987,9 @@ std::unordered_map<const Var*, const Var*> BuildGmOriginMap(const std::vector<St
           propagate_from_expr(ia.get(), ia->initValue_);
         }
         walk_origins(FlattenBody(while_stmt->body_));
-        for (size_t i = 0; i < while_stmt->return_vars_.size() && i < while_stmt->iter_args_.size(); ++i) {
-          auto ia_it = origin_map.find(while_stmt->iter_args_[i].get());
-          if (ia_it != origin_map.end()) {
-            origin_map[while_stmt->return_vars_[i].get()] = ia_it->second;
+        for (size_t i = 0; i < while_stmt->return_vars_.size(); ++i) {
+          if (const Var* o = yield_origin(while_stmt->body_, i)) {
+            origin_map[while_stmt->return_vars_[i].get()] = o;
           }
         }
       } else if (auto if_stmt = std::dynamic_pointer_cast<const IfStmt>(stmt)) {
@@ -982,26 +999,15 @@ std::unordered_map<const Var*, const Var*> BuildGmOriginMap(const std::vector<St
         if (if_stmt->else_body_.has_value()) {
           walk_origins(FlattenBody(if_stmt->else_body_.value()));
         }
-        // Phi return_vars inherit the origin both branches agree on.
-        if (!if_stmt->return_vars_.empty()) {
-          YieldStmtPtr then_yield = transform_utils::GetLastYieldStmt(if_stmt->then_body_);
-          YieldStmtPtr else_yield;
-          if (if_stmt->else_body_.has_value()) {
-            else_yield = transform_utils::GetLastYieldStmt(if_stmt->else_body_.value());
-          }
-          auto yield_origin = [&](const YieldStmtPtr& y, size_t i) -> const Var* {
-            if (!y || i >= y->value_.size()) return nullptr;
-            auto v = std::dynamic_pointer_cast<const Var>(y->value_[i]);
-            if (!v) return nullptr;
-            auto it = origin_map.find(v.get());
-            return (it != origin_map.end()) ? it->second : nullptr;
-          };
-          for (size_t i = 0; i < if_stmt->return_vars_.size(); ++i) {
-            const Var* then_origin = yield_origin(then_yield, i);
-            const Var* else_origin = yield_origin(else_yield, i);
-            if (then_origin != nullptr && then_origin == else_origin) {
-              origin_map[if_stmt->return_vars_[i].get()] = then_origin;
-            }
+        // Phi return_vars inherit the origin both branches' positional yields
+        // agree on; disagreement / unknown origin / missing else leaves it
+        // unmapped (conservative).
+        for (size_t i = 0; i < if_stmt->return_vars_.size(); ++i) {
+          const Var* then_origin = yield_origin(if_stmt->then_body_, i);
+          const Var* else_origin =
+              if_stmt->else_body_.has_value() ? yield_origin(if_stmt->else_body_.value(), i) : nullptr;
+          if (then_origin != nullptr && then_origin == else_origin) {
+            origin_map[if_stmt->return_vars_[i].get()] = then_origin;
           }
         }
       } else if (auto seq = std::dynamic_pointer_cast<const SeqStmts>(stmt)) {
@@ -1025,10 +1031,10 @@ void RemapDanglingGmRefsToParam(const StmtPtr& body_stmt,
                                 std::unordered_map<const Var*, ExprPtr>& side_clone_map,
                                 const std::unordered_map<const Var*, const Var*>& origin_map,
                                 const FunctionPtr& func) {
-  var_collectors::VarDefUseCollector def_collector;
-  def_collector.VisitStmt(body_stmt);
-  var_collectors::VarDefUseCollector ref_collector;
-  ref_collector.VisitStmt(body_stmt);
+  // VarDefUseCollector gathers both defs and uses in a single pass, so one
+  // instance yields var_defs and GetAllVarRefs() — no second traversal.
+  var_collectors::VarDefUseCollector collector;
+  collector.VisitStmt(body_stmt);
 
   // Out/InOut params only: a tile.store / phi version of an In param is never a
   // cross-lane output writeback. Precompute the set so the per-ref test is a
@@ -1041,9 +1047,9 @@ void RemapDanglingGmRefsToParam(const StmtPtr& body_stmt,
     }
   }
 
-  auto all_refs = var_collectors::GetSortedVarRefs(ref_collector.GetAllVarRefs());
+  auto all_refs = var_collectors::GetSortedVarRefs(collector.GetAllVarRefs());
   for (const Var* ref_ptr : all_refs) {
-    if (!ref_ptr || def_collector.var_defs.count(ref_ptr) || side_clone_map.count(ref_ptr)) {
+    if (!ref_ptr || collector.var_defs.count(ref_ptr) || side_clone_map.count(ref_ptr)) {
       continue;
     }
     auto origin_it = origin_map.find(ref_ptr);
