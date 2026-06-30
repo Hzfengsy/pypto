@@ -4053,16 +4053,13 @@ class ASTParser:
 
         # Build a first-class SplitAivScopeStmt region. The region body begins
         # with ``aiv_id = pl.tile.get_subblock_idx()`` and carries the requested
-        # SplitMode on the node; LowerAutoVectorSplit (pass 20) consumes it.
+        # SplitMode on the node; LowerAutoVectorSplit (pass 18) consumes it.
         #
-        # FLATTEN: when already inside a CORE_GROUP scope — InCore *or* AutoInCore
-        # (``pl.at(level=CORE_GROUP, optimizations=[pl.auto_chunk])``), directly or
+        # FLATTEN: when already inside a CORE_GROUP InCore scope — directly or
         # through an intervening pl.range/pl.pipeline/if — emit the region in
         # place; it nests inside the open context. OutlineIncoreScopes outlines the
-        # enclosing core function and the nested region survives. Treating
-        # AutoInCore as an existing core scope avoids synthesizing a redundant
-        # nested InCore wrapper inside the auto-chunk scope.
-        if self._is_inside_scope(ir.ScopeKind.InCore) or self._is_inside_scope(ir.ScopeKind.AutoInCore):
+        # enclosing core function and the nested region survives.
+        if self._is_inside_scope(ir.ScopeKind.InCore):
             self._emit_split_aiv_region(stmt, loop_var_name, split_mode)
             return
 
