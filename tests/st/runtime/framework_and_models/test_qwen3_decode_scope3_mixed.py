@@ -96,7 +96,7 @@ def build_qwen3_scope3_program(
                 k0 = kb * K_CHUNK
                 a_chunk = pl.slice(attn_out, [BATCH_TILE, K_CHUNK], [b0, k0])
                 w_chunk = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [k0, o0])
-                o_acc = pl.add(o_acc, pl.matmul(a_chunk, w_chunk))
+                o_acc = pl.add(o_acc, pl.matmul(a_chunk, w_chunk, out_dtype=pl.FP32))
             resid = pl.cast(
                 pl.slice(hidden_states, [BATCH_TILE, Q_OUT_CHUNK], [b0, o0]),
                 target_type=pl.FP32,
