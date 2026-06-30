@@ -490,11 +490,16 @@ void ScanRegionHalfWidth(const std::vector<StmtPtr>& stmts, std::unordered_set<c
       if (IsOp(leaf, "tile.aic_gather")) {
         continue;
       }
-      // Only tile-producing VECTOR ops are candidates: the implicit affinity gate
-      // (ProcessStmt) halves exactly those, so a scalar-producing VECTOR op (e.g.
-      // tile.get_subblock_idx) is never "left un-localized" and must not flag.
-      if (ClassifyCallAffinity(leaf) == CoreAffinity::VECTOR &&
-          std::dynamic_pointer_cast<const TileType>(leaf->GetType()) != nullptr) {
+      // Dataflow propagation over tile-producing ops. An op that consumes a half
+      // tile STAYS in the half-width dataflow regardless of its affinity
+      // classification -- crucially this includes a Vec->Vec tile.move between the
+      // shard and the compute, which classifies MIXED/SHARED (not VECTOR). Only a
+      // VECTOR-affine tile op that consumes NONE of the half tiles is genuinely
+      // full-width: that is exactly what the implicit affinity gate would halve,
+      // and what the explicit-passthrough path would leave un-localized (both AIV
+      // lanes computing the full tile). A scalar-producing VECTOR op (e.g.
+      // tile.get_subblock_idx) is not a tile op, so it never flags.
+      if (std::dynamic_pointer_cast<const TileType>(leaf->GetType()) != nullptr) {
         bool consumes_half = false;
         for (const auto& arg : leaf->args_) {
           if (auto v = AsVarLike(arg)) {
@@ -505,8 +510,8 @@ void ScanRegionHalfWidth(const std::vector<StmtPtr>& stmts, std::unordered_set<c
           }
         }
         if (consumes_half) {
-          if (def_var) half_tiles.insert(def_var.get());  // stays half-width
-        } else {
+          if (def_var) half_tiles.insert(def_var.get());  // stays in the half-width dataflow
+        } else if (ClassifyCallAffinity(leaf) == CoreAffinity::VECTOR) {
           full_width_vec_ops.push_back(leaf->op_->name_);
         }
         continue;
