@@ -253,6 +253,138 @@ def test_aic_gather_allows_odd_split_axis():
     assert call.type.shape == [30, 128]
 
 
+def test_tensor_cross_core_ops_registered():
+    """The tensor-level split-axis ops are registered alongside the tile ops."""
+    for name in ("tensor.aiv_shard", "tensor.aic_gather"):
+        assert ir.is_op_registered(name), f"{name} should be registered"
+
+
+def test_tensor_aiv_shard_halves_split_axis():
+    """tensor.aiv_shard halves the split axis: UP_DOWN -> axis0, LEFT_RIGHT -> axis1."""
+    span = ir.Span.unknown()
+    tensor_var = ir.Var("t", ir.TensorType([16, 128], DataType.FP32), span)
+
+    up_down = ir.create_op_call("tensor.aiv_shard", [tensor_var], {"split": 1}, span)
+    assert isinstance(up_down.type, ir.TensorType)
+    assert up_down.type.shape == [8, 128]
+    assert up_down.type.dtype == DataType.FP32
+
+    left_right = ir.create_op_call("tensor.aiv_shard", [tensor_var], {"split": 2}, span)
+    assert isinstance(left_right.type, ir.TensorType)
+    assert left_right.type.shape == [16, 64]
+    assert left_right.type.dtype == DataType.FP32
+
+
+def test_tensor_aic_gather_doubles_split_axis():
+    """tensor.aic_gather is the inverse of tensor.aiv_shard: it doubles the split axis."""
+    span = ir.Span.unknown()
+
+    up_down = ir.create_op_call(
+        "tensor.aic_gather", [ir.Var("t", ir.TensorType([8, 128], DataType.FP32), span)], {"split": 1}, span
+    )
+    assert isinstance(up_down.type, ir.TensorType)
+    assert up_down.type.shape == [16, 128]
+
+    left_right = ir.create_op_call(
+        "tensor.aic_gather", [ir.Var("t", ir.TensorType([16, 64], DataType.FP32), span)], {"split": 2}, span
+    )
+    assert isinstance(left_right.type, ir.TensorType)
+    assert left_right.type.shape == [16, 128]
+
+
+def test_tensor_split_reshape_rejects_non_2d_tensor():
+    """tensor.aiv_shard / aic_gather require a 2D tensor (rank-2 gate, with reshape hint)."""
+    span = ir.Span.unknown()
+    tensor_var = ir.Var("t", ir.TensorType([2, 16, 128], DataType.FP32), span)
+
+    with pytest.raises(ValueError, match="2D tensor"):
+        ir.create_op_call("tensor.aiv_shard", [tensor_var], {"split": 1}, span)
+    with pytest.raises(ValueError, match="Reshape the operand to 2D"):
+        ir.create_op_call("tensor.aic_gather", [tensor_var], {"split": 1}, span)
+
+
+def test_tensor_split_reshape_rejects_tile_type():
+    """tensor.aiv_shard rejects a TileType operand — that is the tile op's domain."""
+    span = ir.Span.unknown()
+    tile_var = ir.Var("t", ir.TileType([16, 128], DataType.FP32), span)
+
+    with pytest.raises(ValueError, match="TensorType"):
+        ir.create_op_call("tensor.aiv_shard", [tile_var], {"split": 1}, span)
+
+
+def test_tensor_split_reshape_rejects_distributed_tensor():
+    """tensor.aiv_shard rejects a DistributedTensorType — distributed is out of scope."""
+    span = ir.Span.unknown()
+    dist_var = ir.Var("t", ir.DistributedTensorType([16, 128], DataType.FP32), span)
+
+    with pytest.raises(ValueError, match="non-distributed"):
+        ir.create_op_call("tensor.aiv_shard", [dist_var], {"split": 1}, span)
+
+
+def test_tensor_split_reshape_rejects_bad_split_attr():
+    """split must be 1 or 2 (0 and out-of-range rejected)."""
+    span = ir.Span.unknown()
+    tensor_var = ir.Var("t", ir.TensorType([16, 128], DataType.FP32), span)
+
+    for bad in (0, 3):
+        with pytest.raises(ValueError, match="split must be"):
+            ir.create_op_call("tensor.aiv_shard", [tensor_var], {"split": bad}, span)
+
+
+def test_tensor_aiv_shard_rejects_odd_split_axis():
+    """tensor.aiv_shard requires the static split-axis extent to be even."""
+    span = ir.Span.unknown()
+    tensor_var = ir.Var("t", ir.TensorType([15, 128], DataType.FP32), span)
+
+    with pytest.raises(ValueError, match="must be even"):
+        ir.create_op_call("tensor.aiv_shard", [tensor_var], {"split": 1}, span)
+
+
+def test_tensor_aiv_shard_allows_even_physical_with_odd_valid_shape():
+    """The even-extent guard applies to the physical split axis, not a partial valid_shape.
+
+    Mirrors the tile behavior: physical extent 16 (even) is accepted even though the
+    valid_shape (13) is odd; the result valid is ceil-halved (7)."""
+    span = ir.Span.unknown()
+    tensor_view = ir.TensorView(
+        [],
+        ir.TensorLayout.ND,
+        [ir.ConstInt(13, DataType.INDEX, span), ir.ConstInt(128, DataType.INDEX, span)],
+    )
+    tensor_type = ir.TensorType([16, 128], DataType.FP32, None, tensor_view)
+    tensor_var = ir.Var("t", tensor_type, span)
+
+    sharded = ir.create_op_call("tensor.aiv_shard", [tensor_var], {"split": 1}, span)
+    assert isinstance(sharded.type, ir.TensorType)
+    assert sharded.type.shape == [8, 128]
+    assert sharded.type.tensor_view is not None
+    valid_0 = sharded.type.tensor_view.valid_shape[0]
+    valid_1 = sharded.type.tensor_view.valid_shape[1]
+    assert isinstance(valid_0, ir.ConstInt)
+    assert isinstance(valid_1, ir.ConstInt)
+    assert valid_0.value == 7  # ceil(13 / 2)
+    assert valid_1.value == 128
+
+
+def test_tensor_split_reshape_halves_dynamic_extent_symbolically():
+    """A dynamic split-axis physical extent is reshaped to a symbolic floordiv (shard)
+    / mul (gather), matching the tile deducer."""
+    span = ir.Span.unknown()
+    n = ir.Var("n", ir.ScalarType(DataType.INDEX), span)
+    tensor_type = ir.TensorType([n, ir.ConstInt(128, DataType.INDEX, span)], DataType.FP32)
+    tensor_var = ir.Var("t", tensor_type, span)
+
+    sharded = ir.create_op_call("tensor.aiv_shard", [tensor_var], {"split": 1}, span)
+    assert isinstance(sharded.type, ir.TensorType)
+    half0 = sharded.type.shape[0]
+    assert not isinstance(half0, ir.ConstInt)  # symbolic floordiv(n, 2)
+    assert half0 is not n  # transformed, not an identity passthrough
+
+    gathered = ir.create_op_call("tensor.aic_gather", [tensor_var], {"split": 1}, span)
+    assert isinstance(gathered.type, ir.TensorType)
+    assert gathered.type.shape[0] is not n  # symbolic n * 2
+
+
 def test_dsl_aiv_shard_aic_gather_require_split_aiv_scope():
     """The eager pl.aiv_shard / pl.aic_gather DSL wrappers raise: the split mode is
     inherited from the enclosing pl.split_aiv scope, which only exists during a

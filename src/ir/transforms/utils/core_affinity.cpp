@@ -96,7 +96,12 @@ CoreAffinity ClassifyCallAffinity(const CallPtr& call) {
   // consumer), so they roll up as MIXED exactly like a boundary tile.move.
   // ExpandMixedKernel's boundary arm folds them into tpush/tpop with the
   // op-driven fractal/post-move rules. aiv_shard = C->V, aic_gather = V->C.
-  if (op->name_ == "tile.aiv_shard" || op->name_ == "tile.aic_gather") {
+  // The author-facing tensor.aiv_shard / tensor.aic_gather (pl.aiv_shard(tensor)
+  // inside a pl.split_aiv region) are still tensor.* in the OutlineIncoreScopes
+  // .. ConvertTensorToTileOps window, so recognize them here too — they mark the
+  // same C/V boundary and must roll up as MIXED for cube/vector outlining.
+  if (IsOp(op, "tile.aiv_shard") || IsOp(op, "tile.aic_gather") || IsOp(op, "tensor.aiv_shard") ||
+      IsOp(op, "tensor.aic_gather")) {
     return CoreAffinity::MIXED;
   }
 

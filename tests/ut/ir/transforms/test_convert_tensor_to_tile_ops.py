@@ -18,6 +18,7 @@ from pypto import DataType, ir, passes
 from pypto.ir import IRBuilder
 from pypto.ir.op import tensor as tensor_ops
 from pypto.ir.op import tile as tile_ops
+from pypto.language.parser.text_parser import parse
 from pypto.pypto_core.ir import MemorySpace, PadValue
 
 # ---------------------------------------------------------------------------
@@ -246,6 +247,14 @@ def _count_calls(func: ir.Function, op_names: set[str]) -> dict[str, int]:
     counter = _CallCounter(op_names)
     counter.visit_stmt(func.body)
     return counter.counts
+
+
+def _require_function(program: ir.Program, name: str) -> ir.Function:
+    """Return ``program``'s function ``name``, asserting it exists (narrows the
+    ``Function | None`` from ``get_function`` to a non-optional ``Function``)."""
+    func = program.get_function(name)
+    assert func is not None, f"function '{name}' not found in program"
+    return func
 
 
 # ---------------------------------------------------------------------------
@@ -3904,6 +3913,189 @@ class TestWindowSliceIncoreConversion:
 
         After = passes.convert_tensor_to_tile_ops()(Before)
         ir.assert_structural_equal(After, Expected)
+
+
+class TestConvertCrossCoreSplitOps:
+    """ConvertTensorToTileOps lowers the high-level split-axis ops
+    ``tensor.aiv_shard`` / ``tensor.aic_gather`` (emitted by ``pl.aiv_shard`` /
+    ``pl.aic_gather`` inside a ``for aiv_id in pl.split_aiv(...)`` region) 1:1 to
+    ``tile.aiv_shard`` / ``tile.aic_gather``, re-attaching the Vec boundary memory
+    the tile deducer drops so the result is byte-identical to the AUTO
+    ``pl.split`` path (LowerAutoVectorSplit).
+
+    Each Before is parsed from the ``@pl.jit`` / ``pl.spmd`` author-facing surface:
+    ``pl.aiv_shard`` / ``pl.aic_gather`` on a high-level Tensor inside a
+    ``for aiv_id in pl.split_aiv(...)`` region — the shape that reaches this pass
+    (pass 10), before LowerAutoVectorSplit (pass 18) erases the region. The shard
+    operand is a cube ``pl.matmul`` result (Acc tile after conversion); the gather
+    operand is a Vec vector-compute result (``pl.exp`` → Vec tile).
+    """
+
+    @staticmethod
+    def _parse_split_kernel(op: str, mode: str, out_shape: list[int]) -> ir.Program:
+        """Parse an InCore kernel running ``pl.aiv_shard`` / ``pl.aic_gather`` on a
+        high-level Tensor inside a ``pl.split_aiv`` region.
+
+        ``op`` is ``"aiv_shard"`` or ``"aic_gather"``; ``mode`` is the
+        ``pl.SplitMode`` name (``UP_DOWN`` / ``LEFT_RIGHT``); ``out_shape`` is the
+        function's Tensor return shape. The producer mirrors the realistic boundary
+        each op sees: a cube ``pl.matmul`` for the shard, a Vec ``pl.exp`` for the
+        gather.
+        """
+        if op == "aiv_shard":
+            params = "a: pl.Tensor[[128, 128], pl.FP32], b: pl.Tensor[[128, 128], pl.FP32]"
+            body = "qk = pl.matmul(a, b)\n                res = pl.aiv_shard(qk)"
+        else:
+            params = "x: pl.Tensor[[128, 128], pl.FP32]"
+            body = "h = pl.exp(x)\n                res = pl.aic_gather(h)"
+        text = (
+            "import pypto.language as pl\n\n\n"
+            "@pl.program\n"
+            "class Before:\n"
+            "    @pl.function(type=pl.FunctionType.InCore)\n"
+            f"    def main_incore_0(self, {params}) -> pl.Tensor[{out_shape}, pl.FP32]:\n"
+            "        with pl.at(level=pl.Level.CORE_GROUP):\n"
+            f"            for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.{mode}):\n"
+            f"                {body}\n"
+            "        return res\n"
+        )
+        parsed = parse(text)
+        assert isinstance(parsed, ir.Program)
+        return parsed
+
+    def _find_split_op(self, program: ir.Program, tile_op_name: str) -> ir.Call:
+        call = _find_first_call_to(_require_function(program, "main_incore_0"), tile_op_name)
+        assert call is not None, f"{tile_op_name} not found after conversion"
+        return call
+
+    @pytest.mark.parametrize(
+        ("mode", "split", "expected_shape"),
+        [("UP_DOWN", 1, [64, 128]), ("LEFT_RIGHT", 2, [128, 64])],
+        ids=["up_down_axis0", "left_right_axis1"],
+    )
+    def test_aiv_shard_lowers_to_tile_aiv_shard(self, mode, split, expected_shape):
+        """``pl.aiv_shard(cube_tensor)`` → ``tile.aiv_shard`` with the split axis
+        halved and Vec memory re-attached; the ``split`` attr survives."""
+        before = self._parse_split_kernel("aiv_shard", mode, expected_shape)
+        after = passes.convert_tensor_to_tile_ops()(before)
+
+        # No tensor.aiv_shard survives; exactly the tile op remains.
+        counts = _count_calls(
+            _require_function(after, "main_incore_0"),
+            {ir.get_op("tensor.aiv_shard").name, ir.get_op("tile.aiv_shard").name},
+        )
+        assert counts[ir.get_op("tensor.aiv_shard").name] == 0
+        assert counts[ir.get_op("tile.aiv_shard").name] == 1
+
+        call = self._find_split_op(after, ir.get_op("tile.aiv_shard").name)
+        assert call.op.name == ir.get_op("tile.aiv_shard").name
+        assert isinstance(call.type, ir.TileType)
+        assert [int(str(s)) for s in call.type.shape] == expected_shape
+        assert call.type.memory_space == MemorySpace.Vec
+        assert call.kwargs["split"] == split
+
+    @pytest.mark.parametrize(
+        ("mode", "split", "expected_shape"),
+        [("UP_DOWN", 1, [256, 128]), ("LEFT_RIGHT", 2, [128, 256])],
+        ids=["up_down_axis0", "left_right_axis1"],
+    )
+    def test_aic_gather_lowers_to_tile_aic_gather(self, mode, split, expected_shape):
+        """``pl.aic_gather(vec_tensor)`` → ``tile.aic_gather`` with the split axis
+        doubled and Vec memory re-attached; the ``split`` attr survives."""
+        before = self._parse_split_kernel("aic_gather", mode, expected_shape)
+        after = passes.convert_tensor_to_tile_ops()(before)
+
+        counts = _count_calls(
+            _require_function(after, "main_incore_0"),
+            {ir.get_op("tensor.aic_gather").name, ir.get_op("tile.aic_gather").name},
+        )
+        assert counts[ir.get_op("tensor.aic_gather").name] == 0
+        assert counts[ir.get_op("tile.aic_gather").name] == 1
+
+        call = self._find_split_op(after, ir.get_op("tile.aic_gather").name)
+        assert call.op.name == ir.get_op("tile.aic_gather").name
+        assert isinstance(call.type, ir.TileType)
+        assert [int(str(s)) for s in call.type.shape] == expected_shape
+        assert call.type.memory_space == MemorySpace.Vec
+        assert call.kwargs["split"] == split
+
+    def test_split_region_preserved_through_conversion(self):
+        """The ``SplitAivScopeStmt`` wrapper survives ConvertTensorToTileOps (it is
+        erased later, by LowerAutoVectorSplit); only the inner op is lowered."""
+
+        class _RegionFinder(ir.IRVisitor):
+            def __init__(self) -> None:
+                super().__init__()
+                self.count = 0
+
+            def visit_split_aiv_scope_stmt(self, op: ir.SplitAivScopeStmt) -> None:
+                self.count += 1
+                super().visit_split_aiv_scope_stmt(op)
+
+        before = self._parse_split_kernel("aiv_shard", "UP_DOWN", [64, 128])
+        after = passes.convert_tensor_to_tile_ops()(before)
+        finder = _RegionFinder()
+        finder.visit_stmt(_require_function(after, "main_incore_0").body)
+        assert finder.count == 1
+
+    def test_explicit_shard_type_matches_auto_path(self):
+        """AUTO oracle: the ``tile.aiv_shard`` result type produced by the explicit
+        ``tensor.aiv_shard`` conversion is structurally identical to the one the
+        AUTO ``pl.split`` path synthesizes via LowerAutoVectorSplit (same halved
+        shape, Vec memory, no residual view)."""
+        span = ir.Span.unknown()
+
+        # Explicit path: pl.aiv_shard(matmul) → tile.aiv_shard (Vec half).
+        explicit = passes.convert_tensor_to_tile_ops()(
+            self._parse_split_kernel("aiv_shard", "UP_DOWN", [64, 128])
+        )
+        explicit_call = self._find_split_op(explicit, ir.get_op("tile.aiv_shard").name)
+
+        # AUTO path: a mixed InCore function whose C->V tile.move boundary
+        # LowerAutoVectorSplit rewrites into tile.aiv_shard. Built at the tile level
+        # (the pass runs post-InferTileMemorySpace), so run it under an empty
+        # PassContext to skip the DSL-level roundtrip check on this hand-built IR
+        # (mirrors test_lower_auto_vector_split._lower).
+        qk = ir.Var("qk", ir.TileType([128, 128], DataType.FP32, None, None, MemorySpace.Mat), span)
+        out_0 = ir.Var("out_0", ir.TensorType([128, 128], DataType.FP32), span)
+        move = tile_ops.move(qk, MemorySpace.Vec, span=span)
+        assert isinstance(move.type, ir.TileType)
+        popped = ir.Var(
+            "popped",
+            ir.TileType(move.type.shape, DataType.FP32, None, move.type.tile_view, MemorySpace.Vec),
+            span,
+        )
+        add = tile_ops.add(popped, popped, span)
+        y = ir.Var("y", add.type, span)
+        store = tile_ops.store(y, [0, 0], out_0, span=span)
+        out_store = ir.Var("out_store", store.type, span)
+        auto_func = ir.Function(
+            "split_auto",
+            [(qk, ir.ParamDirection.In), (out_0, ir.ParamDirection.Out)],
+            [out_0.type],
+            ir.SeqStmts(
+                [
+                    ir.AssignStmt(popped, move, span),
+                    ir.AssignStmt(y, add, span),
+                    ir.AssignStmt(out_store, store, span),
+                    ir.ReturnStmt([out_store], span),
+                ],
+                span,
+            ),
+            span,
+            ir.FunctionType.InCore,
+            attrs={"split": ir.SplitMode.UP_DOWN},
+        )
+        auto_program = ir.Program([auto_func], "auto", span)
+        with passes.PassContext([]):
+            auto_lowered = passes.lower_auto_vector_split()(auto_program)
+        auto_call = _find_first_call_to(
+            _require_function(auto_lowered, "split_auto"), ir.get_op("tile.aiv_shard").name
+        )
+        assert auto_call is not None
+
+        # The two aiv_shard result types must be structurally identical.
+        ir.assert_structural_equal(explicit_call.type, auto_call.type)
 
 
 if __name__ == "__main__":

@@ -153,6 +153,7 @@ class OpConversionRegistry {
   void RegisterScatterOps();
   void RegisterCmpOps();
   void RegisterDistributedOps();
+  void RegisterCrossCoreOps();
 
   std::unordered_map<std::string, ConversionEntry> conversions_;
 };

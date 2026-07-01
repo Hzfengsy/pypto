@@ -86,6 +86,7 @@ OpConversionRegistry::OpConversionRegistry() {
   RegisterScatterOps();
   RegisterCmpOps();
   RegisterDistributedOps();
+  RegisterCrossCoreOps();
 }
 
 // ============================================================================
@@ -2311,6 +2312,57 @@ void OpConversionRegistry::RegisterDistributedOps() {
         auto get_call = op_reg.Create("pld.tile.get", get_args, span);
         return ConversionResult{std::move(prologue), get_call};
       });
+}
+
+// ============================================================================
+// Cross-core split-axis ops: tensor.aiv_shard / tensor.aic_gather
+// ============================================================================
+// High-level (@pl.jit / pl.spmd) author-facing shard / gather emitted inside a
+// ``for aiv_id in pl.split_aiv(...)`` region. Each lowers 1:1 to its tile op
+// (tile.aiv_shard / tile.aic_gather) so the result is byte-identical to what the
+// AUTO ``pl.split`` path produces via LowerAutoVectorSplit (pass 18).
+//
+// Memory-space re-attachment. The tile-level split deducer (DeduceSplitReshape)
+// intentionally drops the boundary memory space (returns a TileType with a null
+// memref / null memory_space), because the deduction fixpoint must not inherit an
+// input-side layout. The AUTO path restores it in ReshapeTypeWithMemory:
+//   * C->V aiv_shard  -> the move's Vec DESTINATION memory.
+//   * V->C aic_gather -> the Vec half-tile SOURCE memory (inherit input side).
+// Both boundaries resolve to MemorySpace::Vec (verified against the AUTO oracle:
+// _shard_vec / _gather_vec in test_lower_auto_vector_split.py both assert Vec),
+// so this converter re-attaches Vec to the deduced half/full type.
+//
+// No InputSpaceReq. The realistic (region-only) operand is an on-chip tile — a
+// cube (Mat/Acc) matmul result for aiv_shard, a Vec vector-compute result for
+// aic_gather — already lowered to a TileType earlier in this same pass, so it
+// reaches the converter tile-typed and passes straight into the tile op (the tile
+// deducer accepts any 2D TileType regardless of memory space). aiv_shard / gather
+// ARE the cross-core transfer, so no tile.load should be synthesized; adding a Vec
+// InputSpaceReq would inject a spurious Vec load and force a cube input to Vec,
+// diverging from the AUTO oracle's Mat-tile input. Distributed operands were
+// rejected upstream (parser + tensor deducer), so only a plain TileType arrives.
+void OpConversionRegistry::RegisterCrossCoreOps() {
+  auto convert = [](const std::string& tile_op) -> ConversionFunc {
+    return [tile_op](const std::vector<ExprPtr>& args,
+                     const std::vector<std::pair<std::string, std::any>>& kwargs,
+                     const Span& span) -> ConversionResult {
+      INTERNAL_CHECK_SPAN(args.size() == 1, span)
+          << "Internal error: " << tile_op << " conversion expects 1 arg, got " << args.size();
+      auto& op_reg = OpRegistry::GetInstance();
+      // args[0] is already tile-typed here (its producer lowered earlier in this
+      // pass); the tile deducer forwards the "split" attr and halves/doubles the
+      // split-axis extent.
+      auto call = op_reg.Create(tile_op, args, kwargs, span);
+      auto tt = As<TileType>(call->GetType());
+      INTERNAL_CHECK_SPAN(tt, span) << "Internal error: " << tile_op << " must deduce a TileType";
+      // Re-attach the vector-side (Vec) boundary memory the split deducer drops.
+      auto typed =
+          std::make_shared<TileType>(tt->shape_, tt->dtype_, tt->memref_, tt->tile_view_, MemorySpace::Vec);
+      return ConversionResult{std::make_shared<Call>(call->op_, call->args_, call->kwargs_, typed, span)};
+    };
+  };
+  RegisterCustom("tensor.aiv_shard", convert("tile.aiv_shard"));
+  RegisterCustom("tensor.aic_gather", convert("tile.aic_gather"));
 }
 
 void OpConversionRegistry::RegisterSimple(const std::string& from_op, const std::string& to_op,

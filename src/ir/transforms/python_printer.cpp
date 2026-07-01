@@ -1010,11 +1010,16 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
     // aiv_shard/aic_gather is redundant: the region node's mode is the
     // authoritative carrier and the parser re-stamps it from the enclosing
     // ``pl.split_aiv(..., mode=...)``. Suppress it so the printed body reparses
-    // (the parser rejects an explicit ``split=`` on these ops). Outside a region
+    // (the parser rejects an explicit ``split=`` on these ops). This covers both
+    // the lowered tile form (tile.aiv_shard / tile.aic_gather) and the pre-pass
+    // high-level tensor form (tensor.aiv_shard / tensor.aic_gather emitted by the
+    // @pl.jit / pl.spmd surface before ConvertTensorToTileOps). Outside a region
     // (lowered form) it prints as usual.
     if (split_aiv_scope_depth_ > 0 && key == "split" &&
-        (IsOp(op, "tile.aiv_shard") || IsOp(op, "tile.aic_gather")))
+        (IsOp(op, "tile.aiv_shard") || IsOp(op, "tile.aic_gather") || IsOp(op, "tensor.aiv_shard") ||
+         IsOp(op, "tensor.aic_gather"))) {
       continue;
+    }
     if (need_comma) {
       stream_ << ", ";
     }

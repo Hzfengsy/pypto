@@ -22,6 +22,7 @@ These tests hand-build minimal functions and run the verifier directly through
 ``PropertyVerifierRegistry`` (no full pipeline needed).
 """
 
+import pypto.language as pl
 import pytest
 from pypto import DataType, ir, passes
 from pypto.ir.op import tile_ops as T
@@ -34,6 +35,10 @@ _OUT = ir.ParamDirection.Out
 
 def _tile(shape, mem=MS.Vec):
     return ir.TileType(shape, FP32, None, None, mem)
+
+
+def _tensor(shape):
+    return ir.TensorType(shape, FP32)
 
 
 def _aiv_split_prop_set() -> passes.IRPropertySet:
@@ -215,6 +220,220 @@ def test_cube_in_none_region_passes():
     program = _program(ir.SeqStmts([region], span))
 
     assert _errors(program) == []
+
+
+# ---------------------------------------------------------------------------
+# Tensor-form boundary ops (tensor.aiv_shard / tensor.aic_gather).
+#
+# These are the @pl.jit / pl.spmd author-facing pl.aiv_shard(tensor) /
+# pl.aic_gather(tensor) form: still tensor.* in the window between
+# OutlineIncoreScopes (which produces AivSplitValid) and ConvertTensorToTileOps
+# (which lowers them 1:1 to tile.aiv_shard / tile.aic_gather). The verifier must
+# recognize them as the SAME AIV-split boundary as the tile.* ops: valid inside
+# a data-parallel (UP_DOWN / LEFT_RIGHT) region, rejected in a task-parallel
+# (NONE) region, and rejected at top level. Mirrors the tile-form matrix above.
+#
+# The split attr matches the region's SplitMode value: UP_DOWN == 1 (axis 0),
+# LEFT_RIGHT == 2 (axis 1). The verifier keys the boundary rejection on the
+# region's split MODE, so the op's own split value is what the tile-form tests
+# also use (1) — the region node is the source of truth.
+# ---------------------------------------------------------------------------
+
+
+def _tensor_shard(shape, split, span):
+    """Hand-build a ``tensor.aiv_shard`` Call over a fresh rank-2 Tensor Var."""
+    t = ir.Var("t", _tensor(shape), span)
+    return ir.create_op_call("tensor.aiv_shard", [t], {"split": split}, span)
+
+
+def _tensor_gather(shape, split, span):
+    """Hand-build a ``tensor.aic_gather`` Call over a fresh rank-2 Tensor Var."""
+    t = ir.Var("t", _tensor(shape), span)
+    return ir.create_op_call("tensor.aic_gather", [t], {"split": split}, span)
+
+
+def _has_tensor_call(program, op_name) -> bool:
+    """Whether any ``ir.Call`` to ``op_name`` is reachable in ``program``."""
+    found = []
+
+    def walk(n):
+        if isinstance(n, ir.Call) and isinstance(n.op, ir.Op) and n.op.name == op_name:
+            found.append(n)
+        if isinstance(n, ir.SeqStmts):
+            for s in n.stmts:
+                walk(s)
+            return
+        if isinstance(n, ir.AssignStmt):
+            walk(n.value)
+        body = getattr(n, "body", None)
+        if body is not None:
+            walk(body)
+
+    for func in program.functions.values():
+        if func.body is not None:
+            walk(func.body)
+    return bool(found)
+
+
+# --- Accepted: data-parallel regions (UP_DOWN / LEFT_RIGHT) -----------------
+
+
+def test_tensor_shard_in_up_down_region_passes():
+    """tensor.aiv_shard (split axis 0) inside an UP_DOWN region is valid."""
+    span = ir.Span.unknown()
+    shard = _tensor_shard([16, 128], int(ir.SplitMode.UP_DOWN.value), span)
+    res = ir.Var("res", shard.type, span)
+    region = _region(ir.SplitMode.UP_DOWN, [ir.AssignStmt(res, shard, span)])
+    program = _program(ir.SeqStmts([region], span))
+
+    assert _errors(program) == []
+
+
+def test_tensor_gather_in_up_down_region_passes():
+    """tensor.aic_gather (split axis 0) inside an UP_DOWN region is valid."""
+    span = ir.Span.unknown()
+    gather = _tensor_gather([8, 128], int(ir.SplitMode.UP_DOWN.value), span)
+    res = ir.Var("res", gather.type, span)
+    region = _region(ir.SplitMode.UP_DOWN, [ir.AssignStmt(res, gather, span)])
+    program = _program(ir.SeqStmts([region], span))
+
+    assert _errors(program) == []
+
+
+def test_tensor_shard_in_left_right_region_passes():
+    """tensor.aiv_shard (split axis 1) inside a LEFT_RIGHT region is valid."""
+    span = ir.Span.unknown()
+    shard = _tensor_shard([16, 128], int(ir.SplitMode.LEFT_RIGHT.value), span)
+    res = ir.Var("res", shard.type, span)
+    region = _region(ir.SplitMode.LEFT_RIGHT, [ir.AssignStmt(res, shard, span)])
+    program = _program(ir.SeqStmts([region], span))
+
+    assert _errors(program) == []
+
+
+def test_tensor_gather_in_left_right_region_passes():
+    """tensor.aic_gather (split axis 1) inside a LEFT_RIGHT region is valid."""
+    span = ir.Span.unknown()
+    gather = _tensor_gather([16, 64], int(ir.SplitMode.LEFT_RIGHT.value), span)
+    res = ir.Var("res", gather.type, span)
+    region = _region(ir.SplitMode.LEFT_RIGHT, [ir.AssignStmt(res, gather, span)])
+    program = _program(ir.SeqStmts([region], span))
+
+    assert _errors(program) == []
+
+
+# --- Rejected: task-parallel (NONE) region — no split axis to shard/gather --
+
+
+def test_tensor_shard_in_none_region_fails():
+    """tensor.aiv_shard inside a NONE region -> Error (no split axis)."""
+    span = ir.Span.unknown()
+    shard = _tensor_shard([16, 128], int(ir.SplitMode.UP_DOWN.value), span)
+    res = ir.Var("res", shard.type, span)
+    region = _region(ir.SplitMode.NONE, [ir.AssignStmt(res, shard, span)])
+    program = _program(ir.SeqStmts([region], span))
+
+    errors = _errors(program)
+    assert len(errors) == 1
+    assert errors[0].rule_name == "AivSplitValid"
+    assert "tensor.aiv_shard" in errors[0].message
+    assert "task-parallel" in errors[0].message
+
+
+def test_tensor_gather_in_none_region_fails():
+    """tensor.aic_gather inside a NONE region -> Error (no split axis)."""
+    span = ir.Span.unknown()
+    gather = _tensor_gather([8, 128], int(ir.SplitMode.UP_DOWN.value), span)
+    res = ir.Var("res", gather.type, span)
+    region = _region(ir.SplitMode.NONE, [ir.AssignStmt(res, gather, span)])
+    program = _program(ir.SeqStmts([region], span))
+
+    errors = _errors(program)
+    assert len(errors) == 1
+    assert errors[0].rule_name == "AivSplitValid"
+    assert "tensor.aic_gather" in errors[0].message
+    assert "task-parallel" in errors[0].message
+
+
+# --- Rejected: boundary op escaped its region (top level) -------------------
+
+
+def test_tensor_shard_outside_region_fails():
+    """tensor.aiv_shard at top level (no enclosing region) -> Error."""
+    span = ir.Span.unknown()
+    shard = _tensor_shard([16, 128], int(ir.SplitMode.UP_DOWN.value), span)
+    res = ir.Var("res", shard.type, span)
+    program = _program(ir.SeqStmts([ir.AssignStmt(res, shard, span)], span))
+
+    errors = _errors(program)
+    assert len(errors) == 1
+    assert errors[0].rule_name == "AivSplitValid"
+    assert "tensor.aiv_shard" in errors[0].message
+    assert "must appear inside a pl.split_aiv region" in errors[0].message
+
+
+def test_tensor_gather_outside_region_fails():
+    """tensor.aic_gather at top level (no enclosing region) -> Error."""
+    span = ir.Span.unknown()
+    gather = _tensor_gather([8, 128], int(ir.SplitMode.UP_DOWN.value), span)
+    res = ir.Var("res", gather.type, span)
+    program = _program(ir.SeqStmts([ir.AssignStmt(res, gather, span)], span))
+
+    errors = _errors(program)
+    assert len(errors) == 1
+    assert errors[0].rule_name == "AivSplitValid"
+    assert "tensor.aic_gather" in errors[0].message
+    assert "must appear inside a pl.split_aiv region" in errors[0].message
+
+
+# ---------------------------------------------------------------------------
+# End-to-end DSL path: the author writes pl.aiv_shard(tensor) /
+# pl.aic_gather(tensor) inside a `for aiv_id in pl.split_aiv(mode=...)` region.
+# The parser emits the tensor.* boundary op (region-only, split inherited from
+# the region mode), and the verifier accepts the resulting region. Only the
+# data-parallel accept path is expressible via the DSL: the parser blocks
+# pl.aiv_shard(tensor) in a NONE region (split == 0 fails the rank-2 deducer's
+# split gate) and outside any region (no mode to inherit), so the NONE / top
+# level rejections are covered by the hand-built matrix above.
+# ---------------------------------------------------------------------------
+
+
+def test_dsl_tensor_shard_up_down_region_passes():
+    """DSL pl.aiv_shard(tensor) in an UP_DOWN region -> tensor.aiv_shard, accepted."""
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            a: pl.Tensor[[512, 128], pl.FP32],
+            out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+        ) -> pl.Tensor[[512, 128], pl.FP32]:
+            for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):  # noqa: B007
+                h = pl.aiv_shard(a)  # noqa: F841
+            return out
+
+    assert _has_tensor_call(Prog, ir.get_op("tensor.aiv_shard").name)
+    assert _errors(Prog) == []
+
+
+def test_dsl_tensor_gather_left_right_region_passes():
+    """DSL pl.aic_gather(tensor) in a LEFT_RIGHT region -> tensor.aic_gather, accepted."""
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            a: pl.Tensor[[128, 512], pl.FP32],
+            out: pl.Out[pl.Tensor[[128, 512], pl.FP32]],
+        ) -> pl.Tensor[[128, 512], pl.FP32]:
+            for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.LEFT_RIGHT):  # noqa: B007
+                g = pl.aic_gather(a)  # noqa: F841
+            return out
+
+    assert _has_tensor_call(Prog, ir.get_op("tensor.aic_gather").name)
+    assert _errors(Prog) == []
 
 
 if __name__ == "__main__":

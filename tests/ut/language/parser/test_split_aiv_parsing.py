@@ -18,6 +18,7 @@ InCore scope (directly or through an intervening ``pl.range`` / ``if``).
 """
 
 import pypto.language as pl
+import pypto.language.distributed as pld
 import pytest
 from pypto import ir
 from pypto.language.parser.diagnostics.exceptions import InvalidOperationError, ParserSyntaxError
@@ -77,6 +78,27 @@ def _find_call(node, op_name):
     walk(node)
     assert len(found) == 1, f"expected exactly one Call to {op_name}, got {len(found)}"
     return found[0]
+
+
+def _has_call(node, op_name):
+    """Return whether any ``ir.Call`` to ``op_name`` is reachable from ``node``."""
+    found = []
+
+    def walk(n):
+        if isinstance(n, ir.Call) and isinstance(n.op, ir.Op) and n.op.name == op_name:
+            found.append(n)
+        if isinstance(n, ir.SeqStmts):
+            for s in n.stmts:
+                walk(s)
+            return
+        if isinstance(n, ir.AssignStmt):
+            walk(n.value)
+        body = getattr(n, "body", None)
+        if body is not None:
+            walk(body)
+
+    walk(node)
+    return bool(found)
 
 
 def _first_body_stmt(node):
@@ -457,6 +479,121 @@ class TestAivShardInheritsSplit:
                     qk: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [0, 0], [128, 128])
                     x = pl.aiv_shard(qk)
                     out = pl.store(x, [0, 0], out)
+                return out
+
+
+class TestSplitTransferTensorForm:
+    """``pl.aiv_shard`` / ``pl.aic_gather`` type-dispatch on the operand: a
+    high-level Tensor operand (the ``@pl.jit`` / ``pl.spmd`` author-facing form,
+    e.g. a ``pl.matmul`` result) lowers to ``tensor.aiv_shard`` /
+    ``tensor.aic_gather`` (region-only, converted to the tile op at
+    ConvertTensorToTileOps); a Tile operand keeps the legacy ``tile.*`` form.
+    """
+
+    def test_tensor_aiv_shard_up_down_inherits_split(self):
+        """A Tensor operand (pl.matmul result) inside an UP_DOWN region parses to
+        tensor.aiv_shard with the inherited split == 1."""
+
+        @pl.program
+        class TestProgram:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                b: pl.Tensor[[128, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):  # noqa: B007
+                    s = pl.matmul(a, b)
+                    h = pl.aiv_shard(s)  # noqa: F841
+                return out
+
+        main_func = list(TestProgram.functions.values())[0]
+        region = _unique_descendant(main_func.body, ir.SplitAivScopeStmt)
+        shard = _find_call(region.body, ir.get_op("tensor.aiv_shard").name)
+        # The matmul on GM param tensors yields a Tensor, so the shard is the
+        # tensor form (NOT the legacy tile form).
+        assert shard.op.name == ir.get_op("tensor.aiv_shard").name
+        assert not _has_call(region.body, ir.get_op("tile.aiv_shard").name)
+        assert shard.kwargs["split"] == 1
+
+    def test_tensor_aic_gather_left_right_inherits_split(self):
+        """A Tensor operand inside a LEFT_RIGHT region parses to tensor.aic_gather
+        with the inherited split == 2."""
+
+        @pl.program
+        class TestProgram:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                b: pl.Tensor[[128, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.LEFT_RIGHT):  # noqa: B007
+                    s = pl.matmul(a, b)
+                    g = pl.aic_gather(s)  # noqa: F841
+                return out
+
+        main_func = list(TestProgram.functions.values())[0]
+        region = _unique_descendant(main_func.body, ir.SplitAivScopeStmt)
+        gather = _find_call(region.body, ir.get_op("tensor.aic_gather").name)
+        assert gather.op.name == ir.get_op("tensor.aic_gather").name
+        assert not _has_call(region.body, ir.get_op("tile.aic_gather").name)
+        assert gather.kwargs["split"] == 2
+
+    def test_tile_operand_stays_tile_form(self):
+        """A Tile operand still parses to tile.aiv_shard — the legacy
+        ``@pl.program`` path is unchanged by the type dispatch."""
+
+        @pl.program
+        class TestProgram:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 128], pl.FP32]],
+            ) -> pl.Tensor[[256, 128], pl.FP32]:
+                for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                    offset = aiv_id * 128
+                    qk: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [offset, 0], [128, 128])
+                    x = pl.aiv_shard(qk)
+                    out = pl.store(x, [offset, 0], out)
+                return out
+
+        main_func = list(TestProgram.functions.values())[0]
+        region = _unique_descendant(main_func.body, ir.SplitAivScopeStmt)
+        shard = _find_call(region.body, ir.get_op("tile.aiv_shard").name)
+        assert shard.op.name == ir.get_op("tile.aiv_shard").name
+        assert not _has_call(region.body, ir.get_op("tensor.aiv_shard").name)
+        assert shard.kwargs["split"] == 1
+
+    def test_tensor_operand_rejected_in_outlined_form(self):
+        """The outlined ``pl.tile.aiv_shard(x, split=N)`` form is tile-only: a
+        high-level Tensor operand is rejected with a wrap-in-region hint."""
+        with pytest.raises(ParserSyntaxError, match="tile-only"):
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def bad(
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    h = pl.tile.aiv_shard(a, split=1)  # noqa: F841
+                return out
+
+    def test_distributed_operand_rejected(self):
+        """A DistributedTensorType operand is rejected — distributed is out of
+        scope for AIV/AIC split."""
+        with pytest.raises(ParserSyntaxError, match="distributed"):
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def bad(
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+                data: pl.InOut[pld.DistributedTensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):  # noqa: B007
+                    h = pl.aiv_shard(data)  # noqa: F841
                 return out
 
 

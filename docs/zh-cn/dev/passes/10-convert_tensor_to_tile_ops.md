@@ -166,6 +166,35 @@ for i in [0, rows):                                    # ForStmt，iter_arg = ac
 - `tensor.create_l1(..., transpose=True)` 分配**转置的 Mat（ZN）分形**（`blayout = row_major`,`slayout = col_major`）——即 `b_trans` 操作数所带的布局。
 - `tensor.gather_row(..., transpose=True)` 把 GM 行 `[r, c]` 放成 L1 列 `[c, r]`。`pto.tload` 本身不转置,因此 codegen 把 `src` 表示为 **DN 跨步视图**（`pto.make_tensor_view ... {layout = #pto.layout<dn>}`,shape/strides 互换、base ptr 不变）并把该行分区成列——于是 `tload` 执行 `DN → NZ`,这*即是*转置。（`paged_gather` 的 `is_trans=True` 复用同一条 `tile.gather_row` 路径。）直接的 `ND → NZ` `tload` 会打乱分形布局。
 
+## AIV 切分边界下降（`tensor.aiv_shard` / `tensor.aic_gather`）
+
+`tensor.aiv_shard` / `tensor.aic_gather` 是 cube↔vector AIV 切分边界的 **`@pl.jit` / `pl.spmd` 作者面向**形式。当 `pl.aiv_shard(x)` / `pl.aic_gather(x)` 的操作数 `x` 是高层 **Tensor**（例如一个 `pl.matmul` 结果）、且位于 `for aiv_id in pl.split_aiv(...)` 区域内时发射：
+
+```python
+raw = pl.matmul(q, k, b_trans=True, out_dtype=pl.FP32)   # Tensor，位于区域外
+for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+    h = pl.aiv_shard(raw)     # C->V：tensor.aiv_shard — 整块 [M, N] -> 本 lane 半块 [M/2, N]
+    s = pl.softmax(h)         # AIV 向量运算作用于半块
+    full = pl.aic_gather(s)   # V->C：tensor.aic_gather — 各半块 -> 整块 [M, N]
+oi = pl.matmul(full, v, out_dtype=pl.FP32)               # Tensor，位于区域外
+```
+
+本 pass 将两者**各自 1:1**下降为对应的 tile 算子（`tensor.aiv_shard` → `tile.aiv_shard`,`tensor.aic_gather` → `tile.aic_gather`）；此后 IR 与 AUTO `pl.split` 路径经 [`LowerAutoVectorSplit`](18-lower_auto_vector_split.md)（pass 18）产出的结果逐字节一致。随后 `ExpandMixedKernel`（pass 19）将两者折叠进跨核 `tpush`/`tpop` 机制。
+
+**约束**（由张量级类型推导器与 DSL 解析器施加,而非本 pass）：
+
+- **仅 2D** —— `UP_DOWN` / `LEFT_RIGHT` 仅在 2D 物理 tile 视图上有良定义；N 维操作数会被拒绝并给出 `pl.reshape` 到 2D 的提示（N 维张量会被展平为 `[product(leading), last]`,因此展平前的按行切分不会匹配下降实际取用的连续半块）。
+- **仅区域内** —— `tensor.*` 形式只能经由 `pl.split_aiv` 区域到达（该区域提供切分模式）。已外联的低层 `pl.tile.aiv_shard(t, split=N)` 形式保持 tile-only；在该形式下传入 Tensor 操作数会被拒绝。
+- **拒绝分布式** —— `DistributedTensorType` 操作数超出范围（仅支持 AIV/AIC 切分）,在上游即被拒绝。
+
+**转换细节：**
+
+- **split 关键字透传。** `split` 整型属性（`1` = `UP_DOWN`/axis0,`2` = `LEFT_RIGHT`/axis1,即 tpush/tpop 编码）原样透传给 tile 算子,由其对切分轴长度做减半（shard）或加倍（gather）。
+- **Vec 内存重新附着。** tile 级切分推导器有意丢弃边界内存空间（推导定点不得继承输入侧布局）。AUTO 路径在 `ReshapeTypeWithMemory` 中恢复之；本转换器与之对齐,将 `MemorySpace::Vec` 重新附着到推导出的半块/整块 `TileType` —— C→V shard 目的端与 V→C gather 源端都解析为 Vec。
+- **不合成 load。** 现实（仅区域内）操作数在转换器运行时已是片上 tile（其生产者——`aiv_shard` 对应 cube matmul,`aic_gather` 对应 Vec 向量算子——已在本 pass 更早处下降）,因此不注入 `tile.load`；`aiv_shard` / `aic_gather` **本身**即是跨核传输。
+
+**本 pass 之前即被识别。** 由于 `tensor.*` 形式从 `OutlineIncoreScopes` 一直存活到本 pass 运行,更早的阶段已将其视为 AIV 切分边界：`ClassifyCallAffinity` 把 `tensor.*` 与 `tile.*` 的 shard/gather 都归为 `MIXED`（使 cube/vector 外联正确切分）,`SplitAivStructuralVerifier` 要求两种形式都必须位于区域内。
+
 ## 示例
 
 **转换前**：

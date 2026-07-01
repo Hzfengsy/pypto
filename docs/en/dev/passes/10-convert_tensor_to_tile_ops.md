@@ -175,6 +175,35 @@ Both deduce a `TensorType`, so the gathered result composes with tensor-level `t
 - `tensor.create_l1(..., transpose=True)` allocates the **transposed Mat (ZN) fractal** (`blayout = row_major`, `slayout = col_major`) — the layout a `b_trans` operand carries.
 - `tensor.gather_row(..., transpose=True)` places the GM row `[r, c]` as the L1 column `[c, r]`. `pto.tload` does not transpose, so codegen presents `src` as a **DN-strided view** (`pto.make_tensor_view ... {layout = #pto.layout<dn>}`, shape/strides swapped, same base ptr) and partitions the row as a column — the `tload` then runs `DN → NZ`, which *is* the transpose. (`paged_gather`'s `is_trans=True` shares this `tile.gather_row` path.) A straight `ND → NZ` `tload` would scramble the fractal layout.
 
+## AIV-Split Boundary Lowering (`tensor.aiv_shard` / `tensor.aic_gather`)
+
+`tensor.aiv_shard` / `tensor.aic_gather` are the **`@pl.jit` / `pl.spmd` author-facing** form of the cube↔vector AIV-split boundary. They are emitted by `pl.aiv_shard(x)` / `pl.aic_gather(x)` when the operand `x` is a high-level **Tensor** (e.g. a `pl.matmul` result), inside a `for aiv_id in pl.split_aiv(...)` region:
+
+```python
+raw = pl.matmul(q, k, b_trans=True, out_dtype=pl.FP32)   # Tensor, OUTSIDE the region
+for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+    h = pl.aiv_shard(raw)     # C->V: tensor.aiv_shard — full [M, N] -> lane half [M/2, N]
+    s = pl.softmax(h)         # AIV vector work on the half
+    full = pl.aic_gather(s)   # V->C: tensor.aic_gather — halves -> full [M, N]
+oi = pl.matmul(full, v, out_dtype=pl.FP32)               # Tensor, OUTSIDE the region
+```
+
+This pass lowers each **1:1** to its tile op (`tensor.aiv_shard` → `tile.aiv_shard`, `tensor.aic_gather` → `tile.aic_gather`), so from here on the IR is byte-identical to what the AUTO `pl.split` path produces via [`LowerAutoVectorSplit`](18-lower_auto_vector_split.md) (pass 18). `ExpandMixedKernel` (pass 19) then folds both into the cross-core `tpush`/`tpop` machinery.
+
+**Constraints** (enforced by the tensor-level deducer and the DSL parser, not this pass):
+
+- **2D-only** — `UP_DOWN` / `LEFT_RIGHT` are only well-defined on the 2D physical tile view; an N-D operand is rejected with a `pl.reshape`-to-2D hint (an N-D tensor would flatten to `[product(leading), last]`, so a pre-flatten row split would not match the contiguous half the lowering physically takes).
+- **Region-only** — the `tensor.*` form is reachable solely through the `pl.split_aiv` region (which supplies the split mode). The outlined low-level `pl.tile.aiv_shard(t, split=N)` form stays tile-only; a Tensor operand there is rejected.
+- **Distributed rejected** — a `DistributedTensorType` operand is out of scope (AIV/AIC split only) and is rejected upstream.
+
+**Conversion details:**
+
+- **Split-kwarg forwarding.** The `split` int attr (`1` = `UP_DOWN`/axis0, `2` = `LEFT_RIGHT`/axis1, the tpush/tpop encoding) is passed through verbatim to the tile op, which halves (shard) or doubles (gather) the split-axis extent.
+- **Vec memory re-attach.** The tile-level split deducer intentionally drops the boundary memory space (the deduction fixpoint must not inherit an input-side layout). The AUTO path restores it in `ReshapeTypeWithMemory`; this converter mirrors that by re-attaching `MemorySpace::Vec` to the deduced half/full `TileType` — both the C→V shard destination and the V→C gather source resolve to Vec.
+- **No synthesized load.** The realistic (region-only) operand is already an on-chip tile by the time the converter runs (its producer — a cube matmul for `aiv_shard`, a Vec vector op for `aic_gather` — lowered earlier in this same pass), so no `tile.load` is injected; `aiv_shard` / `aic_gather` **are** the cross-core transfer.
+
+**Recognized before this pass.** Because the `tensor.*` form survives from `OutlineIncoreScopes` until this pass runs, earlier stages already treat it as the AIV-split boundary: `ClassifyCallAffinity` rolls both `tensor.*` and `tile.*` shard/gather up as `MIXED` (so cube/vector outlining splits correctly), and `SplitAivStructuralVerifier` requires both forms to be region-scoped.
+
 ## Example
 
 **Before**:

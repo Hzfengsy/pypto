@@ -5151,15 +5151,19 @@ class ASTParser:
         if isinstance(node, ast.Name):
             attrs.insert(0, node.id)
 
-        # pl.aiv_shard / pl.aic_gather (also pl.tile.aiv_shard / pl.tile.aic_gather):
-        # the split mode is inherited from the enclosing ``pl.split_aiv`` scope,
-        # so intercept before the generic dispatch (the DSL wrapper raises since
-        # it cannot resolve the scope mode).
+        # pl.aiv_shard / pl.aic_gather (also pl.tile.aiv_shard / pl.tile.aic_gather
+        # and the printed pl.tensor.aiv_shard / pl.tensor.aic_gather high-level
+        # form): the split mode is inherited from the enclosing ``pl.split_aiv``
+        # scope, so intercept before the generic dispatch (the DSL wrapper raises
+        # since it cannot resolve the scope mode). The emitted op namespace is
+        # type-dispatched inside ``_parse_split_transfer_op`` (tensor.* for a
+        # high-level Tensor operand, tile.* otherwise), so a printed
+        # ``pl.tensor.aiv_shard(...)`` must also route here for print -> parse.
         if (
             attrs
             and attrs[0] == "pl"
             and attrs[-1] in ("aiv_shard", "aic_gather")
-            and (len(attrs) == 2 or (len(attrs) == 3 and attrs[1] == "tile"))
+            and (len(attrs) == 2 or (len(attrs) == 3 and attrs[1] in ("tile", "tensor")))
         ):
             return self._parse_split_transfer_op(attrs[-1], call)
 
@@ -5207,15 +5211,29 @@ class ASTParser:
         )
 
     def _parse_split_transfer_op(self, op_name: str, call: ast.Call) -> ir.Expr:
-        """Parse ``pl.aiv_shard(tile)`` / ``pl.aic_gather(tile)``.
+        """Parse ``pl.aiv_shard(x)`` / ``pl.aic_gather(x)``.
+
+        The emitted op namespace is **type-dispatched** on the operand:
+
+        - A high-level **Tensor** operand (``@pl.jit`` / ``pl.spmd`` author-facing
+          form, e.g. a ``pl.matmul`` result or a GM tensor param) lowers to
+          ``tensor.aiv_shard`` / ``tensor.aic_gather``. This form is
+          **region-only** — it is reachable solely through the high-level scoped
+          path below (which requires an enclosing ``pl.split_aiv`` region). A
+          ``tensor.*`` op is lowered 1:1 to the matching ``tile.*`` op at
+          ``ConvertTensorToTileOps``.
+        - A **Tile** (or not-yet-typed) operand keeps the ``tile.aiv_shard`` /
+          ``tile.aic_gather`` form, preserving the legacy ``@pl.program`` path.
+        - A **distributed** tensor operand is rejected (AIV/AIC split only).
 
         Two surface forms reach this method:
 
-        - **High-level scoped form** ``pl.aiv_shard(tile)`` inside a
+        - **High-level scoped form** ``pl.aiv_shard(x)`` inside a
           ``for aiv_id in pl.split_aiv(mode=...)`` loop. The op inherits the
           split mode from the enclosing scope — the user does not (and must not)
           pass a ``split=`` / ``mode=`` kwarg. The mode is read off
-          :attr:`_split_aiv_mode_stack` and stamped as the ``split`` attr.
+          :attr:`_split_aiv_mode_stack` and stamped as the ``split`` attr. Both
+          the tile and tensor forms are valid here.
         - **Outlined low-level form** ``pl.tile.aiv_shard(tile, split=N)`` with an
           explicit ``split=`` kwarg and NO enclosing ``pl.split_aiv`` loop. This
           is what the python printer emits for a function already lowered into
@@ -5223,7 +5241,9 @@ class ASTParser:
           ``OutlineIncoreScopes``, or a hand-written ``split_aiv`` kernel). The
           split is carried on the op itself, so the form must round-trip without
           re-synthesising the loop wrapper. The explicit ``split`` is taken
-          verbatim and stamped as the ``split`` attr.
+          verbatim and stamped as the ``split`` attr. This form is **tile-only**:
+          a high-level Tensor operand is rejected (wrap it in a
+          ``pl.split_aiv`` region instead).
         """
         span = self.span_tracker.get_span(call)
         hint = (
@@ -5262,7 +5282,23 @@ class ASTParser:
                 span=span,
                 hint=hint,
             )
-        tile_expr = self.parse_expression(cast("ast.expr", call.args[0]))
+        operand_expr = self.parse_expression(cast("ast.expr", call.args[0]))
+
+        # Reject distributed tensors outright — AIV/AIC split only. This must
+        # come BEFORE the TensorType dispatch: ``DistributedTensorType`` is a
+        # subclass of ``TensorType`` and would otherwise route to the tensor op.
+        if isinstance(operand_expr.type, ir.DistributedTensorType):
+            raise ParserSyntaxError(
+                f"pl.{op_name} does not support distributed tensors (AIV/AIC split only)",
+                span=span,
+                hint=hint,
+            )
+        # Type-dispatch the emitted op namespace: a high-level Tensor operand
+        # lowers to ``tensor.{op}`` (region-only, converted to the tile op at
+        # ConvertTensorToTileOps); a Tile / not-yet-typed operand keeps the
+        # legacy ``tile.{op}`` form.
+        is_tensor_operand = isinstance(operand_expr.type, ir.TensorType)
+        op_ns = "tensor" if is_tensor_operand else "tile"
 
         if explicit_split is not None:
             # Outlined form — bypass the scope-stack requirement; the split is
@@ -5279,6 +5315,18 @@ class ASTParser:
                     span=span,
                     hint=hint,
                 )
+            # The outlined form is tile-only: a high-level Tensor operand is not
+            # valid here. The tensor form is reachable solely through the
+            # region-scoped path (which carries the split mode on the region).
+            if is_tensor_operand:
+                raise ParserSyntaxError(
+                    f"pl.{op_name}(..., split=N) does not accept a high-level Tensor "
+                    "operand — the outlined split= form is tile-only. Wrap the Tensor "
+                    "in a 'for aiv_id in pl.split_aiv(...)' region instead, which supplies "
+                    "the split mode and lowers to the tile op.",
+                    span=span,
+                    hint=hint,
+                )
             if not (isinstance(explicit_split, ast.Constant) and isinstance(explicit_split.value, int)):
                 raise ParserSyntaxError(
                     f"pl.{op_name}(..., split=N) requires an integer split (the lowered "
@@ -5288,10 +5336,11 @@ class ASTParser:
                     hint=hint,
                 )
             return ir.create_op_call(
-                f"tile.{op_name}", [tile_expr], {"split": int(explicit_split.value)}, span
+                f"{op_ns}.{op_name}", [operand_expr], {"split": int(explicit_split.value)}, span
             )
 
         # High-level scoped form — inherit the mode from the enclosing scope.
+        # This is the only path that emits the tensor form (region-only).
         if not self._split_aiv_mode_stack:
             raise ParserSyntaxError(
                 f"pl.{op_name}() must be used inside a 'for ... in pl.split_aiv(...)' loop "
@@ -5301,7 +5350,7 @@ class ASTParser:
                 hint=hint,
             )
         mode = self._split_aiv_mode_stack[-1]
-        return ir.create_op_call(f"tile.{op_name}", [tile_expr], {"split": int(mode.value)}, span)
+        return ir.create_op_call(f"{op_ns}.{op_name}", [operand_expr], {"split": int(mode.value)}, span)
 
     @staticmethod
     def _validate_kernel_call_kwargs(

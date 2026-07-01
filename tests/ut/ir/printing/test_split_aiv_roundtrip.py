@@ -243,6 +243,50 @@ def test_body_split_kwarg_suppressed_yet_reparses():
     ir.assert_structural_equal(prog, reparsed)
 
 
+def _tensor_shard_program():
+    """A region whose input is a high-level Tensor (a ``pl.matmul`` result on GM
+    param tensors) fed to ``pl.aiv_shard`` — the ``@pl.jit`` / ``pl.spmd``
+    author-facing form that emits ``tensor.aiv_shard`` (converted to the tile op
+    at ConvertTensorToTileOps)."""
+
+    @pl.program
+    class TestProgram:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            a: pl.Tensor[[128, 128], pl.FP32],
+            b: pl.Tensor[[128, 128], pl.FP32],
+            out: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
+        ) -> pl.Tensor[[128, 128], pl.FP32]:
+            for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):  # noqa: B007
+                s = pl.matmul(a, b)
+                h = pl.aiv_shard(s)  # noqa: F841
+            return out
+
+    return TestProgram
+
+
+def test_tensor_form_split_kwarg_suppressed_yet_reparses():
+    """Inside a region the per-op ``split=`` kwarg on the high-level
+    ``tensor.aiv_shard`` is suppressed in the printed text (same as the tile
+    form), yet the reparsed program re-stamps the identical ``split=int(mode)``
+    attr (UP_DOWN -> 1) and round-trips structurally.
+    """
+    prog = _tensor_shard_program()
+    # The original parse emits the tensor form with split=1 stamped from the mode.
+    assert _find_call(_main_body(prog), "tensor.aiv_shard").kwargs["split"] == 1
+
+    text = ir.python_print(prog)
+    # The redundant per-op split= kwarg is not printed inside the region.
+    assert "pl.tensor.aiv_shard(s)" in text, text
+    assert "split=" not in text, text
+
+    reparsed = pl.parse_program(text)
+    # The reparsed tensor.aiv_shard re-inherits the same split int from the mode.
+    assert _find_call(_main_body(reparsed), "tensor.aiv_shard").kwargs["split"] == 1
+    ir.assert_structural_equal(prog, reparsed)
+
+
 class _DropAivIdBinding(ir.IRMutator):
     """Strip the leading ``aiv_id = tile.get_subblock_idx()`` binding from every
     SplitAivScopeStmt region (simulating DCE of the unused index binding)."""

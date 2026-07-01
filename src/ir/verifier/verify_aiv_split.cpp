@@ -69,7 +69,13 @@ class SplitAivStructuralVerifier : public IRVisitor {
 
   void VisitExpr_(const CallPtr& op) override {
     if (op && op->op_) {
-      const bool boundary = IsOp(op, "tile.aiv_shard") || IsOp(op, "tile.aic_gather");
+      // The AIV-split boundary appears in two forms in this window: the tile-level
+      // tile.aiv_shard / tile.aic_gather (AUTO split_aiv path, and the outlined
+      // low-level form) and the author-facing tensor.aiv_shard / tensor.aic_gather
+      // (pl.aiv_shard(tensor) inside a pl.split_aiv region, still tensor.* until
+      // ConvertTensorToTileOps lowers them 1:1). Both must be region-scoped.
+      const bool boundary = IsOp(op, "tile.aiv_shard") || IsOp(op, "tile.aic_gather") ||
+                            IsOp(op, "tensor.aiv_shard") || IsOp(op, "tensor.aic_gather");
       const bool in_split_region = depth_ > 0 && cur_split_dim_ != -1;  // data-parallel (UpDown/LeftRight)
       const bool in_none_region = depth_ > 0 && cur_split_dim_ == -1;   // task-parallel (None)
       if (in_split_region) {

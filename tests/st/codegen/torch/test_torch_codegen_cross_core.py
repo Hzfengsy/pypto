@@ -503,6 +503,87 @@ def _iter_func_bodies_op_names(program: _ir.Program) -> list[str]:
     return names
 
 
+def _assert_split_aiv_lowered_and_codegen(transformed: _ir.Program, base_name: str) -> str:
+    """Assert structural + PTO-codegen health of a lowered split_aiv program.
+
+    Shared by the ``@pl.program`` tile-ISA path and the ``@pl.jit`` high-level
+    tensor path — both funnel through the SAME lowering (tile.aiv_shard /
+    tile.aic_gather folded into cross-core tpush/tpop by ExpandMixedKernel), so
+    the post-pipeline invariants are identical. The caller must have already run
+    the Default pipeline under the active Ascend910B backend (the split_aiv /
+    GM-pipe-buffer path is 910B-gated); this helper leaves the backend untouched
+    and returns the generated torch code.
+
+    Asserts: both AIC/AIV lanes exist and carry the split marker; NO
+    tile.aiv_shard / tile.aic_gather / tensor.aiv_shard / tensor.aic_gather
+    survived (AssertNoSplitReshapeSurvives — ExpandMixedKernel folds them into
+    tpush/tpop); PTO codegen emits both lanes with no ``__FREE_VAR``.
+    """
+    funcs = list(transformed.functions.values())
+    names = [f.name for f in funcs]
+    assert f"{base_name}_aic" in names, f"missing AIC lane in {names}"
+    assert f"{base_name}_aiv" in names, f"missing AIV lane in {names}"
+    assert any(f.attrs.get("split_aiv", False) for f in funcs), "no function carries split_aiv marker"
+
+    # AssertNoSplitReshapeSurvives: ExpandMixedKernel must fold the split-reshape
+    # ops into tpush/tpop on each lane. The high-level tensor.* forms are lowered
+    # 1:1 to tile.* at ConvertTensorToTileOps (pass 10), so neither namespace may
+    # survive to the end of the pipeline.
+    op_names = _iter_func_bodies_op_names(transformed)
+    # Route the split-reshape op names through the registry getter so a typo raises
+    # here (loud) instead of making a negative "not in" assertion vacuously pass
+    # (operator-identity-checks rule).
+    split_reshape_ops = [
+        _ir.get_op(name).name
+        for name in ("tile.aiv_shard", "tile.aic_gather", "tensor.aiv_shard", "tensor.aic_gather")
+    ]
+    for folded in split_reshape_ops:
+        assert folded not in op_names, f"{folded} survived ExpandMixedKernel"
+
+    # PTO codegen: both lanes emitted, no FREE_VAR placeholder.
+    with tempfile.TemporaryDirectory() as td:
+        files = pto_backend.generate(transformed, td, skip_ptoas=True)
+    pto_code = "\n".join(v for k, v in files.items() if k.endswith(".pto"))
+    assert f"@{base_name}_aic(" in pto_code, "AIC lane not emitted in PTO codegen"
+    assert f"@{base_name}_aiv(" in pto_code, "AIV lane not emitted in PTO codegen"
+    assert "__FREE_VAR" not in pto_code, "PTO codegen emitted a __FREE_VAR placeholder"
+
+    # Torch golden: split-reshape boundary folds to push_to_/pop_from_.
+    return torch_codegen(transformed, check_shapes=True)
+
+
+def _exec_and_compare_golden(
+    code: str,
+    entry_name: str,
+    tensors: dict[str, torch.Tensor],
+    arg_order: list[str],
+    expected: torch.Tensor,
+) -> torch.Tensor | None:
+    """Exec the generated torch code, run ``entry_name(*args)``, compare golden.
+
+    Asserts the cross-core push_to_/pop_from_ runtime calls were emitted, then
+    checks both the bound output tensor (``tensors["out"]``) and the returned
+    tensor against ``expected``. Returns the entry's return value so callers can
+    layer a cross-form equivalence check on top.
+    """
+    assert "_cross_core_rt.push_to_" in code
+    assert "_cross_core_rt.pop_from_" in code
+
+    ns: dict = {}
+    exec(code, ns)  # noqa: S102
+    args = [tensors[name] for name in arg_order]
+    result = ns[entry_name](*args)
+    actual = tensors["out"]
+    assert torch.allclose(actual, expected, rtol=5e-2, atol=5e-2), (
+        f"max abs diff = {(expected - actual).abs().max().item():.6e}"
+    )
+    if isinstance(result, torch.Tensor):
+        assert torch.allclose(result, expected, rtol=5e-2, atol=5e-2), (
+            f"returned tensor max abs diff = {(expected - result).abs().max().item():.6e}"
+        )
+    return result
+
+
 def _run_split_aiv_default_and_check(
     program: _ir.Program,
     tensors: dict[str, torch.Tensor],
@@ -521,47 +602,11 @@ def _run_split_aiv_default_and_check(
     set_backend_type(BackendType.Ascend910B)
     try:
         transformed = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(program)
-
-        funcs = list(transformed.functions.values())
-        names = [f.name for f in funcs]
-        assert f"{base_name}_aic" in names, f"missing AIC lane in {names}"
-        assert f"{base_name}_aiv" in names, f"missing AIV lane in {names}"
-        assert any(f.attrs.get("split_aiv", False) for f in funcs), "no function carries split_aiv marker"
-
-        # AssertNoSplitReshapeSurvives: ExpandMixedKernel must fold the explicit
-        # split-reshape ops into tpush/tpop on each lane.
-        op_names = _iter_func_bodies_op_names(transformed)
-        assert "tile.aiv_shard" not in op_names, "tile.aiv_shard survived ExpandMixedKernel"
-        assert "tile.aic_gather" not in op_names, "tile.aic_gather survived ExpandMixedKernel"
-
-        # PTO codegen: both lanes emitted, no FREE_VAR placeholder.
-        with tempfile.TemporaryDirectory() as td:
-            files = pto_backend.generate(transformed, td, skip_ptoas=True)
-        pto_code = "\n".join(v for k, v in files.items() if k.endswith(".pto"))
-        assert f"@{base_name}_aic(" in pto_code, "AIC lane not emitted in PTO codegen"
-        assert f"@{base_name}_aiv(" in pto_code, "AIV lane not emitted in PTO codegen"
-        assert "__FREE_VAR" not in pto_code, "PTO codegen emitted a __FREE_VAR placeholder"
-
-        # Torch golden: split-reshape boundary folds to push_to_/pop_from_.
-        code = torch_codegen(transformed, check_shapes=True)
+        code = _assert_split_aiv_lowered_and_codegen(transformed, base_name)
     finally:
         reset_for_testing()
 
-    assert "_cross_core_rt.push_to_" in code
-    assert "_cross_core_rt.pop_from_" in code
-
-    ns: dict = {}
-    exec(code, ns)  # noqa: S102
-    args = [tensors[name] for name in arg_order]
-    result = ns["main"](*args)
-    actual = tensors["out"]
-    assert torch.allclose(actual, expected, rtol=5e-2, atol=5e-2), (
-        f"max abs diff = {(expected - actual).abs().max().item():.6e}"
-    )
-    if isinstance(result, torch.Tensor):
-        assert torch.allclose(result, expected, rtol=5e-2, atol=5e-2), (
-            f"returned tensor max abs diff = {(expected - result).abs().max().item():.6e}"
-        )
+    _exec_and_compare_golden(code, "main", tensors, arg_order, expected)
 
 
 _SPLIT_AIV_SCENARIOS = [
@@ -609,6 +654,112 @@ def test_split_aiv_fused_mixed_codegen_vs_golden(
     expected = golden_fn(golden_tensors)
     codegen_tensors = {k: v.clone() for k, v in base_tensors.items()}
     _run_split_aiv_default_and_check(program, codegen_tensors, arg_order, base_name, expected)
+
+
+# ---------------------------------------------------------------------------
+# High-level (@pl.jit) tensor-vocabulary AIV split (issue #1915).
+#
+# The author-facing analog of the tile-ISA SplitAivQkPvProgram above: producers
+# are high-level ``pl.matmul`` calls that return a *Tensor*, and the C->V shard
+# (``pl.aiv_shard``) / V->C gather (``pl.aic_gather``) operate on that Tensor
+# inside a ``for aiv_id in pl.split_aiv(...)`` region. Those emit tensor.aiv_shard
+# / tensor.aic_gather, which ConvertTensorToTileOps (pass 10) lowers 1:1 to
+# tile.aiv_shard / tile.aic_gather (re-attaching the Vec boundary memory) — so
+# from ExpandMixedKernel onward the pipeline is byte-identical to the tile path.
+# This proves issue #1915's exact use case compiles and is numerically correct.
+# ---------------------------------------------------------------------------
+
+
+@pl.jit
+def TensorSplitAivQkPvProgram(  # noqa: N802 — mirrors the sibling @pl.program class name
+    q: pl.Tensor,
+    k: pl.Tensor,
+    v: pl.Tensor,
+    out: pl.Out[pl.Tensor],
+):
+    """High-level (@pl.jit) analog of SplitAivQkPvProgram: out = ((q @ k^T) * 2) @ v.
+
+    Both matmuls live OUTSIDE the ``pl.split_aiv`` region (cube work); the region
+    shards the ``raw = q @ k^T`` Tensor to each AIV lane, scales the half, and
+    gathers it back to a full Tensor consumed by the second (cube) matmul.
+    """
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="tqkpv"):
+        raw = pl.matmul(q, k, b_trans=True, out_dtype=pl.FP32)  # Tensor [M, N] = q @ k^T
+        for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+            h = pl.aiv_shard(raw)  # C->V: Tensor [M, N] -> this lane's half [M/2, N]
+            s = pl.mul(h, 2.0)  # AIV vector work on the half
+            full = pl.aic_gather(s)  # V->C: gather halves -> full Tensor [M, N]
+        oi = pl.matmul(full, v, out_dtype=pl.FP32)  # Tensor [M, N] @ [N, N] = [M, N]
+        out = pl.assemble(out, oi, offset=[0, 0])
+    return out
+
+
+def _build_tensor_split_aiv_qk_pv_tensors() -> dict[str, torch.Tensor]:
+    # ``k`` is [N, K] because the first matmul uses ``b_trans=True`` (q @ k^T).
+    return {
+        "q": torch.randn(SA_M, SA_K, dtype=torch.float32),
+        "k": torch.randn(SA_N, SA_K, dtype=torch.float32),
+        "v": torch.randn(SA_N, SA_N, dtype=torch.float32),
+        "out": torch.zeros(SA_M, SA_N, dtype=torch.float32),
+    }
+
+
+def _golden_tensor_split_aiv_qk_pv(tensors: dict[str, torch.Tensor]) -> torch.Tensor:
+    raw = torch.matmul(tensors["q"], tensors["k"].t()) * 2.0
+    tensors["out"][:] = torch.matmul(raw, tensors["v"])
+    return tensors["out"]
+
+
+def test_tensor_split_aiv_qk_pv_codegen_vs_golden():
+    """Issue #1915: a high-level ``@pl.jit`` kernel that shards / gathers a *Tensor*
+    (``pl.aiv_shard`` / ``pl.aic_gather``) inside a ``pl.split_aiv`` region compiles
+    end-to-end on Ascend910B and is numerically correct.
+
+    Asserts (mirroring the tile-ISA harness): both AIC/AIV lanes emit; the
+    tensor.* shard/gather ops lower 1:1 to tile.* at ConvertTensorToTileOps and
+    are then folded (no tile.* / tensor.* aiv_shard/aic_gather survives); PTO
+    codegen emits both lanes with no ``__FREE_VAR``; torch golden matches. It then
+    layers an equivalence check against the low-level tile-ISA SplitAivQkPvProgram
+    fed the same math (``a = q``, ``b = k^T``): the two forms must produce
+    bit-for-bit-close device outputs, proving the high-level tensor path is a
+    faithful sugar over the tile path.
+    """
+    torch.manual_seed(42)
+    base_tensors = _build_tensor_split_aiv_qk_pv_tensors()
+    golden_tensors = {k: v.clone() for k, v in base_tensors.items()}
+    expected = _golden_tensor_split_aiv_qk_pv(golden_tensors)
+
+    tensor_tensors = {k: v.clone() for k, v in base_tensors.items()}
+    arg_order = ["q", "k", "v", "out"]
+
+    reset_for_testing()
+    set_backend_type(BackendType.Ascend910B)
+    try:
+        # @pl.jit compiles through the SAME Default pipeline (the specializer
+        # rewrites the kernel into @pl.program source, then run_passes runs).
+        transformed = TensorSplitAivQkPvProgram.compile_for_test(*[tensor_tensors[n] for n in arg_order])
+        code = _assert_split_aiv_lowered_and_codegen(transformed, "tqkpv")
+    finally:
+        reset_for_testing()
+
+    _exec_and_compare_golden(code, "TensorSplitAivQkPvProgram", tensor_tensors, arg_order, expected)
+    tensor_out = tensor_tensors["out"].clone()
+
+    # Equivalence vs the low-level tile-ISA form: feeding a = q, b = k^T reproduces
+    # q @ k^T, so SplitAivQkPvProgram computes the identical ((q @ k^T) * 2) @ v.
+    tile_tensors = {
+        "a": base_tensors["q"].clone(),
+        "b": base_tensors["k"].t().contiguous(),
+        "v": base_tensors["v"].clone(),
+        "out": torch.zeros(SA_M, SA_N, dtype=torch.float32),
+    }
+    _run_split_aiv_default_and_check(
+        SplitAivQkPvProgram, tile_tensors, ["a", "b", "v", "out"], "qkpv", expected
+    )
+    assert torch.allclose(tensor_out, tile_tensors["out"], rtol=5e-2, atol=5e-2), (
+        "high-level tensor split_aiv output diverged from the tile-ISA form: "
+        f"max abs diff = {(tensor_out - tile_tensors['out']).abs().max().item():.6e}"
+    )
 
 
 # ---------------------------------------------------------------------------

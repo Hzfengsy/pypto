@@ -187,6 +187,13 @@ from .system_ops import (  # noqa: F401
 # needed here (which avoids a circular dependency on ``..distributed``).
 _TensorT = TypeVar("_TensorT", bound=Tensor)
 
+# Constrained TypeVar for the split-axis reshape wrappers (aiv_shard / aic_gather):
+# the operand is either a Tile (legacy @pl.program form) or a Tensor (@pl.jit /
+# pl.spmd form), and the result is the SAME kind as the input. A constrained
+# TypeVar keeps that correlation (Tile -> Tile, Tensor -> Tensor) instead of a
+# ``Tensor | Tile`` union, which would type every result as the union.
+_SplitOperandT = TypeVar("_SplitOperandT", Tensor, Tile)
+
 
 class MemRefType:
     """Opaque sentinel type for ``MemRef``-typed variables in printed IR.
@@ -547,46 +554,56 @@ def move(
     return Tile(expr=call_expr)
 
 
-def aiv_shard(tile: Tile, span: Span | None = None) -> Tile:
-    """Shard a 2D tile into half along the split axis (full -> half).
+def aiv_shard(x: _SplitOperandT, span: Span | None = None) -> _SplitOperandT:
+    """Shard a 2D operand into half along the split axis (full -> half).
 
     The split mode is **inherited** from the enclosing
     ``for aiv_id in pl.split_aiv(mode=...)`` scope — it is not passed here.
-    This wrapper therefore only resolves inside a ``@pl.program`` parse, where
-    the parser intercepts the call and fills the inherited mode. Calling it
-    eagerly (outside a parsed program) raises, since there is no scope to read
-    the mode from.
+    This wrapper therefore only resolves inside a parsed kernel, where the
+    parser intercepts the call and fills the inherited mode. Calling it eagerly
+    (outside a parsed program) raises, since there is no scope to read the mode
+    from.
+
+    The operand may be a ``Tile`` (legacy ``@pl.program`` form -> ``tile.aiv_shard``)
+    or a high-level ``Tensor`` (``@pl.jit`` / ``pl.spmd`` form -> ``tensor.aiv_shard``,
+    lowered 1:1 to ``tile.aiv_shard`` at ConvertTensorToTileOps). The Tensor form
+    is region-only. Distributed tensors are not supported.
 
     Args:
-        tile: Input tile (2D)
+        x: Input operand (2D Tile or Tensor)
         span: Optional source span
 
     Returns:
-        Tile with the split axis halved.
+        Operand of the same kind with the split axis halved.
     """
     raise RuntimeError(
-        "pl.aiv_shard must be used inside a @pl.program 'for aiv_id in pl.split_aiv(...)' "
+        "pl.aiv_shard must be used inside a 'for aiv_id in pl.split_aiv(...)' "
         "loop, which supplies the split mode"
     )
 
 
-def aic_gather(tile: Tile, span: Span | None = None) -> Tile:
-    """Gather a 2D tile into full along the split axis (half -> full).
+def aic_gather(x: _SplitOperandT, span: Span | None = None) -> _SplitOperandT:
+    """Gather a 2D operand into full along the split axis (half -> full).
 
     Inverse of :func:`aiv_shard`. Like :func:`aiv_shard`, the split mode is
     **inherited** from the enclosing ``for aiv_id in pl.split_aiv(mode=...)``
     scope and must not be passed here. Calling it eagerly (outside a parsed
-    ``@pl.program``) raises, since there is no scope to read the mode from.
+    program) raises, since there is no scope to read the mode from.
+
+    The operand may be a ``Tile`` (legacy ``@pl.program`` form -> ``tile.aic_gather``)
+    or a high-level ``Tensor`` (``@pl.jit`` / ``pl.spmd`` form -> ``tensor.aic_gather``,
+    lowered 1:1 to ``tile.aic_gather`` at ConvertTensorToTileOps). The Tensor form
+    is region-only. Distributed tensors are not supported.
 
     Args:
-        tile: Input tile (2D)
+        x: Input operand (2D Tile or Tensor)
         span: Optional source span
 
     Returns:
-        Tile with the split axis doubled.
+        Operand of the same kind with the split axis doubled.
     """
     raise RuntimeError(
-        "pl.aic_gather must be used inside a @pl.program 'for aiv_id in pl.split_aiv(...)' "
+        "pl.aic_gather must be used inside a 'for aiv_id in pl.split_aiv(...)' "
         "loop, which supplies the split mode"
     )
 
