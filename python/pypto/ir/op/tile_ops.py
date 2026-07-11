@@ -2539,8 +2539,9 @@ def slice(
     valid_shape: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
     drop_dims: Sequence[int | Expr] | None = None,
     pad_value: PadValue | int | float | None = None,
-    clamp: bool = False,
     span: Span | None = None,
+    *,
+    clamp: bool = False,
 ) -> Call:
     """Create a slice of a tile with static shape and optional valid shape.
 
@@ -2564,12 +2565,12 @@ def slice(
             through unchanged and means "no padding". When omitted (``None``),
             the kwarg is not forwarded — the deducer defaults to
             ``PadValue.null``.
-        clamp: When ``True``, clip the window to the source tile's valid region
+        span: Optional source span for debugging (auto-captured if not provided)
+        clamp: Keyword-only. When ``True``, clip the window to the source tile's valid region
             (its physical shape when unset) at ``offset`` even for a fully-valid
             source, so a ragged tail past the physical edge is derived rather than
             hand-threaded. Composes with the source-region intersect (single
             ``min``, no double-narrowing); intersects an explicit ``valid_shape``.
-        span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression creating a tile slice
@@ -2812,7 +2813,8 @@ def tpush_to_aic(tile: Expr, *, split: int, id: int | None = None, span: Span | 
 def aiv_shard(tile: Expr, *, split: int, span: Span | None = None) -> Call:
     """Shard a 2D tile into half along the split axis (full -> half).
 
-    The result is a TileType with the split axis halved.
+    The result is a TileType with the split axis halved. The split axis must be
+    provably fully valid; partial validity is supported only on the other axis.
 
     Args:
         tile: Input tile (TileType, 2D)
@@ -2826,7 +2828,9 @@ def aiv_shard(tile: Expr, *, split: int, span: Span | None = None) -> Call:
 def aic_gather(tile: Expr, *, split: int, span: Span | None = None) -> Call:
     """Gather a 2D tile into full along the split axis (half -> full).
 
-    Inverse of :func:`aiv_shard`: the result is a TileType with the split axis doubled.
+    Inverse of :func:`aiv_shard`: the result is a TileType with the split axis
+    doubled. The split axis must be provably fully valid; partial validity is
+    supported only on the other axis.
 
     Args:
         tile: Input tile (TileType, 2D)

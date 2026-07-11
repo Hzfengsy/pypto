@@ -931,17 +931,14 @@ def test_tensor_assemble_fully_valid_target_stays_bare():
 
 
 def test_tensor_assemble_out_of_bounds_rejected():
-    """An out-of-bounds write into a narrowing-view target is a user error.
-
-    The union is computed only when the target already carries an explicit narrowing
-    valid region, so that is the gate under which the bounds check runs."""
+    """An out-of-bounds physical source window is a user error."""
     span = ir.Span.unknown()
     view = ir.TensorView([64, 1], ir.TensorLayout.ND, [16, 16], ir.PadValue.zero)
     target_type = ir.TensorType([64, 64], DataType.FP32, None, view)
     source_type = ir.TensorType([64, 64], DataType.FP32)
     target = ir.Var("target", target_type, span)
     source = ir.Var("source", source_type, span)
-    with pytest.raises(ValueError, match="out-of-bounds assemble"):
+    with pytest.raises(ValueError, match="physical window"):
         tensor.assemble(target, source, [8, 0])  # 8 + 64 = 72 > 64
 
 
@@ -960,19 +957,62 @@ def test_tensor_assemble_non_rectangular_union_rejected():
         tensor.assemble(target, source, [32, 0])
 
 
-def test_tensor_assemble_fully_valid_target_does_not_bounds_check():
-    """A fully-valid target (no narrowing view) skips the union path, so even an
-    out-of-bounds write does NOT raise — this locks the documented tile/tensor
-    asymmetry (tile.assemble always computes the union; tensor.assemble gates on an
-    explicit narrowing target to preserve the create+assemble fuse path)."""
+def test_tensor_assemble_fully_valid_target_checks_physical_bounds():
+    """A full target must not bypass physical-window safety."""
     span = ir.Span.unknown()
     target_type = ir.TensorType([64, 64], DataType.FP32)
     source_type = ir.TensorType([64, 64], DataType.FP32)
     target = ir.Var("target", target_type, span)
     source = ir.Var("source", source_type, span)
-    # 8 + 64 = 72 > 64 would be out-of-bounds, but the fully-valid target skips it.
-    result_type = tensor.assemble(target, source, [8, 0]).type
+    with pytest.raises(ValueError, match="physical window"):
+        tensor.assemble(target, source, [8, 0])
+
+
+def test_tensor_assemble_rejects_negative_offset():
+    """A negative destination offset would write before the target allocation."""
+    span = ir.Span.unknown()
+    target = ir.Var("target", ir.TensorType([64, 64], DataType.FP32), span)
+    source = ir.Var("source", ir.TensorType([8, 8], DataType.FP32), span)
+
+    with pytest.raises(ValueError, match=r"offset\[0\].*>= 0"):
+        tensor.assemble(target, source, [-1, 0])
+
+
+def test_tensor_assemble_bounds_the_effective_source_write_not_physical_padding():
+    """Tensor assemble transfers only valid data, so source padding need not fit."""
+    span = ir.Span.unknown()
+    target_view = ir.TensorView([], ir.TensorLayout.ND, [0, 0], ir.PadValue.null)
+    target = ir.Var("target", ir.TensorType([8, 8], DataType.FP32, None, target_view), span)
+    source_view = ir.TensorView([], ir.TensorLayout.ND, [4, 8], ir.PadValue.null)
+    source = ir.Var("source", ir.TensorType([16, 16], DataType.FP32, None, source_view), span)
+
+    result = tensor.assemble(target, source, [0, 0]).type
+    assert isinstance(result, ir.TensorType)
+    assert result.tensor_view is not None
+    assert _const_ints(result.tensor_view.valid_shape) == [4, 8]
+
+
+def test_tensor_assemble_right_aligns_lower_rank_source():
+    """Missing leading source axes are singleton physical/valid extents."""
+    span = ir.Span.unknown()
+    target_view = ir.TensorView([], ir.TensorLayout.ND, [0, 16, 32], ir.PadValue.null)
+    target = ir.Var("target", ir.TensorType([4, 16, 32], DataType.FP32, None, target_view), span)
+    source = ir.Var("source", ir.TensorType([16, 32], DataType.FP32), span)
+
+    result_type = tensor.assemble(target, source, [0, 0, 0]).type
     assert isinstance(result_type, ir.TensorType)
+    assert result_type.tensor_view is not None
+    assert _const_ints(result_type.tensor_view.valid_shape) == [1, 16, 32]
+
+
+def test_tensor_assemble_lower_rank_leading_singleton_is_bounds_checked():
+    """The synthesized leading singleton participates in physical bounds."""
+    span = ir.Span.unknown()
+    target = ir.Var("target", ir.TensorType([4, 16, 32], DataType.FP32), span)
+    source = ir.Var("source", ir.TensorType([16, 32], DataType.FP32), span)
+
+    with pytest.raises(ValueError, match="physical window"):
+        tensor.assemble(target, source, [4, 0, 0])
 
 
 def test_tensor_assemble_dynamic_source_symbolic():
@@ -995,6 +1035,37 @@ def test_tensor_assemble_dynamic_source_symbolic():
     # -> folds to a single ConstInt (no Max(16,16) node).
     assert isinstance(valid[0], ir.Min)
     assert isinstance(valid[1], ir.ConstInt) and valid[1].value == 16
+
+
+def test_tensor_assemble_contiguous_symbolic_appends_do_not_nest_max_nodes():
+    """Dominated union bounds simplify, keeping unrolled append expressions linear."""
+    span = ir.Span.unknown()
+    v = ir.Var("v", ir.ScalarType(DataType.INDEX), span)
+    capacity = ir.Add(v, ir.ConstInt(256, DataType.INDEX, span), DataType.INDEX, span)
+    target_type = ir.TensorType(
+        [capacity, ir.ConstInt(1, DataType.INDEX, span)],
+        DataType.FP32,
+        None,
+        ir.TensorView([], ir.TensorLayout.ND, [v, 1]),
+    )
+    source = ir.Var("source", ir.TensorType([32, 1], DataType.FP32), span)
+    current = v
+
+    def contains_max(expr):
+        if isinstance(expr, ir.Max):
+            return True
+        if isinstance(expr, ir.BinaryExpr):
+            return contains_max(expr.left) or contains_max(expr.right)
+        return False
+
+    for step in range(4):
+        target = ir.Var(f"target{step}", target_type, span)
+        target_type = tensor.assemble(target, source, [current, 0]).type
+        assert isinstance(target_type, ir.TensorType)
+        assert target_type.tensor_view is not None
+        current = target_type.tensor_view.valid_shape[0]
+        assert isinstance(current, ir.Add)
+        assert not contains_max(current)
 
 
 def test_tensor_row_expand_mul():
@@ -1807,6 +1878,24 @@ def test_tensor_transpose_explicit_valid_shape_not_swapped():
     assert _const_int_values(rt.tensor_view.stride) == [1, 16]
 
 
+def test_tensor_transpose_explicit_valid_shape_cannot_widen_source():
+    """The explicit output box is bounded by the source-derived swapped box."""
+    src = _tensor([8, 16], valid=[4, 8])  # derives output valid [8, 4]
+    with pytest.raises(ValueError, match="not provably within the source-derived extent"):
+        tensor.transpose(src, 0, 1, valid_shape=[12, 4])
+    with pytest.raises(ValueError, match="exceeds physical shape"):
+        tensor.transpose(_tensor([8, 16]), 0, 1, valid_shape=[17, 4])
+
+
+def test_tensor_transpose_rejects_unproved_explicit_valid_bound():
+    """Unrelated symbolic extents need a guard, which transpose does not emit."""
+    vm = ir.Var("vm", ir.ScalarType(DataType.INDEX), _SPAN_4F)
+    vk = ir.Var("vk", ir.ScalarType(DataType.INDEX), _SPAN_4F)
+    src = _tensor([8, 16], valid=[vm, 16])  # derives [16, vm]
+    with pytest.raises(ValueError, match="not provably within the source-derived extent"):
+        tensor.transpose(src, 0, 1, valid_shape=[16, vk])
+
+
 def test_tensor_transpose_valid_shape_rank_mismatch_rejected():
     """A 4th-arg valid_shape with the wrong rank raises a clear error."""
     span = ir.Span.unknown()
@@ -1871,6 +1960,15 @@ def test_tensor_slice_with_valid_shape():
     assert len(result_type.tensor_view.valid_shape) == 2
 
 
+def test_tensor_slice_rejects_static_valid_shape_outside_result_shape():
+    """A malformed final valid_shape fails during op deduction."""
+    span = ir.Span.unknown()
+    tensor_var = ir.Var("t", ir.TensorType([16, 32], DataType.FP16), span)
+
+    with pytest.raises(ValueError, match=r"valid_shape\[0\].*exceeds physical shape"):
+        ir.op.tensor.slice(tensor_var, [8, 16], [0, 0], valid_shape=[9, 16])
+
+
 def test_tensor_slice_drop_dims_rank_reduces():
     """tensor.slice drop_dims erases the listed unit axes from the result type."""
     span = ir.Span.unknown()
@@ -1906,6 +2004,25 @@ def test_tensor_slice_drop_dims_rejects_non_unit_dim():
     tensor_var = ir.Var("t", ir.TensorType([64, 64], DataType.FP32), span)
     with pytest.raises(ValueError, match="static unit dimension"):
         ir.op.tensor.slice(tensor_var, [8, 64], [0, 0], drop_dims=[0])
+
+
+@pytest.mark.parametrize("dropped_valid", [0, "symbolic"])
+def test_tensor_slice_drop_dims_requires_provably_valid_unit(dropped_valid):
+    """Rank reduction cannot erase an empty or unproven unit axis."""
+    span = ir.Span.unknown()
+    valid0 = (
+        ir.Var("v0", ir.ScalarType(DataType.INDEX), span)
+        if dropped_valid == "symbolic"
+        else ir.ConstInt(dropped_valid, DataType.INDEX, span)
+    )
+    src_type = ir.TensorType(
+        [1, 64],
+        DataType.FP32,
+        None,
+        ir.TensorView([], ir.TensorLayout.ND, [valid0, ir.ConstInt(64, DataType.INDEX, span)]),
+    )
+    with pytest.raises(ValueError, match="cannot drop axis 0"):
+        tensor.slice(ir.Var("src", src_type, span), [1, 64], [0, 0], drop_dims=[0])
 
 
 def test_tensor_slice_drop_dims_rejects_out_of_range():
@@ -2108,6 +2225,27 @@ def test_tensor_fillpad_expand():
     assert len(result_type.tensor_view.valid_shape) == 0
 
 
+def test_tensor_fillpad_expand_drops_source_allocation_metadata():
+    """A larger fresh result must not retain source MemRef/stride/layout."""
+    span = ir.Span.unknown()
+    memref = ir.MemRef(ir.MemorySpace.DDR, ir.ConstInt(0, DataType.INDEX, span), 4096, 17)
+    src_view = ir.TensorView(
+        [ir.ConstInt(64, DataType.INDEX, span), ir.ConstInt(1, DataType.INDEX, span)],
+        ir.TensorLayout.DN,
+        [ir.ConstInt(8, DataType.INDEX, span), ir.ConstInt(16, DataType.INDEX, span)],
+        ir.PadValue.max,
+    )
+    src = ir.Var("src", ir.TensorType([16, 32], DataType.FP32, memref, src_view), span)
+
+    result = tensor.fillpad_expand(src, [32, 64], pad_value=ir.PadValue.zero).type
+    assert isinstance(result, ir.TensorType)
+    assert result.memref is None
+    assert result.tensor_view is not None
+    assert list(result.tensor_view.stride) == []
+    assert result.tensor_view.layout == ir.TensorLayout.ND
+    assert result.tensor_view.pad == ir.PadValue.zero
+
+
 def test_tensor_fillpad_expand_shrink_raises():
     """tensor.fillpad_expand rejects a destination smaller than the source."""
     span = ir.Span.unknown()
@@ -2251,6 +2389,52 @@ def test_tensor_reshape_with_valid_shape():
     assert len(call.args) == 3
     assert result_type.tensor_view is not None
     assert len(result_type.tensor_view.valid_shape) == 1
+
+
+def test_tensor_reshape_maps_partial_prefix_like_tile_reshape():
+    """A partial tensor prefix is mapped to the same output box as its tile peer."""
+    src = _tensor([4, 8], valid=[2, 8])
+    result_type = ir.op.tensor.reshape(src, [8, 4]).type
+    assert isinstance(result_type, ir.TensorType)
+    assert _valid_of(result_type) == [4, 4]
+
+
+def test_tensor_reshape_preserves_pad_while_remapping_valid_shape():
+    """Reshape changes coordinates, but keeps the source padding policy."""
+    src = _tensor([4, 8], valid=[2, 8], pad=ir.PadValue.zero)
+    result_type = ir.op.tensor.reshape(src, [8, 4]).type
+
+    assert isinstance(result_type, ir.TensorType)
+    assert _valid_of(result_type) == [4, 4]
+    assert result_type.tensor_view is not None
+    assert result_type.tensor_view.pad == ir.PadValue.zero
+
+
+def test_tensor_reshape_inserts_unit_axis_without_requiring_flat_prefix():
+    """A unit-axis rank lift preserves an arbitrary rectangular region exactly;
+    it is not a data-repartitioning reshape that requires a flat prefix."""
+    src = _tensor([16, 16], valid=[8, 8])
+    result_type = ir.op.tensor.reshape(src, [1, 16, 16], valid_shape=[1, 8, 8]).type
+    assert isinstance(result_type, ir.TensorType)
+    assert _valid_of(result_type) == [1, 8, 8]
+
+
+def test_tensor_reshape_rejects_non_prefix_partial_region():
+    """A strided partial region cannot be represented after flattening reshape."""
+    src = _tensor([4, 8], valid=[4, 2])
+    with pytest.raises(ValueError, match="not a contiguous flat prefix"):
+        ir.op.tensor.reshape(src, [8, 4])
+
+
+def test_tensor_reshape_valid_shape_is_bounded_and_cannot_widen_source():
+    """Explicit result validity is checked against physical and source-derived bounds."""
+    full = _tensor([4, 8])
+    with pytest.raises(ValueError, match="exceeds physical shape"):
+        ir.op.tensor.reshape(full, [32], valid_shape=[33])
+
+    partial = _tensor([4, 8], valid=[2, 8])  # maps to [4, 4]
+    with pytest.raises(ValueError, match="not provably within the source-derived extent"):
+        ir.op.tensor.reshape(partial, [8, 4], valid_shape=[8, 4])
 
 
 def test_tensor_transpose_with_valid_shape():
@@ -2872,6 +3056,21 @@ def test_tensor_concat():
     assert len(result_type.shape) == 2
     assert isinstance(result_type.shape[1], ir.ConstInt)
     assert result_type.shape[1].value == 32
+
+
+def test_tensor_concat_propagates_partial_final_operand():
+    """Only a trailing partial suffix in the final operand remains rectangular."""
+    lhs = _tensor([32, 16])
+    rhs = _tensor([32, 16], valid=[32, 8])
+    assert _valid_of(tensor.concat(lhs, rhs).type) == [32, 24]
+
+
+def test_tensor_concat_rejects_gap_or_valid_row_mismatch():
+    """A partial first segment creates a gap; unequal valid rows create an L-shape."""
+    with pytest.raises(ValueError, match="partially valid along the concatenation"):
+        tensor.concat(_tensor([32, 16], valid=[32, 8]), _tensor([32, 16]))
+    with pytest.raises(ValueError, match="disagree on the valid row extent"):
+        tensor.concat(_tensor([32, 16], valid=[20, 16]), _tensor([32, 16], valid=[10, 16]))
 
 
 def test_tensor_concat_dtype_mismatch():
@@ -3505,7 +3704,7 @@ def _tensor(
     return ir.Var("v", ty, _SPAN_4F)
 
 
-# --- unary: regression guard + partial + TRAP 1 (stride/layout/pad survive) ---
+# --- fresh compute views: preserve valid_shape, drop source allocation metadata ---
 
 
 def test_4f_unary_fully_valid_stays_bare():
@@ -3526,23 +3725,39 @@ def test_4f_unary_partial_valid_propagates():
     assert _valid_of(tensor.exp(x).type) == [16, 32]
 
 
-def test_4f_unary_stride_layout_pad_survive():
-    """TRAP 1: a DN-layout tensor with a stride, a pad and a narrow valid_shape keeps
-    all four fields through a unary op (a valid_shape with an empty stride would trip
-    the require-materialized TensorViewCanonical verifier)."""
+def test_4f_fresh_compute_results_keep_only_effective_valid_shape():
+    """Unary, scalar, binary, and cast results are new allocations, not aliases.
+
+    They preserve the source's effective valid box but normalize away source strides,
+    layout, and padding policy so all elementwise spellings produce the same view form.
+    """
     view = ir.TensorView([1, 64], ir.TensorLayout.DN, [16, 32], ir.PadValue.zero)
     x = ir.Var("x", ir.TensorType([64, 64], DataType.FP32, None, view), _SPAN_4F)
-    result = tensor.neg(x).type
-    assert isinstance(result, ir.TensorType)
-    assert result.tensor_view is not None
-    assert _valid_of(result) == [16, 32]
-    assert _const_ints(result.tensor_view.stride) == [1, 64]
-    assert result.tensor_view.layout == ir.TensorLayout.DN
-    assert result.tensor_view.pad == ir.PadValue.zero
+    y = _tensor(
+        [64, 64],
+        valid=[16, 32],
+        stride=[64, 1],
+        layout=ir.TensorLayout.ND,
+        pad=ir.PadValue.max,
+    )
+
+    results = {
+        "unary": tensor.neg(x).type,
+        "scalar": tensor.adds(x, 2.0).type,
+        "binary": tensor.add(x, y).type,
+        "cast": tensor.cast(x, target_type=DataType.FP16).type,
+    }
+    for spelling, result in results.items():
+        assert isinstance(result, ir.TensorType), spelling
+        assert _valid_of(result) == [16, 32], spelling
+        assert result.tensor_view is not None, spelling
+        assert len(result.tensor_view.stride) == 0, spelling
+        assert result.tensor_view.layout == ir.TensorLayout.ND, spelling
+        assert result.tensor_view.pad == ir.PadValue.null, spelling
 
 
-def test_4f_cast_changes_dtype_keeps_view():
-    """cast preserves the input's view while changing dtype; a bare input stays bare."""
+def test_4f_cast_changes_dtype_keeps_valid_shape():
+    """Cast preserves valid_shape while changing dtype; a bare input stays bare."""
     x = _tensor([64, 64], DataType.FP16, valid=[16, 32])
     result = tensor.cast(x, target_type=DataType.FP32).type
     assert isinstance(result, ir.TensorType)
@@ -3587,8 +3802,8 @@ def test_4f_elementwise_binary_static_disagreement_rejected():
         tensor.add(a, b)
 
 
-def test_4f_elementwise_scalar_copies_view():
-    """A tensor+scalar op copies the tensor operand's view; a bare input stays bare."""
+def test_4f_elementwise_scalar_preserves_valid_shape():
+    """A tensor+scalar op preserves the operand's valid box; a bare input stays bare."""
     a = _tensor([64, 64], valid=[16, 64])
     assert _valid_of(tensor.adds(a, 2.0).type) == [16, 64]
     result_type = tensor.adds(_tensor([64, 64]), 2.0).type
@@ -3596,18 +3811,22 @@ def test_4f_elementwise_scalar_copies_view():
     assert result_type.tensor_view is None
 
 
-def test_4f_elementwise_binary_symbolic_disagreement_accepted():
-    """Two shared-dim valid extents that are symbolic and not provably equal cannot be
-    proved to disagree, so the binary op ACCEPTS them (dynamic valid_shape keeps
-    working) rather than falsely rejecting — same discipline as matmul's K check."""
+def test_4f_elementwise_binary_symbolic_disagreement_rejected():
+    """Unrelated symbolic extents reject when the op emits no equality guard."""
     vm = ir.Var("vm", ir.ScalarType(DataType.INDEX), _SPAN_4F)
     vk = ir.Var("vk", ir.ScalarType(DataType.INDEX), _SPAN_4F)
     a = _tensor([64, 64], valid=[vm, 64])
     b = _tensor([64, 64], valid=[vk, 64])
-    result = tensor.add(a, b).type  # must not raise
-    assert isinstance(result, ir.TensorType)
-    assert result.tensor_view is not None
-    assert _valid_of(result) is not None and len(result.tensor_view.valid_shape) == 2
+    with pytest.raises(ValueError, match="symbolic equality cannot be proven"):
+        tensor.add(a, b)
+
+
+def test_4f_elementwise_binary_rejects_empty_broadcast_singleton():
+    """A valid-zero singleton would broadcast padding into every output cell."""
+    full = _tensor([64, 64], valid=[40, 64])
+    row = _tensor([1, 64], valid=[0, 64])
+    with pytest.raises(ValueError, match="singleton value must be provably valid"):
+        tensor.add(full, row)
 
 
 def test_4f_part_combine_uses_union_not_agreement():
@@ -3626,6 +3845,13 @@ def test_4f_part_combine_uses_union_not_agreement():
     result_type = tensor.part_add(_tensor([64, 64]), _tensor([64, 64])).type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.tensor_view is None
+
+
+def test_4f_part_combine_lifts_lower_rank_operand_before_union():
+    """Broadcast lifting normalizes both valid boxes to the output rank."""
+    lhs = _tensor([4, 3], valid=[4, 1])
+    rhs = _tensor([3], valid=[2])
+    assert _valid_of(tensor.part_add(lhs, rhs).type) == [4, 2]
 
 
 # --- reduction: drop the reduced axis, keep the others ---
@@ -3653,18 +3879,30 @@ def test_4f_col_reduction_keeps_col_valid():
     assert _valid_of(result) == [1, 48]
 
 
-# --- broadcast ops: row/col expand copy arg0's view; expand_clone derives ---
+# --- broadcast ops: binary expands validate both operands; scalar expands use target ---
 
 
-def test_4f_row_expand_copies_main_tensor_view():
-    """row_expand_mul takes the main tensor's (arg0) valid region; the row vector is
-    the broadcast operand and does not constrain the result."""
+def test_4f_row_expand_requires_vector_validity():
+    """The row vector agrees on rows and has a real singleton in the broadcast axis."""
     main = _tensor([64, 64], valid=[40, 48])
-    rowv = _tensor([64, 1])
+    rowv = _tensor([64, 1], valid=[40, 1])
     assert _valid_of(tensor.row_expand_mul(main, rowv).type) == [40, 48]
-    result_type = tensor.row_expand_mul(_tensor([64, 64]), rowv).type
-    assert isinstance(result_type, ir.TensorType)
-    assert result_type.tensor_view is None
+
+    with pytest.raises(ValueError, match="disagree on the valid extent"):
+        tensor.row_expand_mul(main, _tensor([64, 1]))
+    with pytest.raises(ValueError, match="singleton value must be provably valid"):
+        tensor.row_expand_mul(main, _tensor([64, 1], valid=[40, 0]))
+
+
+def test_4f_col_expand_requires_vector_validity():
+    """The column vector agrees on columns and has a valid broadcast singleton."""
+    main = _tensor([64, 64], valid=[40, 48])
+    colv = _tensor([1, 64], valid=[1, 48])
+    assert _valid_of(tensor.col_expand_add(main, colv).type) == [40, 48]
+    with pytest.raises(ValueError, match="disagree on the valid extent"):
+        tensor.col_expand_add(main, _tensor([1, 64], valid=[1, 32]))
+    with pytest.raises(ValueError, match="singleton value must be provably valid"):
+        tensor.col_expand_add(main, _tensor([1, 64], valid=[0, 48]))
 
 
 def test_4f_expand_clone_rejects_partial_broadcast_dim():
@@ -3687,7 +3925,7 @@ def test_4f_expand_clone_full_source_stays_bare():
     assert result_type.tensor_view is None
 
 
-# --- matmul: 2D M/N propagation + K check; non-2D rejects partial ---
+# --- matmul: M/N propagation + directional K; ND batch pages must be full ---
 
 
 def test_4f_matmul_2d_propagates_m_n():
@@ -3705,18 +3943,44 @@ def test_4f_matmul_2d_propagates_m_n():
 
 
 def test_4f_matmul_valid_k_mismatch_rejected():
-    """A provable disagreement on the valid contraction K is rejected."""
-    a = _tensor([64, 32], valid=[64, 16])
-    b = _tensor([32, 64], valid=[32, 64])
+    """A provably-too-short RHS valid K is rejected."""
+    a = _tensor([64, 32], valid=[64, 32])
+    b = _tensor([32, 64], valid=[16, 64])
     with pytest.raises(ValueError, match="valid contraction length K"):
         tensor.matmul(a, b, out_dtype=DataType.FP32)
 
 
-def test_4f_matmul_batched_partial_input_rejected():
-    """A partially-valid operand in a batched (non-2D) matmul is rejected, not widened."""
+def test_4f_matmul_accepts_rhs_valid_k_larger_than_lhs():
+    """The RHS may contain more valid K rows than the LHS-selected contraction length."""
+    a = _tensor([64, 64], valid=[64, 16])
+    b = _tensor([64, 64], valid=[32, 64])
+    result = tensor.matmul(a, b, out_dtype=DataType.FP32).type
+    assert isinstance(result, ir.TensorType)
+
+
+def test_4f_matmul_unprovable_symbolic_k_relation_rejected():
+    """Unrelated dynamic K extents need a guard, which matmul inference does not emit."""
+    k1 = ir.Var("k1", ir.ScalarType(DataType.INDEX), _SPAN_4F)
+    k2 = ir.Var("k2", ir.ScalarType(DataType.INDEX), _SPAN_4F)
+    a = _tensor([64, 64], valid=[64, k1])
+    b = _tensor([64, 64], valid=[k2, 64])
+    with pytest.raises(ValueError, match="cannot prove lhs valid contraction length K"):
+        tensor.matmul(a, b, out_dtype=DataType.FP32)
+
+
+def test_4f_matmul_batched_propagates_partial_matrix_axes():
+    """ND matmul matches tile.batch_matmul: full batches, partial M/N/K."""
     a = _tensor([2, 64, 32], valid=[2, 40, 32])
+    b = _tensor([2, 32, 64], valid=[2, 32, 48])
+    result = tensor.matmul(a, b, out_dtype=DataType.FP32).type
+    assert _valid_of(result) == [2, 40, 48]
+
+
+def test_4f_matmul_batched_partial_batch_rejected():
+    """Flattening cannot enumerate a partial batch tail as real pages."""
+    a = _tensor([2, 64, 32], valid=[1, 64, 32])
     b = _tensor([2, 32, 64])
-    with pytest.raises(ValueError, match="partial valid_shape"):
+    with pytest.raises(ValueError, match=r"lhs batch axis 0.*provably full"):
         tensor.matmul(a, b, out_dtype=DataType.FP32)
 
 
@@ -3740,22 +4004,29 @@ def test_4f_matmul_acc_2d_unions_accumulator():
 
 
 def test_4f_matmul_acc_2d_valid_k_mismatch_rejected():
-    """The 2D matmul_acc path runs its own valid-K compatibility check; a provable
-    disagreement on the valid contraction K is rejected (distinct from plain matmul)."""
+    """The 2D matmul_acc path rejects a provably-too-short RHS valid K."""
     acc = _tensor([64, 64])
-    a = _tensor([64, 32], valid=[64, 16])  # valid K = 16
-    b = _tensor([32, 64], valid=[32, 64])  # valid K = 32
+    a = _tensor([64, 32], valid=[64, 32])  # lhs valid K = 32
+    b = _tensor([32, 64], valid=[16, 64])  # rhs valid K = 16
     with pytest.raises(ValueError, match="valid contraction length K"):
         tensor.matmul_acc(acc, a, b)
 
 
-def test_4f_matmul_acc_batched_partial_input_rejected():
-    """A partially-valid operand on the batched (non-2D) matmul_acc dispatch is rejected,
-    not widened (the else branch guards acc/lhs/rhs via CheckTensorInputFullyValid)."""
-    acc = _tensor([2, 64, 64])
+def test_4f_matmul_acc_batched_propagates_partial_matrix_axes():
+    """ND matmul_acc unions partial M/N while retaining full batch pages."""
+    acc = _tensor([2, 64, 64], valid=[2, 0, 0])
     a = _tensor([2, 64, 32], valid=[2, 40, 32])
+    b = _tensor([2, 32, 64], valid=[2, 32, 48])
+    result = tensor.matmul_acc(acc, a, b).type
+    assert _valid_of(result) == [2, 40, 48]
+
+
+def test_4f_matmul_acc_batched_partial_batch_rejected():
+    """Every acc/lhs/rhs batch page must be provably real."""
+    acc = _tensor([2, 64, 64])
+    a = _tensor([2, 64, 32], valid=[1, 64, 32])
     b = _tensor([2, 32, 64])
-    with pytest.raises(ValueError, match="partial valid_shape"):
+    with pytest.raises(ValueError, match=r"lhs batch axis 0.*provably full"):
         tensor.matmul_acc(acc, a, b)
 
 
@@ -3766,7 +4037,15 @@ def test_4f_sort32_rejects_partial_input():
     """A partially-valid sort input has no well-defined sorted output — rejected."""
     src = _tensor([1, 32], valid=[1, 16])
     idx = ir.Var("i", ir.TensorType([1, 32], DataType.UINT32), _SPAN_4F)
-    with pytest.raises(ValueError, match="partial valid_shape"):
+    with pytest.raises(ValueError, match="not provably fully valid"):
+        tensor.sort32(src, idx)
+
+
+def test_4f_sort32_rejects_partial_index():
+    """sort32 consumes the whole index run as well as the value run."""
+    src = _tensor([1, 32])
+    idx = _tensor([1, 32], DataType.UINT32, valid=[1, 16])
+    with pytest.raises(ValueError, match="not provably fully valid"):
         tensor.sort32(src, idx)
 
 
@@ -3784,7 +4063,7 @@ def test_4f_scatter_rejects_partial_input():
     inp = _tensor([4, 8], DataType.FP32, valid=[2, 8])
     idx = ir.Var("i", ir.TensorType([4, 4], DataType.INT32), _SPAN_4F)
     src = ir.Var("s", ir.TensorType([4, 4], DataType.FP32), _SPAN_4F)
-    with pytest.raises(ValueError, match="partial valid_shape"):
+    with pytest.raises(ValueError, match="not provably fully valid"):
         tensor.scatter(inp, dim=-1, index=idx, src=src)
 
 
@@ -3793,7 +4072,7 @@ def test_4f_scatter_mask_rejects_partial_input():
     cannot derive its output region from a partial operand — reject rather than widen."""
     inp = _tensor([4, 8], DataType.FP32, valid=[2, 8])
     dst = ir.Var("dst", ir.TensorType([4, 16], DataType.FP32), _SPAN_4F)  # cols = 8 * 2 (pattern 1)
-    with pytest.raises(ValueError, match="partial valid_shape"):
+    with pytest.raises(ValueError, match="not provably fully valid"):
         ir.op.tensor.scatter(inp, mask_pattern=1, dst=dst)
 
 
@@ -3805,8 +4084,20 @@ def test_4f_gather_rejects_partial_input():
     index) cannot derive the output region — rejected rather than widened."""
     inp = _tensor([4, 16], DataType.FP32, valid=[2, 16])
     idx = ir.Var("idx", ir.TensorType([4, 3], DataType.INT32), _SPAN_4F)
-    with pytest.raises(ValueError, match="partial valid_shape"):
+    with pytest.raises(ValueError, match="not provably fully valid"):
         ir.op.tensor.gather(inp, dim=-1, index=idx)
+
+
+@pytest.mark.parametrize("form", ["mask", "compare"])
+def test_4f_tensor_gather_specialized_forms_reject_partial_input(form):
+    """Mask/compare forms scan physical input and cannot ignore its padding."""
+    inp = _tensor([4, 16], DataType.FP32, valid=[2, 16])
+    with pytest.raises(ValueError, match="not provably fully valid"):
+        if form == "mask":
+            ir.op.tensor.gather(inp, mask_pattern=1)
+        else:
+            kvalue = ir.Var("k", ir.ScalarType(DataType.FP32), _SPAN_4F)
+            ir.op.tensor.gather(inp, kvalue=kvalue, cmp_mode="eq", out_cols=4)
 
 
 def test_4f_gather_fully_valid_stays_bare():
@@ -3824,7 +4115,7 @@ def test_4f_scatter_update_rejects_partial_input():
     inp = _tensor([16, 64], DataType.FP32, valid=[8, 64])
     idx = ir.Var("idx", ir.TensorType([2, 4], DataType.INT32), _SPAN_4F)
     src = ir.Var("src", ir.TensorType([8, 64], DataType.FP32), _SPAN_4F)
-    with pytest.raises(ValueError, match="partial valid_shape"):
+    with pytest.raises(ValueError, match="not provably fully valid"):
         ir.op.tensor.scatter_update(inp, -2, idx, src)
 
 
@@ -3834,8 +4125,17 @@ def test_4f_paged_gather_rejects_partial_input():
     src = _tensor([128, 128], DataType.FP16, valid=[64, 128])
     idx = ir.Var("idx", ir.TensorType([1, 8], DataType.INT32), _SPAN_4F)
     bt = ir.Var("bt", ir.TensorType([1, 8], DataType.INT32), _SPAN_4F)
-    with pytest.raises(ValueError, match="partial valid_shape"):
+    with pytest.raises(ValueError, match="not provably fully valid"):
         ir.op.tensor.paged_gather(src, idx, bt, block_size=128, size=128, max_indices=16)
+
+
+def test_4f_gather_row_rejects_partial_runtime_indexed_source():
+    """gather_row's runtime src_offset cannot prove that a partial source window
+    avoids padding, so the indirect GM read fails closed."""
+    acc = _tensor([16, 128], DataType.FP16)
+    src = _tensor([128, 128], DataType.FP16, valid=[64, 128])
+    with pytest.raises(ValueError, match="not provably fully valid"):
+        tensor.gather_row(acc, src, [0, 0], [0, 0], [1, 128])
 
 
 # --- dynamic (symbolic) valid region propagates ---
@@ -4017,6 +4317,25 @@ def test_tensor_slice_symbolic_offset_not_rejected():
     assert call.op.name == "tensor.slice"
 
 
+def test_tensor_slice_rank_mismatch_rejected_without_clamp():
+    """A rank-changing window has no backend representation; use drop_dims."""
+    with pytest.raises(ValueError, match="window rank to match the source tensor rank"):
+        tensor.slice(_mk_slice_tensor([100, 64]), [32], [0])
+
+
+def test_tensor_slice_negative_offset_rejected_without_clamp():
+    """Negative offsets are unsafe even on the bare/full-source path."""
+    with pytest.raises(ValueError, match=r"offset\[0\].*>= 0"):
+        tensor.slice(_mk_slice_tensor([100, 64]), [32, 64], [-1, 0])
+
+
+def test_tensor_slice_intersects_partial_source_without_clamp():
+    """The ordinary slice path cannot widen an already-partial source."""
+    src = _mk_slice_tensor([100, 64], valid=[40, 50])
+    result = tensor.slice(src, [32, 32], [20, 10]).type
+    assert _slice_valid_ints(result) == [20, 32]
+
+
 def test_tensor_slice_explicit_valid_shape_past_edge_accepted():
     """A past-edge slice that supplies a CORRECT explicit valid_shape is sound -> accept.
 
@@ -4088,9 +4407,9 @@ def test_tensor_slice_clamp_negative_offset_rejected():
     pre-origin, out-of-bounds padding). A narrow source reported [50,50] (exceeding its
     own 40 valid rows) and a fully-valid source reported the full [64,64]. Both reject.
     """
-    with pytest.raises(ValueError, match="offset is negative"):
+    with pytest.raises(ValueError, match="must be >= 0"):
         tensor.slice(_mk_slice_tensor([128, 64], valid=[40, 50]), [64, 64], [-10, 0], clamp=True)
-    with pytest.raises(ValueError, match="offset is negative"):
+    with pytest.raises(ValueError, match="must be >= 0"):
         tensor.slice(_mk_slice_tensor([128, 64]), [64, 64], [-10, 0], clamp=True)
 
 

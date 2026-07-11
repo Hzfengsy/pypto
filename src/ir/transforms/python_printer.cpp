@@ -940,10 +940,11 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
     std::string core_type = "mix";
     std::string mode = "soft";
     for (const auto& [key, val] : op->kwargs_) {
-      if (key == "core_type")
+      if (key == "core_type") {
         core_type = AnyCast<std::string>(val, "syncall core_type");
-      else if (key == "mode")
+      } else if (key == "mode") {
         mode = AnyCast<std::string>(val, "syncall mode");
+      }
     }
     const size_t used_idx = op->args_.size() - 1;
     stream_ << "mode=\"" << mode << "\", core_type=\"" << core_type << "\", gm_workspace=";
@@ -2528,7 +2529,7 @@ static std::unordered_map<const Var*, std::string> CollectDynVarMapping(const Pr
   };
 
   std::function<void(const TypePtr&)> collect_from_type = [&](const TypePtr& type) {
-    if (auto tensor_type = As<TensorType>(type)) {
+    if (auto tensor_type = AsTensorTypeLike(type)) {
       for (const auto& dim : tensor_type->shape_) {
         collect_vars_from_expr(dim);
       }
@@ -2741,7 +2742,11 @@ std::string IRPythonPrinter::PrintTileView(const TileView& tile_view, const std:
 
   // valid_shape — omit if it matches the parent tile's shape
   bool valid_shape_matches = tile_view_semantics::ShapeExprListsEquivalent(tile_view.valid_shape, tile_shape);
-  if (!valid_shape_matches) {
+  // An empty field is the canonical spelling of fully valid (D2), even when
+  // the surrounding TileView survives for stride/layout metadata. Do not emit
+  // ``valid_shape=[]``: it is redundant and older parser/printer contracts
+  // intentionally omit default fields.
+  if (!valid_shape_matches && !tile_view.valid_shape.empty()) {
     maybe_comma();
     oss << "valid_shape=[";
     for (size_t i = 0; i < tile_view.valid_shape.size(); ++i) {

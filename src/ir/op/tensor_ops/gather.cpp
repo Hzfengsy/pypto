@@ -138,6 +138,7 @@ TypePtr DeduceTensorGatherMaskType(const std::vector<ExprPtr>& args,
 
   CHECK(input_type->shape_.size() == 2)
       << "The operator " << op_name << " requires 2D input, but got rank " << input_type->shape_.size();
+  CheckTensorInputFullyValid(input_type, op_name, "input", args[0]->span_);
 
   int pattern = -1;
   for (const auto& [key, value] : kwargs) {
@@ -250,6 +251,7 @@ static TypePtr DeduceTensorGatherCompareType(const std::vector<ExprPtr>& args,
       << input_type->dtype_.ToString();
   CHECK(input_type->shape_.size() == 2)
       << "The operator " << op_name << " requires 2D input, but got rank " << input_type->shape_.size();
+  CheckTensorInputFullyValid(input_type, op_name, "input", args[0]->span_);
 
   auto kv_type = As<ScalarType>(args[1]->GetType());
   CHECK(kv_type) << "The operator " << op_name << " requires kvalue to be a ScalarType, but got "

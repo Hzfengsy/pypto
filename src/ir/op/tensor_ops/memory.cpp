@@ -34,6 +34,7 @@
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/transforms/printer.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/type_inference.h"
 
@@ -186,6 +187,13 @@ TypePtr DeduceTensorSliceType(const std::vector<ExprPtr>& args,
   auto offset_tuple_type = As<TupleType>(args[2]->GetType());
   CHECK(offset_tuple_type) << "tensor.slice requires offset to be TupleType, but got "
                            << args[2]->GetType()->TypeName();
+  CHECK(shape_tuple_type->types_.size() == tensor_type->shape_.size())
+      << "tensor.slice requires the slice window rank to match the source tensor rank, but got window rank "
+      << shape_tuple_type->types_.size() << " and source rank " << tensor_type->shape_.size()
+      << ". Use drop_dims for explicit rank reduction after a full-rank window.";
+  CHECK(offset_tuple_type->types_.size() == shape_tuple_type->types_.size())
+      << "tensor.slice requires offset and shape to have the same rank, but got offset rank "
+      << offset_tuple_type->types_.size() << " and shape rank " << shape_tuple_type->types_.size();
 
   // Validate all offset elements are ScalarType with integer dtype
   for (size_t i = 0; i < offset_tuple_type->types_.size(); ++i) {
@@ -226,6 +234,16 @@ TypePtr DeduceTensorSliceType(const std::vector<ExprPtr>& args,
     }
   }
 
+  // Negative offsets create a leading invalid gap and therefore cannot be
+  // represented by valid_shape. Enforce this independently of clamp/source view.
+  auto zero = std::make_shared<ConstInt>(0, DataType::INDEX, args[2]->span_);
+  for (size_t i = 0; i < offset.size(); ++i) {
+    const ProofResult non_negative = ProveValidExtentLessEqual(zero, offset[i]);
+    CHECK_SPAN(non_negative != ProofResult::kFalse, args[2]->span_)
+        << "tensor.slice: offset[" << i << "] must be >= 0 because the offset is negative (got "
+        << PythonPrint(offset[i]) << ")";
+  }
+
   // clamp=True: DERIVE the ragged tail from the source's valid
   // region rather than have the user hand-thread a ``min(TILE, N - i*TILE)``
   // extent. It also suppresses the static out-of-bounds check below — clamping is
@@ -240,8 +258,10 @@ TypePtr DeduceTensorSliceType(const std::vector<ExprPtr>& args,
 
   // Read optional pad_value kwarg (default PadValue::null = no padding).
   PadValue pad_value = PadValue::null;
+  bool pad_value_specified = false;
   for (const auto& [k, v] : kwargs) {
     if (k != "pad_value") continue;
+    pad_value_specified = true;
     CHECK(v.type() == typeid(PadValue))
         << "tensor.slice pad_value must be a PadValue enum, got " << v.type().name();
     pad_value = std::any_cast<PadValue>(v);
@@ -250,6 +270,10 @@ TypePtr DeduceTensorSliceType(const std::vector<ExprPtr>& args,
         << "tensor.slice pad_value has invalid enum value: " << static_cast<int>(pad_value);
     break;
   }
+  const PadValue result_pad =
+      pad_value_specified
+          ? pad_value
+          : (tensor_type->tensor_view_.has_value() ? tensor_type->tensor_view_->pad : PadValue::null);
 
   // valid_shape (4th arg): an empty MakeTuple means "no valid_shape" — that form
   // exists so callers can pass drop_dims (5th arg) without a custom valid_shape.
@@ -268,6 +292,14 @@ TypePtr DeduceTensorSliceType(const std::vector<ExprPtr>& args,
         CHECK(valid_shape_tuple->elements_.size() == full_shape.size())
             << "tensor.slice valid_shape rank " << valid_shape_tuple->elements_.size()
             << " must match shape rank " << full_shape.size() << " when drop_dims is set";
+        for (int64_t axis : drop_dims) {
+          const ProofResult dropped_full = ProveValidExtentEqual(
+              valid_shape_tuple->elements_[static_cast<size_t>(axis)], full_shape[static_cast<size_t>(axis)]);
+          CHECK_SPAN(dropped_full == ProofResult::kTrue, args[3]->span_)
+              << "tensor.slice: cannot drop axis " << axis
+              << " unless its unit extent is provably valid; dropping an empty or unproven axis would "
+                 "erase the fact that the result is empty";
+        }
         valid_shape = ApplyDropDims(valid_shape_tuple->elements_, drop_dims);
       }
       // Retain the full-rank explicit request as the per-dim valid_arg for the
@@ -294,15 +326,12 @@ TypePtr DeduceTensorSliceType(const std::vector<ExprPtr>& args,
   //                                 the real rows (the tail is declared padding).
   //   * ``pad_value`` set         — the user acknowledged the past-edge read and named
   //                                 the fill value.
-  // Two shapes are also NOT flagged even for a bare slice:
-  //   * A rank-changing slice (``full_shape`` rank != input rank) — shape / offset
-  //     live in different coordinate spaces, so a per-dim comparison is meaningless.
-  //   * A window intrinsically LARGER than the input dim (``shape[i] > input[i]``),
+  // A window intrinsically LARGER than the input dim (``shape[i] > input[i]``),
   //     i.e. a super-window over-view of a larger backing allocation; the check
   //     enforces that a claimed sub-window fits, it does not police over-views.
   const size_t in_rank = tensor_type->shape_.size();
   const bool tail_declared = clamp || has_valid_shape || pad_value != PadValue::null;
-  if (!tail_declared && full_shape.size() == in_rank && offset.size() == in_rank) {
+  if (!tail_declared) {
     for (size_t i = 0; i < in_rank; ++i) {
       auto off_c = As<ConstInt>(offset[i]);
       auto shp_c = As<ConstInt>(full_shape[i]);
@@ -318,30 +347,47 @@ TypePtr DeduceTensorSliceType(const std::vector<ExprPtr>& args,
     }
   }
 
-  // clamp=True: intersect the slice window with the source tensor's valid region
-  // (physical shape when unset, per D2) clipped at ``offset`` — the same
+  // Intersect with an already-partial source on every path; clamp=True extends
+  // the same rule to a fully-valid source so a physical ragged tail is derived.
+  // This is the same
   // ``min(valid_arg, clamp(src_valid - offset, 0, window))`` rule as tile.load /
   // tile.slice, so it NEVER widens. When an explicit valid_shape= is ALSO given it
   // becomes the per-dim valid_arg, so the two INTERSECT. Computed in the full
   // pre-drop_dims coordinate space, then reduced by drop_dims. A clamp that stays
   // fully valid (an interior slice into a fully-valid source) records no view,
   // matching a plain slice and the D2 "unset == fully valid" encoding.
-  if (clamp) {
+  const bool source_has_valid_region =
+      tensor_type->tensor_view_.has_value() && !tensor_type->tensor_view_->valid_shape.empty();
+  if (clamp || source_has_valid_region) {
     const std::vector<ExprPtr> src_valid = GetValidShape(tensor_type);
     CHECK_SPAN(src_valid.size() == full_shape.size() && offset.size() == full_shape.size(), args[0]->span_)
-        << "tensor.slice: clamp=True requires the slice shape (" << full_shape.size() << "), offset ("
-        << offset.size() << ") and input (" << src_valid.size()
-        << ") to share a rank so the valid region can be clipped dim-for-dim";
+        << "tensor.slice: a clamp or partial source requires the slice shape (" << full_shape.size()
+        << "), offset (" << offset.size() << ") and input valid_shape (" << src_valid.size()
+        << ") to share a rank so the valid region can be intersected dim-for-dim";
     std::vector<ExprPtr> clamped_full(full_shape.size());
     for (size_t i = 0; i < full_shape.size(); ++i) {
       const ExprPtr valid_arg = explicit_valid_full.empty() ? full_shape[i] : explicit_valid_full[i];
       clamped_full[i] =
           IntersectWindowValidDim(src_valid[i], offset[i], full_shape[i], valid_arg, args[0]->span_);
     }
+    for (int64_t axis : drop_dims) {
+      const ProofResult dropped_full = ProveValidExtentEqual(clamped_full[static_cast<size_t>(axis)],
+                                                             full_shape[static_cast<size_t>(axis)]);
+      CHECK_SPAN(dropped_full == ProofResult::kTrue, args[0]->span_)
+          << "tensor.slice: cannot drop axis " << axis
+          << " unless its unit extent is provably valid after intersecting the source; dropping an empty "
+             "or unproven axis would erase the fact that the result is empty";
+    }
     valid_shape = ApplyDropDims(clamped_full, drop_dims);
     has_valid_shape = !AreExprVectorsEqual(valid_shape, new_shape);
     if (!has_valid_shape) valid_shape.clear();
   }
+
+  // Validate the final region after clamp/drop-dims. Unknown symbolic bounds are
+  // intentionally preserved, while statically invalid extents fail during op
+  // deduction even when the structural verifier is disabled.
+  ValidateValidShapeBounds(has_valid_shape ? valid_shape : new_shape, new_shape, args[0]->span_,
+                           "tensor.slice");
 
   // View preserves dtype but has new shape (which can have different rank than input).
   // If valid_shape is provided or pad_value is set, build a TensorView. When the
@@ -350,9 +396,9 @@ TypePtr DeduceTensorSliceType(const std::vector<ExprPtr>& args,
   // allocation.
   std::optional<TensorView> result_tv;
   if (has_valid_shape) {
-    result_tv = TensorView({}, TensorLayout::ND, valid_shape, pad_value);
-  } else if (pad_value != PadValue::null) {
-    result_tv = TensorView(std::vector<ExprPtr>{}, TensorLayout::ND, std::vector<ExprPtr>{}, pad_value);
+    result_tv = TensorView({}, TensorLayout::ND, valid_shape, result_pad);
+  } else if (result_pad != PadValue::null) {
+    result_tv = TensorView(std::vector<ExprPtr>{}, TensorLayout::ND, std::vector<ExprPtr>{}, result_pad);
   }
   if (auto dt = As<DistributedTensorType>(args[0]->GetType())) {
     return std::make_shared<DistributedTensorType>(new_shape, tensor_type->dtype_, std::nullopt,
@@ -427,22 +473,14 @@ TypePtr DeduceTensorFillpadExpandType(const std::vector<ExprPtr>& args,
     }
   }
 
-  // After expand the entire destination is valid. Inherit the source view layout;
-  // only the (larger) shape, valid_shape, and pad change.
-  std::optional<TensorView> tensor_view = tensor_type->tensor_view_;
-  if (tensor_view.has_value()) {
-    tensor_view->valid_shape = new_shape;
-    tensor_view->pad = pad_value;
-  } else {
-    TensorView view;
-    view.valid_shape = new_shape;
-    view.pad = pad_value;
-    tensor_view = view;
-  }
-
-  // The destination is larger than the source, so it cannot share the source's
-  // backing buffer — return a fresh tensor (no inherited MemRef).
-  return std::make_shared<TensorType>(new_shape, tensor_type->dtype_, std::nullopt, std::move(tensor_view));
+  // The destination is a fresh allocation. Its full region is valid because the
+  // expansion writes both copied data and padding, but source stride/layout and
+  // MemRef are allocation-specific and must not leak onto the larger result.
+  TensorView tensor_view;
+  tensor_view.valid_shape = new_shape;
+  tensor_view.pad = pad_value;
+  return std::make_shared<TensorType>(new_shape, tensor_type->dtype_, std::nullopt,
+                                      std::make_optional(std::move(tensor_view)));
 }
 
 TypePtr DeduceTensorAssembleType(const std::vector<ExprPtr>& args,
@@ -505,29 +543,53 @@ TypePtr DeduceTensorAssembleType(const std::vector<ExprPtr>& args,
   }
 
   // The assembled result IS the target buffer after the write, so it preserves the
-  // target's view (stride/layout/pad) and memref. Only the valid region changes:
-  // the written region [offset, offset + valid(source)) unions per-dim with the
-  // target's existing valid region (never the full physical shape — that would
-  // claim padding is real data). Compute the union only when the target already
-  // carries an explicit narrowing valid region; a fully-valid target's union clamps
-  // straight back to the full shape (TensorType canonicalizes that away), so it is
-  // left untouched — this also avoids forcing source/offset ranks to match the
-  // target, which the create+assemble fuse path violates by assembling a lower-rank
-  // source into a fully-valid parent.
-  std::optional<TensorView> tensor_view = target_type->tensor_view_;
-  if (tensor_view.has_value() && !tensor_view->valid_shape.empty()) {
-    std::vector<ExprPtr> offset;
-    if (auto mt = As<MakeTuple>(args[2])) {
-      offset = mt->elements_;
-    } else {
-      offset.reserve(offset_tuple_type->types_.size());
-      for (size_t i = 0; i < offset_tuple_type->types_.size(); ++i) {
-        offset.push_back(std::make_shared<TupleGetItemExpr>(args[2], static_cast<int>(i), args[2]->span_));
-      }
+  // target's view (stride/layout/pad) and memref. Only the valid region changes.
+  // A lower-rank source is a right-aligned window: missing leading dimensions are
+  // physical and valid singletons. This is the same coordinate interpretation used
+  // by rank broadcasting, and lets the union/bounds proof run unconditionally rather
+  // than bypassing safety for the create+assemble fuse pattern.
+  CHECK_SPAN(source_type->shape_.size() <= target_type->shape_.size(), args[0]->span_)
+      << "tensor.assemble: source rank (" << source_type->shape_.size() << ") cannot exceed target rank ("
+      << target_type->shape_.size() << ")";
+
+  std::vector<ExprPtr> aligned_source_valid;
+  aligned_source_valid.reserve(target_type->shape_.size());
+  const size_t leading_dims = target_type->shape_.size() - source_type->shape_.size();
+  for (size_t i = 0; i < leading_dims; ++i) {
+    auto one = std::make_shared<ConstInt>(1, DataType::INDEX, args[1]->span_);
+    aligned_source_valid.push_back(one);
+  }
+  const std::vector<ExprPtr> source_valid = GetValidShape(source_type);
+  aligned_source_valid.insert(aligned_source_valid.end(), source_valid.begin(), source_valid.end());
+
+  std::vector<ExprPtr> offset;
+  if (auto mt = As<MakeTuple>(args[2])) {
+    offset = mt->elements_;
+  } else {
+    offset.reserve(offset_tuple_type->types_.size());
+    for (size_t i = 0; i < offset_tuple_type->types_.size(); ++i) {
+      offset.push_back(std::make_shared<TupleGetItemExpr>(args[2], static_cast<int>(i), args[2]->span_));
     }
-    tensor_view->valid_shape =
-        ComputeAssembleUnionValidShape(GetValidShape(target_type), GetValidShape(source_type), offset,
-                                       target_type->shape_, args[0]->span_, "tensor.assemble");
+  }
+
+  // Assemble transfers only the source's valid rectangle; physical padding in
+  // a larger source allocation is not written. Bounds must therefore use the
+  // aligned effective validity (for example a physical [16,16] source valid
+  // [8,8] may safely fill an [8,8] destination window).
+  ValidatePhysicalWindowBounds(aligned_source_valid, offset, target_type->shape_, args[0]->span_,
+                               "tensor.assemble");
+  std::vector<ExprPtr> out_valid =
+      ComputeAssembleUnionValidShape(GetValidShape(target_type), aligned_source_valid, offset,
+                                     target_type->shape_, args[0]->span_, "tensor.assemble");
+
+  std::optional<TensorView> tensor_view = target_type->tensor_view_;
+  if (!AreExprVectorsEqual(out_valid, target_type->shape_)) {
+    if (!tensor_view.has_value()) tensor_view = TensorView{};
+    tensor_view->valid_shape = std::move(out_valid);
+  } else if (tensor_view.has_value()) {
+    // Canonical full-valid encoding: preserve addressing/layout/pad metadata but
+    // remove a now-redundant validity field.
+    tensor_view->valid_shape.clear();
   }
 
   // When the target is a DistributedTensorType, the result preserves that kind

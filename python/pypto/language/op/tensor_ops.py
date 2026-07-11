@@ -396,6 +396,7 @@ def slice(
     valid_shape: Sequence[IntLike] | None = None,
     drop_dims: Sequence[int | Expr] | None = None,
     pad_value: PadValue | int | float | None = None,
+    *,
     clamp: bool = False,
 ) -> _TensorT:
     """Create a slice of a tensor with new shape and optional valid shape.
@@ -415,7 +416,7 @@ def slice(
             the literal sugars ``0``, ``math.inf``, ``-math.inf`` (same
             spelling as :func:`tensor.fillpad`). Only meaningful when
             ``valid_shape`` is smaller than ``shape``.
-        clamp: When ``True``, DERIVE the result's ``valid_shape`` from the source's
+        clamp: Keyword-only. When ``True``, DERIVE the result's ``valid_shape`` from the source's
             valid region (its physical shape when unset) clipped to the window at
             ``offset``. The ragged tail past the physical edge is clamped instead of
             triggering the out-of-bounds check; never widens, and intersects an

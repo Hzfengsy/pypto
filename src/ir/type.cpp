@@ -55,8 +55,21 @@ std::optional<MemorySpace> ValidateTileMemorySpaceConsistency(const std::optiona
 // state — required for lossless print/parse round-trip.
 void CanonicalizeTileViewInPlace(std::optional<TileView>& tile_view, const std::vector<ExprPtr>& shape,
                                  const std::optional<MemorySpace>& memory_space) {
-  if (tile_view.has_value() &&
-      tile_view_semantics::IsImplicitPrintedTileView(*tile_view, shape, memory_space)) {
+  if (!tile_view.has_value()) {
+    return;
+  }
+
+  // A full valid_shape is redundant independently of every other TileView field.
+  // Clear only that field first so non-default stride / layout / start_offset /
+  // pad metadata survives canonicalization.
+  if (!tile_view->valid_shape.empty() &&
+      tile_view_semantics::ShapeExprListsEquivalent(tile_view->valid_shape, shape)) {
+    tile_view->valid_shape.clear();
+  }
+
+  // Once the redundant valid_shape is removed, collapse the whole view only when
+  // the remaining fields match the implicit view for (shape, memory_space).
+  if (tile_view_semantics::IsImplicitPrintedTileView(*tile_view, shape, memory_space)) {
     tile_view.reset();
   }
 }

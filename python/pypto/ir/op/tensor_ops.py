@@ -295,8 +295,9 @@ def slice(
     valid_shape: list[int | Expr] | _ir_core.MakeTuple | None = None,
     drop_dims: Sequence[int | Expr] | None = None,
     pad_value: PadValue | int | float | None = None,
-    clamp: bool = False,
     span: Span | None = None,
+    *,
+    clamp: bool = False,
 ) -> Call:
     """Create a slice of a tensor with new shape and offset.
 
@@ -317,13 +318,13 @@ def slice(
             through unchanged and means "no padding". When omitted (``None``),
             the kwarg is not forwarded — the deducer defaults to
             ``PadValue.null``.
-        clamp: When ``True``, DERIVE the result's ``valid_shape`` from the source
+        span: Optional source span for debugging (auto-captured if not provided)
+        clamp: Keyword-only. When ``True``, DERIVE the result's ``valid_shape`` from the source
             tensor's valid region (its physical shape when unset) clipped to the
             slice window at ``offset`` — the ragged tail past the physical edge is
             clamped rather than rejected. Never widens; intersects with an explicit
             ``valid_shape`` when both are given. ``False`` (default) leaves the
             static out-of-bounds check active.
-        span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression creating a tensor slice

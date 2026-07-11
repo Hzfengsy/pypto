@@ -16,20 +16,22 @@ See also [`02-types.md`](02-types.md) for `TensorType` / `TileType` themselves.
 
 ## Core rules
 
-**D1 — tiles are physically 2-D.** A tile's physical shape is always `ConstInt`.
-Dynamism rides entirely on `valid_shape`, which may be a `ConstInt`, a `Var`, or a
-`Call` such as `pl.min(...)`. `FlattenTileNdTo2d` is the sole ND → 2-D lowering point,
-so PTO codegen reading only `valid_shape[0]` / `valid_shape[1]` is correct by
-construction.
+**D1 — backend tile buffers are physically 2-D.** Before `FlattenTileNdTo2D`, logical
+`TileType` values may be N-D. That pass is the stage boundary: afterward every
+`TileType` has rank at most 2 and `ConstInt` physical extents. PTO's `tile_buf` is
+always exactly 2-D; a logical rank-1 `[N]` tile is normalized to physical `[1, N]` by
+`ExtractTileTypeInfo`. Runtime dynamism rides on `valid_shape`, whose elements may be
+a `ConstInt`, a `Var`, or a `Call` such as `pl.min(...)`. This rank/static-extent rule
+is a post-flatten invariant, not a global constructor rule.
 
 **D2 — unset means fully valid.** An absent or empty `valid_shape` denotes the full
 physical shape.
 
-**Canonical encoding.** A `valid_shape` equal to the physical shape carries no
-information and is collapsed at construction, so exactly one in-memory form exists per
-semantic state. `TileType` resets the **whole** view (nothing else is meaningful on a
-fully-valid tile); `TensorType` clears only the `valid_shape` **field**, because
-`stride` / `layout` / `pad` remain independently meaningful.
+**Canonical encoding.** A `valid_shape` structurally equal to the physical shape
+carries no information, so its field is cleared at construction. The whole optional
+view is reset only when every remaining field matches the implicit view. This preserves
+independently meaningful `stride` / `layout` / `start_offset` / `pad` metadata on a
+fully-valid `TileType`, and `stride` / `layout` / `pad` on a `TensorType`.
 
 ```python
 from pypto import DataType, ir
@@ -44,6 +46,14 @@ assert full.tile_view is None
 ir.assert_structural_equal(
     full, ir.TileType([ci(128), ci(128)], DataType.FP32, None, None, ir.Mem.Vec))
 
+# A non-default tile view survives; only its redundant valid_shape is cleared.
+strided = ir.TileType(
+    [ci(128), ci(128)], DataType.FP32, None,
+    ir.TileView(valid_shape=[ci(128), ci(128)], stride=[ci(128), ci(1)]),
+    ir.Mem.Vec)
+assert len(strided.tile_view.valid_shape) == 0
+assert len(strided.tile_view.stride) == 2
+
 # TENSOR: only the valid_shape field is cleared; the stride/layout view survives.
 # A PARTIAL valid_shape (e.g. [32, 64]) is kept verbatim on either view.
 tv = ir.TensorView(stride=[ci(128), ci(1)], layout=ir.TensorLayout.ND,
@@ -52,14 +62,27 @@ t = ir.TensorType([ci(128), ci(128)], DataType.FP32, tensor_view=tv)
 assert len(t.tensor_view.valid_shape) == 0
 ```
 
-**Standing invariant** (always-on `TypeCheck` verifier): `rank(valid) == rank(shape)`
-and `0 <= valid[i] <= shape[i]` for every static dim (symbolic dims deferred). A
-`pl.load(valid_shapes=[999, 999])` on a `[128, 128]` tile is rejected.
+**Well-formedness invariant** (when the `TypeCheck` property verifier is enabled):
+`rank(valid) == rank(shape)` and `0 <= valid[i] <= shape[i]`. The arithmetic analyzer
+rejects every relation it can prove false; genuinely unknown symbolic bounds are
+deferred. Automatic property verification can be disabled with
+`VerificationLevel.None`, so this is not an always-on constructor guarantee. Operators
+that accept or derive a valid region also call `ValidateValidShapeBounds` at type
+inference boundaries and reject provable violations even when automatic verification is
+off. For example, `pl.load(valid_shapes=[999, 999])` on a `[128, 128]` tile is rejected.
 
 **`GetValidShape()` is the single source of truth**
 ([`include/pypto/ir/type_inference.h`](../../../../include/pypto/ir/type_inference.h)):
 it returns the view's `valid_shape` when set, else the physical `shape_`, so "unset"
 and "explicit-full" are indistinguishable to every consumer.
+
+**Fresh compute is not a view.** A newly computed value preserves the semantic
+effective `valid_shape`, but it must not accidentally inherit metadata belonging to the
+source allocation. Fresh tensor results use default ND layout, empty strides, and null
+padding. Fresh tile results retain only the block/scatter layout and fractal constraints
+needed to produce the result; source `stride`, `start_offset`, `memref`, and `pad` do not
+propagate. View-producing and in-place operations preserve or recompute alias/padding
+metadata only when their own contract intentionally requires it.
 
 ## Propagation and rejection
 
@@ -75,19 +98,28 @@ rather than defaulting to the full shape or to arg0's region. The shared helpers
 
 | Op family | `valid_shape` rule | Rejects (`CHECK_SPAN`) when |
 | --------- | ------------------ | --------------------------- |
-| `load(valid_shapes=)` | Sets it; **intersects** the source tensor's region; inherits `pad` | a negative (non-origin-anchored) window offset |
-| unary / cast / scalar-binary / move | Copy the input's region | — |
-| elementwise binary / multi-operand | Per-dim **agreement**: equal extents on non-broadcast dims; `valid_shape` never broadcasts | a provable static extent disagreement |
+| `load(valid_shapes=)` | Sets it; **intersects** the source tensor's region; inherits `pad` | window/source ranks differ; requested validity exceeds tile capacity; the requested transfer is out of the source allocation; or an offset is negative |
+| unary / cast / scalar-binary / move | Preserve the input's effective region on a fresh result | — |
+| elementwise binary / multi-operand | Per-dim **agreement**: non-broadcast contributors must be provably equal; `valid_shape` never broadcasts | equality is false **or unknown**; a broadcast singleton is not provably valid with extent 1 |
 | `part_add` / `part_mul` / `part_max` / `part_min` | Per-dim **union** (valid where *either* source is valid) | the union is not an origin-anchored rectangle |
 | reduction | Drop the reduced axis, keep the rest | — |
-| `matmul(A[M,K], B[K,N])` | `[valid(A)[M], valid(B)[N]]`; K must agree | a provable static K mismatch |
-| `assemble(target, source, off)` | Per-dim bounding box of the target + written rectangles | the union is not a provable origin-anchored rectangle (gap / L-shape / unprovable) |
-| `slice(clamp=True)` | Clip the window to the source region at `offset` (never widens) | a negative offset |
-| `reshape` | Map the region through the flattened buffer | the input region is not a contiguous flat prefix |
+| 2-D `matmul(A[M,K], B[K,N])` | `[valid(A)[M], valid(B)[N]]`; PTO contracts over `valid(A)[K]` | `valid(A)[K] <= valid(B)[K]` is false **or unknown** |
+| `tile.batch_matmul` | Broadcast the physical batch shape; propagate partial M/N and use the same directional K rule | any input batch axis is not provably fully valid, including unknown symbolic equality |
+| `assemble(target, source, off)` | Per-dim bounding box of the target + source-valid write rectangles | an offset is negative; the tensor-valid transfer (or tile physical subview) cannot fit the target; or the union is not a provable origin-anchored rectangle (gap / L-shape / unprovable) |
+| `slice(clamp=True)` | Clip the full-rank window to the source region at `offset` (never widens) | window/offset/source ranks differ, an offset is negative, or the effective valid transfer extends past the source allocation |
+| `slice(..., drop_dims=...)` | Erase only static physical unit axes whose post-intersection valid extent is provably 1 | a dropped axis is empty or its unit validity is unproven |
+| `reshape` | Map a contiguous flat prefix; inserting/removing provably-full physical unit axes preserves any rectangle exactly; an empty region stays empty | a genuine data-repartitioning reshape receives a non-prefix region, or a removed unit axis is not provably valid |
 | `transpose` / `extract` / `concat` | Permute / carve / stack the region | a `concat` non-final operand is partially valid (L-shape) |
-| `sort` / `mrgsort` | Full-shape output | a partially-valid input (padding would enter the compare) |
-| `store` | Writes exactly `valid(tile)` | — |
-| tensor→tile `load`; tensor compute ops | Inherit the source region / carry the view | same as the tile peer |
+| indexed / gather / scatter / sort families | Fail closed: every data, index, workspace, accumulator, or destination operand consumed as a full contract must be provably fully valid | any required operand is partial or full-valid equality is unknown |
+| AIV shard / gather boundary | The split axis must be provably fully valid; validity on non-split axes is preserved | partial or symbolically unknown split-axis validity |
+| `store` | Transfer exactly `valid(tile)`, or the explicit original-rank partition injected by flattening | transfer rank differs from the destination; an offset is provably negative; or `offset + transfer > destination` is provable |
+| tensor→tile `load`; tensor compute ops | Preserve the effective region across the boundary; fresh compute follows the metadata rule above | same proof obligations as the tile peer |
+
+Control-flow joins are part of the contract too. Every `if` branch yield and its
+declared return variable must agree on dtype, physical shape, effective `valid_shape`,
+and padding policy (`PadValue.null` for an absent view); loop-carried values obey the
+corresponding invariant. A symbolic validity equality that cannot be proven is rejected
+rather than allowing the join annotation to widen either path.
 
 ### Why `assemble` rejects
 
@@ -141,13 +173,14 @@ flat_row = i0*(d1*...*d_{k-2}) + i1*(d2*...*d_{k-2}) + ... + i_{k-2}
 
 The ND valid region is a **contiguous row prefix** — the only thing
 `(valid_row, valid_col)` can express — iff there is a single *free* row dim: reading the
-row dims most-significant first, every one before it is pinned (`valid[j] == 1`, so `i_j`
-is forced to 0 and contributes no stride) and every one after it is fully valid.
+row dims most-significant first, every one before it is either pinned by
+`valid[j] == 1` or physically unit-sized (`shape[j] == 1`, so a symbolic 0/1
+validity is only an empty/non-empty gate), and every one after it is fully valid.
 
 ```text
 exists f in [0, k-2] such that
-    valid[j] == 1           for all j <  f     // pinned: index forced to 0
-    valid[j] == shape[j]    for all f < j <= k-2
+    valid[j] == 1 OR shape[j] == 1  for all j < f
+    valid[j] == shape[j]            for all f < j <= k-2
 ```
 
 Under this precondition the product fold `Π(valid[0..k-2])` is exactly correct. A partial
@@ -158,9 +191,10 @@ Two worked examples. Shape `[16,4,8]` with valid `[1,2,8]`: `i0` is pinned, so
 Shape `[4,8,16]` with valid `[3,1,16]`: the free dim is `0` but `valid[1]=1 != 8`, so
 `flat_row = i0*8 ∈ {0,8,16}` — strided, and the fold would wrongly give `3`. ✗
 
-The pinning test is on `valid[j] == 1`, not `shape[j] == 1`: a `valid[j]` of 1 forces
-`i_j = 0` regardless of the physical extent. An **empty** region (any dim provably `0`) is
-trivially a prefix and folds to zero rows.
+A `valid[j]` of 1 pins the index regardless of physical extent. A physical unit axis is
+also safe when its validity is symbolic: the standing bounds invariant limits it to 0 or
+1, so it merely gates the whole flattened prefix. An **empty** region (any dim provably
+`0`) is trivially a prefix and folds to zero rows.
 
 See [`../passes/13-flatten_tile_nd_to_2d.md`](../passes/13-flatten_tile_nd_to_2d.md).
 
@@ -169,7 +203,7 @@ See [`../passes/13-flatten_tile_nd_to_2d.md`](../passes/13-flatten_tile_nd_to_2d
 | API | Purpose |
 | --- | ------- |
 | `pl.load(t, offs, shapes, valid_shapes=...)` | Attach a valid region to a loaded tile |
-| `pl.slice(x, shape, offset, valid_shape=..., clamp=...)` | Slice; `clamp=True` derives the ragged-tail extent |
+| `pl.slice(x, shape, offset, valid_shape=..., drop_dims=..., clamp=...)` | Full-rank slice; `drop_dims` explicitly erases valid unit axes and `clamp=True` derives the ragged-tail extent |
 | `pl.create_tile(shape, dtype, valid_shape=...)` | Create a tile with an explicit (possibly empty) region |
 | `pl.valid_dim(t, i)` | Compile-time query of the valid extent on axis `i` |
 | `pl.fillpad(t, pad_value=...)` | Fill the invalid region with a pad value |

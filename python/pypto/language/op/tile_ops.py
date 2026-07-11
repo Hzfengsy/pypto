@@ -585,6 +585,10 @@ def aiv_shard(x: _SplitOperandT, span: Span | None = None) -> _SplitOperandT:
     lowered 1:1 to ``tile.aiv_shard`` at ConvertTensorToTileOps). The Tensor form
     is region-only. Distributed tensors are not supported.
 
+    The selected split axis must be provably fully valid. Partial validity may
+    be carried only on the non-split axis because one shared boundary type
+    cannot encode different lane-local prefix lengths.
+
     Args:
         x: Input operand (2D Tile or Tensor)
         span: Optional source span
@@ -610,6 +614,10 @@ def aic_gather(x: _SplitOperandT, span: Span | None = None) -> _SplitOperandT:
     or a high-level ``Tensor`` (``@pl.jit`` / ``pl.spmd`` form -> ``tensor.aic_gather``,
     lowered 1:1 to ``tile.aic_gather`` at ConvertTensorToTileOps). The Tensor form
     is region-only. Distributed tensors are not supported.
+
+    The selected split axis must be provably fully valid. Partial validity may
+    be carried only on the non-split axis because one shared boundary type
+    cannot encode different lane-local prefix lengths.
 
     Args:
         x: Input operand (2D Tile or Tensor)
@@ -1769,6 +1777,7 @@ def slice(
     valid_shape: Sequence[IntLike] | None = None,
     drop_dims: Sequence[int | Expr] | None = None,
     pad_value: PadValue | int | float | None = None,
+    *,
     clamp: bool = False,
 ) -> Tile:
     """Create a slice of a tile with static shape and optional valid shape.
@@ -1790,7 +1799,7 @@ def slice(
             the literal sugars ``0``, ``math.inf``, ``-math.inf`` (same
             spelling as :func:`tile.fillpad`). Only meaningful when
             ``valid_shape`` is smaller than ``shape``.
-        clamp: When ``True``, clip the window to the source tile's valid region
+        clamp: Keyword-only. When ``True``, clip the window to the source tile's valid region
             (its physical shape when unset) at ``offset`` even for a fully-valid
             source, deriving a ragged tail past the physical edge instead of
             hand-threading it. Composes with the source-region intersect (single

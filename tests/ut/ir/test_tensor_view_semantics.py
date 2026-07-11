@@ -355,12 +355,37 @@ def test_tensor_valid_shape_cleared_preserves_stride_layout_pad():
 
 
 def test_tile_type_collapses_whole_view_when_full():
-    """Contrast: TileType resets the ENTIRE view to None when the explicit view
-    matches implicit full-tile semantics — there is no stride/layout/pad to keep
-    independently meaningful, so the whole optional is dropped."""
+    """TileType drops the whole view when every field matches implicit semantics."""
     tile_view = ir.TileView(valid_shape=_shape(128, 128), stride=[], start_offset=None)
     tile = ir.TileType(_shape(128, 128), DataType.FP32, None, tile_view)
     assert tile.tile_view is None
+
+
+def test_tile_full_valid_shape_cleared_preserves_nondefault_view_fields():
+    """A redundant full valid_shape is independent of other TileView metadata."""
+    start_offset = _const(7)
+    tile_view = ir.TileView(
+        valid_shape=_shape(128, 128),
+        stride=_stride(128, 1),
+        start_offset=start_offset,
+        blayout=ir.TileLayout.col_major,
+        slayout=ir.TileLayout.row_major,
+        fractal=1024,
+        pad=ir.PadValue.zero,
+    )
+    tile = ir.TileType(_shape(128, 128), DataType.FP32, None, tile_view, ir.MemorySpace.Vec)
+
+    assert tile.tile_view is not None
+    assert list(tile.tile_view.valid_shape) == []
+    assert _values_of(tile.tile_view.stride) == [128, 1]
+    assert _const_value(tile.tile_view.start_offset) == 7
+    assert tile.tile_view.blayout == ir.TileLayout.col_major
+    assert tile.tile_view.slayout == ir.TileLayout.row_major
+    assert tile.tile_view.fractal == 1024
+    assert tile.tile_view.pad == ir.PadValue.zero
+    # The stored field is canonical-empty, but D2 still makes the effective view
+    # fully valid for every consumer.
+    assert _values_of(tile.get_effective_tile_view().valid_shape) == [128, 128]
 
 
 if __name__ == "__main__":

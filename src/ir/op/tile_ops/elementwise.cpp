@@ -31,11 +31,13 @@
 
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/memory_space.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
+#include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/type_inference.h"
 
@@ -141,14 +143,19 @@ TypePtr DeduceTileOpElementwiseBinaryType(const std::vector<ExprPtr>& args,
     // strict agreement of true elementwise ops. Reuse the assemble-union rule with a
     // zero offset (it rejects a non-representable L-shaped union per the North Star,
     // and is symmetric in the two operands so operand order does not matter).
-    const std::vector<ExprPtr> src0_valid = GetValidShape(tile_type1);
-    const std::vector<ExprPtr> src1_valid = GetValidShape(tile_type2);
+    const std::vector<ExprPtr> src0_valid = LiftValidShapeForBroadcast(
+        tile_type1->shape_, GetValidShape(tile_type1), broadcast_result.shape, args[0]->span_, op_name);
+    const std::vector<ExprPtr> src1_valid = LiftValidShapeForBroadcast(
+        tile_type2->shape_, GetValidShape(tile_type2), broadcast_result.shape, args[0]->span_, op_name);
     const std::vector<ExprPtr> zero_offset(broadcast_result.shape.size(),
                                            std::make_shared<ConstInt>(0, DataType::INDEX, args[0]->span_));
     tile_view.valid_shape = ComputeAssembleUnionValidShape(src0_valid, src1_valid, zero_offset,
                                                            broadcast_result.shape, args[0]->span_, op_name);
-    InheritTileViewLayout(tile_view,
-                          PickElementwiseLayoutSource(broadcast_result.shape, {tile_type1, tile_type2}));
+    if (auto layout_source = PickElementwiseLayoutSource(broadcast_result.shape, {tile_type1, tile_type2})) {
+      InheritFreshTileComputeLayout(tile_view, layout_source);
+    } else {
+      tile_view.blayout = tile_view_semantics::InferImplicitTileLayoutFromShape(broadcast_result.shape);
+    }
   } else {
     // True elementwise binary: operands must AGREE on their valid regions (Q2 —
     // valid_shape never broadcasts); a broadcast operand is exempt in its broadcast
@@ -211,7 +218,7 @@ TypePtr DeduceTileOpScalarBinaryType(const std::vector<ExprPtr>& args,
   // scalar operand is implicitly narrowed to match the tile dtype at runtime.
   TileView tile_view;
   tile_view.valid_shape = GetValidShape(tile_type);
-  InheritTileViewLayout(tile_view, tile_type);
+  InheritFreshTileComputeLayout(tile_view, tile_type);
   return std::make_shared<TileType>(tile_type->shape_, tile_type->dtype_, std::nullopt, tile_view);
 }
 
@@ -241,7 +248,7 @@ TypePtr DeduceTileOpIntScalarBinaryType(const std::vector<ExprPtr>& args,
   // Result has the same shape and dtype as the input tile; the shift amount does not change element type.
   TileView tile_view;
   tile_view.valid_shape = GetValidShape(tile_type);
-  InheritTileViewLayout(tile_view, tile_type);
+  InheritFreshTileComputeLayout(tile_view, tile_type);
   return std::make_shared<TileType>(tile_type->shape_, tile_type->dtype_, std::nullopt, tile_view);
 }
 
@@ -758,7 +765,7 @@ TypePtr DeduceTileOpXorScalarType(const std::vector<ExprPtr>& args,
   // Result has the same shape and dtype as the input tile; bitwise ops do not change element type.
   TileView tile_view;
   tile_view.valid_shape = GetValidShape(tile_type);
-  InheritTileViewLayout(tile_view, tile_type);
+  InheritFreshTileComputeLayout(tile_view, tile_type);
   return std::make_shared<TileType>(tile_type->shape_, tile_type->dtype_, std::nullopt, tile_view);
 }
 
@@ -1210,13 +1217,14 @@ REGISTER_OP("tile.fillpad_expand")
       }
 
       // After expand the entire destination tile is valid (the padding region is
-      // filled). Inherit the source layout; only the shape and pad change.
+      // filled). This is a fresh allocation: retain only production
+      // layout/fractal constraints, never source addressing or alias identity.
       TileView tile_view;
       tile_view.valid_shape = new_shape;
-      InheritTileViewLayout(tile_view, tile_type);
+      InheritFreshTileComputeLayout(tile_view, tile_type);
       tile_view.pad = pad_value;
-      return std::make_shared<TileType>(new_shape, tile_type->dtype_, tile_type->memref_, tile_view,
-                                        tile_type->memory_space_);
+      return std::make_shared<TileType>(new_shape, tile_type->dtype_, std::nullopt, tile_view,
+                                        MemorySpace::Vec);
     });
 
 }  // namespace ir

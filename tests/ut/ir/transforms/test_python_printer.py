@@ -417,6 +417,32 @@ class TestDynVarAndSSARename:
         assert "M_1" not in src
         assert "N_1" not in src
 
+    def test_dynamic_distributed_tensor_metadata_declared_and_roundtrips(self):
+        """DTT shape and TensorView metadata contribute free dynamic declarations."""
+        span = ir.Span.unknown()
+        shape_dim = ir.Var("DTT_SHAPE", ir.ScalarType(DataType.INDEX), span)
+        valid_dim = ir.Var("DTT_VALID", ir.ScalarType(DataType.INDEX), span)
+        stride_dim = ir.Var("DTT_STRIDE", ir.ScalarType(DataType.INDEX), span)
+        tensor_view = ir.TensorView(
+            stride=[stride_dim],
+            layout=ir.TensorLayout.ND,
+            valid_shape=[valid_dim],
+            pad=ir.PadValue.min,
+        )
+        distributed_type = ir.DistributedTensorType([shape_dim], DataType.FP32, None, tensor_view)
+        assert distributed_type.window_buffer is None
+        value = ir.Var("value", distributed_type, span)
+        func = ir.Function("main", [value], [distributed_type], ir.ReturnStmt([value], span), span)
+        program = ir.Program([func], "DynamicDTT", span)
+
+        src = program.as_python()
+
+        assert 'DTT_SHAPE = pl.dynamic("DTT_SHAPE")' in src
+        assert 'DTT_VALID = pl.dynamic("DTT_VALID")' in src
+        assert 'DTT_STRIDE = pl.dynamic("DTT_STRIDE")' in src
+        reparsed = pl.parse_program(src)
+        ir.assert_structural_equal(reparsed, program)
+
     def test_ssa_shadowed_vars_get_unique_names(self):
         @pl.program
         class Prog:

@@ -82,6 +82,7 @@ TypePtr DeduceTensorSort32Type(const std::vector<ExprPtr>& args,
   // region (valid_shape North Star; mirrors tile_ops/sort.cpp). A fully-valid src
   // produces a fully-valid (bare) output, byte-identical to before.
   CheckTensorInputFullyValid(src_type, op_name, "src", args[0]->span_);
+  CheckTensorInputFullyValid(idx_type, op_name, "idx", args[1]->span_);
 
   std::vector<ExprPtr> output_shape(input_shape.begin(), input_shape.end() - 1);
   auto last_dim = input_shape.back();

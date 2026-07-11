@@ -25,7 +25,7 @@ Auto-selects between tensor and tile implementation based on input type.
 | `cast` | `(input: T, target_type: int \| DataType, mode="round") -> T` | Type cast (`mode`: none, rint, round, floor, ceil, trunc, odd) |
 | `reshape` | `(input: T, shape: Sequence[IntLike]) -> T` | Reshape to new dimensions |
 | `transpose` | `(input: T, axis1: int, axis2: int) -> T` | Swap two axes |
-| `slice` | `(input: T, shape: Sequence[IntLike], offset: Sequence[IntLike], valid_shape: Sequence[IntLike] \| None = None, clamp: bool = False) -> T` | Slice with offset. `valid_shape` narrows the result's valid region; `clamp=True` DERIVES a ragged tail — clips the window to the source's valid region at `offset` (never widens, intersects an explicit `valid_shape`) and suppresses the static out-of-bounds check |
+| `slice` | `(input: T, shape: Sequence[IntLike], offset: Sequence[IntLike], valid_shape: Sequence[IntLike] \| None = None, drop_dims: Sequence[int] \| None = None, *, clamp: bool = False) -> T` | Full-rank slice with offset. `drop_dims` explicitly erases listed static unit axes after proving their intersected valid extent is 1. `valid_shape` narrows the result; keyword-only `clamp=True` derives a ragged tail by clipping the window to the source's valid region at `offset` (never widens, and intersects an explicit `valid_shape`). A tile slice's effective valid transfer must fit its source allocation |
 | `valid_dim` | `(input: T, axis: int) -> Scalar` | Compile-time query of `valid_shape[axis]` as a `Scalar[INDEX]` (the physical extent when unset, per D2); `axis` must be in `[0, rank)`. Lets a kernel consume the ragged extent, e.g. divide a row-sum by the valid column count |
 | `matmul` | `(lhs: T, rhs: T, out_dtype=None, a_trans=False, b_trans=False, c_matrix_nz=False) -> T` | Matrix multiplication |
 | `matmul_acc` | `(acc: T, lhs: T, rhs: T, a_trans=False, b_trans=False) -> T` | Matrix multiply with accumulation: `acc += lhs @ rhs` |
@@ -45,6 +45,15 @@ Auto-selects between tensor and tile implementation based on input type.
 | `read` | `(src: T, offset: IntLike \| Sequence[IntLike]) -> Scalar` | Read scalar at indices (dispatched by source type). Sugar: `A[i, j]` |
 | `write` | `(dst: T, offset: IntLike \| Sequence[IntLike], value: Scalar) -> None` | Write scalar at indices (dispatched by destination type). Sugar: `A[i, j] = v` |
 
+`shape`, `offset`, and `valid_shape` are always full-rank. Scalar indexing is
+represented explicitly by putting a physical unit extent in `shape` and listing
+that axis in `drop_dims`; an empty or not-provably-valid unit axis cannot be
+dropped. Tile results retain the backend's minimum physical rank of 2. `clamp`
+is keyword-only on every slice API. The low-level `pypto.ir.op.tensor.slice` and
+`pypto.ir.op.tile.slice` functions additionally expose positional `drop_dims`,
+`pad_value`, and `span` slots in that order; `clamp` must still be written as a
+keyword.
+
 ## Tensor-Only (`pl.tensor.*`)
 
 Operate on `Tensor` objects (DDR memory).
@@ -55,7 +64,7 @@ Operate on `Tensor` objects (DDR memory).
 | `read` | `(tensor: Tensor, indices: IntLike \| Sequence[IntLike]) -> Scalar` | Read scalar at indices. Sugar: `A[i, j]` |
 | `write` | `(tensor: Tensor, indices: IntLike \| Sequence[IntLike], value: Scalar) -> None` | Write scalar at indices. Sugar: `A[i, j] = v` |
 | `dim` | `(tensor: Tensor, axis: int) -> Scalar` | Get dimension size (supports negative indexing) |
-| `slice` | `(tensor: Tensor, shape: Sequence[IntLike], offset: Sequence[IntLike], valid_shape=None, clamp=False) -> Tensor` | Slice. Sugar: `A[0:16, :]`. `valid_shape` / `clamp` as in the unified `pl.slice` (a bare past-edge slice without `clamp` / `valid_shape` / `pad_value` is a static out-of-bounds error) |
+| `slice` | `(tensor: Tensor, shape: Sequence[IntLike], offset: Sequence[IntLike], valid_shape=None, drop_dims=None, pad_value=None, *, clamp=False) -> Tensor` | Full-rank slice. Sugar: `A[0:16, :]`. `drop_dims`, `valid_shape`, and `clamp` follow unified `pl.slice`; `pad_value` selects reads outside the valid region. A bare past-edge slice without `clamp` / `valid_shape` / `pad_value` is a static out-of-bounds error |
 | `reshape` | `(tensor: Tensor, shape: Sequence[IntLike]) -> Tensor` | Reshape |
 | `transpose` | `(tensor: Tensor, axis1: int, axis2: int) -> Tensor` | Swap two axes |
 | `assemble` | `(target: Tensor, source: Tensor, offset: Sequence[IntLike], *, atomic: AtomicType = AtomicType.None_) -> Tensor` | Write source into target at offset. Sugar (pre-SSA only): `target[i:i+H, j:j+W] = source`. `atomic=AtomicType.Add` accumulates instead of overwriting (split-K) — only valid when the target is a function output (global memory); non-deterministic FP, target must be pre-zeroed, dtypes fp32/bf16/fp16/int32/int16/int8 (bf16 requires the Ascend910B/A2/A3 profile) |
@@ -260,7 +269,7 @@ scratch tile to materialize numeric results on A2/A3.
 
 | Name | Signature | Description |
 | ---- | --------- | ----------- |
-| `slice` | `(tile: Tile, shape: Sequence[IntLike], offset: Sequence[IntLike], valid_shape=None, clamp=False) -> Tile` | Slice (at most 2D). Sugar: `A[0:16, :]`. `valid_shape` / `clamp` as in the unified `pl.slice` |
+| `slice` | `(tile: Tile, shape: Sequence[IntLike], offset: Sequence[IntLike], valid_shape=None, drop_dims=None, pad_value=None, *, clamp=False) -> Tile` | Full-rank slice. Sugar: `A[0:16, :]`. `drop_dims`, `valid_shape`, `pad_value`, and `clamp` follow the tensor form; the effective valid transfer must fit the source allocation, while `clamp=True` or a fitting explicit tail may leave a physical invalid suffix. Dropping axes never lowers the physical result below rank 2. PTO lowers this as a pure subview, so a non-null slice `pad_value` is rejected at codegen; apply `pl.fillpad` to the sliced tile instead |
 | `reshape` | `(tile: Tile, shape: Sequence[IntLike]) -> Tile` | Reshape (at most 2D) |
 | `transpose` | `(tile: Tile, axis1: int, axis2: int) -> Tile` | Swap two axes |
 | `cast` | `(tile: Tile, target_type: DataType, mode="round") -> Tile` | Type cast |

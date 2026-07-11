@@ -161,6 +161,87 @@ std::optional<int64_t> GetConstantDimension(const ExprPtr& dim);
 bool DimensionsEqual(const ExprPtr& dim1, const ExprPtr& dim2);
 
 /**
+ * @brief Tri-state result for symbolic valid-extent proofs.
+ *
+ * ``kUnknown`` is intentionally distinct from ``kFalse``: callers that cannot
+ * emit a runtime guard must reject both, but diagnostics should explain whether
+ * the requested relation was disproved or merely could not be established.
+ */
+enum class ProofResult { kTrue, kFalse, kUnknown };
+
+/** @brief Prove that two valid extents are equal for every runtime value. */
+ProofResult ProveValidExtentEqual(const ExprPtr& lhs, const ExprPtr& rhs);
+
+/** @brief Prove that ``lhs <= rhs`` for every runtime value. */
+ProofResult ProveValidExtentLessEqual(const ExprPtr& lhs, const ExprPtr& rhs);
+
+/**
+ * @brief Validate the standing valid-shape rank and static-bounds invariant.
+ *
+ * Rejects rank mismatches and every statically provable violation of
+ * ``0 <= valid[i] <= shape[i]``. Symbolic relations that cannot be proved are
+ * deferred to the verifier/runtime contract rather than silently clamped.
+ */
+void ValidateValidShapeBounds(const std::vector<ExprPtr>& valid_shape,
+                              const std::vector<ExprPtr>& physical_shape, const Span& span,
+                              const std::string& op_name);
+
+/**
+ * @brief Validate that a physical window lies within its target allocation.
+ *
+ * Rejects rank mismatches, provably-negative offsets, and every provable
+ * ``offset[i] + window_shape[i] > target_shape[i]`` violation. Unknown symbolic
+ * relations defer to later verification/runtime guards. This checks the physical
+ * window, not merely its valid sub-region, which is required for subview safety.
+ */
+void ValidatePhysicalWindowBounds(const std::vector<ExprPtr>& window_shape,
+                                  const std::vector<ExprPtr>& offsets,
+                                  const std::vector<ExprPtr>& target_shape, const Span& span,
+                                  const std::string& op_name);
+
+/**
+ * @brief Lift an operand's origin-anchored valid box into broadcast-output coordinates.
+ *
+ * Shapes are right-aligned. A missing leading axis is an implicit valid singleton
+ * and therefore covers the output axis. An explicit physical singleton contributes
+ * ``valid * out_extent``: valid 1 covers the output axis, while valid 0 remains
+ * empty. Non-broadcast axes keep their original valid extent.
+ */
+std::vector<ExprPtr> LiftValidShapeForBroadcast(const std::vector<ExprPtr>& operand_shape,
+                                                const std::vector<ExprPtr>& operand_valid,
+                                                const std::vector<ExprPtr>& out_shape, const Span& span,
+                                                const std::string& op_name);
+
+/**
+ * @brief Map an origin-anchored valid box through a reshape without widening.
+ *
+ * Fully-valid inputs map to ``new_shape``. A partial input is accepted only when
+ * it denotes a contiguous flat prefix and that prefix is a rectangular box under
+ * ``new_shape``. Two exact exceptions do not repartition data: an empty input
+ * stays empty, and inserting/removing provably-full physical unit axes preserves
+ * any origin-anchored rectangle. Otherwise the relation is rejected because
+ * ``valid_shape`` cannot represent the reshaped region. Tensor and tile reshape
+ * share this rule.
+ */
+std::vector<ExprPtr> ComputeReshapeValidShape(const std::vector<ExprPtr>& src_valid,
+                                              const std::vector<ExprPtr>& in_shape,
+                                              const std::vector<ExprPtr>& new_shape, const Span& span,
+                                              const std::string& op_name);
+
+/**
+ * @brief Compute a 2-D column-concat valid box shared by tensor and tile ops.
+ *
+ * Valid rows must agree, and the first operand must be fully valid in columns so
+ * the second operand begins immediately after real data rather than after a gap.
+ * The final operand may have a trailing invalid column suffix.
+ */
+std::vector<ExprPtr> ComputeConcatValidShape(const std::vector<ExprPtr>& lhs_shape,
+                                             const std::vector<ExprPtr>& lhs_valid,
+                                             const std::vector<ExprPtr>& rhs_shape,
+                                             const std::vector<ExprPtr>& rhs_valid, const Span& span,
+                                             const std::string& op_name);
+
+/**
  * @brief Check if a dimension is broadcastable to another
  *
  * A dimension is broadcastable if:
@@ -210,6 +291,20 @@ inline void InheritTileViewLayout(TileView& dst, const std::shared_ptr<const Til
 }
 
 /**
+ * @brief Preserve only layout requirements on a freshly computed tile result.
+ *
+ * Block/scatter layout and fractal size constrain how the new result is produced.
+ * Source stride/start-offset are alias metadata, and source padding describes reads
+ * from the old allocation, so those fields intentionally remain at fresh defaults.
+ */
+inline void InheritFreshTileComputeLayout(TileView& dst, const std::shared_ptr<const TileType>& src) {
+  const TileView eff = tile_view_semantics::GetEffectiveTileView(*src);
+  dst.blayout = eff.blayout;
+  dst.slayout = eff.slayout;
+  dst.fractal = eff.fractal;
+}
+
+/**
  * @brief Return the source tile's effective valid_shape, falling back to its static shape.
  *
  * Same-shape elementwise tile ops (tile.neg, tile.muls, tile.cast, ...) must propagate
@@ -246,6 +341,25 @@ inline std::vector<ExprPtr> GetValidShape(const std::shared_ptr<const TensorType
     return t->tensor_view_->valid_shape;
   }
   return t->shape_;  // unset => fully valid
+}
+
+/**
+ * @brief Build the canonical view metadata for a freshly allocated tensor result.
+ *
+ * A compute result preserves the semantic valid box but does not alias its input
+ * allocation. Input strides/layout and padding policy therefore must not leak onto
+ * it: they describe how to address or read the source allocation, not the newly
+ * produced values. Fresh tensor compute results use the default ND layout, empty
+ * strides, and null padding. ``TensorType`` canonicalization removes this view when
+ * ``effective_valid_shape`` equals the physical result shape.
+ *
+ * View-producing operations (slice, reshape, and similar) intentionally do not
+ * use this helper; each derives whatever view metadata its own contract requires.
+ */
+inline std::optional<TensorView> MakeFreshTensorResultView(std::vector<ExprPtr> effective_valid_shape) {
+  TensorView result;
+  result.valid_shape = std::move(effective_valid_shape);
+  return result;
 }
 
 /**
@@ -312,9 +426,11 @@ ExprPtr IntersectWindowValidDim(const ExprPtr& src_valid, const ExprPtr& offset,
  * source (some ``source_valid`` dim == 0) writes nothing and returns
  * ``target_valid`` unchanged.
  *
- * The outer ``min`` clamps to the physical shape so the always-on
- * ``valid_shape[i] <= shape[i]`` verifier invariant holds even for a symbolic
- * write. When ``offset[i] + source_valid[i]`` and ``shape[i]`` are all
+ * The outer ``min`` clamps to the physical shape so the standing
+ * ``valid_shape[i] <= shape[i]`` invariant holds even for a symbolic write
+ * (operators enforce provable violations directly; ``TypeCheck`` also enforces
+ * it when property verification is enabled). When
+ * ``offset[i] + source_valid[i]`` and ``shape[i]`` are all
  * compile-time constants, an out-of-bounds write (the box would exceed the
  * physical shape) is a user error and is rejected via ``CHECK_SPAN``. When both
  * operands of a fold are ``ConstInt`` the result is folded to a single ``ConstInt``
@@ -340,15 +456,14 @@ std::vector<ExprPtr> ComputeAssembleUnionValidShape(const std::vector<ExprPtr>& 
                                                     const std::string& op_name);
 
 /**
- * @brief Reject a matmul whose contraction (K) valid extents provably disagree.
+ * @brief Require enough valid RHS rows for the LHS-selected contraction length.
  *
- * For ``C[M,N] = A[M,K] @ B[K,N]`` the cube accumulates over the *full physical* K.
- * When ``valid(A)[K-axis]`` and ``valid(B)[K-axis]`` differ, the operand carrying the
- * shorter valid K feeds unzeroed padding columns into the accumulation, silently
- * corrupting the result. A disagreement is therefore a user error and is rejected —
- * but only when it is *provable*: both extents ``ConstInt`` and unequal. Structurally
- * equal (``AreExprsEqual``) or otherwise symbolic K extents cannot be proved to
- * disagree — dynamic K is supported — and are accepted.
+ * PTO TMATMUL takes its contraction length from the LHS tile's valid column
+ * extent. The RHS must therefore provide at least that many valid rows:
+ * ``valid(lhs)[K] <= valid(rhs)[K]``. A provably-false relation is rejected as
+ * unsafe; an unprovable relation is also rejected because this type-inference
+ * path emits no runtime guard. Equal symbolic expressions and other relations
+ * established by the arithmetic analyzer remain supported.
  *
  * This validates the *valid* K extents, which may be narrower than the physical K the
  * caller already shape-checks; e.g. two ``128``-column operands where one carries an
@@ -376,11 +491,10 @@ void CheckMatMulValidKCompat(const ExprPtr& k_lhs_valid, const ExprPtr& k_rhs_va
  *
  * The output N extent is the INTERSECTION ``min(valid(B)[N], valid(bias)[N])`` — the
  * bias narrows the reported region but never widens it past the real bias columns (the
- * ``valid_shape`` North Star forbids marking padding as valid). A provably fully-padding
- * bias row (``valid(bias)[0]`` a ``ConstInt`` 0) makes every column's bias padding, so
- * the effective bias N — and thus the output N — is 0. The M extent is ``valid(A)[M]``,
- * unaffected by the bias (the row vector is broadcast down the rows). When both N
- * extents are ``ConstInt`` the ``min`` is folded to a single ``ConstInt``.
+ * ``valid_shape`` North Star forbids marking padding as valid). The singleton bias row
+ * must be provably valid (extent 1); zero or unknown row validity rejects because this
+ * path emits no runtime guard. The M extent is ``valid(A)[M]``, unaffected by the bias.
+ * When both N extents are ``ConstInt`` the ``min`` folds to a single ``ConstInt``.
  *
  * Shared by ``tile.matmul_bias`` and ``tile.gemv_bias`` (M = lhs axis 0, N = rhs axis 1).
  *
@@ -388,7 +502,7 @@ void CheckMatMulValidKCompat(const ExprPtr& k_lhs_valid, const ExprPtr& k_rhs_va
  * @param rhs_valid  rhs effective valid_shape (``GetValidShape(rhs)``); [K, N].
  * @param bias_valid bias effective valid_shape (``GetValidShape(bias)``); [1, N].
  * @param span       Source location for folded-constant provenance.
- * @return The 2-D output valid_shape [valid(A)[M], min(valid(B)[N], effective bias N)].
+ * @return The 2-D output valid_shape [valid(A)[M], min(valid(B)[N], valid(bias)[N])].
  */
 std::vector<ExprPtr> ComputeMatMulBiasValidShape(const std::vector<ExprPtr>& lhs_valid,
                                                  const std::vector<ExprPtr>& rhs_valid,
@@ -397,21 +511,17 @@ std::vector<ExprPtr> ComputeMatMulBiasValidShape(const std::vector<ExprPtr>& lhs
 /**
  * @brief Compute the output ``valid_shape`` of a broadcasting elementwise op.
  *
- * Per-dim agreement: ``valid_shape`` never broadcasts.
+ * Per-dim agreement: ``valid_shape`` never silently widens or narrows.
  *
  * The type-agnostic core of the valid-region agreement rule shared by
  * ``DeduceBroadcastElementwiseTileView`` (tile side) and the tensor-level
- * elementwise-binary deducer: **valid_shape NEVER broadcasts**. For each output
- * dim ``i``, an operand whose PHYSICAL ``shape[i] == 1`` while ``out_shape[i] != 1``
- * is a broadcast source there — fully valid by construction and EXEMPT from the
- * agreement check, contributing nothing to ``out_valid[i]``. Every other
- * (non-broadcast) operand CONTRIBUTES its ``valid[i]``; all contributors must be
- * EQUAL. A provable static disagreement (two differing ``ConstInt``) is a user
- * error rejected via ``CHECK_SPAN``; structurally-equal / symbolic extents cannot
- * be proved to disagree and are ACCEPTED (dynamic ``valid_shape`` keeps working).
- * ``out_valid[i]`` prefers a proven ``ConstInt`` (order-independent) over a symbolic
- * representative. Broadcasting is right-aligned (a lower-rank operand's leading dims
- * are implicit size-1 broadcast dims).
+ * elementwise-binary deducer. For each output dim ``i``, every non-broadcast
+ * operand contributes its valid extent and all contributors must be provably
+ * equal. An explicit physical singleton that broadcasts to a larger output dim
+ * is exempt only after its sole element is proved valid (``valid == 1``); an
+ * empty or symbolically-unknown singleton is rejected because every output cell
+ * would otherwise read padding. Missing leading axes are implicit valid
+ * singleton axes. Broadcasting is right-aligned.
  *
  * ``operand_shapes[k]`` / ``operand_valids[k]`` are operand ``k``'s physical shape and
  * effective valid_shape (``GetValidShape``). The returned vector has rank
@@ -434,9 +544,9 @@ std::vector<ExprPtr> ComputeBroadcastElementwiseValidShape(
  *
  * The tensor-side dual of ``tile_ops/sort.cpp``'s ``CheckSortInputFullyValid``.
  * Some ops have no way to prove the output valid region when an input is only
- * partially valid: a sort mixes padding into the valid region under comparison; a
- * scatter's per-element writes land at runtime indices; a non-2D matmul contracts
- * over the full physical K. Per the ``valid_shape`` North Star such a case is
+ * partially valid: a sort mixes padding into the valid region under comparison,
+ * while indirect writes such as scatter land at runtime indices. Per the
+ * ``valid_shape`` North Star such a case is
  * rejected rather than silently widened to the full shape. A canonicalized fully
  * valid input has ``GetValidShape == shape`` (its redundant view collapses to
  * empty), so this passes exactly the truly-full inputs.
@@ -453,20 +563,42 @@ void CheckTensorInputFullyValid(const std::shared_ptr<const TensorType>& t, cons
                                 const std::string& arg_desc, const Span& span);
 
 /**
+ * @brief Tile-side counterpart of ``CheckTensorInputFullyValid``.
+ *
+ * Use for tile operations whose semantics cannot safely consume or propagate a
+ * partial valid region (for example, indirect gather/scatter families). The
+ * diagnostic is a user error and suggests materializing padding first.
+ */
+void CheckTileInputFullyValid(const std::shared_ptr<const TileType>& t, const std::string& op_name,
+                              const std::string& arg_desc, const Span& span);
+
+/**
+ * @brief Require every explicitly-present batch axis to be provably full.
+ *
+ * Batch matmul lowering enumerates physical pages. Until it can guard a partial
+ * batch tail, accepting a partial or symbolically-unproved batch extent would
+ * address padding as a real matrix page. Matrix axes are checked separately.
+ */
+void CheckBatchAxesFullyValid(const std::vector<ExprPtr>& batch_shape,
+                              const std::vector<ExprPtr>& batch_valid, const Span& span,
+                              const std::string& op_name, const std::string& operand_name);
+
+/**
  * @brief Pick the "shaping" tile operand for result-layout inheritance.
  *
  * A broadcasting multi-operand tile op (``tile.add``, ``tile.sel``, ...) must take
- * its result ``blayout`` / ``slayout`` / ``pad`` from an operand whose PHYSICAL
+ * its result ``blayout`` / ``slayout`` / ``fractal`` from an operand whose PHYSICAL
  * shape equals the broadcast output shape — never from a shape-1 broadcast operand,
  * whose layout (e.g. the ``col_major`` a ``[N,1]`` tile infers) would otherwise leak
  * into a full-shaped result. Returns the first operand whose ``shape_`` equals
- * ``out_shape``; falls back to ``operands.front()`` when none is full-shaped (e.g.
- * two mutually-broadcasting ``[R,1]`` and ``[1,C]`` operands — no clearly-correct
- * layout, and ``front()`` is no worse than the old arg0 default).
+ * ``out_shape``. Returns null when none is full-shaped (for example mutually
+ * broadcasting ``[R,1]`` and ``[1,C]`` operands); callers must then infer the
+ * fresh result layout from ``out_shape`` itself so commutative operand order
+ * cannot change the result type.
  *
  * @param out_shape The broadcast output (result) physical shape.
  * @param operands  The value tile operands participating in the op.
- * @return The layout-source tile (never null; ``operands`` must be non-empty).
+ * @return The layout-source tile, or null when no operand owns the output shape.
  */
 std::shared_ptr<const TileType> PickElementwiseLayoutSource(
     const std::vector<ExprPtr>& out_shape, const std::vector<std::shared_ptr<const TileType>>& operands);
@@ -477,23 +609,15 @@ std::shared_ptr<const TileType> PickElementwiseLayoutSource(
  * Encapsulates the two 4e fixes for every true-elementwise deducer (binary, shift,
  * ternary, tri-tile, tile-scalar-tile, sel, sel-scalar, and the cmp/cmps mask):
  *
- * 1. **valid_shape agreement (valid_shape NEVER broadcasts).** For
- *    each output dim ``i``, an operand whose PHYSICAL ``shape[i] == 1`` while
- *    ``out_shape[i] != 1`` is a broadcast source there: it is fully valid by
- *    construction (``valid <= shape == 1``) and imposes NO constraint — EXEMPT from
- *    the agreement check and contributing nothing to ``out_valid[i]``. Every other
- *    (non-broadcast) operand CONTRIBUTES its ``valid[i]``; all contributors must be
- *    EQUAL. A provable static disagreement (two differing ``ConstInt``) is a user
- *    error and is rejected via ``CHECK_SPAN``; structurally-equal or merely-symbolic
- *    extents cannot be proved to disagree and are ACCEPTED (dynamic ``valid_shape``
- *    must keep working — mirrors the matmul K-compatibility rule). ``out_valid[i]``
- *    is the common contributor value, preferring a proven ``ConstInt`` (unique) over
- *    a symbolic representative so the choice is order-independent (commutative). A
- *    broadcast operand's own ``valid[i]`` — even a ``0`` empty extent — is discarded
- *    per "valid_shape never broadcasts"; the output takes the non-broadcast extent.
+ * 1. **valid_shape agreement.** Every non-broadcast contributor must be
+ *    provably equal. Unknown equality rejects because no runtime guard is
+ *    emitted. A physical singleton broadcasting to a larger dim is exempt only
+ *    when its valid extent is provably 1; a valid-zero or unknown singleton is
+ *    rejected rather than treated as real data.
  *
  * 2. **layout from the shaping operand** — via ``PickElementwiseLayoutSource``, never
- *    from a shape-1 broadcast operand.
+ *    from a shape-1 broadcast operand. Only layout/fractal requirements survive;
+ *    fresh results intentionally do not inherit source pad or alias metadata.
  *
  * ``operands`` lists ONLY the value tiles whose valid regions participate — exclude
  * scalar operands, ``tmp`` scratch tiles, and the ``sel`` predicate mask (whose
@@ -505,7 +629,7 @@ std::shared_ptr<const TileType> PickElementwiseLayoutSource(
  * @param operands  The value tile operands (non-empty).
  * @param span      Source location for CHECK_SPAN diagnostics.
  * @param op_name   Operator name for error messages (e.g. "tile.add").
- * @return The result TileView (agreed valid_shape + inherited layout).
+ * @return The result TileView (agreed valid_shape + inherited layout/fractal).
  */
 TileView DeduceBroadcastElementwiseTileView(const std::vector<ExprPtr>& out_shape,
                                             const std::vector<std::shared_ptr<const TileType>>& operands,
@@ -518,8 +642,10 @@ TileView DeduceBroadcastElementwiseTileView(const std::vector<ExprPtr>& out_shap
  *
  * Builds a mapping from Var dimensions in callee param types to the
  * corresponding dimensions in actual arg types, then substitutes those
- * Vars in each return type.  Handles TensorType (shape + tensor_view),
- * TileType (shape + tile_view), and TupleType (recursive).
+ * Vars in each return type. Handles TensorType and DistributedTensorType
+ * (shape + tensor_view, preserving distributed window identity), TileType
+ * (shape + tile_view), and TupleType (recursive). Substitution recursively
+ * rebuilds composite metadata expressions such as ``M + 1``.
  *
  * @param callee_params  Callee function parameter variables
  * @param args           Actual call argument expressions

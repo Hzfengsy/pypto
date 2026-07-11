@@ -63,7 +63,7 @@ TypePtr DeduceTensorOpElementwiseBinaryType(const std::vector<ExprPtr>& args,
                                   << FormatShape(tensor_type1->shape_) << " and "
                                   << FormatShape(tensor_type2->shape_);
 
-  TensorView view;
+  std::vector<ExprPtr> output_valid;
   if (partial_combine) {
     // Partial-combine ops (tensor.part_add/part_mul/part_max/part_min) copy whichever
     // source is valid where only one is, so the result is valid wherever EITHER source
@@ -73,12 +73,14 @@ TypePtr DeduceTensorOpElementwiseBinaryType(const std::vector<ExprPtr>& args,
     // union per the North Star and is symmetric in the two operands so operand order
     // does not matter). A fully-valid pair unions back to out_shape, which TensorType's
     // ctor collapses to a bare result.
-    const std::vector<ExprPtr> src0_valid = GetValidShape(tensor_type1);
-    const std::vector<ExprPtr> src1_valid = GetValidShape(tensor_type2);
+    const std::vector<ExprPtr> src0_valid = LiftValidShapeForBroadcast(
+        tensor_type1->shape_, GetValidShape(tensor_type1), broadcast_result.shape, args[0]->span_, op_name);
+    const std::vector<ExprPtr> src1_valid = LiftValidShapeForBroadcast(
+        tensor_type2->shape_, GetValidShape(tensor_type2), broadcast_result.shape, args[0]->span_, op_name);
     const std::vector<ExprPtr> zero_offset(broadcast_result.shape.size(),
                                            std::make_shared<ConstInt>(0, DataType::INDEX, args[0]->span_));
-    view.valid_shape = ComputeAssembleUnionValidShape(src0_valid, src1_valid, zero_offset,
-                                                      broadcast_result.shape, args[0]->span_, op_name);
+    output_valid = ComputeAssembleUnionValidShape(src0_valid, src1_valid, zero_offset, broadcast_result.shape,
+                                                  args[0]->span_, op_name);
   } else {
     // valid_shape agreement (valid_shape never broadcasts). Reuse the same
     // shared helper the tile-side elementwise deducers use so tensor and tile binaries
@@ -89,11 +91,11 @@ TypePtr DeduceTensorOpElementwiseBinaryType(const std::vector<ExprPtr>& args,
     std::vector<std::vector<ExprPtr>> operand_shapes = {tensor_type1->shape_, tensor_type2->shape_};
     std::vector<std::vector<ExprPtr>> operand_valids = {GetValidShape(tensor_type1),
                                                         GetValidShape(tensor_type2)};
-    view.valid_shape = ComputeBroadcastElementwiseValidShape(broadcast_result.shape, operand_shapes,
-                                                             operand_valids, args[0]->span_, op_name);
+    output_valid = ComputeBroadcastElementwiseValidShape(broadcast_result.shape, operand_shapes,
+                                                         operand_valids, args[0]->span_, op_name);
   }
   return std::make_shared<TensorType>(broadcast_result.shape, *result_dtype, std::nullopt,
-                                      std::make_optional(std::move(view)));
+                                      MakeFreshTensorResultView(std::move(output_valid)));
 }
 
 TypePtr DeduceTensorOpElementwiseScalarType(const std::vector<ExprPtr>& args,
@@ -117,11 +119,11 @@ TypePtr DeduceTensorOpElementwiseScalarType(const std::vector<ExprPtr>& args,
   CHECK(result_dtype) << "The operator " << op_name << " requires compatible data types, but got "
                       << args[0]->GetType()->TypeName() << " and " << args[1]->GetType()->TypeName();
 
-  // The scalar has no valid region of its own, so the result's valid region is the
-  // tensor operand's — carry its whole view. A bare input yields a
-  // bare result.
+  // The scalar has no valid region of its own, so preserve the tensor operand's
+  // effective valid box. This is a fresh allocation, so do not copy the source's
+  // alias-only strides/layout or padding policy.
   return std::make_shared<TensorType>(tensor_type1->shape_, *result_dtype, std::nullopt,
-                                      tensor_type1->tensor_view_);
+                                      MakeFreshTensorResultView(GetValidShape(tensor_type1)));
 }
 
 // ============================================================================

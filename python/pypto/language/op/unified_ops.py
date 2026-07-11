@@ -634,6 +634,7 @@ def slice(
     offset: Sequence[IntLike],
     valid_shape: Sequence[IntLike] | None = None,
     drop_dims: Sequence[int | _ir_core.Expr] | None = None,
+    *,
     clamp: bool = False,
 ) -> T:
     """Slice operation, dispatched by input type.
@@ -642,7 +643,7 @@ def slice(
     reduction); each must be a static unit dim of ``shape``. ``None`` / ``[]``
     drops nothing.
 
-    ``clamp=True`` DERIVES the result's ``valid_shape`` by clipping the window to
+    ``clamp=True`` is keyword-only and DERIVES the result's ``valid_shape`` by clipping the window to
     the source's valid region (its physical shape when unset) at ``offset``, so a
     ragged tail past the physical edge is computed rather than hand-threaded. It
     never widens, intersects with an explicit ``valid_shape``, and suppresses the

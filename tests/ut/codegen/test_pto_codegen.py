@@ -731,7 +731,17 @@ def test_pto_codegen_clamp_ragged_tail_narrows_tstore():
             return result
 
     mlir_code = _generate_default_mlir(ClampRaggedProgram)
-    tstore_line = _single_line(_get_mlir_lines(mlir_code), "pto.tstore", startswith=True)
+    lines = _get_mlir_lines(mlir_code)
+    tstore_line = _single_line(lines, "pto.tstore", startswith=True)
+    subview_line = _single_line(lines, "pto.subview")
+    assert " valid [" in subview_line, (
+        "clamp-derived validity must be materialized on pto.subview even when "
+        f"tile.slice has no explicit valid_shape operand, got: {subview_line}"
+    )
+    subview_result_type = subview_line.split("->", 1)[-1]
+    assert "v_row=?" in subview_result_type and "v_col=128" in subview_result_type, (
+        f"pto.subview result typing must come from the slice result TileType; got: {subview_line}"
+    )
     # The clamped ragged tail lowers to a dynamic <?x128xf32> store view.
     assert "!pto.partition_tensor_view<?x128xf32>" in tstore_line, (
         f"Expected the clamped ragged tail to lower to a dynamic <?x128xf32> tstore view, got: {tstore_line}"
@@ -1516,8 +1526,8 @@ class TestGenerateArgUnpacking:
         with ib.function("dyn_multi_var", type=ir.FunctionType.InCore) as f:
             t = f.param("t", ty)
             out = f.param("out", ty)
-            tile_t = ib.let("tile_t", tile.load(t, [0, 0], [16, 64]))
-            ret = ib.let("ret", tile.store(tile_t, [0, 0], out))
+            tile_t = ib.let("tile_t", tile.load(t, [0, 0, 0], [1, 16, 64]))
+            ret = ib.let("ret", tile.store(tile_t, [0, 0, 0], out))
             f.return_type(ty)
             ib.return_stmt(ret)
         func = f.get_result()
@@ -1664,10 +1674,11 @@ class TestGenerateArgUnpacking:
         ib = IRBuilder()
         with ib.function("dyn_unary_func", type=ir.FunctionType.InCore) as f:
             a = f.param("a", ty)
-            t = ib.let("t", tile.load(a, [0, 0], [16, 64]))
-            ret = ib.let("ret", t)
             f.return_type(ty)
-            ib.return_stmt(ret)
+            # This test exercises wrapper argument inversion only.  Keeping the
+            # deliberately non-invertible extent out of a memory operation avoids
+            # conflating that contract with tile.load's physical-window bounds.
+            ib.return_stmt(a)
         func = f.get_result()
 
         with pytest.raises(ValueError, match="non-invertible"):
@@ -2121,8 +2132,8 @@ def test_compile_writes_orchestration_on_partial_codegen_failure(tmp_path):
         def bad_kernel(
             self,
             a: pl.Tensor[[16, 16], pl.FP32],
-            output: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
-        ) -> pl.Tensor[[16, 1], pl.FP32]:
+            output: pl.Out[pl.Tensor[[1, 16], pl.FP32]],
+        ) -> pl.Tensor[[1, 16], pl.FP32]:
             tile = pl.load(a, offsets=[0, 0], shapes=[16, 16])
             result = pl.tile.sum(tile, axis=1)
             out = pl.store(result, offsets=[0, 0], output_tensor=output)

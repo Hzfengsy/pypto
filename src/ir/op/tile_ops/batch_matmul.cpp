@@ -17,10 +17,8 @@
  * supporting multi-dimensional tensors with batch dimensions.
  */
 
-#include <algorithm>
 #include <any>
 #include <cstddef>
-#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -42,73 +40,16 @@ namespace ir {
 
 namespace {
 
-/**
- * @brief Propagate batch-dim valid extents through a (possibly broadcasting) batch matmul.
- *
- * Mirrors ``BroadcastShapes`` on the *physical* batch dims but resolves the *valid*
- * extent per output batch dim: a size-1 (broadcast) operand dim contributes its
- * counterpart's valid extent; two full-extent dims must agree, and a provable
- * ``ConstInt`` disagreement is a user error (symbolic dims defer, matching the K
- * rule — never widen, but never falsely reject a dynamic extent either).
- *
- * Precondition: the physical batch shapes already broadcast (the caller verifies via
- * ``BroadcastShapes``); this only selects each output dim's valid extent. Right-aligned
- * like ``BroadcastShapes``, so ``lhs_batch_valid[i]`` pairs with ``lhs_batch_shape[i]``.
- */
 std::vector<ExprPtr> BroadcastBatchValidShape(const std::vector<ExprPtr>& lhs_batch_shape,
                                               const std::vector<ExprPtr>& lhs_batch_valid,
                                               const std::vector<ExprPtr>& rhs_batch_shape,
                                               const std::vector<ExprPtr>& rhs_batch_valid, const Span& span,
                                               const std::string& op_name) {
-  const size_t nl = lhs_batch_shape.size();
-  const size_t nr = rhs_batch_shape.size();
-  const size_t n = std::max(nl, nr);
-  std::vector<ExprPtr> out;
-  out.reserve(n);
-  for (size_t i = 0; i < n; ++i) {
-    const int64_t il = static_cast<int64_t>(nl) - 1 - static_cast<int64_t>(i);
-    const int64_t ir = static_cast<int64_t>(nr) - 1 - static_cast<int64_t>(i);
-    ExprPtr l_shape = (il >= 0) ? lhs_batch_shape[il] : nullptr;
-    ExprPtr l_valid = (il >= 0) ? lhs_batch_valid[il] : nullptr;
-    ExprPtr r_shape = (ir >= 0) ? rhs_batch_shape[ir] : nullptr;
-    ExprPtr r_valid = (ir >= 0) ? rhs_batch_valid[ir] : nullptr;
-    if (!l_shape) {  // dim present only on rhs
-      out.push_back(r_valid);
-      continue;
-    }
-    if (!r_shape) {  // dim present only on lhs
-      out.push_back(l_valid);
-      continue;
-    }
-    auto lc = As<ConstInt>(l_shape);
-    auto rc = As<ConstInt>(r_shape);
-    if (lc && lc->value_ == 1) {  // lhs broadcasts along this dim
-      // The sole lhs batch matrix is replicated across the counterpart's valid extent.
-      // But if that single matrix is itself padding (valid extent provably 0), every
-      // replicated output batch is garbage — the output valid extent is 0, NOT the
-      // counterpart's (which would widen padding into claimed-valid output batches).
-      auto lv = As<ConstInt>(l_valid);
-      out.push_back((lv && lv->value_ == 0) ? std::make_shared<ConstInt>(0, DataType::INDEX, span) : r_valid);
-      continue;
-    }
-    if (rc && rc->value_ == 1) {  // rhs broadcasts along this dim
-      auto rv = As<ConstInt>(r_valid);
-      out.push_back((rv && rv->value_ == 0) ? std::make_shared<ConstInt>(0, DataType::INDEX, span) : l_valid);
-      continue;
-    }
-    // Non-broadcast: both carry the full physical extent, so their valid extents must
-    // agree. Only a static-vs-static disagreement is provable; symbolic dims defer.
-    auto lv = As<ConstInt>(l_valid);
-    auto rv = As<ConstInt>(r_valid);
-    if (lv && rv) {
-      CHECK_SPAN(lv->value_ == rv->value_, span)
-          << op_name << ": lhs and rhs disagree on the valid extent of a non-broadcast batch "
-          << "dimension (lhs valid=" << lv->value_ << ", rhs valid=" << rv->value_ << ")";
-    }
-    out.push_back(l_valid);
-  }
-  std::reverse(out.begin(), out.end());
-  return out;
+  CheckBatchAxesFullyValid(lhs_batch_shape, lhs_batch_valid, span, op_name, "lhs");
+  CheckBatchAxesFullyValid(rhs_batch_shape, rhs_batch_valid, span, op_name, "rhs");
+  const BroadcastResult result = BroadcastShapes(lhs_batch_shape, rhs_batch_shape);
+  CHECK_SPAN(result.success, span) << op_name << ": cannot broadcast batch dimensions";
+  return result.shape;
 }
 
 }  // namespace
@@ -203,10 +144,9 @@ TypePtr DeduceTileBatchMatMulType(const std::vector<ExprPtr>& args,
   auto result_dtype =
       (lhs_type->dtype_.IsFloat() && rhs_type->dtype_.IsFloat()) ? DataType::FP32 : DataType::INT32;
 
-  // Propagate the valid region: for C[..,M,N] = A[..,M,K] @ B[..,K,N] the valid output
-  // is [broadcast(batch valid).., valid(A)[M-axis], valid(B)[N-axis]] — never the full
-  // physical shape, which would claim padding carries real data. M is lhs axis -2, N is
-  // rhs axis -1 (see the m_dim/n_dim assignment above).
+  // Batch pages must be provably full because ND-to-2D flattening cannot preserve
+  // partial batch axes. M/K/N remain independently partial: output M comes from lhs,
+  // output N from rhs, and directional K compatibility is checked below.
   const std::vector<ExprPtr> lhs_valid = GetValidShape(lhs_type);
   const std::vector<ExprPtr> rhs_valid = GetValidShape(rhs_type);
   CheckMatMulValidKCompat(lhs_valid[lhs_ndim - 1], rhs_valid[rhs_ndim - 2], args[0]->span_, op_name);
@@ -362,7 +302,8 @@ TypePtr DeduceTileBatchMatMulAccType(const std::vector<ExprPtr>& args,
   std::vector<ExprPtr> output_shape = acc_shape;
 
   // acc[..,M,N] += lhs[..,M,K] @ rhs[..,K,N] writes the matmul result in place at the
-  // origin. The written region is [broadcast(batch valid).., valid(lhs)[M], valid(rhs)[N]]
+  // origin. Batch pages of acc/lhs/rhs must be provably full before flattening; the
+  // written matrix region is [full broadcast batch.., valid(lhs)[M], valid(rhs)[N]]
   // (M is lhs axis -2, N is rhs axis -1); the result's valid region is the bounding box
   // (union) of the accumulator's existing region and that written rectangle — never the
   // full physical shape. Reuse the assemble union rule at offset = origin, which clamps
@@ -374,6 +315,8 @@ TypePtr DeduceTileBatchMatMulAccType(const std::vector<ExprPtr>& args,
   const std::vector<ExprPtr> rhs_valid = GetValidShape(rhs_type);
   CheckMatMulValidKCompat(lhs_valid[lhs_ndim - 1], rhs_valid[rhs_ndim - 2], args[0]->span_, op_name);
 
+  std::vector<ExprPtr> acc_batch_valid(acc_valid.begin(), acc_valid.end() - 2);
+  CheckBatchAxesFullyValid(acc_batch, acc_batch_valid, args[0]->span_, op_name, "acc");
   std::vector<ExprPtr> lhs_batch_valid(lhs_valid.begin(), lhs_valid.end() - 2);
   std::vector<ExprPtr> rhs_batch_valid(rhs_valid.begin(), rhs_valid.end() - 2);
   std::vector<ExprPtr> written_valid = BroadcastBatchValidShape(lhs_batch, lhs_batch_valid, rhs_batch,
