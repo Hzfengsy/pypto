@@ -845,7 +845,7 @@ class RetypeApplier : public IRMutator {
   }
 
   /// Re-anchor an inherit-input view (tile.transpose_view / reshape / slice /
-  /// set_validshape / tensor.as_layout, ...) onto its input's reused buffer when
+  /// set_validshape / tensor.view, ...) onto its input's reused buffer when
   /// the input was retargeted.  The planner never retargets a view's output
   /// directly (RetargetAssign declines OutputMemoryInheritsInput ops), so when its
   /// input (e.g. a tile.load) is retargeted onto a reused buffer, the view's

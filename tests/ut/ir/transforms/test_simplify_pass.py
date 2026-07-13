@@ -22,6 +22,7 @@ literals to pre-fold).
 """
 
 import pypto.language as pl
+import pypto.language.distributed as pld
 import pytest
 from pypto import ir, passes
 
@@ -716,6 +717,25 @@ class TestScalarConstantPropagation:
         after = passes.simplify()(Before)
         ir.assert_structural_equal(after, Expected)
 
+    def test_propagates_into_distributed_tensor_view_type(self):
+        """Simplified view shapes refresh DistributedTensorType metadata."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, x: pld.DistributedTensor[[4, 8], pl.FP32]):
+                n: pl.Scalar[pl.INDEX] = 2
+                _viewed = pl.tensor.view(x, [n * 2, 8])
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, x: pld.DistributedTensor[[4, 8], pl.FP32]):
+                _viewed = pl.tensor.view(x, [4, 8])
+
+        after = passes.simplify()(Before)
+        ir.assert_structural_equal(after, Expected)
+
     def test_folds_nested_arithmetic_in_call_args(self):
         """`K + 0` buried inside a tensor-op argument should fold to `K` even
         though Analyzer::Simplify does not recurse into Call/MakeTuple."""
@@ -1314,15 +1334,15 @@ class TestFoldComposition:
 
 
 # ============================================================================
-# tensor.as_layout folding (RFC #1300 P4-b)
+# tensor.view folding (RFC #1300 P4-b)
 # ============================================================================
 
 
-class TestAsLayoutFolding:
-    """Simplify drops identity ``tensor.as_layout`` reinterprets per RFC §3.3.
+class TestTensorViewFolding:
+    """Simplify drops identity ``tensor.view`` reinterprets per RFC §3.3.
 
-    ``pl.tensor.as_layout`` is a thin DSL wrapper over the internal
-    ``tensor.as_layout`` IR op — a recognised attribute of the ``pl.tensor``
+    ``pl.tensor.view`` is a thin DSL wrapper over the internal
+    ``tensor.view`` IR op — a recognised attribute of the ``pl.tensor``
     namespace — and the op round-trips through print→parse, so these stay
     style-A (Before/Expected ``@pl.program``) tests.
 
@@ -1330,16 +1350,16 @@ class TestAsLayoutFolding:
     the same physical buffer as ``[b, a]`` DN-packed. The trailing-dim swap
     is the canonical pair the validity check accepts.
 
-    Note on chain folding: folding ``as_layout(as_layout(x, ...), ...)`` →
-    ``as_layout(x, ...)`` is intentionally not implemented at this layer.
+    Note on chain folding: folding ``view(view(x, ...), ...)`` →
+    ``view(x, ...)`` is intentionally not implemented at this layer.
     After SSA the outer Call references its inner via a Var, not inline,
     so naive pointer inspection cannot see across the binding. A dedicated
     SSA-aware chain optimizer can be added if a real pipeline produces such
     chains.
     """
 
-    def test_eliminates_identity_as_layout(self):
-        """``as_layout(x, x.layout)`` simplifies to ``x``: target layout
+    def test_eliminates_identity_view(self):
+        """``view(x, x.layout)`` simplifies to ``x``: target layout
         matches source layout, so the call is a no-op."""
 
         @pl.program
@@ -1347,14 +1367,14 @@ class TestAsLayoutFolding:
             @pl.function
             def main(self, x: pl.Tensor[[8, 4], pl.FP32]) -> pl.Tensor[[8, 4], pl.FP32]:
                 # x is bare ND [8, 4]; flipping to ND is identity.
-                same: pl.Tensor[[8, 4], pl.FP32] = pl.tensor.as_layout(x, layout=pl.TensorLayout.ND)
+                same: pl.Tensor[[8, 4], pl.FP32] = pl.tensor.view(x, layout=pl.TensorLayout.ND)
                 return same
 
         @pl.program
         class Expected:
             @pl.function
             def main(self, x: pl.Tensor[[8, 4], pl.FP32]) -> pl.Tensor[[8, 4], pl.FP32]:
-                # 21f11ecb dropped the alias-fold: the as_layout Call still folds
+                # 21f11ecb dropped the alias-fold: the view Call still folds
                 # to ``x``, but the ``same = x`` residual is no longer removed.
                 same: pl.Tensor[[8, 4], pl.FP32, pl.TensorView(stride=[4, 1], layout=pl.TensorLayout.ND)] = x
                 return same
@@ -1373,7 +1393,7 @@ class TestAsLayoutFolding:
                 self, x: pl.Tensor[[8, 4], pl.FP32]
             ) -> pl.Tensor[[4, 8], pl.FP32, pl.TensorView(stride=[1, 4], layout=pl.TensorLayout.DN)]:
                 y: pl.Tensor[[4, 8], pl.FP32, pl.TensorView(stride=[1, 4], layout=pl.TensorLayout.DN)] = (
-                    pl.tensor.as_layout(x, layout=pl.TensorLayout.DN)
+                    pl.tensor.view(x, layout=pl.TensorLayout.DN)
                 )
                 return y
 

@@ -142,10 +142,10 @@ class SimplifyMutator : public arith::IRMutatorWithAnalyzer {
   /// Refresh the Call's result type_ so the in-memory IR matches what a
   /// fresh parse would produce (needed for roundtrip structural equality).
   ///
-  /// Also drops identity ``tensor.as_layout`` reinterprets per RFC #1300 §3.3:
-  ///   - ``as_layout(x, x.layout)`` → ``x`` (target layout matches source)
+  /// Also drops identity ``tensor.view`` reinterprets per RFC #1300 §3.3:
+  ///   - ``view(x, x.layout)`` → ``x`` (target layout matches source)
   ///
-  /// Chain folding (``as_layout(as_layout(x, L1), L2)`` → ``as_layout(x, L2)``)
+  /// Chain folding (``view(view(x, L1), L2)`` → ``view(x, L2)``)
   /// is intentionally not done at this layer: after SSA conversion the outer
   /// Call references its inner result via a Var binding, not inline, so a
   /// naive pointer inspection cannot see across the binding. A dedicated
@@ -154,8 +154,8 @@ class SimplifyMutator : public arith::IRMutatorWithAnalyzer {
   ExprPtr VisitExpr_(const CallPtr& op) override {
     auto base = IRMutator::VisitExpr_(op);
     auto call = std::dynamic_pointer_cast<const Call>(base);
-    if (IsOp(call, "tensor.as_layout")) {
-      base = SimplifyAsLayout(call);
+    if (IsOp(call, "tensor.view")) {
+      base = SimplifyTensorView(call);
     }
     auto new_type = SimplifyType(base->GetType());
     if (new_type.get() == base->GetType().get()) return base;
@@ -522,25 +522,28 @@ class SimplifyMutator : public arith::IRMutatorWithAnalyzer {
 
  private:
   /// Identity elimination per RFC #1300 §3.3:
-  /// ``as_layout(x, layout=x.layout)`` → ``x``.
+  /// ``view(x, layout=x.layout)`` → ``x``.
   ///
-  /// Drops a ``tensor.as_layout`` call when the requested target layout
+  /// Drops a ``tensor.view`` call when the requested target layout
   /// matches what the source already carries — the call is then a no-op
   /// metadata reinterpret and downstream consumers can use ``src`` directly.
-  /// (When layouts differ, ``as_layout`` performs the canonical-pair swap;
+  /// (When layouts differ, ``view`` performs the canonical-pair swap;
   /// such substantive reinterprets are preserved.)
   ///
-  /// Chain folding (``as_layout(as_layout(x, L1), L2)`` → ``as_layout(x, L2)``)
+  /// Chain folding (``view(view(x, L1), L2)`` → ``view(x, L2)``)
   /// is intentionally not implemented here. After SSA the outer Call's arg is
   /// a Var bound to the inner Call (not the inner Call inline), so naive
   /// pointer inspection cannot see across the binding. A dedicated SSA-aware
   /// chain optimizer can be added if real pipelines produce such chains.
-  ExprPtr SimplifyAsLayout(const std::shared_ptr<const Call>& call) {
+  ExprPtr SimplifyTensorView(const std::shared_ptr<const Call>& call) {
+    // Shape-only views (2 args: src + shape) are never identity folds --
+    // they reinterpret shape by design. Only layout-only views (1 arg)
+    // can be simplified when source and target layout are identical.
     if (call->args_.size() != 1) return call;
     auto src = call->args_[0];
 
-    auto src_tensor = As<TensorType>(src->GetType());
-    auto out_tensor = As<TensorType>(call->GetType());
+    auto src_tensor = AsTensorTypeLike(src->GetType());
+    auto out_tensor = AsTensorTypeLike(call->GetType());
     if (!src_tensor || !out_tensor) return call;
 
     // Bare TensorType is implicitly ND-packed.
@@ -585,7 +588,7 @@ class SimplifyMutator : public arith::IRMutatorWithAnalyzer {
   /// Returns the original TypePtr if nothing changed.
   TypePtr SimplifyType(const TypePtr& type) {
     if (!type) return type;
-    if (auto t = As<TensorType>(type)) {
+    if (auto t = AsTensorTypeLike(type)) {
       bool changed = false;
       auto new_shape = SimplifyExprVec(t->shape_, &changed);
       std::optional<TensorView> new_tv = t->tensor_view_;
@@ -600,6 +603,10 @@ class SimplifyMutator : public arith::IRMutatorWithAnalyzer {
         }
       }
       if (!changed) return type;
+      if (auto distributed = As<DistributedTensorType>(type)) {
+        return std::make_shared<DistributedTensorType>(std::move(new_shape), t->dtype_, t->memref_,
+                                                       std::move(new_tv), distributed->window_buffer_);
+      }
       return std::make_shared<TensorType>(std::move(new_shape), t->dtype_, t->memref_, std::move(new_tv));
     }
     if (auto t = As<TileType>(type)) {

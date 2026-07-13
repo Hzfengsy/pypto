@@ -17,6 +17,7 @@
 #include <cstring>
 #include <iomanip>
 #include <limits>
+#include <memory>
 #include <sstream>
 #include <string>
 
@@ -416,37 +417,21 @@ REGISTER_ORCHESTRATION_OP(tensor_transpose, ("tensor.transpose")) {
   return oss.str();
 }
 
-REGISTER_ORCHESTRATION_OP(tensor_as_layout, ("tensor.as_layout")) {
-  // tensor.as_layout(input, layout=...) — metadata reinterpret over the same
-  // physical buffer (RFC #1300 §3.3). The op is internal-only: passes inject
-  // it at orch ↔ InCore bridge sites so the downstream callee's IR-declared
-  // param type carries the new layout / canonical shape.
-  //
-  // **Lowering** (runtime strided-Tensor model, #808 — addressing is
-  // ``buffer.addr + (start_offset + Σ coords[i]·strides[i]) · elem_size``):
-  //
-  // - **Identity flip** (target layout == source layout): emit a plain
-  //   ``Tensor result = input;`` alias. ``DeduceTensorAsLayoutType`` also
-  //   keeps the shape unchanged in this case.
-  // - **Cross-layout flip** (ND ↔ DN, §4.2 canonical pair): lower to
-  //   ``input.transpose(ndim-2, ndim-1)``. The runtime ``Tensor::transpose``
-  //   swaps the trailing-pair ``shapes`` **and** ``strides`` together while
-  //   leaving ``start_offset`` untouched — exactly the post-flip view that
-  //   ``DeduceTensorAsLayoutType`` deduces (it trailing-pair-swaps both shapes
-  //   and strides). Because ``start_offset`` is preserved, strided/paged
-  //   sub-views (e.g. paged-attention's ``[block_offset, 0]`` slice into
-  //   ``key_cache``) keep pointing at the original physical region.
-  //
-  // (This reverses the pre-#808 lowering, which avoided ``transpose`` because the
-  // old helper swapped ``raw_shapes``/``offsets`` and shifted ``start_offset``;
-  // those fields are gone, so ``transpose`` is now the correct lowering.)
-  CHECK(op->args_.size() == 1) << "tensor.as_layout requires 1 arg (input) plus a 'layout' kwarg";
+REGISTER_ORCHESTRATION_OP(tensor_view, ("tensor.view")) {
+  // tensor.view(input[, shape], layout=...) is a metadata reinterpret over the
+  // same physical buffer. Runtime Tensor has no layout tag or arbitrary-stride
+  // constructor, so shape-changing orchestration views lower to reshape only
+  // for ND layouts. Layout-only keeps the legacy ND/DN alias/transpose
+  // behavior.
+  INTERNAL_CHECK_SPAN(op->args_.size() == 1 || op->args_.size() == 2, op->span_)
+      << "tensor.view requires 1 or 2 args (input[, shape])";
 
   std::string input_name = codegen.TryGetVarName(op->args_[0]);
-  CHECK(!input_name.empty()) << "tensor.as_layout input must be a variable";
+  INTERNAL_CHECK_SPAN(!input_name.empty(), op->span_) << "tensor.view input must be a variable";
 
-  auto input_type = As<TensorType>(op->args_[0]->GetType());
-  CHECK(input_type) << "tensor.as_layout input must be TensorType";
+  auto input_type = AsTensorTypeLike(op->args_[0]->GetType());
+  INTERNAL_CHECK_SPAN(input_type, op->span_)
+      << "tensor.view input must be TensorType or DistributedTensorType";
 
   TensorLayout src_layout =
       input_type->tensor_view_.has_value() ? input_type->tensor_view_->layout : TensorLayout::ND;
@@ -460,19 +445,42 @@ REGISTER_ORCHESTRATION_OP(tensor_as_layout, ("tensor.as_layout")) {
 
   std::string ext_input_name = codegen.GetExternalTensorName(input_name);
   std::string result_var = codegen.GetCurrentResultTarget();
-
   std::ostringstream oss;
+
+  if (op->args_.size() == 2) {
+    CHECK_SPAN(target_layout == src_layout, op->span_)
+        << "tensor.view orchestration lowering cannot combine shape reinterpret with layout change: "
+        << "runtime Tensor::reshape has no arbitrary-stride layout view; pass only a shape argument "
+        << "(no layout change) in orchestration code or lower the view through PTO in-core codegen";
+    CHECK_SPAN(src_layout == TensorLayout::ND && target_layout == TensorLayout::ND, op->span_)
+        << "tensor.view orchestration lowering only supports shape reinterpret for ND layout tensors: "
+        << "runtime Tensor::reshape assumes row-major contiguous storage; lower non-ND views through "
+        << "PTO in-core codegen";
+    auto shape_tuple = As<MakeTuple>(op->args_[1]);
+    auto tuple_type = As<TupleType>(op->args_[1]->GetType());
+    INTERNAL_CHECK_SPAN(tuple_type, op->span_) << "tensor.view shape must be TupleType";
+    size_t ndim = tuple_type->types_.size();
+    oss << "uint32_t " << result_var << "_shapes[" << ndim << "] = {";
+    for (size_t i = 0; i < ndim; ++i) {
+      if (i > 0) oss << ", ";
+      ExprPtr shape_dim =
+          shape_tuple ? shape_tuple->elements_[i]
+                      : std::make_shared<TupleGetItemExpr>(op->args_[1], static_cast<int>(i), op->span_);
+      oss << EmitAsUint32(shape_dim, codegen);
+    }
+    oss << "};\n";
+    oss << "Tensor " << result_var << " = " << ext_input_name << ".reshape(" << result_var << "_shapes, "
+        << ndim << ");";
+    return oss.str();
+  }
+
   if (target_layout == src_layout) {
-    // Identity flip: pure alias over the same physical buffer.
     oss << "Tensor " << result_var << " = " << ext_input_name << ";";
   } else {
-    // Cross-layout flip (ND ↔ DN, §4.2 canonical pair): swap the trailing pair
-    // via the runtime strided-Tensor transpose (shapes + strides swapped,
-    // start_offset preserved).
     int64_t ndim = static_cast<int64_t>(input_type->shape_.size());
     INTERNAL_CHECK_SPAN(ndim >= 2, op->span_)
-        << "Internal error: tensor.as_layout cross-layout flip reached codegen with rank=" << ndim
-        << "; DeduceTensorAsLayoutType is supposed to reject cross-layout flips below rank 2";
+        << "Internal error: tensor.view cross-layout flip reached codegen with rank=" << ndim
+        << "; DeduceTensorViewType is supposed to reject cross-layout flips below rank 2";
     oss << "Tensor " << result_var << " = " << ext_input_name << ".transpose(" << (ndim - 2) << ", "
         << (ndim - 1) << ");";
   }

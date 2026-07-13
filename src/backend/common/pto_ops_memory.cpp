@@ -201,7 +201,7 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
     const std::string one = codegen.GetOrEmitConstant(static_cast<int64_t>(1), DataType::INDEX);
     const std::string view2d = codegen.NewNamedTemp(tensor->name_hint_ + "_view2d");
     std::ostringstream mtv;
-    mtv << view2d << " = pto.make_tensor_view " << codegen.GetVarName(tensor) << ", shape = ["
+    mtv << view2d << " = pto.make_tensor_view " << codegen.GetTensorBasePtr(tensor) << ", shape = ["
         << view_shape[0] << ", " << view_shape[1] << "], strides = [" << view_shape[1] << ", " << one
         << "] {layout = #pto.layout<nd>}: !pto.tensor_view<?x?x" << dtype_str << ">";
     codegen.Emit(mtv.str());
@@ -772,36 +772,39 @@ void RegisterMemoryOps(Backend& backend, const std::unordered_set<std::string>& 
     return MakeTensorWriteCodegenPTO(op, codegen);
   });
 
-  // ``tensor.as_layout`` (RFC #1300 §3.3): pure metadata reinterpret over the
-  // same physical buffer. A compiler pass may prepend ``b_dn =
-  // tensor.as_layout(b, DN)`` at the top of an InCore body to bridge an
-  // ND ↔ DN view (``b_dn`` carries TensorType ``[..., b, a] DN`` with explicit
-  // canonical strides) and rewrite the body to use ``b_dn`` in place of ``b``.
+  // ``tensor.view`` (RFC #1300 section 3.3): pure metadata reinterpret over the
+  // same physical buffer. A compiler pass may prepend a view at the top of an
+  // InCore body to bridge layouts or reshape the logical tensor.
   //
   // Codegen lowers this to a fresh ``pto.make_tensor_view`` bound to the
   // input's underlying buffer (the function parameter SSA), using the LHS's
   // own ``(shape, stride, layout)`` from its TensorType. Downstream
   // ``tile.load`` lookups via ``GetOrCreateTensorView`` find the LHS through
-  // the ``RegisterTensorView`` call below.
-  reg("tensor.as_layout", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
+  // the ``RegisterTensorView`` call below. The LHS also aliases the input base
+  // pointer and CommContext so later tensor or distributed ops address the
+  // original storage.
+  reg("tensor.view", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
     auto& codegen = AsPto(codegen_base);
-    CHECK(op->args_.size() == 1) << "tensor.as_layout requires 1 arg (input)";
+    INTERNAL_CHECK_SPAN(op->args_.size() == 1 || op->args_.size() == 2, op->span_)
+        << "tensor.view requires 1 or 2 args (input[, shape])";
     auto input_var = AsVarLike(op->args_[0]);
-    CHECK(input_var) << "tensor.as_layout input must be a Var/IterArg";
+    INTERNAL_CHECK_SPAN(input_var, op->span_) << "tensor.view input must be a Var/IterArg";
 
     auto lhs_var = codegen.GetCurrentResultVar();
     INTERNAL_CHECK_SPAN(static_cast<bool>(lhs_var), op->span_)
-        << "Internal error: tensor.as_layout result var must be set by VisitStmt_(AssignStmt)";
-    auto lhs_type = As<ir::TensorType>(lhs_var->GetType());
-    CHECK(lhs_type) << "tensor.as_layout output must be TensorType, got " << lhs_var->GetType()->TypeName();
+        << "Internal error: tensor.view result var must be set by VisitStmt_(AssignStmt)";
+    auto lhs_type = ir::AsTensorTypeLike(lhs_var->GetType());
+    INTERNAL_CHECK_SPAN(lhs_type, op->span_)
+        << "tensor.view output must be TensorType or DistributedTensorType, got "
+        << lhs_var->GetType()->TypeName();
     INTERNAL_CHECK_SPAN(lhs_type->tensor_view_.has_value(), op->span_)
-        << "Internal error: tensor.as_layout output must have an explicit TensorView "
-           "(set by DeduceTensorAsLayoutType + CanonicalizeView)";
+        << "Internal error: tensor.view output must have an explicit TensorView "
+           "(set by DeduceTensorViewType + CanonicalizeView)";
 
     const size_t rank = lhs_type->shape_.size();
     const auto& view = lhs_type->tensor_view_.value();
     INTERNAL_CHECK_SPAN(view.stride.size() == rank, op->span_)
-        << "Internal error: tensor.as_layout output stride rank " << view.stride.size()
+        << "Internal error: tensor.view output stride rank " << view.stride.size()
         << " does not match shape rank " << rank;
 
     // The result SSA name (auto-allocated by VisitStmt_(AssignStmt) for the
@@ -809,7 +812,11 @@ void RegisterMemoryOps(Backend& backend, const std::unordered_set<std::string>& 
     // register it in tensor_to_view so downstream tile.load lookups resolve.
     std::string result_buf = codegen.GetCurrentResultTarget();
     INTERNAL_CHECK_SPAN(!result_buf.empty(), op->span_) << "Internal error: result buf must be set";
+    std::string input_base_ptr = codegen.GetTensorBasePtr(input_var);
     codegen.RegisterTensorView(lhs_var, result_buf);
+    codegen.RegisterVarToMlir(lhs_var, result_buf);
+    codegen.RegisterBasePtr(lhs_var, input_base_ptr);
+    codegen.RegisterCommCtxFor(lhs_var, codegen.GetCommCtxSSAFor(input_var.get()));
 
     // Materialize shape and stride SSA names.
     auto emit_dim = [&](const ir::ExprPtr& dim) -> std::string {
@@ -836,7 +843,7 @@ void RegisterMemoryOps(Backend& backend, const std::unordered_set<std::string>& 
     }
 
     std::ostringstream oss;
-    oss << result_buf << " = pto.make_tensor_view " << codegen.GetVarName(input_var) << ", shape = [";
+    oss << result_buf << " = pto.make_tensor_view " << input_base_ptr << ", shape = [";
     for (size_t j = 0; j < rank; ++j) {
       if (j > 0) oss << ", ";
       oss << shape_dim_names[j];
