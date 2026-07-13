@@ -1,6 +1,6 @@
 # CanonicalizeTileSlice Pass
 
-将 `tile.slice` 下沉 (lower) 为规范的 `tile.extract` 形式，使搬运统一走 `pto.textract`——既包括 Mat-resident 切片（折叠进 matmul / `tile.extract` 消费者），也包括动态偏移的 Vec 切片（为 `tile.col_expand_mul` / `tile.col_expand_add` 实例化，issue #1640）。
+将 `tile.slice` 下沉 (lower) 为规范的 `tile.extract` 形式，使搬运统一走 `pto.textract`——既包括 Mat-resident 切片（折叠进 matmul / `tile.extract` 消费者），也包括那些惰性实例化会破坏源 tile 的 Vec 切片（为 `tile.col_expand_*` 系列实例化，issue #1640、#2010）。
 
 ## 概览
 
@@ -8,7 +8,14 @@
 
 PTO ISA 支持 Mat 上的 `pto.subview` 作为零拷贝别名（无数据搬运），因此当消费者能直接接受 subview SSA 时，独立的 Mat slice 是合法的。但是，触发惰性实例化（通过 `MaterializeSubviewOperandIfNeeded`）的消费者会尝试生成 `loc=mat → loc=mat` 的 `pto.textract`——这是 Ascend 910C 等目标不支持的 L1→L1 DMA 路径。本 pass 为了效率，通过把可规范化消费者（extract/matmul）对应的 Mat-resident `tile.slice` 偏移折叠进消费者来消除这些 slice，随后删除已死的 slice。消费者不可规范化的 Mat slice（如 `tile.move`）保持原样——它会下沉为合法的 `pto.subview`。
 
-本 pass 还会规范化被 `tile.col_expand_mul` / `tile.col_expand_add` 消费的**动态偏移 Vec** `tile.slice`（issue #1640）。`pto.tcolexpandmul` / `pto.tcolexpandadd` 无法读取 `pto.subview` 操作数，因此 codegen 会通过 `pto.textract` 把该 slice 惰性实例化到 slice 自身的结果缓冲区。由于 `tile.slice` 继承其源 tile 的内存，而 `AllocateMemoryAddr` 无法把动态偏移编码为 `ConstInt` 地址，该缓冲区会退化到裸源基址——实例化于是把抽出的那一行写进源 tile 的第 0 行。把该操作数替换为新的 `tile.extract(..., target_memory=Vec)`（其结果获得独立、非继承的分配）即可消除别名。只有**动态**偏移是隐患：`AllocateMemoryAddr` 会把常量偏移折叠成 `base + off`，因此惰性 `pto.textract` 是一次恒等拷贝，常量偏移的 slice 保持原样。
+本 pass 还会规范化被 `tile.col_expand_*` 系列消费的 **Vec** `tile.slice`（issue #1640、#2010）。这些算子无法读取 `pto.subview` 操作数，因此 codegen 会通过 `pto.textract` 把该 slice 惰性实例化到 slice 自身的结果缓冲区——而由于 `tile.slice` 继承其源 tile 的内存，该缓冲区**位于仍然存活的源 tile 内部**。于是这次 extract 是在自己的输入上原地执行的，只有当它是一次**恒等拷贝**时才安全。这需要同时满足两个条件：
+
+| 条件 | 何时会不成立 |
+| ---- | ------------ |
+| 目标**地址**正确 | `AllocateMemoryAddr` 会把 `ConstInt` 偏移折叠成 `base + off`；但**动态**偏移无法编码为 `ConstInt` 地址，会退化到裸源基址——抽出的窗口于是落到源 tile 的第 0 行（#1640）。 |
+| 目标**布局**一致 | slice 缓冲区是稠密的（行间距 = slice 列数），而源窗口是跨步的（行间距 = 源列数）。二者只有在窗口**连续**时才相同：单行，或覆盖全部列。多行 tile 的列切片（`t[:, a:b]`）会在自己仍然存活的源上做 跨步 → 稠密 的重排并将其摧毁——只有第 0 行幸存，因为它的稠密目标地址恰好等于其源地址（#2010）。 |
+
+只要任一条件不成立，该操作数就会被替换为新的 `tile.extract(..., target_memory=Vec)`，其结果获得独立、非继承的分配。`tile.extract` 注册为 `not_inplace_safe()`，因此 [`MemoryReuse`](30-memory_reuse.md) 也不会把这块新缓冲区重新放回源 tile 上。若实例化本身就是恒等拷贝，则该 slice 保持原样——它继续共享源缓冲区，而不必付出一份重复分配的代价。
 
 **Pipeline 位置**：紧跟在 [`AutoTileMatmulL0`](14-auto_tile_matmul_l0.md) 之后（此时读取 batch-page slice 的逐迭代 `tile.extract` 已经存在），先于 [`InferTileMemorySpace`](16-infer_tile_memory_space.md)。
 
@@ -41,7 +48,7 @@ program_canon = passes.canonicalize_tile_slice()(program)
 2. **改写消费者 (Rewrite consumers)** —— 对每个 slice：
    - **`tile.extract(slice, ir, ic, shape)`**（仅 Mat slice） → `tile.extract(base, ir + off_row, ic + off_col, shape)`。extract 直接读取 slice 的源 tile；当两个加数都是 `ConstInt` 时对索引加法做常量折叠。
    - **`tile.matmul` / `tile.matmul_acc` / `tile.matmul_bias` 的操作数**（仅 Mat slice） → 该操作数被替换为一个新的 `tile.extract(base, off_row, off_col, slice_shape, target_memory=Left|Right)`——lhs 操作数用 `Left`，rhs 操作数用 `Right`。（`tile.matmul_acc` 的累加器操作数位于 `Acc`，永远不会是 Mat slice。）
-   - **`tile.col_expand_mul` / `tile.col_expand_add` 的操作数**（仅动态偏移 Vec slice） → 该操作数被替换为一个新的 `tile.extract(base, off_row, off_col, slice_shape, target_memory=Vec)`。两个操作数都会检查。常量（`ConstInt`）偏移的 slice 保持原样——`AllocateMemoryAddr` 会把它折叠成 `base + off`，因此惰性 `pto.textract` 是一次安全的恒等拷贝。
+   - **`tile.col_expand_*` 的操作数**（仅 Vec slice） → 当惰性 `pto.textract` 不是恒等拷贝时——即偏移是动态的，或窗口在基 tile 中不连续（行数大于 1 *且* 比基 tile 窄）——该操作数被替换为一个新的 `tile.extract(base, off_row, off_col, slice_shape, target_memory=Vec)`。两个操作数都会检查。常量偏移且窗口连续的 slice 保持原样。
 
 3. **删除死 slice (Drop dead slices)** —— 结果不再被任何使用者引用的 `tile.slice` 被删除。链式 slice（slice 的 slice）只有在消费它的那个 slice 被删除后才会变死，因此该步骤迭代至不动点（迭代次数以 slice 数量为上界）。结束时仍被使用的 slice，说明其消费者不被本 pass 规范化——保持原样，相对 pass 前的 IR 无回退。
 
@@ -111,6 +118,27 @@ row_ext: pl.Tile[[1, 256], pl.FP32, pl.Mem.Vec] = pl.tile.extract(
 scaled:  pl.Tile[[1, 256], pl.FP32, pl.Mem.Vec] = pl.tile.col_expand_mul(row_ext, gamma_t)
 ```
 
+### 多行 Vec tile 的列切片（#2010）
+
+`[16, 128]` tile 上的 `t[:, 64:128]` 是**常量**偏移的 slice，但它的窗口并不连续——16 行，只取源 128 列中的 64 列——因此同样需要实例化：
+
+**改写前 (Before)**：
+
+```python
+hi:     pl.Tile[[16, 64], pl.FP32, pl.Mem.Vec] = pl.tile.slice(t, [16, 64], [0, 64])
+scaled: pl.Tile[[16, 64], pl.FP32, pl.Mem.Vec] = pl.tile.col_expand_mul(hi, gamma_t)
+```
+
+**改写后 (After)**：
+
+```python
+hi_ext: pl.Tile[[16, 64], pl.FP32, pl.Mem.Vec] = pl.tile.extract(
+    t, 0, 64, shape=[16, 64], target_memory=pl.Mem.Vec)
+scaled: pl.Tile[[16, 64], pl.FP32, pl.Mem.Vec] = pl.tile.col_expand_mul(hi_ext, gamma_t)
+```
+
+若不做这次改写，`hi` 会在 `t + 256 B`（即 `t` 内部）分配一块稠密的 `[16, 64]` 缓冲区，惰性 `pto.textract` 一边读 `t` 一边把它的跨步列重排进去，从而覆盖掉 `t` 本身。最终只有第 0 行是正确的——这也正是同样的写法在单行 tile 上无害的原因。
+
 ## 实现
 
 **头文件**：`include/pypto/ir/transforms/passes.h`
@@ -137,10 +165,11 @@ scaled:  pl.Tile[[1, 256], pl.FP32, pl.Mem.Vec] = pl.tile.col_expand_mul(row_ext
 | -- | ---- |
 | 喂给 `tile.extract` 的 Mat-resident `tile.slice`（3 参数） | 折叠进 extract；删除 slice |
 | 喂给 matmul 族操作数的 Mat-resident `tile.slice`（3 参数） | 替换为 `tile.extract(target_memory=Left\|Right)`；删除 slice |
-| 喂给 `tile.col_expand_mul` / `tile.col_expand_add` 的动态偏移 Vec `tile.slice`（3 参数） | 替换为 `tile.extract(target_memory=Vec)`；删除 slice（#1640） |
-| 喂给 col-expand op 的常量（`ConstInt`）偏移 Vec `tile.slice` | 不处理（`AllocateMemoryAddr` 折叠成 `base + off`，惰性 textract 是安全的恒等拷贝） |
+| 喂给 `tile.col_expand_*` 的动态偏移 Vec `tile.slice`（3 参数） | 替换为 `tile.extract(target_memory=Vec)`；删除 slice（#1640——地址退化到裸源基址） |
+| 喂给 `tile.col_expand_*` 的常量偏移**非连续** Vec `tile.slice`（多行 *且* 比基 tile 窄，如 `t[:, a:b]`） | 替换为 `tile.extract(target_memory=Vec)`；删除 slice（#2010——稠密重排会写在自己仍然存活的源上） |
+| 喂给 `tile.col_expand_*` 的常量偏移**连续** Vec `tile.slice`（单行，或覆盖源的全部列） | 保持原样（惰性 textract 是安全的恒等拷贝；继续共享源缓冲区） |
 | 链式 Mat `tile.slice`（slice 的 slice） | 剥离；累加偏移 |
-| 带 `valid_shape` / `drop_dims` 的 `tile.slice` | 跳过（不是普通窗口） |
+| 带 `valid_shape` / `drop_dims` 的 `tile.slice` | 跳过（不是普通窗口）。若这样的 slice 同时不满足上述任一恒等拷贝条件——动态偏移（例如降秩的 `t[i]`）或非连续窗口——并喂给 col-expand op，codegen 会以 `INTERNAL_CHECK` 直接报错，而不是生成会破坏源 tile 的代码 |
 | 其他位于 Vec/Left/Right/Acc 的 `tile.slice` | 不处理（无匹配的消费者） |
 | 不含规范 `tile.slice` 的 function | 原样返回 |
 

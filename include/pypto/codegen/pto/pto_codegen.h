@@ -378,6 +378,19 @@ class PTOCodegen : public CodegenBase {
     std::string materialize_target_ssa;
     std::string materialize_target_type;
     std::optional<ir::MemorySpace> source_memory_space;
+    /// Column count of the tile the subview is taken of, and the subview's own
+    /// shape. The materialize target inherits the source's buffer, so the lazy
+    /// pto.textract writes into its own input: it is only safe when the window is
+    /// contiguous (view_rows == 1 or view_cols == source_cols) and the repack is
+    /// therefore an identity copy. See MaterializeSubviewOperandIfNeeded (#2010).
+    int64_t source_cols = 0;
+    int64_t view_rows = 0;
+    int64_t view_cols = 0;
+    /// Both slice offset components are ConstInt. A dynamic offset cannot be
+    /// folded into the inherited buffer's address, which then falls back to the
+    /// bare source base — so even a contiguous window would be extracted onto the
+    /// source's row 0. See MaterializeSubviewOperandIfNeeded (#1640).
+    bool const_offset = false;
     bool emitted = false;
   };
   void RegisterSubviewMaterialization(const std::string& subview_ssa, const SubviewMaterializationInfo& info);

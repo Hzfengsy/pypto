@@ -405,6 +405,43 @@ std::string MaterializeSubviewOperandIfNeeded(const ir::ExprPtr& expr, codegen::
          "would produce an unsupported Mat->Mat pto.textract (no L1->L1 DMA); "
          "the consumer should accept the subview SSA directly";
 
+  // The materialize target is the slice's own buffer, which inherits — and sits
+  // inside — the source allocation. The pto.textract therefore repacks in place
+  // over its own still-live input, and only survives that when it is an identity
+  // copy: the destination address must be right *and* its dense layout must
+  // match the source window's. CanonicalizeTileSlice rewrites every slice that
+  // fails either condition into a tile.extract with a fresh buffer, so reaching
+  // here with such a slice means it escaped that pass (e.g. it carries a
+  // valid_shape / drop_dims and is not a plain 3-arg window). Fail loudly rather
+  // than emit silently-wrong data.
+  //
+  // Address: a dynamic offset cannot be folded into the inherited buffer's
+  // ConstInt address, so the destination falls back to the bare source base and
+  // the extracted window lands on the source's row 0 (#1640).
+  INTERNAL_CHECK_SPAN(mat->const_offset, expr->span_)
+      << "Internal error: lazy pto.textract materialization of a dynamic-offset tile.slice would write the "
+         "extracted window onto its own live source's row 0: the source-inherited destination buffer cannot "
+         "encode a dynamic offset and falls back to the source base. CanonicalizeTileSlice must rewrite it "
+         "into a tile.extract with a fresh buffer";
+
+  // Layout: the destination is dense (row pitch = view cols) while the source
+  // window is strided (row pitch = source cols). These coincide only for a
+  // contiguous window — a single row, or one spanning every column. A column
+  // slice of a multi-row tile repacks strided -> dense on top of its source and
+  // destroys it (#2010).
+  //
+  // Note the check reads the *immediate* source's cols; for a slice of a slice
+  // the effective pitch is the root tile's. CanonicalizeTileSlice peels such
+  // chains, so a non-contiguous chain never reaches this path.  source_cols == 0
+  // means the source columns were not statically known — stand down rather than
+  // reject a shape we cannot reason about.
+  INTERNAL_CHECK_SPAN(mat->source_cols == 0 || mat->view_rows == 1 || mat->view_cols == mat->source_cols,
+                      expr->span_)
+      << "Internal error: lazy pto.textract materialization of a non-contiguous tile.slice window ("
+      << mat->view_rows << "x" << mat->view_cols << " of a tile with " << mat->source_cols
+      << " columns) would repack strided -> dense on top of its own live source and corrupt it. "
+         "CanonicalizeTileSlice must rewrite this slice into a tile.extract with a fresh buffer";
+
   auto result_type = mat->materialize_target_type;
   std::ostringstream extract;
   extract << "pto.textract ins(" << mat->source_ssa << ", " << mat->row_off_ssa << ", " << mat->col_off_ssa;

@@ -16,12 +16,15 @@ The pass lowers Mat-resident ``tile.slice`` into ``tile.extract``:
   extract index;
 * a ``tile.slice`` consumed by a ``tile.matmul`` family operand is replaced by
   a ``tile.extract(target_memory=Left|Right)``;
-* a *dynamic-offset* Vec ``tile.slice`` consumed by ``tile.col_expand_mul`` /
-  ``tile.col_expand_add`` is replaced by a ``tile.extract(target_memory=Vec)``
-  (issue #1640 — avoids the lazy ``pto.textract`` materializing into the slice's
-  source-aliasing buffer; a static-offset slice is left untouched because
-  ``AllocateMemoryAddr`` folds it to ``base + off``, making the textract a safe
-  identity copy).
+* a Vec ``tile.slice`` consumed by a ``tile.col_expand_*`` op is replaced by a
+  ``tile.extract(target_memory=Vec)`` whenever codegen's lazy ``pto.textract``
+  materialization into the slice's own (source-aliasing) buffer would not be an
+  identity copy — i.e. the offset is dynamic (issue #1640: the address falls back
+  to the bare source base) or the window is not contiguous in the source (issue
+  #2010: a column slice of a multi-row tile repacks strided -> dense on top of
+  its own live source). An identity-copy slice — const offset AND a contiguous
+  window (single row, or full source width) — is left untouched so it keeps
+  sharing the source buffer.
 
 The now-dead ``tile.slice`` is dropped. ``ir.assert_structural_equal`` with
 auto-mapping compares After against a hand-written Expected, so intermediate
@@ -33,10 +36,10 @@ Coverage:
   extracted inside it);
 * a slice with multiple ``tile.extract`` consumers;
 * a slice consumed directly by ``tile.matmul`` and ``tile.matmul_acc``;
-* a dynamic-offset Vec slice consumed by ``tile.col_expand_mul`` /
-  ``tile.col_expand_add`` (materialized), and static-offset slices — const
-  ``[0,0]`` and a sub-window const ``[5,0]`` — into ``col_expand_mul`` (left
-  untouched, since a const offset folds to ``base + off``);
+* Vec slices into ``col_expand_mul`` / ``col_expand_add`` — materialized when
+  hazardous (dynamic offset; static-offset column slice of a multi-row tile),
+  left untouched when the textract is an identity copy (const ``[0,0]``
+  full-shape; single-row ``[5,0]``; full-width multi-row ``[16,0]``);
 * no-op cases — no Mat slice, and a Vec-resident slice (left untouched).
 """
 
@@ -845,11 +848,95 @@ class TestSliceIntoColExpand:
 
         ir.assert_structural_equal(_run_pass(Before), Expected)
 
+    def test_static_offset_column_slice_of_multirow_tile_materialized(self):
+        """Regression for #2010: a *static*-offset COLUMN slice of a multi-row Vec
+        tile feeding ``tile.col_expand_mul`` is a hazard even though the offset is
+        const. Its own buffer is dense (row pitch 64) but aliases the source (row
+        pitch 128), so the lazy ``pto.textract`` would repack strided -> dense on
+        top of its own live source. The window is not contiguous (16 rows, 64 of
+        the source's 128 columns), so the pass materializes it through a fresh
+        ``tile.extract(target_memory=Vec)`` and drops the slice."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 128], pl.FP32],
+                gamma: pl.Tensor[[1, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                local: pl.Tile[[16, 128], pl.FP32, pl.Mem.Vec] = pl.tile.load(
+                    x, [0, 0], [16, 128], target_memory=pl.Mem.Vec
+                )
+                gamma_t: pl.Tile[[1, 64], pl.FP32, pl.Mem.Vec] = pl.tile.load(
+                    gamma, [0, 0], [1, 64], target_memory=pl.Mem.Vec
+                )
+                hi: pl.Tile[[16, 64], pl.FP32, pl.Mem.Vec] = pl.tile.slice(local, [16, 64], [0, 64])
+                scaled: pl.Tile[[16, 64], pl.FP32, pl.Mem.Vec] = pl.tile.col_expand_mul(hi, gamma_t)
+                out = pl.store(scaled, [0, 0], out)
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 128], pl.FP32],
+                gamma: pl.Tensor[[1, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                local: pl.Tile[[16, 128], pl.FP32, pl.Mem.Vec] = pl.tile.load(
+                    x, [0, 0], [16, 128], target_memory=pl.Mem.Vec
+                )
+                gamma_t: pl.Tile[[1, 64], pl.FP32, pl.Mem.Vec] = pl.tile.load(
+                    gamma, [0, 0], [1, 64], target_memory=pl.Mem.Vec
+                )
+                hi_ext: pl.Tile[[16, 64], pl.FP32, pl.Mem.Vec] = pl.tile.extract(
+                    local, 0, 64, shape=[16, 64], target_memory=pl.Mem.Vec
+                )
+                scaled: pl.Tile[[16, 64], pl.FP32, pl.Mem.Vec] = pl.tile.col_expand_mul(hi_ext, gamma_t)
+                out = pl.store(scaled, [0, 0], out)
+                return out
+
+        ir.assert_structural_equal(_run_pass(Before), Expected)
+
+    def test_static_row_slice_full_width_left_untouched(self):
+        """A static-offset multi-row slice spanning *every* column of its source is
+        contiguous in the source buffer: the slice's dense row pitch equals the
+        source's, so the lazy ``pto.textract`` is an identity copy that leaves the
+        source intact. The pass leaves it untouched (no duplicate buffer). This is
+        the boundary case against #2010's column slice."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                scores: pl.Tensor[[32, 64], pl.FP32],
+                gamma: pl.Tensor[[1, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                local: pl.Tile[[32, 64], pl.FP32, pl.Mem.Vec] = pl.tile.load(
+                    scores, [0, 0], [32, 64], target_memory=pl.Mem.Vec
+                )
+                gamma_t: pl.Tile[[1, 64], pl.FP32, pl.Mem.Vec] = pl.tile.load(
+                    gamma, [0, 0], [1, 64], target_memory=pl.Mem.Vec
+                )
+                rows: pl.Tile[[16, 64], pl.FP32, pl.Mem.Vec] = pl.tile.slice(local, [16, 64], [16, 0])
+                scaled: pl.Tile[[16, 64], pl.FP32, pl.Mem.Vec] = pl.tile.col_expand_mul(rows, gamma_t)
+                out = pl.store(scaled, [0, 0], out)
+                return out
+
+        ir.assert_structural_equal(_run_pass(Before), Before)
+
     def test_const_zero_offset_vec_slice_into_col_expand_left_untouched(self):
-        """A const-``[0,0]`` Vec ``tile.slice`` feeding ``tile.col_expand_mul`` is
-        NOT the #1640 hazard: ``AllocateMemoryAddr`` folds the const offset into
-        ``base + 0``, so the lazy ``pto.textract`` is a safe identity copy. The
-        pass leaves the slice untouched."""
+        """A const-``[0,0]`` full-shape Vec ``tile.slice`` feeding
+        ``tile.col_expand_mul`` is not a hazard: the offset is const (so
+        ``AllocateMemoryAddr`` folds it into ``base + 0``) and the window covers the
+        whole source (so the dense result pitch equals the source's). The lazy
+        ``pto.textract`` is a safe identity copy and the pass leaves the slice
+        untouched."""
 
         @pl.program
         class Before:
@@ -873,13 +960,13 @@ class TestSliceIntoColExpand:
 
         ir.assert_structural_equal(_run_pass(Before), Before)
 
-    def test_static_nonzero_offset_vec_slice_into_col_expand_left_untouched(self):
-        """A *static non-zero* offset Vec ``tile.slice`` feeding
-        ``tile.col_expand_mul`` is also NOT the #1640 hazard: ``AllocateMemoryAddr``
-        folds the const offset into ``base + off``, so the lazy ``pto.textract``
-        materializes the row into its own offset-correct address — an identity
-        copy that leaves the source intact. Only a *dynamic* offset falls back to
-        the bare base. The pass must leave this sub-window static slice untouched."""
+    def test_static_nonzero_offset_single_row_slice_left_untouched(self):
+        """A *static non-zero* offset **single-row** Vec ``tile.slice`` feeding
+        ``tile.col_expand_mul`` is not a hazard either: the const offset folds into
+        ``base + off``, and a one-row window is contiguous whatever its width, so
+        the lazy ``pto.textract`` materializes the row into its own offset-correct
+        address — an identity copy that leaves the source intact. The pass must
+        leave this sub-window static slice untouched."""
 
         @pl.program
         class Before:

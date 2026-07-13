@@ -1,6 +1,6 @@
 # CanonicalizeTileSlice Pass
 
-Lowers a `tile.slice` into the canonical `tile.extract` form so that movement is unified on `pto.textract` — both Mat-resident slices (folded into matmul / `tile.extract` consumers) and dynamic-offset Vec slices (materialized for `tile.col_expand_mul` / `tile.col_expand_add`, issue #1640).
+Lowers a `tile.slice` into the canonical `tile.extract` form so that movement is unified on `pto.textract` — both Mat-resident slices (folded into matmul / `tile.extract` consumers) and Vec slices whose lazy materialization would corrupt their source (materialized for the `tile.col_expand_*` family, issues #1640 and #2010).
 
 ## Overview
 
@@ -8,7 +8,14 @@ A `tile.slice` whose result tile is `Mem.Mat` is a legal high-level "sub-window 
 
 PTO ISA supports `pto.subview` on Mat as a zero-copy alias (no data movement), so a standalone Mat slice is valid when its consumer accepts the subview SSA directly. However, consumers that trigger lazy materialization (via `MaterializeSubviewOperandIfNeeded`) would attempt a `loc=mat → loc=mat` `pto.textract` — an unsupported L1→L1 DMA path on targets such as Ascend 910C. This pass eliminates Mat-resident `tile.slice` nodes whose consumers it can canonicalize (extract/matmul) by folding the offset into each consumer for efficiency, then drops the now-dead slice. A Mat slice with a consumer that is not canonicalized (e.g. `tile.move`) is left intact — it lowers to a valid `pto.subview`.
 
-The pass also canonicalizes a **dynamic-offset Vec** `tile.slice` consumed by `tile.col_expand_mul` / `tile.col_expand_add` (issue #1640). `pto.tcolexpandmul` / `pto.tcolexpandadd` cannot read a `pto.subview` operand, so codegen lazily materializes the slice via `pto.textract` into the slice's own result buffer. Because `tile.slice` inherits its source's memory, and `AllocateMemoryAddr` cannot encode a dynamic offset as a `ConstInt` address, that buffer falls back to the bare source base — the materialization then writes the extracted row into the source's row 0. Replacing the operand with a fresh `tile.extract(..., target_memory=Vec)` — whose result gets its own non-inherited allocation — removes the aliasing. Only **dynamic** offsets are the hazard: `AllocateMemoryAddr` folds a const offset into `base + off`, so the lazy `pto.textract` is an identity copy and a static-offset slice is left untouched.
+The pass also canonicalizes a **Vec** `tile.slice` consumed by the `tile.col_expand_*` family (issues #1640, #2010). Those ops cannot read a `pto.subview` operand, so codegen lazily materializes the slice via `pto.textract` into the slice's own result buffer — and because `tile.slice` inherits its source's memory, that buffer sits **inside the still-live source**. The extract therefore runs in place over its own input, which is only safe when it is an **identity copy**. Two conditions must hold:
+
+| Condition | Why it can fail |
+| --------- | --------------- |
+| The destination **address** is right | `AllocateMemoryAddr` folds a `ConstInt` offset into `base + off`, but a **dynamic** offset cannot be encoded as a `ConstInt` address and falls back to the bare source base — the extracted window lands on the source's row 0 (#1640). |
+| The destination **layout** matches | The slice's buffer is dense (row pitch = slice cols) while the source window is strided (row pitch = source cols). These coincide only for a **contiguous** window: a single row, or one spanning every column. A column slice of a multi-row tile (`t[:, a:b]`) repacks strided → dense on top of its own source and destroys it — only row 0 survives, because its dense destination happens to equal its source address (#2010). |
+
+When either condition fails, the operand is replaced by a fresh `tile.extract(..., target_memory=Vec)`, whose result gets its own non-inherited allocation. `tile.extract` is registered `not_inplace_safe()`, so [`MemoryReuse`](30-memory_reuse.md) cannot place that fresh buffer back onto the source either. A slice whose materialization *is* an identity copy is left untouched, so it keeps sharing the source buffer rather than paying for a duplicate allocation.
 
 **Pipeline position**: After [`AutoTileMatmulL0`](14-auto_tile_matmul_l0.md) (so the per-iter `tile.extract`s that read the batch-page slices already exist), before [`InferTileMemorySpace`](16-infer_tile_memory_space.md).
 
@@ -41,7 +48,7 @@ For each InCore-typed function, in three phases:
 2. **Rewrite consumers** — for each slice:
    - **`tile.extract(slice, ir, ic, shape)`** (Mat slices only) → `tile.extract(base, ir + off_row, ic + off_col, shape)`. The extract reads the slice's source directly; the index add is constant-folded when both terms are `ConstInt`.
    - **`tile.matmul` / `tile.matmul_acc` / `tile.matmul_bias` operand** (Mat slices only) → the operand is replaced by a fresh `tile.extract(base, off_row, off_col, slice_shape, target_memory=Left|Right)` — `Left` for the lhs operand, `Right` for the rhs. (The `tile.matmul_acc` accumulator operand is `Acc`-resident and never a Mat slice.)
-   - **`tile.col_expand_mul` / `tile.col_expand_add` operand** (dynamic-offset Vec slices only) → the operand is replaced by a fresh `tile.extract(base, off_row, off_col, slice_shape, target_memory=Vec)`. Both operands are checked. A static (`ConstInt`) offset is left untouched — `AllocateMemoryAddr` folds it into `base + off`, so the lazy `pto.textract` is a safe identity copy.
+   - **`tile.col_expand_*` operand** (Vec slices only) → when the lazy `pto.textract` would not be an identity copy — a dynamic offset, or a window that is not contiguous in the base tile (more than one row *and* narrower than the base) — the operand is replaced by a fresh `tile.extract(base, off_row, off_col, slice_shape, target_memory=Vec)`. Both operands are checked. Contiguous const-offset windows are left untouched.
 
 3. **Drop dead slices** — a `tile.slice` whose result no longer has any use is removed. A chained slice only becomes dead once the slice consuming it is dropped, so this iterates to a fixpoint (bounded by the slice count). A slice still used at the end had a consumer this pass does not canonicalize; it is left intact — no regression versus the pre-pass IR.
 
@@ -111,6 +118,27 @@ row_ext: pl.Tile[[1, 256], pl.FP32, pl.Mem.Vec] = pl.tile.extract(
 scaled:  pl.Tile[[1, 256], pl.FP32, pl.Mem.Vec] = pl.tile.col_expand_mul(row_ext, gamma_t)
 ```
 
+### Column slice of a multi-row Vec tile (#2010)
+
+`t[:, 64:128]` on a `[16, 128]` tile is a *static*-offset slice, but its window is not contiguous — 16 rows, 64 of the source's 128 columns — so it is materialized too:
+
+**Before**:
+
+```python
+hi:     pl.Tile[[16, 64], pl.FP32, pl.Mem.Vec] = pl.tile.slice(t, [16, 64], [0, 64])
+scaled: pl.Tile[[16, 64], pl.FP32, pl.Mem.Vec] = pl.tile.col_expand_mul(hi, gamma_t)
+```
+
+**After**:
+
+```python
+hi_ext: pl.Tile[[16, 64], pl.FP32, pl.Mem.Vec] = pl.tile.extract(
+    t, 0, 64, shape=[16, 64], target_memory=pl.Mem.Vec)
+scaled: pl.Tile[[16, 64], pl.FP32, pl.Mem.Vec] = pl.tile.col_expand_mul(hi_ext, gamma_t)
+```
+
+Without the rewrite, `hi` allocates a dense `[16, 64]` buffer at `t + 256 B` — inside `t` — and the lazy `pto.textract` repacks `t`'s strided columns into it, overwriting `t` as it reads it. Only row 0 comes back correct, which is why the same construct is harmless on a single-row tile.
+
 ## Implementation
 
 **Header**: `include/pypto/ir/transforms/passes.h`
@@ -137,10 +165,11 @@ scaled:  pl.Tile[[1, 256], pl.FP32, pl.Mem.Vec] = pl.tile.col_expand_mul(row_ext
 | -- | ------ |
 | Mat-resident `tile.slice` (3-arg) feeding `tile.extract` | Folded into the extract; slice dropped |
 | Mat-resident `tile.slice` (3-arg) feeding a matmul-family operand | Replaced by `tile.extract(target_memory=Left\|Right)`; slice dropped |
-| Dynamic-offset Vec `tile.slice` (3-arg) feeding `tile.col_expand_mul` / `tile.col_expand_add` | Replaced by `tile.extract(target_memory=Vec)`; slice dropped (#1640) |
-| Static (`ConstInt`) offset Vec `tile.slice` feeding a col-expand op | Untouched (`AllocateMemoryAddr` folds `base + off`, so the lazy textract is a safe identity copy) |
+| Dynamic-offset Vec `tile.slice` (3-arg) feeding a `tile.col_expand_*` op | Replaced by `tile.extract(target_memory=Vec)`; slice dropped (#1640 — the address falls back to the bare source base) |
+| Static-offset **non-contiguous** Vec `tile.slice` (multi-row *and* narrower than its base, e.g. `t[:, a:b]`) feeding a `tile.col_expand_*` op | Replaced by `tile.extract(target_memory=Vec)`; slice dropped (#2010 — the dense repack would run on top of its own live source) |
+| Static-offset **contiguous** Vec `tile.slice` (single row, or full source width) feeding a `tile.col_expand_*` op | Untouched (the lazy textract is a safe identity copy; keeps sharing the source buffer) |
 | Chained Mat `tile.slice` (slice of a slice) | Peeled; offsets accumulated |
-| `tile.slice` with `valid_shape` / `drop_dims` | Skipped (not a plain window) |
+| `tile.slice` with `valid_shape` / `drop_dims` | Skipped (not a plain window). If such a slice *also* fails either identity-copy condition above — a dynamic offset (e.g. a rank-reducing `t[i]`) or a non-contiguous window — while feeding a col-expand op, codegen rejects it with an `INTERNAL_CHECK` rather than emitting the source-corrupting materialization |
 | Other Vec/Left/Right/Acc-resident `tile.slice` | Untouched (no matching consumer) |
 | Functions with no canonical `tile.slice` | Returned unchanged |
 

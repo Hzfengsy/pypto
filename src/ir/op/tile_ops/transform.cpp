@@ -645,6 +645,13 @@ REGISTER_OP("tile.extract")
     .add_argument("shape", "Static destination shape (TupleType, 2D MakeTuple of ConstInt)")
     .set_attr<MemorySpace>("target_memory")
     .set_output_memory_from_kwarg("target_memory", MemorySpace::Vec)
+    // pto.textract repacks a strided window of src (row pitch = src cols) into a
+    // dense dst (row pitch = dst cols) while reading src.  With dst on src's
+    // buffer that repack runs in place, and whether a row's write clobbers a
+    // source row the extract has not read yet depends on the DMA's internal
+    // ordering — an assumption the ISA does not give us.  Forbid the aliasing
+    // outright so MemoryReuse never places the output on an input buffer (#2010).
+    .not_inplace_safe()
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTileExtractType(args, kwargs);

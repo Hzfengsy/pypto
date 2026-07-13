@@ -41,20 +41,30 @@
 ///     the lhs operand, Right for the rhs).  This is the same Mat->Left/Right
 ///     extract that ``AutoTileMatmulL0`` emits for tiled matmuls.
 ///
-/// It also canonicalizes a **dynamic-offset Vec** ``tile.slice`` consumed by
-/// ``tile.col_expand_mul`` / ``tile.col_expand_add`` (issue #1640).
-/// ``pto.tcolexpandmul`` / ``pto.tcolexpandadd`` cannot read a ``pto.subview``
-/// operand, so codegen lazily materializes the slice via ``pto.textract`` into
-/// the slice's own result buffer.  Because ``tile.slice`` inherits its source's
-/// memory, and ``AllocateMemoryAddr`` cannot encode a dynamic offset as a
-/// ``ConstInt`` address, that buffer falls back to the bare source base — the
-/// materialization then writes the extracted row into the source's row 0.
-/// Replacing the operand with a fresh
+/// It also canonicalizes a **Vec** ``tile.slice`` consumed by the
+/// ``tile.col_expand_*`` family (issues #1640, #2010).  Those ops cannot read a
+/// ``pto.subview`` operand, so codegen lazily materializes the slice via
+/// ``pto.textract`` into the slice's own result buffer — and because
+/// ``tile.slice`` inherits its source's memory, that buffer sits *inside the
+/// still-live source*.  The extract is therefore performed in place over its own
+/// input, which is safe only when it is an identity copy.  Two things must hold:
+///
+///   * the destination **address** must be right — a const offset is folded into
+///     ``base + off``, but a dynamic one cannot be encoded as a ``ConstInt``
+///     address and falls back to the bare source base, so the extracted window
+///     lands on the source's row 0 (#1640);
+///   * the destination **layout** must match — the slice buffer is dense (row
+///     pitch = slice cols) while the source window is strided (row pitch = base
+///     cols).  These coincide only for a *contiguous* window: a single row, or a
+///     window spanning every column.  A column slice of a multi-row tile
+///     (``t[:, a:b]``) repacks strided -> dense on top of its own source and
+///     destroys it — only row 0 survives, since its dense destination happens to
+///     equal its source address (#2010).
+///
+/// Whenever either condition fails, the operand is replaced by a fresh
 /// ``tile.extract(src, or, oc, shape, target_memory=Vec)`` — whose result gets
-/// its own non-inherited allocation — removes the aliasing.  Only **dynamic**
-/// offsets are the hazard: ``AllocateMemoryAddr`` folds a const offset into
-/// ``base + off``, so the lazy ``pto.textract`` is an identity copy and a
-/// static-offset slice is left untouched.
+/// its own non-inherited allocation — which removes the aliasing.  An
+/// identity-copy slice is left untouched so it keeps sharing the source buffer.
 ///
 /// After all consumers are rewritten the now-dead ``tile.slice`` is dropped.
 /// Chained slices (a slice of a slice) are peeled, accumulating the offset.
@@ -325,30 +335,68 @@ class CanonicalizeMutator : public IRMutator {
   }
 
   /// True when a slice offset is dynamic (either component is not a `ConstInt`).
-  /// Only a dynamic offset is the #1640 hazard: `AllocateMemoryAddr` folds a
-  /// const offset into `base + off`, so the lazy `pto.textract` materializes the
-  /// row into its own (offset-correct) address — an identity copy that leaves
-  /// the source intact.  A dynamic offset cannot be encoded as a `ConstInt`
-  /// address, so the slice buffer falls back to the bare source base and the
-  /// materialization writes the extracted row into the source's row 0.
+  /// A dynamic offset cannot be encoded as a `ConstInt` address, so the slice
+  /// buffer falls back to the bare source base and the lazy `pto.textract`
+  /// materialization writes the extracted window into the source's row 0
+  /// (#1640).  A const offset is folded into `base + off` by
+  /// `AllocateMemoryAddr`, so the destination address is at least correct — but
+  /// see `IsContiguousWindow` for why that alone is not enough.
   static bool IsDynamicSliceOffset(const SliceInfo& info) {
     return !As<ConstInt>(info.off_row) || !As<ConstInt>(info.off_col);
   }
 
-  /// If `assign` is `tile.col_expand_mul(a, b)` / `tile.col_expand_add(a, b)`
-  /// with a dynamic-offset Vec `tile.slice` operand, return a fresh
-  /// `tile.extract(src, off_row, off_col, shape, target_memory=Vec)` for each
-  /// sliced operand followed by the rebuilt col-expand op (issue #1640).
+  /// True when the slice's window occupies one unbroken run of bytes in the base
+  /// tile's buffer — i.e. it is a single row, or it spans every column of the
+  /// base.  Only such a window has a row pitch equal to the *dense* pitch of the
+  /// slice's own (source-inherited) buffer, which is what makes the lazy
+  /// `pto.textract` materialization an identity copy.
   ///
-  /// Codegen materializes a subview operand of `pto.tcolexpandmul` /
-  /// `pto.tcolexpandadd` via `pto.textract` into the slice's own result buffer
-  /// (pto_ops_common.cpp).  For a dynamic-offset slice of a local tile that
-  /// buffer inherits — and aliases — the bare source allocation base, so the
-  /// materialization corrupts the source.  Materializing through `tile.extract`
-  /// (which gets its own fresh non-inherited allocation) instead removes the
-  /// aliasing.  Static-offset slices are skipped (`AllocateMemoryAddr` folds the
-  /// offset into `base + off`, so their lazy textract is a safe identity copy).
-  /// Returns nullopt when no operand is a rewritable dynamic Vec slice.
+  /// A column slice of a multi-row tile is NOT contiguous: `pto.textract` has to
+  /// repack strided (base cols) -> dense (slice cols), and its destination —
+  /// `base + off`, inside the still-live source — overlaps its own input.  Row 0
+  /// happens to land on its source address, every later row is written over data
+  /// the extract has not read yet, and the source is destroyed (#2010).  Returns
+  /// false conservatively when the shapes are not 2-D `ConstInt` (rewriting is
+  /// always safe; skipping the rewrite is not).
+  static bool IsContiguousWindow(const VarPtr& slice_var, const SliceInfo& info) {
+    auto slice_tile = As<TileType>(slice_var->GetType());
+    auto base_tile = info.base ? As<TileType>(info.base->GetType()) : nullptr;
+    if (!slice_tile || !base_tile) return false;
+    if (slice_tile->shape_.size() != 2 || base_tile->shape_.size() != 2) return false;
+    auto slice_rows = As<ConstInt>(slice_tile->shape_[0]);
+    auto slice_cols = As<ConstInt>(slice_tile->shape_[1]);
+    auto base_cols = As<ConstInt>(base_tile->shape_[1]);
+    if (!slice_rows || !slice_cols || !base_cols) return false;
+    return slice_rows->value_ == 1 || slice_cols->value_ == base_cols->value_;
+  }
+
+  /// True when codegen's lazy `pto.textract` materialization of this slice into
+  /// its own source-inherited buffer would NOT be an identity copy — i.e. it
+  /// would corrupt the source.  Either the destination address is wrong (dynamic
+  /// offset, #1640) or the destination layout is wrong (non-contiguous window,
+  /// #2010).  Such a slice must be materialized through a `tile.extract` into a
+  /// fresh, non-aliasing buffer instead.
+  static bool MaterializationCorruptsSource(const VarPtr& slice_var, const SliceInfo& info) {
+    return IsDynamicSliceOffset(info) || !IsContiguousWindow(slice_var, info);
+  }
+
+  /// If `assign` is a col-expand op with a Vec `tile.slice` operand whose lazy
+  /// materialization would corrupt its source, return a fresh
+  /// `tile.extract(src, off_row, off_col, shape, target_memory=Vec)` for each
+  /// such operand followed by the rebuilt col-expand op (issues #1640, #2010).
+  ///
+  /// Codegen materializes a subview operand of the `pto.tcolexpand*` family via
+  /// `pto.textract` into the slice's own result buffer (pto_ops_shared.cpp).
+  /// That buffer inherits — and aliases — the source's allocation, so the
+  /// extract writes into its own still-live input.  This is harmless only when
+  /// the write is an identity copy: the destination address must be right (const
+  /// offset) *and* its dense layout must match the source window's (a contiguous
+  /// window).  Otherwise the repack destroys the source — see
+  /// `MaterializationCorruptsSource`.  Materializing through `tile.extract`
+  /// (which gets its own fresh non-inherited allocation) removes the aliasing.
+  /// Identity-copy slices are left untouched so they keep sharing the source
+  /// buffer rather than paying for a duplicate allocation.
+  /// Returns nullopt when no operand is such a Vec slice.
   std::optional<std::vector<StmtPtr>> TryRewriteColExpand(const AssignStmtPtr& assign) {
     auto call = As<Call>(assign->value_);
     if (!call || !call->op_ || !IsColExpandMaterializingOp(call->op_) || call->args_.size() != 2) {
@@ -374,7 +422,7 @@ class CanonicalizeMutator : public IRMutator {
       // pass — treat nullopt as Vec.)
       const auto& ms = it->second.memory_space;
       if (ms.has_value() && *ms != MemorySpace::Vec) continue;
-      if (!IsDynamicSliceOffset(it->second)) continue;  // static offset → identity textract, safe
+      if (!MaterializationCorruptsSource(operand, it->second)) continue;  // identity textract, safe
       auto extract = BuildOperandExtract(operand, it->second, MemorySpace::Vec, sp);
       extracts.push_back(extract);
       new_args[i] = extract->var_;

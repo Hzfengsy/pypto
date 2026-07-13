@@ -278,6 +278,86 @@ class TestColExpandMulSliceSourceUnchanged(PTOTestCase):
         tensors["out_echo"][:] = tensors["scores"]
 
 
+class TestColExpandMulColumnSliceMultiRow(PTOTestCase):
+    """Regression for #2010: a *static*-offset column slice of a MULTI-ROW tile
+    feeding ``tile.col_expand_mul`` must not corrupt its source.
+
+    ``t[:, 0:N//2]`` / ``t[:, N//2:N]`` are static-offset windows, so #1640's
+    dynamic-offset guard did not cover them.  They are still hazardous: the
+    slice's own result buffer is dense (row pitch N//2) but aliases the source
+    (row pitch N), so ``pto.tcolexpandmul``'s lazy ``pto.textract`` repacked
+    strided -> dense *on top of its own live source*.  Only row 0 survived (its
+    dense destination happened to equal its source address), so a single-row tile
+    was unaffected while every ``rows >= 2`` tile was destroyed — and ``out_lo``
+    came back holding a later row's data.
+
+    Both halves are scaled by the same ``gamma``, so the expected output is
+    simply the source scaled column-wise — any surviving corruption shows up as a
+    mismatch on the rows after row 0.
+    """
+
+    __test__ = False
+
+    def __init__(self, m: int = 16, n: int = 128, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+        self.M = m
+        self.N = n
+
+    def get_name(self) -> str:
+        return f"col_expand_mul_column_slice_multirow_{self.M}x{self.N}"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        half = self.N // 2
+        return [
+            TensorSpec("x", [self.M, self.N], DataType.FP32, init_value=torch.randn),
+            TensorSpec("gamma", [1, half], DataType.FP32, init_value=torch.randn),
+            TensorSpec("out_lo", [self.M, half], DataType.FP32, is_output=True),
+            TensorSpec("out_hi", [self.M, half], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        M, N = self.M, self.N
+        HALF = N // 2
+
+        @pl.program
+        class ColExpandMulColumnSliceProgram:
+            @pl.function(type=pl.FunctionType.InCore)
+            def col_expand_mul_column_slice_kernel(
+                self,
+                x: pl.Tensor[[M, N], pl.FP32],
+                gamma: pl.Tensor[[1, HALF], pl.FP32],
+                out_lo: pl.Out[pl.Tensor[[M, HALF], pl.FP32]],
+                out_hi: pl.Out[pl.Tensor[[M, HALF], pl.FP32]],
+            ) -> tuple[pl.Tensor[[M, HALF], pl.FP32], pl.Tensor[[M, HALF], pl.FP32]]:
+                t: pl.Tile[[M, N], pl.FP32] = pl.load(x, [0, 0], [M, N])
+                gamma_t: pl.Tile[[1, HALF], pl.FP32] = pl.load(gamma, [0, 0], [1, HALF])
+                lo: pl.Tile[[M, HALF], pl.FP32] = t[:, 0:HALF]
+                hi: pl.Tile[[M, HALF], pl.FP32] = t[:, HALF:N]
+                lo_scaled: pl.Tile[[M, HALF], pl.FP32] = pl.tile.col_expand_mul(lo, gamma_t)
+                hi_scaled: pl.Tile[[M, HALF], pl.FP32] = pl.tile.col_expand_mul(hi, gamma_t)
+                out_lo = pl.store(lo_scaled, [0, 0], out_lo)
+                out_hi = pl.store(hi_scaled, [0, 0], out_hi)
+                return out_lo, out_hi
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orchestrator(
+                self,
+                x: pl.Tensor[[M, N], pl.FP32],
+                gamma: pl.Tensor[[1, HALF], pl.FP32],
+                out_lo: pl.Out[pl.Tensor[[M, HALF], pl.FP32]],
+                out_hi: pl.Out[pl.Tensor[[M, HALF], pl.FP32]],
+            ) -> tuple[pl.Tensor[[M, HALF], pl.FP32], pl.Tensor[[M, HALF], pl.FP32]]:
+                out_lo, out_hi = self.col_expand_mul_column_slice_kernel(x, gamma, out_lo, out_hi)
+                return out_lo, out_hi
+
+        return ColExpandMulColumnSliceProgram
+
+    def compute_expected(self, tensors, params=None):
+        half = self.N // 2
+        tensors["out_lo"][:] = tensors["x"][:, :half] * tensors["gamma"]
+        tensors["out_hi"][:] = tensors["x"][:, half:] * tensors["gamma"]
+
+
 class TestBroadcastOperations:
     """Test suite for tile broadcast operations."""
 
@@ -307,6 +387,16 @@ class TestBroadcastOperations:
         """Regression for #1640: col_expand_mul on a dynamic-offset slice of a
         local tile must leave the source tile unchanged."""
         result = test_runner.run(TestColExpandMulSliceSourceUnchanged(platform=platform))
+        assert result.passed, f"Test failed: {result.error}"
+
+    @pytest.mark.parametrize("rows", [1, 2, 16])
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_col_expand_mul_column_slice_multi_row(self, test_runner, platform, rows):
+        """Regression for #2010: col_expand_mul on a static-offset COLUMN slice of a
+        multi-row tile must return the right data. ``rows=1`` was always correct
+        (the repack degenerates to an identity copy); every ``rows >= 2`` case was
+        silently corrupted."""
+        result = test_runner.run(TestColExpandMulColumnSliceMultiRow(m=rows, platform=platform))
         assert result.passed, f"Test failed: {result.error}"
 
 
