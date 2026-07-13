@@ -763,6 +763,12 @@ REGISTER_OP("tile.concat")
     .set_input_memory(0, MemorySpace::Vec)
     .set_input_memory(1, MemorySpace::Vec)
     .set_output_memory(MemorySpace::Vec)
+    // pto.tconcat is not in-place safe: dst's row stride (validCol0 + validCol1)
+    // differs from each src's, so if dst shares a base address with a src, the
+    // row-by-row forward copy overwrites source rows before they are read.  Mark
+    // it not_inplace_safe so MemoryReuse never coalesces the output onto a src
+    // buffer (same rationale as tile.transpose above).
+    .not_inplace_safe()
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTileConcatType(args, kwargs);

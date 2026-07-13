@@ -1173,6 +1173,40 @@ class TestViewOps:
 class TestInplaceOps:
     """Tests verifying that ops marked not_inplace_safe block producer-consumer reuse."""
 
+    def test_concat_output_must_not_alias_either_source(self):
+        """tile.concat's output must get a buffer distinct from both sources.
+
+        pto.tconcat copies row by row, and dst's row stride (cols0 + cols1)
+        differs from each source's. A dst sharing a source's base therefore
+        overwrites source rows before they are read — the concat silently
+        returns rows of the wrong data on both the simulator and the device.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[32, 16], pl.FP32],
+                b: pl.Tensor[[32, 16], pl.FP32],
+                out: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+            ) -> pl.Tensor[[32, 32], pl.FP32]:
+                tile_a: pl.Tile[[32, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(a, [0, 0], [32, 16])
+                tile_b: pl.Tile[[32, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(b, [0, 0], [32, 16])
+                tile_c: pl.Tile[[32, 32], pl.FP32, pl.MemorySpace.Vec] = pl.concat(tile_a, tile_b)
+                result: pl.Tensor[[32, 32], pl.FP32] = pl.store(tile_c, [0, 0], out)
+                return result
+
+        After = _run_pipeline(Before)
+        bases = _collect_tile_memref_bases(After)
+
+        assert bases["tile_c"] != bases["tile_a"], (
+            "concat output must not reuse src0's buffer (tile.concat is not in-place safe)"
+        )
+        assert bases["tile_c"] != bases["tile_b"], (
+            "concat output must not reuse src1's buffer (tile.concat is not in-place safe)"
+        )
+
     def test_inplace_unsafe_op_no_producer_consumer_reuse(self):
         """tile.recip must NOT reuse its input's buffer."""
 
