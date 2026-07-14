@@ -892,6 +892,14 @@ void RegisterMemoryOps(Backend& backend, const std::unordered_set<std::string>& 
   reg("tensor.dim", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
     return MakeTensorDimCodegenPTO(op, codegen);
   });
+
+  reg("system.fence", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
+    auto& codegen = AsPto(codegen_base);
+    INTERNAL_CHECK_SPAN(op->args_.empty(), op->span_)
+        << "system.fence takes no arguments, got " << op->args_.size();
+    codegen.Emit("pto.fence.barrier_all #pto.fence_scope<gm>");
+    return std::string("");
+  });
 }
 }  // namespace backend
 }  // namespace pypto
