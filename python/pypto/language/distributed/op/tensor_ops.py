@@ -408,6 +408,11 @@ def allreduce(
     ``[2 * (NR − 1), NR]`` (one row per ring round). Both are single-shot
     per call.
 
+    Mesh lowering preserves a packed ND target ``TensorView.valid_shape`` when
+    its valid box can be represented by collapsing leading dimensions to one
+    2D rectangle, and reduces only that rectangle. Strided targets, DN partial
+    views, and non-representable partial boxes are rejected explicitly.
+
     **Mesh barrier protocol:** two waves on the same cells —
     ``Set(1) → WaitGe(1)`` for the first wave (Phases 2a/2b), then
     ``AtomicAdd(1) → WaitGe(2)`` for the post-reduce WAR guard

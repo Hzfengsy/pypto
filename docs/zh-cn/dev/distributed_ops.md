@@ -236,6 +236,10 @@ pld.tensor.allreduce(src, *, op: ReduceOp = ReduceOp.Sum, mode: str = "mesh") ->
 pld.tensor.allreduce(src, signal, *, op: ReduceOp = ReduceOp.Sum, mode: str = "mesh") -> DistributedTensorType(src)
 ```
 
+对于 mesh 降级，如果 packed ND 目标的 partial `TensorView.valid_shape` 能通过折叠
+leading dimensions 表示为单个 2D 矩形，Pass 会保留该元数据并且只归约这个矩形；
+strided 目标、DN partial view 和无法按该方式表示的 partial 区域会被明确拒绝。
+
 对所有参与 rank 的窗口绑定 `src` 切片做原地 all-reduce，并返回与 `src`
 相同的类型。`mode` 关键字选择降级算法：
 

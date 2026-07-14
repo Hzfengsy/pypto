@@ -417,13 +417,13 @@ REGISTER_ORCHESTRATION_OP(tensor_transpose, ("tensor.transpose")) {
 }
 
 REGISTER_ORCHESTRATION_OP(tensor_view, ("tensor.view")) {
-  // tensor.view(input[, shape], layout=...) is a metadata reinterpret over the
+  // tensor.view(input[, shape[, valid_shape]], layout=...) is a metadata reinterpret over the
   // same physical buffer. Runtime Tensor has no layout tag or arbitrary-stride
   // constructor, so shape-changing orchestration views lower to reshape only
   // for ND layouts. Layout-only keeps the legacy ND/DN alias/transpose
   // behavior.
-  INTERNAL_CHECK_SPAN(op->args_.size() == 1 || op->args_.size() == 2, op->span_)
-      << "tensor.view requires 1 or 2 args (input[, shape])";
+  INTERNAL_CHECK_SPAN(op->args_.size() >= 1 && op->args_.size() <= 3, op->span_)
+      << "tensor.view requires 1 to 3 args (input[, shape[, valid_shape]])";
 
   std::string input_name = codegen.TryGetVarName(op->args_[0]);
   INTERNAL_CHECK_SPAN(!input_name.empty(), op->span_) << "tensor.view input must be a variable";
@@ -446,7 +446,7 @@ REGISTER_ORCHESTRATION_OP(tensor_view, ("tensor.view")) {
   std::string result_var = codegen.GetCurrentResultTarget();
   std::ostringstream oss;
 
-  if (op->args_.size() == 2) {
+  if (op->args_.size() >= 2) {
     CHECK_SPAN(target_layout == src_layout, op->span_)
         << "tensor.view orchestration lowering cannot combine shape reinterpret with layout change: "
         << "runtime Tensor::reshape has no arbitrary-stride layout view; pass only a shape argument "

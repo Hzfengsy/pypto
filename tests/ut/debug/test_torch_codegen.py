@@ -141,6 +141,35 @@ def test_tensor_view_shape_and_layout_uses_target_stride():
     assert actual.stride() == (1, 4)
 
 
+def test_tensor_view_explicit_valid_shape_codegen_and_execution():
+    """A three-argument view should reshape and preserve target validity metadata."""
+    src_view = ir.TensorView(
+        [_int(2048), _int(128), _int(1)],
+        ir.TensorLayout.ND,
+        valid_shape=[_int(1), _int(16), _int(128)],
+    )
+    src = ir.Var("src", ir.TensorType([2, 16, 128], DataType.FP32, None, src_view), _span())
+    result = ir.op.tensor.view(src, [32, 128], [16, 128])
+    out = ir.Var("out", result.type, _span())
+    body = ir.SeqStmts(
+        [ir.AssignStmt(out, result, _span()), ir.ReturnStmt([out], _span())],
+        _span(),
+    )
+    func = _simple_function("partial_view", [src], body, [out.type])
+
+    code = torch_codegen(func)
+    assert "_tensor_view(src, (32, 128), False, (16, 128))" in code
+
+    ns: dict = {}
+    exec(code, ns)  # noqa: S102
+    value = torch.arange(4096, dtype=torch.float32).reshape(2, 16, 128)
+    actual = ns["partial_view"](value)
+    assert actual.shape == (32, 128)
+    assert actual.stride() == (128, 1)
+    assert actual._pypto_valid_shape == (16, 128)
+    assert actual._pypto_full_shape == (32, 128)
+
+
 def test_tensor_view_same_layout_is_identity():
     """A layout-only view targeting the current layout should be an identity."""
     src = _tensor_var("src", [2, 4])

@@ -24,9 +24,14 @@ Tests follow the Before/Expected ``@pl.program`` pattern: the pass runs on
 ``Before``.
 """
 
+from collections.abc import Sequence
+from typing import cast
+
 import pypto.language as pl
+import pypto.language.distributed as pld
 import pytest
 from pypto import DataType, ir
+from pypto.ir import IRBuilder
 from pypto.pypto_core import passes as _passes
 
 _SPAN = ir.Span.unknown()
@@ -36,20 +41,33 @@ _SPAN = ir.Span.unknown()
 # ----------------------------------------------------------------------------
 
 
-def _materialize(program):
+def _materialize(program: ir.Program) -> ir.Program:
     return _passes.materialize_tensor_strides()(program)
 
 
-def _verify_strict(program):
+def _materialize_basic(program: ir.Program) -> ir.Program:
+    ctx = _passes.PassContext(
+        [_passes.VerificationInstrument(_passes.VerificationMode.BEFORE_AND_AFTER)],
+        _passes.VerificationLevel.BASIC,
+    )
+    with ctx:
+        return _passes.materialize_tensor_strides()(program)
+
+
+def _verify_strict(program: ir.Program):
     """Run TensorViewCanonical in strict mode — empty stride is rejected."""
     return _passes.verify_tensor_view_canonical(program, require_materialized=True)
 
 
-def _dims(shape):
+def _dims(shape: Sequence[int]) -> list[ir.ConstInt]:
     return [ir.ConstInt(s, DataType.INDEX, _SPAN) for s in shape]
 
 
-def _dn_tensor(shape, stride):
+def _values_of(exprs: Sequence[ir.Expr]) -> list[int]:
+    return [cast(ir.ConstInt, expr).value for expr in exprs]
+
+
+def _dn_tensor(shape: Sequence[int], stride: Sequence[int]) -> ir.TensorType:
     """Build a TensorType with an explicit DN-stride TensorView.
 
     ``stride=[]`` yields the implicit (empty-stride) form that the pass must
@@ -190,6 +208,62 @@ def test_empty_default_nd_view_canonicalizes_absent():
     ir.assert_structural_equal(After, Expected)
 
 
+def test_distributed_tensor_param_preserves_memref_and_pad_metadata():
+    """Materializing a distributed tensor view keeps non-stride metadata."""
+    base = ir.Var("base", ir.PtrType(), _SPAN)
+    memref = ir.MemRef(base, 0, 128, _SPAN)
+    view = ir.TensorView([], ir.TensorLayout.DN, [], ir.PadValue.zero)
+    dist_type = ir.DistributedTensorType(_dims([4, 8]), DataType.FP32, memref, view)
+
+    ib = IRBuilder()
+    with ib.program("main") as prog:
+        with ib.function("f") as f:
+            f.param("x", dist_type)
+            ib.return_stmt([])
+        prog.add_function(f.get_result())
+    After = _materialize(prog.get_result())
+    func = After.get_function("f")
+    assert func is not None
+
+    param_type = func.params[0].type
+    assert isinstance(param_type, ir.DistributedTensorType)
+    assert param_type.memref is memref
+    assert param_type.window_buffer is None
+    assert param_type.tensor_view is not None
+    assert _values_of(param_type.tensor_view.stride) == [1, 4]
+    assert param_type.tensor_view.layout == ir.TensorLayout.DN
+    assert param_type.tensor_view.pad == ir.PadValue.zero
+
+
+def test_distributed_tensor_view_preserves_window_buffer_metadata():
+    """A materialized distributed tensor.view keeps its WindowBuffer binding."""
+    base = ir.Var("buf", ir.PtrType(), _SPAN)
+    window = ir.WindowBuffer(base, ir.ConstInt(128, DataType.INT64, _SPAN), span=_SPAN)
+    src_type = ir.DistributedTensorType(_dims([4, 8]), DataType.FP32, window)
+
+    ib = IRBuilder()
+    with ib.program("main") as prog:
+        with ib.function("f") as f:
+            x = f.param("x", src_type)
+            viewed = ib.let("viewed", ir.op.tensor.view(x, layout=ir.TensorLayout.DN))
+            f.return_type(viewed.type)
+            ib.return_stmt(viewed)
+        prog.add_function(f.get_result())
+    After = _materialize_basic(prog.get_result())
+    func = After.get_function("f")
+    assert func is not None
+    body = cast(ir.SeqStmts, func.body)
+    viewed_stmt = cast(ir.AssignStmt, body.stmts[0])
+
+    viewed_call = cast(ir.Call, viewed_stmt.value)
+    assert len(func.return_types) == 1
+    for type_ in (func.return_types[0], viewed_stmt.var.type, viewed_call.type):
+        assert isinstance(type_, ir.DistributedTensorType)
+        assert type_.window_buffer is window
+        assert type_.tensor_view is not None
+        assert _values_of(type_.tensor_view.stride) == [1, 8]
+
+
 # ============================================================================
 # Already-explicit view stays unchanged (no spurious rewrite)
 # ============================================================================
@@ -258,6 +332,20 @@ def test_nz_on_tensor_rejected_by_paired_verifier():
         def f(
             self,
             x: pl.Tensor[[8, 16], pl.FP32, pl.TensorView(stride=[], layout=pl.TensorLayout.NZ)],
+        ):
+            pl.const(0, pl.INT64)
+
+    with pytest.raises(ValueError, match="NZ layout"):
+        _materialize(Before)
+
+
+def test_nz_on_distributed_tensor_rejected_by_paired_verifier():
+    @pl.program
+    class Before:
+        @pl.function
+        def f(
+            self,
+            x: pld.DistributedTensor[[8, 16], pl.FP32, pl.TensorView(stride=[], layout=pl.TensorLayout.NZ)],
         ):
             pl.const(0, pl.INT64)
 

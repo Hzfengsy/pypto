@@ -178,11 +178,34 @@ PeerViewInfo EmitCommRemoteView(const DistTensorBinding& target, const ExprPtr& 
     }
   }
   std::vector<std::string> stride_ssa(rank);
-  stride_ssa[rank - 1] = codegen.GetOrEmitConstant(static_cast<int64_t>(1), DataType::INDEX);
-  for (size_t j = rank - 1; j > 0; --j) {
-    std::string mul = codegen.NewTemp();
-    codegen.Emit(mul + " = arith.muli " + stride_ssa[j] + ", " + shape_ssa[j] + " : index");
-    stride_ssa[j - 1] = mul;
+  std::string layout_str = "nd";
+  const auto& tensor_view = target.type->tensor_view_;
+  if (tensor_view.has_value() && tensor_view->stride.size() == rank) {
+    for (size_t i = 0; i < rank; ++i) {
+      if (auto ci = As<ir::ConstInt>(tensor_view->stride[i])) {
+        stride_ssa[i] = codegen.GetOrEmitConstant(ci->value_, DataType::INDEX);
+      } else {
+        stride_ssa[i] =
+            codegen.EmitCastToIndex(tensor_view->stride[i], codegen.GetExprAsCode(tensor_view->stride[i]));
+      }
+    }
+    switch (tensor_view->layout) {
+      case ir::TensorLayout::DN:
+        layout_str = "dn";
+        break;
+      case ir::TensorLayout::NZ:
+        layout_str = "nz";
+        break;
+      case ir::TensorLayout::ND:
+        break;
+    }
+  } else {
+    stride_ssa[rank - 1] = codegen.GetOrEmitConstant(static_cast<int64_t>(1), DataType::INDEX);
+    for (size_t j = rank - 1; j > 0; --j) {
+      std::string mul = codegen.NewTemp();
+      codegen.Emit(mul + " = arith.muli " + stride_ssa[j] + ", " + shape_ssa[j] + " : index");
+      stride_ssa[j - 1] = mul;
+    }
   }
 
   std::string peer_view = codegen.NewTemp();
@@ -205,7 +228,7 @@ PeerViewInfo EmitCommRemoteView(const DistTensorBinding& target, const ExprPtr& 
     if (i > 0) mv << ", ";
     mv << stride_ssa[i];
   }
-  mv << "] {layout = #pto.layout<nd>} : " << view_type.str();
+  mv << "] {layout = #pto.layout<" << layout_str << ">} : " << view_type.str();
   codegen.Emit(mv.str());
 
   return {peer_view, view_type.str()};

@@ -27,7 +27,6 @@
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
-#include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/tile_conversion_utils.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
@@ -223,7 +222,7 @@ ExprPtr PeelSafeBatchReshape(const ExprPtr& operand_expr, const AssignDefMap& de
 /// codegen guard via `IsRowMajorCollapseContiguous`, so routing and guard agree.
 bool WholeLoadContiguous(const CallPtr& base_load) {
   if (!base_load || base_load->args_.size() < 4) return true;
-  auto tensor_type = As<TensorType>(base_load->args_[0]->GetType());
+  auto tensor_type = AsTensorTypeLike(base_load->args_[0]->GetType());
   auto valid = As<MakeTuple>(base_load->args_[3]);
   if (!tensor_type || !valid) return true;
   const size_t ndim = valid->elements_.size();
@@ -365,10 +364,11 @@ BatchPageResult ExtractBatchPage(const BatchOperandInfo& info, const std::vector
     // only while the whole moved tile fits the fixed cross-core ring. A per-batch
     // V2C move for large shapes is a deferred follow-up (see BatchOperandsWholeFit).
     auto load_tensor = info.base_load->args_[0];
-    auto load_tensor_type = As<TensorType>(load_tensor->GetType());
+    auto load_tensor_var = AsVarLike(load_tensor);
+    auto load_tensor_type = AsTensorTypeLike(load_tensor->GetType());
     auto base_offsets = As<MakeTuple>(info.base_load->args_[1]);
     auto base_shapes = As<MakeTuple>(info.base_load->args_[2]);
-    INTERNAL_CHECK_SPAN(load_tensor_type && base_offsets && base_shapes &&
+    INTERNAL_CHECK_SPAN(load_tensor_var && load_tensor_type && base_offsets && base_shapes &&
                             load_tensor_type->shape_.size() >= 2 &&
                             base_shapes->elements_.size() == load_tensor_type->shape_.size(),
                         span)
@@ -390,20 +390,30 @@ BatchPageResult ExtractBatchPage(const BatchOperandInfo& info, const std::vector
     load_shape_values.push_back(x_dim->value_);
     load_shape_values.push_back(y_dim->value_);
     auto load_offsets = std::make_shared<MakeTuple>(load_offset_elems, span);
-    auto load_shape = MakeShapeTupleFromInts(load_shape_values, span);
-    std::vector<ExprPtr> load_args = {load_tensor, load_offsets, load_shape, load_shape};
-    auto per_batch_load = op_registry.Create("tile.load", load_args, info.base_load->kwargs_, span);
+    auto load_shape = As<MakeTuple>(MakeShapeTupleFromInts(load_shape_values, span));
+    INTERNAL_CHECK_SPAN(load_shape, span) << "FlattenTileNdTo2D: !fit per-batch load shape must be a tuple";
+    auto view_call = CreateCollapsedTensorView(load_tensor_var, load_tensor_type, span);
+    auto view_var = std::make_shared<Var>(base_name + "_pbview2d_" + suffix, view_call->GetType(), span);
+    page.stmts.push_back(std::make_shared<AssignStmt>(view_var, view_call, span));
 
-    // The [1,..,X,Y] window deduces a rank>2 TileType; hardware tiles are 2D —
-    // override the result to a 2D [X,Y] tile with the implicit Mat view.
-    auto load_2d_shape = Make2DShapeExprs(x_dim->value_, y_dim->value_, span);
-    auto load_2d_view = tile_view_semantics::GetImplicitTileView(load_2d_shape, MemorySpace::Mat);
-    auto pbl_type = As<TileType>(per_batch_load->GetType());
-    auto load_2d_type =
-        std::make_shared<TileType>(load_2d_shape, pbl_type ? pbl_type->dtype_ : operand_type->dtype_,
-                                   std::nullopt, load_2d_view, MemorySpace::Mat);
-    auto load_2d =
-        std::make_shared<Call>(per_batch_load->op_, load_args, per_batch_load->kwargs_, load_2d_type, span);
+    auto row_offset = CollapseLeadingOffsetsToRow(load_offsets->elements_, load_tensor_type->shape_, span);
+    auto load_2d_shape = CollapseLeadingDimsTo2D(load_shape->elements_, span);
+    auto load_2d_offsets =
+        std::make_shared<MakeTuple>(std::vector<ExprPtr>{row_offset, load_offsets->elements_.back()}, span);
+    auto load_2d_shape_tuple = std::make_shared<MakeTuple>(load_2d_shape, span);
+    std::vector<ExprPtr> load_args;
+    load_args.reserve(4);
+    load_args.push_back(view_var);
+    load_args.push_back(load_2d_offsets);
+    load_args.push_back(load_2d_shape_tuple);
+    load_args.push_back(load_2d_shape_tuple);
+    auto load_2d = op_registry.Create("tile.load", load_args, info.base_load->kwargs_, span);
+
+    // The source tensor view and load window are both collapsed to 2D here, so
+    // codegen sees a regular 2D ND2NZ Mat load instead of a rank>2 source view.
+    auto load_2d_type = As<TileType>(load_2d->GetType());
+    INTERNAL_CHECK_SPAN(load_2d_type && load_2d_type->shape_.size() == 2, span)
+        << "FlattenTileNdTo2D: !fit per-batch collapsed load must produce a 2D tile";
     current = std::make_shared<Var>(base_name + "_pbload_" + suffix, load_2d_type, span);
     page.stmts.push_back(std::make_shared<AssignStmt>(current, load_2d, span));
 

@@ -50,7 +50,7 @@ Per-statement handling:
 
 | Tile op | Transformation |
 | ------- | -------------- |
-| `tile.load` (>2D) | Change result type to 2D directly (load produces a 2D tile from a rank>2 tensor window) |
+| `tile.load` (>2D) | Rebuild the result tile as 2D. For a natural NZ Mat load, also insert a shape-only 2D `tensor.view` on the source tensor, collapse leading offsets/shapes/valid_shapes to the 2D source window, and require that window to be row-major contiguous. Vec loads and transposed Mat loads keep the original rank>2 source window and only flatten the result tile |
 | `tile.store` (rank>2 tensor) | Inject the original tensor-rank partition `shapes` as an extra 4th operand in the transformed IR so backend codegen can reconstruct the `partition_view`; the DSL source is unchanged. If the tile operand itself is still rank>2 (e.g. a user-written `tile.reshape` to 3D feeding `pl.assemble` into an N-D tensor view), insert a `tile.reshape` to flatten the tile operand to 2D first — the codegen requires a 2D tile while the original tile shape still flows through as the `shapes` partition operand |
 | `tile.store` (2D tensor) | Pass through unchanged |
 | `tile.create`/`tile.full` (>2D) | Rebuild with flattened 2D shape directly |
@@ -71,12 +71,11 @@ a capacity gate) **and** this operand's whole load collapses contiguously
 - **whole (default):** the operand is brought whole into Mat once and
   per-batch **sliced** — a row slice for a plain (row-batched `[B*rows, cols]`)
   operand, a column slice for a `tile.transpose_view` (column-batched
-  `[K, B*N]`) operand. A natural Mat load of a 3D `[B, N, K]` tensor keeps its ND
-  source window here; the hardware ND2NZ "2-dim GlobalTensor" collapse to
-  `[B*N, K]` is owned by the `tile.load` codegen — it fires when the load's result
-  is an NZ Mat tile and emits the 2D `make_tensor_view` there — so this pass only
-  flattens the load's **result tile** to 2D. A broadcast operand reuses its single
-  page.
+  `[K, B*N]`) operand. A natural Mat load of a 3D `[B, N, K]` tensor keeps its
+  logical ND source semantics here, but this pass inserts the 2D `tensor.view`
+  (`[B*N, K]`) before the load so downstream `tile.load` codegen sees the same
+  flattened source window as every other consumer. The pass also flattens the
+  load's **result tile** to 2D. A broadcast operand reuses its single page.
 - **per batch** (the whole tile would overflow L1, **or** the whole load is
   non-contiguous): re-emit the operand from its underlying natural `tile.load`
   one batch at a time (a per-batch `[1, .., X, Y]` window → 2D `[X, Y]`, using the

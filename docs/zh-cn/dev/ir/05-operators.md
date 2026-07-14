@@ -231,6 +231,9 @@ UINT32 + INT32 → INT32 (signed precedence)
 in-core codegen 会将其降级为基于原始 base pointer 的 `pto.make_tensor_view`。
 目标 rank 至少为 1（DN 至少为 2）；编排层仅支持 ND shape 重新解释，且不能
 同时改变 layout。
+对部分有效的源张量进行 shape 重新解释时，仅支持把 packed ND 的 leading
+dimensions 折叠为 2D，并且必须显式提供目标 `valid_shape`；该形式会保留源张量
+类型及其底层元数据。
 
 **示例：**
 

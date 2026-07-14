@@ -364,6 +364,50 @@ def test_shape_reinterpret_rejects_partial_valid_shape():
         ir.op.tensor.view(src, [32])
 
 
+def test_shape_reinterpret_accepts_explicit_target_valid_shape():
+    """An explicit target rectangle makes a compiler-owned partial reshape unambiguous."""
+    src_view = ir.TensorView(
+        [_const(2048), _const(128), _const(1)],
+        ir.TensorLayout.ND,
+        valid_shape=[_const(1), _const(16), _const(128)],
+        pad=ir.PadValue.zero,
+    )
+    src = _tensor_var([2, 16, 128], view=src_view)
+
+    call = ir.op.tensor.view(src, [32, 128], [16, 128])
+    view = _result_view(call)
+
+    assert view is not None
+    assert _values_of(view.valid_shape) == [16, 128]
+    assert view.pad == ir.PadValue.zero
+
+
+def test_shape_reinterpret_rejects_invalid_explicit_valid_shape():
+    src = _tensor_var([4, 8])
+    with pytest.raises(ValueError, match="valid_shape rank"):
+        ir.op.tensor.view(src, [2, 16], [16])
+    with pytest.raises(ValueError, match="exceeds target shape"):
+        ir.op.tensor.view(src, [2, 16], [3, 16])
+
+    partial_view = ir.TensorView(
+        [_const(8), _const(1)], ir.TensorLayout.ND, valid_shape=[_const(3), _const(8)]
+    )
+    partial_src = _tensor_var([4, 8], view=partial_view)
+    with pytest.raises(ValueError, match="leading-dimension collapse"):
+        ir.op.tensor.view(partial_src, [2, 16], [1, 16])
+    with pytest.raises(ValueError, match="leading-dimension collapse"):
+        ir.op.tensor.view(partial_src, [2, 16], [2, 12])
+
+    dn_view = ir.TensorView(
+        [_const(12), _const(1), _const(3)],
+        ir.TensorLayout.DN,
+        valid_shape=[_const(1), _const(3), _const(2)],
+    )
+    dn_src = _tensor_var([2, 3, 4], view=dn_view)
+    with pytest.raises(ValueError, match="only supports ND layout"):
+        ir.op.tensor.view(dn_src, [6, 4], [3, 2])
+
+
 def test_shape_reinterpret_clears_inert_full_valid_padding():
     """A full valid region may be reshaped; its padding metadata is inert."""
     src_view = ir.TensorView(

@@ -1615,6 +1615,7 @@ def transpose(tensor: Tensor, axis1: int, axis2: int) -> Tensor:
 def view(
     tensor: _TensorT,
     shape: Sequence[IntLike] | None = None,
+    valid_shape: Sequence[IntLike] | None = None,
     *,
     layout: TensorLayout | None = None,
 ) -> _TensorT:
@@ -1630,6 +1631,9 @@ def view(
         tensor: Source tensor.
         shape: New shape for the view. Must be product-preserving unless
             symbolic dimensions are present. Rank-zero views are not supported.
+        valid_shape: Explicit valid dimensions for a packed ND leading-dimension
+            collapse to 2D. Required when this supported collapse reinterprets
+            a source with partial validity.
         layout: Target ``TensorLayout`` (ND or DN); DN requires rank at least 2.
             Layout changes combined with ``shape`` are supported in-core but not by orchestration
             lowering. Orchestration shape reinterpret is limited to ND-layout
@@ -1645,6 +1649,7 @@ def view(
     call_expr = _ir_ops.view(
         tensor.unwrap(),
         None if shape is None else _normalize_intlike(shape),
+        None if valid_shape is None else _normalize_intlike(valid_shape),
         layout=layout,
     )
     return tensor.__class__(expr=call_expr)

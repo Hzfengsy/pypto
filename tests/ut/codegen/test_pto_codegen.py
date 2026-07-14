@@ -2623,7 +2623,7 @@ def test_pto_codegen_tensor_view_aliases_input_base_ptr():
 
 
 def test_pto_codegen_rank3_tensor_view_mat_load_uses_input_base_ptr():
-    """The NZ/Mat 2D collapse remains rooted at the view's raw GM pointer."""
+    """A rank-3 tensor.view remains rooted at the input's raw GM pointer."""
     span = ir.Span.unknown()
     src_type = ir.TensorType([2, 16, 32], DataType.FP32)
     src = ir.Var("src", src_type, span)
@@ -2650,8 +2650,10 @@ def test_pto_codegen_rank3_tensor_view_mat_load_uses_input_base_ptr():
     program = ir.Program([func], "TensorViewRank3MatLoadTest", span)
 
     lines = _get_mlir_lines(_generate_mlir(program))
-    collapsed_view = _single_line(lines, "src_view_view2d = pto.make_tensor_view")
-    assert "pto.make_tensor_view %arg0" in collapsed_view, collapsed_view
+    view_line = _single_line(lines, "strides = [%c512_index, %c32_index, %c1_index]")
+    assert "pto.make_tensor_view %arg0" in view_line
+    assert "shape = [%c2_index, %c16_index, %c32_index]" in view_line
+    assert "strides = [%c512_index, %c32_index, %c1_index]" in view_line
 
 
 def test_pto_codegen_tensor_view_default_pipeline_variants():

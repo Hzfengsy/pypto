@@ -25,9 +25,12 @@
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
+#include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
+#include "pypto/ir/transforms/utils/tensor_view_semantics.h"
+#include "pypto/ir/transforms/utils/tile_conversion_utils.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
 #include "src/ir/transforms/flatten_tile_nd_to_2d/rewrite_internal.h"
@@ -150,6 +153,59 @@ ExprPtr MakeCanonicalIndexAdd(const ExprPtr& lhs, const ExprPtr& rhs, const Span
     return lhs;
   }
   return MakeAdd(lhs, rhs, span);
+}
+
+std::vector<ExprPtr> CollapseLeadingDimsTo2D(const std::vector<ExprPtr>& dims, const Span& span) {
+  INTERNAL_CHECK(dims.size() > 2) << "FlattenTileNdTo2D: collapse to 2D requires rank > 2";
+  ExprPtr rows = dims[0];
+  for (size_t i = 1; i + 1 < dims.size(); ++i) {
+    rows = tile_conversion_utils::MakeCanonicalIndexMul(rows, dims[i], span, "FlattenTileNdTo2D");
+  }
+  return {rows, dims.back()};
+}
+
+CallPtr CreateCollapsedTensorView(const ExprPtr& tensor, const TensorTypePtr& tensor_type, const Span& span) {
+  // This compiler-owned alias carries a collapsed partial valid_shape. Public
+  // tensor.view intentionally rejects partial-valid shape reinterpretation.
+  auto flat_shape = CollapseLeadingDimsTo2D(tensor_type->shape_, span);
+  const TensorLayout layout =
+      tensor_type->tensor_view_.has_value() ? tensor_type->tensor_view_->layout : TensorLayout::ND;
+  TensorView flat_view = tensor_view_semantics::CanonicalizeView(flat_shape, layout);
+
+  if (tensor_type->tensor_view_.has_value()) {
+    const auto& source_view = *tensor_type->tensor_view_;
+    if (!source_view.valid_shape.empty()) {
+      INTERNAL_CHECK_SPAN(source_view.valid_shape.size() == tensor_type->shape_.size(), span)
+          << "FlattenTileNdTo2D: tensor valid_shape rank must match tensor rank";
+      INTERNAL_CHECK_SPAN(
+          tile_conversion_utils::IsRowMajorCollapseContiguous(source_view.valid_shape, tensor_type->shape_),
+          span)
+          << "FlattenTileNdTo2D: tensor valid_shape cannot be represented by a single 2D view";
+      flat_view.valid_shape = CollapseLeadingDimsTo2D(source_view.valid_shape, span);
+    }
+    flat_view.pad = source_view.pad;
+  }
+
+  auto shape_tuple = std::make_shared<MakeTuple>(flat_shape, span);
+  std::vector<ExprPtr> view_args{tensor, shape_tuple};
+  if (!flat_view.valid_shape.empty() || flat_view.pad != PadValue::null) {
+    view_args.push_back(std::make_shared<MakeTuple>(flat_view.valid_shape, span));
+  }
+  return OpRegistry::GetInstance().Create("tensor.view", view_args, {}, span);
+}
+
+ExprPtr CollapseLeadingOffsetsToRow(const std::vector<ExprPtr>& offsets,
+                                    const std::vector<ExprPtr>& tensor_shape, const Span& span) {
+  INTERNAL_CHECK(offsets.size() == tensor_shape.size())
+      << "FlattenTileNdTo2D: offsets and tensor shape rank must match";
+  INTERNAL_CHECK(offsets.size() > 2) << "FlattenTileNdTo2D: offset collapse requires rank > 2";
+  ExprPtr row_offset = offsets[0];
+  for (size_t i = 1; i + 1 < offsets.size(); ++i) {
+    row_offset = MakeCanonicalIndexAdd(
+        tile_conversion_utils::MakeCanonicalIndexMul(row_offset, tensor_shape[i], span, "FlattenTileNdTo2D"),
+        offsets[i], span);
+  }
+  return row_offset;
 }
 
 /// Mat (L1) byte budget for the whole-tile batch_matmul slicing path. Returns the

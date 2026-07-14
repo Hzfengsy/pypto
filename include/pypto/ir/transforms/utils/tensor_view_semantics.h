@@ -51,19 +51,19 @@ inline int64_t ComputeShapeProduct(const std::vector<ExprPtr>& shape) {
 /// fold path; on overflow, falls back to a symbolic ``Mul`` rather than
 /// silently wrapping (which would yield an incorrect stride that the
 /// canonical-view verifier cannot detect).
-inline ExprPtr MakeIndexMul(const ExprPtr& lhs, const ExprPtr& rhs) {
+inline ExprPtr MakeIndexMul(const ExprPtr& lhs, const ExprPtr& rhs, const Span& span = Span::unknown()) {
   auto const_lhs = As<ConstInt>(lhs);
   auto const_rhs = As<ConstInt>(rhs);
   if (const_lhs && const_rhs) {
     int64_t folded = 0;
     if (!__builtin_mul_overflow(const_lhs->value_, const_rhs->value_, &folded)) {
-      return std::make_shared<ConstInt>(folded, DataType::INDEX, Span::unknown());
+      return std::make_shared<ConstInt>(folded, DataType::INDEX, span);
     }
     // Overflow — drop to symbolic so callers / verifiers see a non-folded form.
   }
   if (const_rhs && const_rhs->value_ == 1) return lhs;
   if (const_lhs && const_lhs->value_ == 1) return rhs;
-  return std::make_shared<Mul>(lhs, rhs, DataType::INDEX, Span::unknown());
+  return std::make_shared<Mul>(lhs, rhs, DataType::INDEX, span);
 }
 
 /// Build row-major (ND-packed) strides for the given shape:

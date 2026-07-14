@@ -49,7 +49,7 @@ program_2d = flatten_pass(program)
 
 | Tile 操作 | 变换方式 |
 | --------- | -------- |
-| `tile.load`（>2D） | 直接将结果类型改为 2D（load 从 rank>2 张量窗口产生 2D tile） |
+| `tile.load`（>2D） | 将结果 tile 重建为 2D。对于 natural NZ Mat load，还会在源张量上插入 shape-only 的 2D `tensor.view`，把 leading offsets/shapes/valid_shapes 折叠到 2D 源窗口，并要求该窗口按 row-major 连续可折叠。Vec load 和 transposed Mat load 保留原始 rank>2 源窗口，只展平结果 tile |
 | `tile.store`（rank>2 张量） | 在转换后 IR 中注入原始张量 rank 对应的分区 `shapes` 作为额外的第 4 个操作数，供后端 codegen 重建 `partition_view`；DSL 源码不变。若 tile 操作数本身仍是 rank>2(例如用户显式 `tile.reshape` 升到 3D 后再喂给 `pl.assemble` 写入 N-D 张量视图),pass 会先插入一个 `tile.reshape` 把 tile 操作数压回 2D —— codegen 要求 tile 必须是 2D,而原始 tile shape 仍由 `shapes` 分区操作数携带 |
 | `tile.store`（2D 张量） | 直接透传 |
 | `tile.create`/`tile.full`（>2D） | 直接使用展平的 2D 形状重建 |
@@ -68,10 +68,10 @@ batch 重发。
 
 - **整块（默认）**：操作数整块进 Mat 一次，再按 batch **切片** —— 普通
   （行批 `[B*rows, cols]`）操作数行切，`tile.transpose_view`（列批 `[K, B*N]`）
-  操作数列切。3D `[B, N, K]` 张量的自然 Mat load 在此**保留 ND 源窗口**；硬件
-  ND2NZ「2 维 GlobalTensor」塌成 `[B*N, K]` 的处理由 `tile.load` codegen 负责
-  —— 当 load 结果为 NZ Mat tile 时触发，并在那里发射 2D `make_tensor_view`，故本
-  pass 只把 load 的**结果 tile** 展平为 2D。广播操作数复用其单页。
+  操作数列切。3D `[B, N, K]` 张量的自然 Mat load 在此保留逻辑 ND 源语义，但本
+  pass 会在 load 前插入 2D `tensor.view`（`[B*N, K]`），让下游 `tile.load`
+  codegen 看到与其他消费者一致的展平源窗口。本 pass 同时把 load 的**结果 tile**
+  展平为 2D。广播操作数复用其单页。
 - **逐 batch**（整块会撑爆 L1，**或**整块 load 非连续）：从底层自然 `tile.load`
   **逐 batch 重发**（每 batch `[1, .., X, Y]` 窗口 → 2D `[X, Y]`，用 load 自身的
   窗口维度，故部分子 tile 也能正确重发），转置时再加逐 batch

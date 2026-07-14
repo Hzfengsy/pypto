@@ -44,6 +44,10 @@ ExprPtr MakeShapeTupleFromInts(const std::vector<int64_t>& dims, const Span& spa
 std::vector<ExprPtr> Make2DShapeExprs(int64_t merged, int64_t last, const Span& span);
 std::vector<ExprPtr> ComputeMergedValidShape(const std::vector<ExprPtr>& valid, const Span& span);
 ExprPtr MakeCanonicalIndexAdd(const ExprPtr& lhs, const ExprPtr& rhs, const Span& span);
+std::vector<ExprPtr> CollapseLeadingDimsTo2D(const std::vector<ExprPtr>& dims, const Span& span);
+CallPtr CreateCollapsedTensorView(const ExprPtr& tensor, const TensorTypePtr& tensor_type, const Span& span);
+ExprPtr CollapseLeadingOffsetsToRow(const std::vector<ExprPtr>& offsets,
+                                    const std::vector<ExprPtr>& tensor_shape, const Span& span);
 bool BatchOperandsWholeFit(const TileTypePtr& lhs_type, const TileTypePtr& rhs_type);
 std::vector<int64_t> ToStaticDims(const std::vector<ExprPtr>& shape, const std::string& context);
 int64_t MultiplyStaticDims(const std::vector<int64_t>& dims, const std::string& context);

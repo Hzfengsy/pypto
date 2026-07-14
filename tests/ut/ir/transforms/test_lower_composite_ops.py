@@ -725,6 +725,240 @@ def test_allreduce_emits_for_and_if_control_flow():
     assert collector.if_count == 5, f"expected 5 IfStmts (one per ForStmt body), got {collector.if_count}"
 
 
+def test_allreduce_flattens_target_to_2d_view_for_mesh_lowering():
+    """Mesh allreduce uses a 2D target view for tile load/remote/store codegen."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[2, 3, 4], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[2, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[2, 3, 4], pl.FP32]:
+            data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            return data
+
+    After = passes.lower_composite_ops()(Before)
+    op_names = _collect_op_names(After)
+    assert "pld.tensor.allreduce" not in op_names
+    assert "tensor.view" in op_names
+
+    func = After.get_function("reduce_step")
+    assert func is not None
+    body = func.body
+    assert isinstance(body, ir.SeqStmts)
+    view_stmt = next(
+        stmt
+        for stmt in body.stmts
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == "tensor.view"
+    )
+    view_type = view_stmt.var.type
+    assert isinstance(view_type, ir.DistributedTensorType)
+    assert view_type.shape == [6, 4]
+
+
+def test_allreduce_mesh_lowering_preserves_partial_valid_shape():
+    """Mesh allreduce operates only on the target's representable valid rectangle."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            data: pl.InOut[
+                pld.DistributedTensor[
+                    [2, 3, 4],
+                    pl.FP32,
+                    pl.TensorView(valid_shape=[1, 3, 2], stride=[], layout=pl.TensorLayout.ND),
+                ]
+            ],
+            signal: pl.InOut[pld.DistributedTensor[[2, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[
+            [2, 3, 4],
+            pl.FP32,
+            pl.TensorView(valid_shape=[1, 3, 2], stride=[], layout=pl.TensorLayout.ND),
+        ]:
+            data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            return data
+
+    After = passes.lower_composite_ops()(Before)
+    func = After.get_function("reduce_step")
+    assert func is not None
+    assert isinstance(func.body, ir.SeqStmts)
+
+    view_stmt = next(
+        stmt
+        for stmt in func.body.stmts
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == "tensor.view"
+    )
+    view_type = view_stmt.var.type
+    assert isinstance(view_stmt.value, ir.Call)
+    assert len(view_stmt.value.args) == 3
+    assert isinstance(view_type, ir.DistributedTensorType)
+    assert view_type.shape == [6, 4]
+    assert view_type.tensor_view is not None
+    assert view_type.tensor_view.valid_shape == [3, 2]
+
+    class CallCollector(ir.IRVisitor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls: list[ir.Call] = []
+
+        def visit_call(self, op: ir.Call) -> None:
+            self.calls.append(op)
+            super().visit_call(op)
+
+    collector = CallCollector()
+    collector.visit_program(After)
+    load = next(call for call in collector.calls if call.op.name == "tile.load")
+    remote_load = next(call for call in collector.calls if call.op.name == "pld.tile.remote_load")
+    load_shape = load.args[2]
+    load_valid_shape = load.args[3]
+    remote_shape = remote_load.args[3]
+    assert isinstance(load_shape, ir.MakeTuple)
+    assert isinstance(load_valid_shape, ir.MakeTuple)
+    assert isinstance(remote_shape, ir.MakeTuple)
+    assert load_shape.elements == [3, 2]
+    assert load_valid_shape.elements == [3, 2]
+    assert remote_shape.elements == [3, 2]
+
+
+def test_allreduce_mesh_lowering_rejects_noncontiguous_partial_valid_shape():
+    """A partial box spanning disjoint flattened row ranges cannot use one 2D view."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            data: pl.InOut[
+                pld.DistributedTensor[
+                    [2, 3, 4],
+                    pl.FP32,
+                    pl.TensorView(valid_shape=[2, 2, 4], stride=[], layout=pl.TensorLayout.ND),
+                ]
+            ],
+            signal: pl.InOut[pld.DistributedTensor[[2, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[
+            [2, 3, 4],
+            pl.FP32,
+            pl.TensorView(valid_shape=[2, 2, 4], stride=[], layout=pl.TensorLayout.ND),
+        ]:
+            data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            return data
+
+    with pytest.raises(Exception, match="valid_shape cannot be represented by a single 2D view"):
+        passes.lower_composite_ops()(Before)
+
+
+def test_allreduce_mesh_lowering_rejects_strided_target_collapse():
+    """Flattening must not replace a legal strided-family view with packed storage."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            data: pl.InOut[
+                pld.DistributedTensor[
+                    [2, 3, 4],
+                    pl.FP32,
+                    pl.TensorView(stride=[100, 10, 1], layout=pl.TensorLayout.ND),
+                ]
+            ],
+            signal: pl.InOut[pld.DistributedTensor[[2, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[
+            [2, 3, 4],
+            pl.FP32,
+            pl.TensorView(stride=[100, 10, 1], layout=pl.TensorLayout.ND),
+        ]:
+            data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            return data
+
+    with pytest.raises(Exception, match="requires a packed source"):
+        passes.lower_composite_ops()(Before)
+
+
+def test_allreduce_mesh_lowering_rejects_partial_dn_target_collapse():
+    """The row-major partial-valid collapse is not valid for DN addresses."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            data: pl.InOut[
+                pld.DistributedTensor[
+                    [2, 3, 4],
+                    pl.FP32,
+                    pl.TensorView(valid_shape=[1, 3, 2], stride=[12, 1, 3], layout=pl.TensorLayout.DN),
+                ]
+            ],
+            signal: pl.InOut[pld.DistributedTensor[[2, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[
+            [2, 3, 4],
+            pl.FP32,
+            pl.TensorView(valid_shape=[1, 3, 2], stride=[12, 1, 3], layout=pl.TensorLayout.DN),
+        ]:
+            data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            return data
+
+    with pytest.raises(Exception, match="only supports ND layout"):
+        passes.lower_composite_ops()(Before)
+
+
+def test_allreduce_flattened_mesh_lowering_reaches_pto_codegen(default_pass_manager, ascend_backend):
+    """Default pipeline codegens the three-arg partial-valid target view."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            data: pl.InOut[
+                pld.DistributedTensor[
+                    [2, 3, 4],
+                    pl.FP32,
+                    pl.TensorView(valid_shape=[1, 3, 2], stride=[], layout=pl.TensorLayout.ND),
+                ]
+            ],
+            signal: pl.InOut[pld.DistributedTensor[[2, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[
+            [2, 3, 4],
+            pl.FP32,
+            pl.TensorView(valid_shape=[1, 3, 2], stride=[], layout=pl.TensorLayout.ND),
+        ]:
+            data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            return data
+
+    from pypto import codegen  # noqa: PLC0415
+
+    optimized = default_pass_manager.run_passes(Before)
+    func = optimized.get_function("reduce_step")
+    assert func is not None
+    view_stmt = next(
+        stmt
+        for stmt in func.body.stmts
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == "tensor.view"
+    )
+    assert isinstance(view_stmt.value, ir.Call)
+    assert len(view_stmt.value.args) == 3
+    assert isinstance(view_stmt.var.type, ir.DistributedTensorType)
+    assert view_stmt.var.type.shape == [6, 4]
+    assert view_stmt.var.type.tensor_view is not None
+    assert view_stmt.var.type.tensor_view.valid_shape == [3, 2]
+    single = ir.Program([func], func.name, optimized.span)
+    mlir = codegen.PTOCodegen().generate(single)
+    assert "tile.store tile valid_shape must be 2D" not in mlir
+
+
 def test_allreduce_lowering_is_idempotent():
     """Running the pass on already-lowered IR is a no-op — the second pass
     has nothing left to rewrite."""

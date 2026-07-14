@@ -1622,6 +1622,7 @@ def transpose(
 def view(
     tensor: Expr,
     shape: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
+    valid_shape: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
     *,
     layout: TensorLayout | None = None,
     span: Span | None = None,
@@ -1640,7 +1641,8 @@ def view(
        product-preserving (new product == old product), except for symbolic
        dimensions where equality is unprovable and accepted optimistically.
        Static target dimensions must be positive. A source with a partial
-       ``valid_shape`` cannot be shape-reinterpreted.
+       ``valid_shape`` can only use the packed ND leading-dimension collapse
+       to 2D and requires an explicit target ``valid_shape``.
     Combining ``shape`` with a layout change is valid for type deduction and
     PTO in-core lowering. Orchestration lowering only supports shape
     reinterpret for ND-layout tensors because the runtime ``Tensor::reshape``
@@ -1653,6 +1655,9 @@ def view(
             dimensions (RFC #1300 P4). Must be a sequence of ints or
             Expr values, or a ``MakeTuple``. In an InCore function, the source
             must remain a GM Tensor through tensor-to-tile conversion.
+        valid_shape: Explicit valid dimensions for a packed ND leading-dimension
+            collapse to 2D. Required when this supported collapse reinterprets
+            a source with partial validity.
         layout: Target ``TensorLayout`` (ND or DN). Must not be ``NZ``.
             When provided without ``shape``, performs a layout-only flip.
             When combined with ``shape``, layout changes are supported in-core
@@ -1670,10 +1675,14 @@ def view(
     """
     if shape is None and layout is None:
         raise ValueError("tensor.view requires at least one of shape or layout")
+    if valid_shape is not None and shape is None:
+        raise ValueError("tensor.view valid_shape requires shape")
     actual_span = _get_span_or_capture(span)
     args = [tensor]
     if shape is not None:
         args.append(_to_make_tuple(shape, actual_span))
+    if valid_shape is not None:
+        args.append(_to_make_tuple(valid_shape, actual_span))
     kwargs: dict[str, Any] = {}
     if layout is not None:
         kwargs["layout"] = layout

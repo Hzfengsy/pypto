@@ -1,6 +1,6 @@
 # LowerCompositeOps Pass
 
-Decomposes composite tile / distributed ops into compositions of primitive tile ops (`tile.muls`, `tile.adds`, `tile.add`, `tile.sub`, `tile.mul`, `tile.cast`) and distributed primitives, so codegen never has to emit a high-level intrinsic. Today the pass handles `tile.sin` / `tile.cos` (FP32 Cody-Waite + Horner) and `pld.tensor.*` distributed collectives (`allreduce` (mesh and ring), `allgather`, `reduce_scatter`, `broadcast`, `barrier`). New composite ops add a lowering rule to the dispatch table inside the pass file without touching the dispatcher.
+Decomposes composite tile / distributed ops into compositions of primitive tile ops (`tile.muls`, `tile.adds`, `tile.add`, `tile.sub`, `tile.mul`, `tile.cast`) and distributed primitives, so codegen never has to emit a high-level intrinsic. Today the pass handles `tile.sin` / `tile.cos` (FP32 Cody-Waite + Horner) and `pld.tensor.*` distributed collectives (`allreduce` (mesh and ring), `allgather`, `reduce_scatter`, `broadcast`, `barrier`). Mesh allreduce may also create a metadata-preserving `tensor.view` so tile load/remote/store operate on a 2D flattened target window. New composite ops add a lowering rule to the dispatch table inside the pass file without touching the dispatcher.
 
 ## Overview
 
@@ -18,7 +18,7 @@ The pass is **structural no-op** on programs that contain no registered composit
 
 **Invalidates**: nothing.
 
-The empty `PassProperties` contract (`kLowerCompositeOpsProperties` in `include/pypto/ir/transforms/pass_properties.h`) reflects that the lowering operates purely within the existing tile-op vocabulary (`tile.muls`, `tile.adds`, `tile.add`, `tile.sub`, `tile.mul`, `tile.cast`) — it neither establishes nor breaks any `IRProperty`.
+The empty `PassProperties` contract (`kLowerCompositeOpsProperties` in `include/pypto/ir/transforms/pass_properties.h`) reflects that the lowering operates within the existing tile/distributed vocabulary plus shape-only tensor views (`tensor.view`) used to expose canonical flattened windows; it neither establishes nor breaks any `IRProperty`.
 
 ## When It Runs
 
@@ -192,6 +192,8 @@ The pass also lowers the `pld.tensor.*` family of window-bound distributed colle
 ### `pld.tensor.allreduce`
 
 The allreduce rule decomposes one composite call into two cross-rank barriers reusing the same `signal` cells: Phase 2a `Set 1` + Phase 2b `wait ≥1`, then Phase 3.5a `AtomicAdd 1` + Phase 3.5b `wait ≥2`. By the time the call returns, every cell sits at `2` rather than its initial `0`.
+
+Mesh lowering collapses a packed target to `[product(leading dimensions), last dimension]`. If an ND target carries a partial `TensorView.valid_shape`, the pass preserves it and reduces only the corresponding 2D rectangle. Strided targets, DN partial views, and partial boxes that cannot be represented by this leading-dimension collapse are rejected explicitly.
 
 **Signal buffers must NOT be reused for back-to-back allreduce calls.** A stale `2` in any cell would let the next call's Phase 2b `wait ≥1` pass immediately on the leftover value, breaking the barrier and racing the next Phase 3 reads against the previous reduction's Phase 4 writes. Callers issuing multiple allreduces must allocate a fresh signal buffer (via `alloc_window_buffer` + `window`) for each call. The user-facing DSL docstring at `python/pypto/language/distributed/op/tensor_ops.py::allreduce` carries the same warning.
 

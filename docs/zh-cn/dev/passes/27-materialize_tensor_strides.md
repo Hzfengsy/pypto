@@ -1,8 +1,8 @@
 # MaterializeTensorStrides Pass
 
-将程序中所有 `view.has_value() && view.stride.empty()` 槽位按对应 layout 的 packed canonical 公式填入显式 stride（参考 RFC #1300 §2.4）。Pass 运行后即满足 codegen 入口契约：每个存在的 `TensorView` 都带显式 stride 与其 layout / shape 一致，严格模式 `TensorViewCanonical` verifier 也会通过。
+将程序中所有 `TensorType` / `DistributedTensorType` 上的 `view.has_value() && view.stride.empty()` 槽位按对应 layout 的 packed canonical 公式填入显式 stride（参考 RFC #1300 §2.4）。Pass 运行后即满足 codegen 入口契约：每个存在的 `TensorView` 都带显式 stride 与其 layout / shape 一致，严格模式 `TensorViewCanonical` verifier 也会通过。
 
-> **状态**：本 Pass 已注册（`passes.materialize_tensor_strides()`）并通过独立单测，但**尚未接入默认 pipeline**。原因是按 canonical（逻辑 shape）公式物化 DN stride 与 PTO codegen 中遗留的「源 shape + 出口处再做 swap」路径冲突（`get_shape_source_idx` / `dn_swap`）。pipeline 接入将在 RFC #1300 P6/P7 的 codegen 清理一并完成；`pass_manager.py` 的预留位置已给后续阶段留下注释。
+> **状态**：本 Pass 已注册（`passes.materialize_tensor_strides()`）、有单测覆盖，并自 RFC #1300 P6 起接入默认 tile/PTO pipeline，位置在 `CanonicalizeIOOrder` 与 `InitMemRef` 之间。
 
 ## 概述
 
@@ -11,7 +11,7 @@ PyPTO IR 上 `TensorType.tensor_view_` 当前可以处于两种等价形态：
 - **隐式** —— `view.has_value() && view.stride.empty()`：layout 标签已设（如 `DN`），但每维 stride 为空。下游消费方需把空 stride 当作「该 layout 的 packed canonical stride」。
 - **显式** —— 每个维度的 stride `ExprPtr` 都已写出。
 
-为了让 codegen 看到单一可机械读取的契约，`MaterializeTensorStrides` 遍历整个程序，把所有隐式 `TensorView` 用 `tensor_view_semantics.h` 中的 `BuildLogicalStridesFromLayout` 改写为显式 packed canonical 形式。**裸 `TensorType`**（`!view.has_value()`）不被改写：`TensorViewCanonical` verifier 在弱/严格模式下都把它当作 ND-packed 接受，本身就无歧义。
+为了让 codegen 看到单一可机械读取的契约，`MaterializeTensorStrides` 遍历整个程序，把所有隐式 `TensorView` 用 `tensor_view_semantics.h` 中的 `BuildLogicalStridesFromLayout` 改写为显式 packed canonical 形式。**裸 `TensorType`**（`!view.has_value()`）不被改写：`TensorViewCanonical` verifier 在弱/严格模式下都把它当作 ND-packed 接受，本身就无歧义。输入类型是 `DistributedTensorType` 时，重建后的类型仍保持 distributed wrapper，并保留 `memref`、`TensorView.pad` 等非 stride 元数据以及 `window_buffer` 反向引用。
 
 **Requirements**：
 
@@ -50,7 +50,7 @@ Pass 使用带 Var 替换缓存的 `IRMutator`，结构与 `InferTileMemorySpace
      - `VisitStmt_(AssignStmtPtr)`：先重建 RHS；若 RHS Call 的返回类型比 LHS Var 当前类型更显式（已物化），同步 LHS Var。
 
 2. **类型重写** —— `MaterializeType(type)`：
-   - `TensorType` 满足 `view.has_value() && view.stride.empty() && layout != NZ`：用 `BuildLogicalStridesFromLayout(shape, layout)` 重建。其他 `TensorType` 形态原样返回（保持指针身份）。
+   - `TensorType` / `DistributedTensorType` 满足 `view.has_value() && view.stride.empty() && layout != NZ`：用 `BuildLogicalStridesFromLayout(shape, layout)` 重建，并保留 distributed wrapper 与可选元数据（`memref`、`TensorView.pad`、`window_buffer`）。其他 tensor 形态原样返回（保持指针身份）。
    - `TensorType` 且 `layout == NZ`：原样返回（NZ 在 `TensorType` 上属于非法 IR；交由 verifier 报错而非在这里 `BuildLogicalStridesFromLayout` `CHECK`-fail）。
    - `TupleType`：递归处理元素类型；任一子类型变化时重建。
    - 其它：原样返回。

@@ -237,6 +237,9 @@ registered as a `TensorOp` passthrough in `ConvertTensorToTileOps`; PTO in-core
 codegen lowers it to `pto.make_tensor_view` over the original base pointer.
 Targets require rank at least 1 (DN requires rank at least 2); orchestration
 shape reinterpret is ND-only and cannot also change layout.
+Shape reinterpretation of a partially valid source is limited to a packed ND
+leading-dimension collapse to 2D and requires an explicit target `valid_shape`;
+this form preserves the source tensor kind and backing metadata.
 
 **Example:**
 

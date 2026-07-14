@@ -271,6 +271,11 @@ pld.tensor.allreduce(src, signal, *, op: ReduceOp = ReduceOp.Sum, mode: str = "m
 Reduces every participating rank's window-bound `src` slice in place and returns
 the same type as `src`. The `mode` keyword selects the lowering algorithm:
 
+For mesh lowering, a partial `TensorView.valid_shape` is preserved for packed ND
+targets when its valid box can be represented by collapsing the leading dimensions
+to one 2D rectangle; only that rectangle is reduced. Strided targets, DN partial
+views, and non-representable partial boxes are rejected explicitly.
+
 - **`"mesh"` (default)** — direct all-to-all exchange with O(P) HCCL windows.
   Signal shape `[NR, 1]` (one cell per rank).  4-phase decomposition: notify-all
   (Set 1) / wait-all (Ge 1) / remote_load+accumulate / store-back with a

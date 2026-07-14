@@ -9,6 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include <algorithm>
 #include <any>
 #include <cstddef>
 #include <functional>
@@ -32,6 +33,7 @@
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
+#include "pypto/ir/transforms/utils/tile_conversion_utils.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
 #include "src/ir/transforms/flatten_tile_nd_to_2d/internal.h"
@@ -45,6 +47,22 @@ using transform_utils::Substitute;
 
 namespace flatten_tile_nd_to_2d {
 namespace rewrite_internal {
+
+bool IsNaturalNzMatLoad(const TileTypePtr& result_tile, bool assume_mat = false) {
+  if (!result_tile) return false;
+  if (result_tile->memory_space_ != MemorySpace::Mat && !assume_mat) return false;
+  const auto view = result_tile->tile_view_.has_value()
+                        ? *result_tile->tile_view_
+                        : tile_view_semantics::GetImplicitTileView(
+                              result_tile->shape_,
+                              assume_mat ? std::make_optional(MemorySpace::Mat) : result_tile->memory_space_);
+  return view.blayout == TileLayout::col_major && view.slayout == TileLayout::row_major;
+}
+
+bool HasKwarg(const std::vector<std::pair<std::string, std::any>>& kwargs, const std::string& name) {
+  return std::any_of(kwargs.begin(), kwargs.end(),
+                     [&name](const auto& kwarg) { return kwarg.first == name; });
+}
 
 /**
  * @brief Recursively transform statements, flattening >2D tile ops to 2D.
@@ -574,6 +592,12 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
 
       auto result_tile = As<TileType>(call->GetType());
       if (result_tile && result_tile->shape_.size() > 2) {
+        const bool pending_batch_matmul_mat = batch_matmul_only_vars.count(assign->var_.get()) != 0 &&
+                                              !HasKwarg(call->kwargs_, "target_memory") &&
+                                              result_tile->memory_space_ != MemorySpace::Mat;
+        const std::optional<MemorySpace> flat_memory_space =
+            pending_batch_matmul_mat ? std::make_optional(MemorySpace::Mat) : result_tile->memory_space_;
+
         // Rank>2 tile.load: keep the original tensor-rank offsets/shapes, but
         // construct a 2D TileType for the result. DeduceTileLoadType produces a
         // rank>2 TileType from those shapes, but hardware tiles are always 2D.
@@ -601,18 +625,69 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
           flat_tile_view = TileView(flat_valid, /*stride=*/{}, /*start_offset=*/nullptr, orig_tv.blayout,
                                     orig_tv.slayout, orig_tv.fractal, orig_tv.pad);
         } else {
-          flat_tile_view =
-              tile_view_semantics::GetImplicitTileView(flat_shape_exprs, result_tile->memory_space_);
+          flat_tile_view = tile_view_semantics::GetImplicitTileView(flat_shape_exprs, flat_memory_space);
         }
         auto flat_tile_type = std::make_shared<TileType>(flat_shape_exprs, result_tile->dtype_, std::nullopt,
-                                                         flat_tile_view, result_tile->memory_space_);
+                                                         flat_tile_view, flat_memory_space);
 
-        // The rank>2 source window is preserved as-is for codegen. A natural Mat
-        // load lowers to ND2NZ, which requires a 2-dim GlobalTensor — that
-        // collapse is owned by the tile.load codegen (it triggers on the NZ result
-        // tile), so flatten only needs to flatten the RESULT tile to 2D here.
+        // A natural Mat load lowers to ND2NZ, which requires a 2D GlobalTensor.
+        // Materialize that source-window collapse in IR with tensor.view; plain
+        // Vec loads and transposed Mat loads keep their tensor-rank source window.
+        if (IsNaturalNzMatLoad(result_tile, pending_batch_matmul_mat)) {
+          auto tensor = AsVarLike(sub_args[0]);
+          auto tensor_type = tensor ? AsTensorTypeLike(tensor->GetType()) : nullptr;
+          INTERNAL_CHECK_SPAN(tensor && tensor_type, span)
+              << "FlattenTileNdTo2D: tile.load source must be tensor-like for NZ 2D collapse";
+          INTERNAL_CHECK_SPAN(tensor_type->shape_.size() == result_tile->shape_.size(), span)
+              << "FlattenTileNdTo2D: tile.load source rank must match result tile rank for NZ 2D collapse";
+
+          auto offsets_tuple = As<MakeTuple>(sub_args[1]);
+          auto shapes_tuple = As<MakeTuple>(sub_args[2]);
+          INTERNAL_CHECK_SPAN(offsets_tuple && shapes_tuple, span)
+              << "FlattenTileNdTo2D: tile.load offsets and shapes must be tuples";
+          auto valid_shapes_tuple = shapes_tuple;
+          if (sub_args.size() >= 4) {
+            valid_shapes_tuple = As<MakeTuple>(sub_args[3]);
+            INTERNAL_CHECK_SPAN(valid_shapes_tuple, span)
+                << "FlattenTileNdTo2D: tile.load valid_shapes must be a tuple";
+          }
+          INTERNAL_CHECK_SPAN(offsets_tuple->elements_.size() == tensor_type->shape_.size() &&
+                                  shapes_tuple->elements_.size() == tensor_type->shape_.size() &&
+                                  valid_shapes_tuple->elements_.size() == tensor_type->shape_.size(),
+                              span)
+              << "FlattenTileNdTo2D: tile.load offset/shape ranks must match tensor rank";
+          INTERNAL_CHECK_SPAN(tile_conversion_utils::IsRowMajorCollapseContiguous(
+                                  valid_shapes_tuple->elements_, tensor_type->shape_),
+                              span)
+              << "FlattenTileNdTo2D: tile.load NZ 2D source-window collapse requires the valid "
+                 "sub-box of the leading dims to be contiguous in row-major order";
+
+          auto view_call = CreateCollapsedTensorView(tensor, tensor_type, span);
+          auto view_var =
+              std::make_shared<Var>(assign->var_->name_hint_ + "_view2d", view_call->GetType(), span);
+          result.push_back(std::make_shared<AssignStmt>(view_var, view_call, span));
+
+          auto row_offset = CollapseLeadingOffsetsToRow(offsets_tuple->elements_, tensor_type->shape_, span);
+          sub_args[0] = view_var;
+          sub_args[1] = std::make_shared<MakeTuple>(
+              std::vector<ExprPtr>{row_offset, offsets_tuple->elements_.back()}, span);
+          sub_args[2] =
+              std::make_shared<MakeTuple>(CollapseLeadingDimsTo2D(shapes_tuple->elements_, span), span);
+          auto flat_valid_shapes =
+              std::make_shared<MakeTuple>(CollapseLeadingDimsTo2D(valid_shapes_tuple->elements_, span), span);
+          if (sub_args.size() >= 4) {
+            sub_args[3] = flat_valid_shapes;
+          } else {
+            sub_args.push_back(flat_valid_shapes);
+          }
+        }
+
+        auto flat_kwargs = call->kwargs_;
+        if (pending_batch_matmul_mat) {
+          flat_kwargs.emplace_back("target_memory", MemorySpace::Mat);
+        }
         auto flat_call =
-            std::make_shared<Call>(call->op_, sub_args, call->kwargs_, flat_tile_type, call->span_);
+            std::make_shared<Call>(call->op_, sub_args, flat_kwargs, flat_tile_type, call->span_);
         auto flat_var = std::make_shared<Var>(assign->var_->name_hint_, flat_tile_type, assign->var_->span_);
         result.push_back(std::make_shared<AssignStmt>(flat_var, flat_call, assign->span_));
         ctx.Insert(assign->var_, flat_var);

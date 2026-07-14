@@ -1,8 +1,8 @@
 # MaterializeTensorStrides Pass
 
-Fills every `view.has_value() && view.stride.empty()` slot on every `TensorType` reachable from the program with the packed canonical stride for the carried layout (per RFC #1300 §2.4). After this pass runs, the codegen-entry contract holds: every `TensorView` that exists has explicit stride matching its layout / shape, and the strict-mode `TensorViewCanonical` verifier accepts the IR.
+Fills every `view.has_value() && view.stride.empty()` slot on every `TensorType` / `DistributedTensorType` reachable from the program with the packed canonical stride for the carried layout (per RFC #1300 §2.4). After this pass runs, the codegen-entry contract holds: every `TensorView` that exists has explicit stride matching its layout / shape, and the strict-mode `TensorViewCanonical` verifier accepts the IR.
 
-> **Status**: this pass is registered (`passes.materialize_tensor_strides()`) and fully tested in isolation, but it is intentionally **not yet inserted into the default pipeline**. Materializing DN strides per the canonical (logical-shape) formula conflicts with the legacy "source shape + post-emit swap" path still living in PTO codegen (`get_shape_source_idx` / `dn_swap`). The pipeline insertion will land alongside the codegen cleanup in RFC #1300 P6/P7. The `pass_manager.py` insertion site carries a comment pointer for the next phase.
+> **Status**: this pass is registered (`passes.materialize_tensor_strides()`), covered by unit tests, and wired into the default tile/PTO pipeline between `CanonicalizeIOOrder` and `InitMemRef` starting from RFC #1300 P6.
 
 ## Overview
 
@@ -11,7 +11,7 @@ PyPTO's IR allows two equivalent forms for `TensorType.tensor_view_`:
 - **Implicit** — `view.has_value() && view.stride.empty()`: the layout tag is set (e.g. `DN`) but the per-dimension stride is left blank. Downstream consumers must treat empty stride as "use the packed canonical stride for this layout."
 - **Explicit** — every dimension has its `ExprPtr` stride spelled out.
 
-Codegen needs one machine-readable contract, so `MaterializeTensorStrides` walks the program and rewrites every implicit `TensorView` into its explicit packed canonical form using `BuildLogicalStridesFromLayout` from `tensor_view_semantics.h`. Bare `TensorType`s (`!view.has_value()`) are left untouched: the `TensorViewCanonical` verifier accepts them in both modes as implicitly ND-packed and the bare form is unambiguous.
+Codegen needs one machine-readable contract, so `MaterializeTensorStrides` walks the program and rewrites every implicit `TensorView` into its explicit packed canonical form using `BuildLogicalStridesFromLayout` from `tensor_view_semantics.h`. Bare `TensorType`s (`!view.has_value()`) are left untouched: the `TensorViewCanonical` verifier accepts them in both modes as implicitly ND-packed and the bare form is unambiguous. When the input type is a `DistributedTensorType`, the rebuilt type remains distributed and preserves its `memref`, non-stride `TensorView` metadata such as `pad`, and `window_buffer` back-reference.
 
 **Requirements**:
 
@@ -50,7 +50,7 @@ The pass uses an `IRMutator` with a Var-substitution cache, mirroring the patter
      - `VisitStmt_(AssignStmtPtr)`: rebuild RHS first; if the RHS Call's return type is more specific than the current LHS Var type, sync the Var.
 
 2. **Type rewriting** — `MaterializeType(type)`:
-   - `TensorType` with `view.has_value() && view.stride.empty() && layout != NZ`: rebuild with `BuildLogicalStridesFromLayout(shape, layout)` filled in. Other `TensorType` shapes pass through unchanged (identity preserved).
+   - `TensorType` / `DistributedTensorType` with `view.has_value() && view.stride.empty() && layout != NZ`: rebuild with `BuildLogicalStridesFromLayout(shape, layout)` filled in. The distributed wrapper and optional metadata (`memref`, `TensorView.pad`, `window_buffer`) are preserved. Other tensor shapes pass through unchanged (identity preserved).
    - `TensorType` with `layout == NZ`: untouched (NZ on `TensorType` is invalid IR; the verifier flags it instead of `BuildLogicalStridesFromLayout` `CHECK`-failing).
    - `TupleType`: recurse into element types; rebuild only if any sub-type changed.
    - Anything else: pass through.

@@ -298,6 +298,40 @@ def test_remote_load_uses_comm_layout_constants():
     assert "arith.divsi" in helper
 
 
+def test_remote_load_peer_view_preserves_explicit_tensor_view_layout_and_strides():
+    """remote_load reuses explicit TensorView metadata for the peer view."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            data: pld.DistributedTensor[[4, 8], pl.FP32],
+            out: pl.Tensor[[8, 4], pl.FP32],
+            peer: pl.Scalar[pl.INT32],
+        ):
+            viewed: pld.DistributedTensor[
+                [8, 4],
+                pl.FP32,
+                pl.TensorView(stride=[1, 8], layout=pl.TensorLayout.DN),
+            ] = pl.tensor.view(data, [8, 4], layout=pl.TensorLayout.DN)
+            t = pld.tile.remote_load(viewed, peer=peer, offsets=[0, 0], shape=[8, 4])
+            pl.store(t, [0, 0], out)
+
+    mlir = _generate_mlir(P)
+    funcs = _split_module(mlir)
+    kernel = funcs["kernel"]
+    addptr_line = next(line for line in kernel.splitlines() if "pto.addptr %arg0" in line)
+    peer_ptr = re.search(r"(%\d+) = pto\.addptr", addptr_line)
+    assert peer_ptr is not None, addptr_line
+    peer_view_line = next(
+        line for line in kernel.splitlines() if f"pto.make_tensor_view {peer_ptr.group(1)}" in line
+    )
+    assert "shape = [%c8_index, %c4_index]" in peer_view_line, peer_view_line
+    assert "strides = [%c1_index, %c8_index]" in peer_view_line, peer_view_line
+    assert "{layout = #pto.layout<dn>}" in peer_view_line, peer_view_line
+
+
 def test_notify_emits_comm_tnotify_with_attr():
     """notify codegen emits pto.comm.tnotify with #pto<notify_op …> attr."""
 

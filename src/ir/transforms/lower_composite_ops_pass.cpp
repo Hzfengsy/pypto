@@ -57,6 +57,36 @@ struct CommSetup {
   ExprPtr my_rank;     ///< Result of pld.system.rank (INT32)
 };
 
+std::vector<ExprPtr> CollapseShapeTo2D(const std::vector<ExprPtr>& shape, const Span& span) {
+  INTERNAL_CHECK_SPAN(!shape.empty(), span) << "Cannot flatten a rank-0 tensor shape";
+  if (shape.size() == 1) {
+    return {std::make_shared<ConstInt>(1, DataType::INDEX, span), shape[0]};
+  }
+  if (shape.size() == 2) return shape;
+
+  ExprPtr rows = shape[0];
+  for (size_t i = 1; i + 1 < shape.size(); ++i) {
+    rows = tile_conversion_utils::MakeCanonicalIndexMul(rows, shape[i], span, "LowerCompositeOps");
+  }
+  return {rows, shape.back()};
+}
+
+CallPtr CreateAllReduceTargetView(const ExprPtr& target, const DistributedTensorTypePtr& target_type,
+                                  const std::vector<ExprPtr>& flat_shape,
+                                  const std::vector<ExprPtr>& flat_valid_shape, const Span& span) {
+  // Mesh allreduce owns this alias and reduces only flat_valid_shape. Public
+  // tensor.view cannot infer a shape reinterpretation for partial validity.
+  auto shape_tuple = tile_conversion_utils::MakeShapeTuple(flat_shape, span);
+  std::vector<ExprPtr> view_args{target, shape_tuple};
+  if (target_type->tensor_view_.has_value() &&
+      (!target_type->tensor_view_->valid_shape.empty() || target_type->tensor_view_->pad != PadValue::null)) {
+    const auto& source_valid_shape = target_type->tensor_view_->valid_shape;
+    view_args.push_back(tile_conversion_utils::MakeShapeTuple(
+        source_valid_shape.empty() ? std::vector<ExprPtr>{} : flat_valid_shape, span));
+  }
+  return OpRegistry::GetInstance().Create("tensor.view", view_args, {}, span);
+}
+
 // ============================================================================
 // LoweringBuilder
 //
@@ -596,8 +626,6 @@ ExprPtr LowerTensorAllReduceRule(const CallPtr& call, const std::vector<ExprPtr>
     return LowerTensorRingAllReduceRule(call, args, b);
   }
 
-  const std::size_t ndim = target_type->shape_.size();
-
   // ---- Pre-build expressions shared across phases ----
   auto& reg = OpRegistry::GetInstance();
   auto comm = b.EmitCommSetup(target, span);
@@ -637,8 +665,20 @@ ExprPtr LowerTensorAllReduceRule(const CallPtr& call, const std::vector<ExprPtr>
   auto one_idx = std::make_shared<ConstInt>(1, DataType::INDEX, span);
   auto one_i32 = std::make_shared<ConstInt>(1, DataType::INT32, span);
   auto two_i32 = std::make_shared<ConstInt>(2, DataType::INT32, span);
-  auto zero_offsets = tile_conversion_utils::MakeZeroOffsets(ndim, span);
-  auto shape_tuple = tile_conversion_utils::MakeShapeTuple(target_type->shape_, span);
+  auto flat_shape = CollapseShapeTo2D(target_type->shape_, span);
+  auto flat_valid_shape = flat_shape;
+  if (target_type->tensor_view_.has_value() && !target_type->tensor_view_->valid_shape.empty()) {
+    const auto& valid_shape = target_type->tensor_view_->valid_shape;
+    CHECK_SPAN(valid_shape.size() == target_type->shape_.size(), span)
+        << "pld.tensor.allreduce target valid_shape rank must match target rank";
+    CHECK_SPAN(tile_conversion_utils::IsRowMajorCollapseContiguous(valid_shape, target_type->shape_), span)
+        << "pld.tensor.allreduce target valid_shape cannot be represented by a single 2D view";
+    flat_valid_shape = CollapseShapeTo2D(valid_shape, span);
+  }
+  auto flat_valid_shape_tuple = tile_conversion_utils::MakeShapeTuple(flat_valid_shape, span);
+  auto flat_target = b.Bind(
+      "target_2d", CreateAllReduceTargetView(target, target_type, flat_shape, flat_valid_shape, span), span);
+  auto zero_offsets = tile_conversion_utils::MakeZeroOffsets(2, span);
 
   // ---- Phase 2a: notify all peers (Set cell[my_rank, 0] on each peer to 1) ----
   b.EmitNotifyAll(signal, comm.nranks_idx, comm.my_rank, NotifyOp::kSet, one_i32, "", span);
@@ -649,10 +689,11 @@ ExprPtr LowerTensorAllReduceRule(const CallPtr& call, const std::vector<ExprPtr>
   // ---- Phase 3: acc = load(target); for peer != my_rank: acc += remote_load(peer) ----
   // tile.load needs the valid_shapes arg (same as shapes when omitted) plus
   // target_memory / transpose kwargs — mirrors `pl.load(...)`.
-  auto acc_initial = b.Bind("acc_initial",
-                            reg.Create("tile.load", {target, zero_offsets, shape_tuple, shape_tuple},
-                                       {{"target_memory", MemorySpace::Vec}}, span),
-                            span);
+  auto acc_initial = b.Bind(
+      "acc_initial",
+      reg.Create("tile.load", {flat_target, zero_offsets, flat_valid_shape_tuple, flat_valid_shape_tuple},
+                 {{"target_memory", MemorySpace::Vec}}, span),
+      span);
 
   auto acc_final = b.EmitForReduce(
       "peer", zero_idx, comm.nranks_idx, one_idx, acc_initial,
@@ -660,11 +701,12 @@ ExprPtr LowerTensorAllReduceRule(const CallPtr& call, const std::vector<ExprPtr>
         return body.EmitIfExpr(
             body.NotEq(peer, comm.my_rank, span),
             [&](LoweringBuilder& then_body) {
-              auto recv = then_body.Bind(
-                  "recv",
-                  OpRegistry::GetInstance().Create("pld.tile.remote_load",
-                                                   {target, peer, zero_offsets, shape_tuple}, {}, span),
-                  span);
+              auto recv =
+                  then_body.Bind("recv",
+                                 OpRegistry::GetInstance().Create(
+                                     "pld.tile.remote_load",
+                                     {flat_target, peer, zero_offsets, flat_valid_shape_tuple}, {}, span),
+                                 span);
               // Bind the add result so codegen sees a named tile buffer to
               // write into (pto.tadd lowers to `ins(...) outs(<bound>)`);
               // yielding a raw Call leaves outs() empty and MLIR rejects it.
@@ -698,7 +740,7 @@ ExprPtr LowerTensorAllReduceRule(const CallPtr& call, const std::vector<ExprPtr>
   b.EmitWaitAll(signal, comm.nranks_idx, comm.my_rank, two_i32, "2", span);
 
   // ---- Phase 4: store the reduced accumulator back into the target slot ----
-  b.Bind("store_ret", reg.Create("tile.store", {acc_final, zero_offsets, target}, {}, span), span);
+  b.Bind("store_ret", reg.Create("tile.store", {acc_final, zero_offsets, flat_target}, {}, span), span);
 
   // In-place semantics: the rebind LHS receives the (post-reduce) target view.
   return target;

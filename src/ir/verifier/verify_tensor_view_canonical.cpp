@@ -32,8 +32,8 @@ namespace ir {
 namespace {
 
 /// Walks every Var/IterArg/Call/Function-param/return type reachable from a
-/// program and asserts the TensorType canonical-view invariant on each
-/// TensorType (including TensorTypes nested in TupleTypes).
+/// program and asserts the tensor-like canonical-view invariant on each
+/// TensorType / DistributedTensorType (including nested TupleTypes).
 class TensorViewCanonicalVisitor : public IRVisitor {
  public:
   TensorViewCanonicalVisitor(std::vector<Diagnostic>& diagnostics, std::string func_name,
@@ -44,7 +44,7 @@ class TensorViewCanonicalVisitor : public IRVisitor {
 
   void CheckType(const TypePtr& type, const Span& span) {
     if (!type) return;
-    if (auto tensor_type = As<TensorType>(type)) {
+    if (auto tensor_type = AsTensorTypeLike(type)) {
       CheckTensorType(tensor_type, span);
     } else if (auto tuple_type = As<TupleType>(type)) {
       for (const auto& sub : tuple_type->types_) {
