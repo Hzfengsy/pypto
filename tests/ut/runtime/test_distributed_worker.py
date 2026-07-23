@@ -20,6 +20,7 @@ import sys
 import threading
 import weakref
 from collections.abc import Callable
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -35,6 +36,7 @@ from pypto.runtime.distributed_runner import (
     DistributedWorker,
     _assemble_chip_callables,
     _clear_dfx_dispatch_dirs,
+    _collect_l3_swimlane,
     _make_call_config,
     _submit_chip,
 )
@@ -1171,7 +1173,7 @@ class _RecordingOrch:
         self.calls: list[tuple[Any, int, str]] = []
         # ``_submit_chip`` reads/writes this per-card dispatch counter on the
         # orch; declare it so the attribute is known to the type checker.
-        self._dfx_dispatch_idx: dict[int, int] = {}
+        self._dfx_dispatch_idx: dict[str, int] = {}
 
     def submit_next_level(self, callable_id: Any, task_args: Any, config: Any, *, worker: int) -> str:
         self.calls.append((callable_id, worker, config.output_prefix))
@@ -1241,12 +1243,47 @@ class TestSubmitChip:
         assert orch.calls == [("chip", 5, "")]
         assert cfg.output_prefix == ""
 
-    def test_unconstrained_worker_not_suffixed(self):
+    def test_unconstrained_worker_suffixed_as_rank_local(self):
+        # A comm-less / unconstrained dispatch (``worker < 0``) has no real rank
+        # but still gets a per-dispatch namespace under ``rank_local`` so its
+        # fixed-name artifacts don't clobber sibling dispatches and
+        # ``_collect_l3_swimlane`` (globs ``rank*``) finds them.
         orch = _RecordingOrch()
         cfg = _SpyDfxConfig(output_prefix="/work/dfx_outputs")
         _submit_chip(orch, "chip", "ta", cfg, -1)
-        assert orch.calls == [("chip", -1, "/work/dfx_outputs")]
+        _submit_chip(orch, "chip", "ta", cfg, -1)  # second comm-less dispatch
+        assert [c[2] for c in orch.calls] == [
+            "/work/dfx_outputs/rank_local/d0",
+            "/work/dfx_outputs/rank_local/d1",
+        ]
+        # worker is still forwarded as -1 (unconstrained) to the runtime.
+        assert [c[1] for c in orch.calls] == [-1, -1]
         assert cfg.output_prefix == "/work/dfx_outputs"
+
+    def test_distinct_unconstrained_workers_share_one_counter(self):
+        # Every ``worker < 0`` collapses to the same ``rank_local`` dir, so the
+        # dispatch counter must be keyed by that *label* — keying it by the raw
+        # worker would give two distinct negative workers ``rank_local/d0``
+        # each, clobbering the first dispatch's fixed-name artifacts.
+        orch = _RecordingOrch()
+        cfg = _SpyDfxConfig(output_prefix="/work/dfx_outputs")
+        _submit_chip(orch, "chip", "ta", cfg, -1)
+        _submit_chip(orch, "chip", "ta", cfg, -2)  # a different unconstrained worker
+        assert [c[2] for c in orch.calls] == [
+            "/work/dfx_outputs/rank_local/d0",
+            "/work/dfx_outputs/rank_local/d1",
+        ]
+
+
+def _write_dfx_dispatch_dirs(dfx: Path, *rels: str) -> None:
+    """Lay down ``<dfx>/<rel>/l2_swimlane_records.json`` for each dispatch dir.
+
+    Shared by the cleaner and collector tests below so the on-disk DFX layout
+    they both assume is spelled out once.
+    """
+    for rel in rels:
+        (dfx / rel).mkdir(parents=True)
+        (dfx / rel / "l2_swimlane_records.json").write_text("{}", encoding="utf-8")
 
 
 class TestClearDfxDispatchDirs:
@@ -1257,17 +1294,20 @@ class TestClearDfxDispatchDirs:
         # only write d0, so the stale d1/d2 must be cleared. A sibling non-d{k}
         # dir (e.g. a future diagnostic) is preserved.
         dfx = tmp_path / "dfx_outputs"
-        for d in ("rank0/d0", "rank0/d1", "rank0/d2", "rank1/d0", "rank0/keepme"):
-            (dfx / d).mkdir(parents=True)
-            (dfx / d / "l2_swimlane_records.json").write_text("{}", encoding="utf-8")
+        # ``rank_local`` is the comm-less dispatch namespace; it must be cleared
+        # like any other ``rank*`` dir (it matches the same ``rank*`` glob).
+        _write_dfx_dispatch_dirs(
+            dfx, "rank0/d0", "rank0/d1", "rank0/d2", "rank1/d0", "rank_local/d0", "rank0/keepme"
+        )
 
         _clear_dfx_dispatch_dirs(dfx)
 
-        # All d{k} dirs gone...
+        # All d{k} dirs gone (rank-pinned and comm-less alike)...
         assert not (dfx / "rank0" / "d0").exists()
         assert not (dfx / "rank0" / "d1").exists()
         assert not (dfx / "rank0" / "d2").exists()
         assert not (dfx / "rank1" / "d0").exists()
+        assert not (dfx / "rank_local" / "d0").exists()
         # ...but the non-dispatch dir and the rank dirs themselves remain.
         assert (dfx / "rank0" / "keepme").is_dir()
         assert (dfx / "rank0").is_dir()
@@ -1275,6 +1315,63 @@ class TestClearDfxDispatchDirs:
     def test_missing_base_is_noop(self, tmp_path):
         # No dfx_outputs yet (first dispatch) -> nothing to clear, no error.
         _clear_dfx_dispatch_dirs(tmp_path / "dfx_outputs")
+
+
+class TestCollectL3Swimlane:
+    """``_collect_l3_swimlane`` converts every ``rank*/d{k}`` dispatch's records."""
+
+    @staticmethod
+    def _spy_generate_swimlane(monkeypatch) -> list[Path]:
+        """Record which dispatch dirs the converter was invoked on."""
+        import pypto.runtime.runner as _runner  # noqa: PLC0415
+
+        seen: list[Path] = []
+
+        def _fake(work_dir, out_dir, records, func_names=None):  # noqa: ANN001, ARG001
+            seen.append(out_dir)
+
+        monkeypatch.setattr(_runner, "_generate_swimlane", _fake)
+        return seen
+
+    def test_collects_rank_pinned_and_comm_less_dirs(self, tmp_path, monkeypatch):
+        # The consumer half of the comm-less fix: globbing ``rank*`` (rather
+        # than iterating a rank count) is what makes a comm-less dispatch's
+        # records — written under ``rank_local`` — get converted at all.
+        seen = self._spy_generate_swimlane(monkeypatch)
+        dfx = tmp_path / "dfx_outputs"
+        # ``rank0/keepme`` carries a records file like a real dispatch dir, so
+        # only the ``d[0-9]*`` filter can exclude it — that makes the assertion
+        # below a genuine discriminator for the glob rather than for the
+        # ``records.exists()`` guard.
+        _write_dfx_dispatch_dirs(dfx, "rank0/d0", "rank0/d1", "rank_local/d0", "rank0/keepme")
+        # A dispatch dir with no records (DFX wrote nothing) is skipped.
+        (dfx / "rank_local" / "d1").mkdir(parents=True)
+
+        _collect_l3_swimlane(tmp_path, "a2a3")
+
+        assert sorted(str(p.relative_to(dfx)) for p in seen) == [
+            "rank0/d0",
+            "rank0/d1",
+            "rank_local/d0",
+        ]
+
+    def test_simulator_platform_skips_conversion(self, tmp_path, monkeypatch):
+        # Onboard-only: the simulator emits records but not the task metadata
+        # the converter joins against, so the raw records are kept as-is.
+        seen = self._spy_generate_swimlane(monkeypatch)
+        _write_dfx_dispatch_dirs(tmp_path / "dfx_outputs", "rank_local/d0")
+
+        _collect_l3_swimlane(tmp_path, "a2a3sim")
+
+        assert seen == []
+
+    def test_missing_dfx_base_is_noop(self, tmp_path, monkeypatch):
+        # DFX was off (or nothing was written) -> nothing to convert, no error.
+        seen = self._spy_generate_swimlane(monkeypatch)
+
+        _collect_l3_swimlane(tmp_path, "a2a3")
+
+        assert seen == []
 
 
 class _BoolStrictCallConfig:
