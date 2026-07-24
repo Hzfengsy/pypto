@@ -109,6 +109,31 @@ result = passes.lower_auto_vector_split()(program)
   lane-0-only 的非拆分 replay（后者只针对非 `split_aiv` 核）——故两个 lane 都运行完整函数体。
   当区域的 tile 无法折半（单位维）或归约必须保持全宽时使用本模式。
 
+### 显式边界区域内允许出现哪些算子
+
+由于该区域体是**原样**拼接的，其中每个 vector 算子都必须已经是 per-lane 的——保持全宽的
+算子会在两个 AIV lane 上运行出完全相同的结果。`ValidateMixedExplicitRegion` 负责校验这一
+点，并以可操作的错误信息列出违规算子。满足以下任一条件的 tile 生成算子会被接受：
+
+| 接受条件 | 原因 |
+| -------- | ---- |
+| （传递地）消费了 `tile.aiv_shard` 的结果 | 依构造即处于 half-width 数据流中。 |
+| 纯生成算子——`tile.full` / `tile.ci` / `tile.random`（以及 `tile.create`，它归类为 `SHARED`，本就不会被报告） | 其结果仅是自身属性的函数：不读取任何 tile、不读取内存，因此无论作者写的是什么 extent，per-lane 复制都是正确的。 |
+| 携带**地址**的算子——`tile.load` / `tile.slice` / `tile.extract`——且其**地址参数**引用了区域的 `aiv_id` | 作者已显式做了 per-lane 定位，例如 `data[base + aiv_id * HALF : ...]`。仅偏移参数计入（`tile.load` 第 1 个、`tile.slice` 第 2 个、`tile.extract` 第 1–2 个）——出现在 `shape` 或 `valid_shape` 中的 lane 引用并不会移动窗口，因此不予接受。 |
+
+其余归类为 `VECTOR` 的算子都会被报告。有两点需要注意：
+
+- 生成算子**仅对其自身**被接受，它不会加入 half-width 数据流。
+  `z = pl.full([FULL, N]); y = pl.add(z, z)` 仍会在 `y` 处被拒绝——全宽生成算子不得为其
+  消费者背书。
+- lane 引用**仅**在携带地址的算子上被信任。在其他算子上，lane 派生的标量只是一个普通操作数，
+  并不能说明结果的宽度——因此 `pl.set_validshape(full_width_tile, 1, aiv_id * HALF)`
+  无法把一个全宽 tile 洗白进区域。
+
+该校验证明的是**意图**而非**范围**：偏移按 lane 跨步、但 extent 仍为全宽的 load 会被接受，
+此时两个 lane 会读到重叠的窗口。这与本 pass 从不检查 `tile.store` 的 lane 相关偏移是同一种
+信任。
+
 由于区域经由通用的 `BeginScope`/`EndScope` 构建且不被提取，它可**嵌套**在 `pl.range` /
 `pl.pipeline` 循环或 `if` 之内；区域路径会递归进入复合语句，找到并下降每个区域，同时保留
 外围控制流。

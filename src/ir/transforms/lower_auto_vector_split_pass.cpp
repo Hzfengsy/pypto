@@ -483,32 +483,124 @@ void ValidateTransposeSplitHazard(const std::vector<StmtPtr>& stmts, int split_d
   }
 }
 
+// Mutable state shared across the whole region walk, so propagation follows
+// program order. Bundled (rather than threaded as three out-params) to match
+// split_axis::SubblockInjectionResult, which this file already unpacks.
+struct HalfWidthScan {
+  std::unordered_set<const Var*> half_tiles;    // in the aiv_shard half-width dataflow
+  std::unordered_set<const Var*> lane_scalars;  // derived from the region's lane index
+  std::vector<std::string> full_width_vec_ops;  // offenders to report
+};
+
+// True iff any Var / IterArg referenced anywhere in ``exprs`` is lane-derived.
+// One collector over all of them: the walk covers each whole expression tree, so
+// a lane reference nested inside a MakeTuple offset list or an arithmetic
+// sub-expression is found. VarDefUseCollector overrides both the Var and the
+// IterArg handler (see var_collectors.h) — a loop-carried lane offset is a
+// reference too.
+bool ReferencesLaneIndex(const std::vector<ExprPtr>& exprs,
+                         const std::unordered_set<const Var*>& lane_scalars) {
+  if (lane_scalars.empty()) return false;
+  var_collectors::VarDefUseCollector collector;
+  for (const auto& e : exprs) {
+    if (e) collector.VisitExpr(e);
+  }
+  for (const auto* v : collector.var_uses) {
+    if (lane_scalars.count(v) != 0) return true;
+  }
+  return false;
+}
+
+// The positional args that carry an op's ADDRESS — the base offset selecting
+// which window of the source this call reads. Empty for anything that is not an
+// addressing op.
+//
+// Only these args are consulted for a lane reference. A lane-derived scalar
+// anywhere ELSE in an addressing op — a shape, a valid_shape — does not localize
+// the window: ``tile.load(data, [0, 0], [64, 128], valid_shapes=[aiv_id + 1,
+// 128])`` mentions aiv_id, yet both lanes still read the same base rows. Scanning
+// every arg would admit it and then trust its consumers as half-width.
+std::vector<ExprPtr> AddressArgs(const CallPtr& call) {
+  const auto& args = call->args_;
+  auto at = [&args](size_t i) -> ExprPtr { return i < args.size() ? args[i] : nullptr; };
+  if (IsOp(call, "tile.load")) return {at(1)};            // (tensor, offsets, shapes, valid_shapes)
+  if (IsOp(call, "tile.slice")) return {at(2)};           // (input, shape, offset, valid_shape, drop_dims)
+  if (IsOp(call, "tile.extract")) return {at(1), at(2)};  // (src, index_row, index_col, shape)
+  return {};
+}
+
 // Track tiles that are part of the half-width boundary dataflow: results of
 // tile.aiv_shard, plus results of VECTOR-affine ops that consume such a half
 // tile. Any VECTOR-affine op consuming NONE of them operates on full-width data
 // — exactly what the implicit affinity gate would have halved. Records the names
-// of such full-width vector ops (a single ordered walk; ``half_tiles`` is shared
-// across recursion so the propagation follows program order).
-void ScanRegionHalfWidth(const std::vector<StmtPtr>& stmts, std::unordered_set<const Var*>& half_tiles,
-                         std::vector<std::string>& full_width_vec_ops) {
+// of such full-width vector ops in a single ordered walk.
+void ScanRegionHalfWidth(const std::vector<StmtPtr>& stmts, HalfWidthScan& scan) {
   for (const auto& stmt : stmts) {
     CallPtr leaf;
     VarPtr def_var;
-    if (auto assign = std::dynamic_pointer_cast<const AssignStmt>(stmt)) {
+    auto assign = std::dynamic_pointer_cast<const AssignStmt>(stmt);
+    if (assign) {
       leaf = AsCall(assign->value_);
       def_var = assign->var_;
     } else if (auto eval = std::dynamic_pointer_cast<const EvalStmt>(stmt)) {
       leaf = AsCall(eval->expr_);
     }
+
+    // --- Lane-index dataflow (SCALARS) --------------------------------------
+    // SEED: the region's own lane index, bound by ``aiv_id =
+    // tile.get_subblock_idx()`` (the parser emits it as the region body's first
+    // statement — ast_parser.py::_emit_split_aiv_region). Matched by OP, not by
+    // position, so a re-injected or reordered binding is still found. The parser
+    // emits it unconditionally, so the set is normally non-empty from statement
+    // one; it stays empty only if the binding is absent (e.g. DCE stripped an
+    // unused aiv_id, or hand-built IR omits it), in which case nothing is
+    // admitted below and the guard behaves exactly as before.
+    // PROPAGATE: any scalar bound from an expression referencing a lane-derived
+    // scalar (``kv_lane0 = kv0 + aiv_id * 64``). Program order + SSA put every
+    // def before its uses, so one forward pass reaches the fixpoint. A lane value
+    // carried through a loop iter_arg is NOT propagated (the walk does not visit
+    // loop phi defs) — conservative: it rejects rather than wrongly admits.
+    if (def_var && As<ScalarType>(def_var->GetType()) &&
+        (IsOp(leaf, "tile.get_subblock_idx") ||
+         // ``assign &&`` is defensive: def_var is currently only set in the
+         // AssignStmt arm above, so def_var non-null already implies it.
+         (assign && ReferencesLaneIndex({assign->value_}, scan.lane_scalars)))) {
+      scan.lane_scalars.insert(def_var.get());
+    }
+
     if (leaf && leaf->op_) {
       // aiv_shard produces a HALF tile (the C->V boundary); seed the dataflow.
       if (IsOp(leaf, "tile.aiv_shard")) {
-        if (def_var) half_tiles.insert(def_var.get());
+        if (def_var) scan.half_tiles.insert(def_var.get());
         continue;
       }
       // aic_gather doubles HALF -> FULL (the V->C boundary back to cube); its
       // result leaves the half-width dataflow, so it is not tracked.
       if (IsOp(leaf, "tile.aic_gather")) {
+        continue;
+      }
+      // Pure generators are lane-invariant ROOTS: the result is a function of the
+      // op's ATTRIBUTES ONLY -- they read no tile and no memory, so there is no
+      // "which half do I read?" question for them to get wrong, and replicating
+      // one on both lanes is correct by construction at whatever extent the
+      // author wrote.
+      //
+      // Deliberately NOT inserted into half_tiles: being lane-invariant makes a
+      // generator SAFE, it does not make it HALF-WIDTH. Admitting it would let a
+      // full-width generator vouch for its consumers and silently suppress a real
+      // rejection -- e.g. `z = tile.full([128,128]); y = tile.add(z, z);
+      // tile.store(y, [0,0], out, atomic)`, where both lanes would atomically add
+      // the same full tile (double-counted result). Leaving it NEUTRAL keeps each
+      // consumer judged on its own merits.
+      //
+      // (tile.create is listed for category completeness; it also classifies
+      // SHARED, so the VECTOR arm below would never report it anyway. For
+      // tile.random, replication means both lanes draw the SAME stream from the
+      // same key/counter -- identical to what the implicit path produces, since
+      // halving shrinks the shape, not the stream. Per-lane independence is the
+      // author's job: vary the counter with aiv_id.)
+      if (IsOp(leaf, "tile.full") || IsOp(leaf, "tile.create") || IsOp(leaf, "tile.ci") ||
+          IsOp(leaf, "tile.random")) {
         continue;
       }
       // Dataflow propagation over tile-producing ops. An op that consumes a half
@@ -524,33 +616,45 @@ void ScanRegionHalfWidth(const std::vector<StmtPtr>& stmts, std::unordered_set<c
         bool consumes_half = false;
         for (const auto& arg : leaf->args_) {
           if (auto v = AsVarLike(arg)) {
-            if (half_tiles.count(v.get()) != 0) {
+            if (scan.half_tiles.count(v.get()) != 0) {
               consumes_half = true;
               break;
             }
           }
         }
-        if (consumes_half) {
-          if (def_var) half_tiles.insert(def_var.get());  // stays in the half-width dataflow
+        // Stays in the half-width dataflow when it either consumes a half tile,
+        // or is AUTHOR-LOCALIZED: an op whose ADDRESS args reference the region's
+        // lane index, so the author explicitly wrote it per-lane — e.g. a GM load
+        // at ``[kv0 + aiv_id * 64, 0]``. That is the same trust the pass already
+        // extends to tile.store, whose lane-dependent offset it never checks (a
+        // store returns a TensorType, so it never reaches this branch).
+        //
+        // Localization is trusted only via AddressArgs, and so only on addressing
+        // ops. On any other op a lane-derived scalar is just an operand and proves
+        // nothing about width; without that restriction
+        // ``tile.set_validshape(full_width_tile, 1, valid_aiv)`` would launder a
+        // full-width tile into the half-width dataflow and silence every
+        // downstream check.
+        if (consumes_half ||
+            (!scan.lane_scalars.empty() && ReferencesLaneIndex(AddressArgs(leaf), scan.lane_scalars))) {
+          if (def_var) scan.half_tiles.insert(def_var.get());
         } else if (ClassifyCallAffinity(leaf) == CoreAffinity::VECTOR) {
-          full_width_vec_ops.push_back(leaf->op_->name_);
+          scan.full_width_vec_ops.push_back(leaf->op_->name_);
         }
         continue;
       }
     }
     if (auto for_stmt = std::dynamic_pointer_cast<const ForStmt>(stmt)) {
-      ScanRegionHalfWidth(transform_utils::FlattenToStmts(for_stmt->body_), half_tiles, full_width_vec_ops);
+      ScanRegionHalfWidth(transform_utils::FlattenToStmts(for_stmt->body_), scan);
     } else if (auto if_stmt = std::dynamic_pointer_cast<const IfStmt>(stmt)) {
-      ScanRegionHalfWidth(transform_utils::FlattenToStmts(if_stmt->then_body_), half_tiles,
-                          full_width_vec_ops);
+      ScanRegionHalfWidth(transform_utils::FlattenToStmts(if_stmt->then_body_), scan);
       if (if_stmt->else_body_.has_value()) {
-        ScanRegionHalfWidth(transform_utils::FlattenToStmts(*if_stmt->else_body_), half_tiles,
-                            full_width_vec_ops);
+        ScanRegionHalfWidth(transform_utils::FlattenToStmts(*if_stmt->else_body_), scan);
       }
     } else if (auto while_stmt = std::dynamic_pointer_cast<const WhileStmt>(stmt)) {
-      ScanRegionHalfWidth(transform_utils::FlattenToStmts(while_stmt->body_), half_tiles, full_width_vec_ops);
+      ScanRegionHalfWidth(transform_utils::FlattenToStmts(while_stmt->body_), scan);
     } else if (auto seq = std::dynamic_pointer_cast<const SeqStmts>(stmt)) {
-      ScanRegionHalfWidth(seq->stmts_, half_tiles, full_width_vec_ops);
+      ScanRegionHalfWidth(seq->stmts_, scan);
     }
   }
 }
@@ -564,15 +668,14 @@ void ScanRegionHalfWidth(const std::vector<StmtPtr>& stmts, std::unordered_set<c
 // miscompile). A purely-explicit region — every vector op derived from the
 // aiv_shard result — passes through unchanged.
 void ValidateMixedExplicitRegion(const std::vector<StmtPtr>& stmts, const Span& region_span) {
-  std::unordered_set<const Var*> half_tiles;
-  std::vector<std::string> full_width_vec_ops;
-  ScanRegionHalfWidth(stmts, half_tiles, full_width_vec_ops);
-  if (full_width_vec_ops.empty()) return;
+  HalfWidthScan scan;
+  ScanRegionHalfWidth(stmts, scan);
+  if (scan.full_width_vec_ops.empty()) return;
 
   std::string ops;
-  for (size_t i = 0; i < full_width_vec_ops.size(); ++i) {
+  for (size_t i = 0; i < scan.full_width_vec_ops.size(); ++i) {
     if (i != 0) ops += ", ";
-    ops += full_width_vec_ops[i];
+    ops += scan.full_width_vec_ops[i];
   }
   CHECK_SPAN(false, region_span)
       << "LowerAutoVectorSplit: a pl.split_aiv region mixes explicit "
@@ -580,10 +683,11 @@ void ValidateMixedExplicitRegion(const std::vector<StmtPtr>& stmts, const Span& 
       << ops
       << "] that operate outside the per-lane half-width dataflow. The explicit boundary keeps the "
          "region in half-width form, so these full-width ops would be left un-localized and both AIV "
-         "lanes would compute the full tile. Fix it one of two ways: (1) author the whole region in "
-         "half-width form — derive every vector op from the tile.aiv_shard result; or (2) remove the "
-         "explicit tile.aiv_shard/tile.aic_gather and let the implicit affinity-gated path halve the "
-         "region.";
+         "lanes would compute the full tile. Fix it one of three ways: (1) derive the op from the "
+         "tile.aiv_shard result; (2) localize it yourself with the region's lane index, e.g. load at "
+         "'base + aiv_id * HALF' at the half extent — an op whose arguments reference aiv_id is "
+         "per-lane by construction and is accepted; or (3) remove the explicit "
+         "tile.aiv_shard/tile.aic_gather and let the implicit affinity-gated path halve the region.";
 }
 
 // Top-level walk for the explicit ``SplitAivScopeStmt`` path. Statements OUTSIDE

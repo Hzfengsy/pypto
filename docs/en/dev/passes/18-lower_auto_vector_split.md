@@ -143,6 +143,36 @@ Three region body shapes are handled, selected by the region's `split_` mode:
   kernels) — so both lanes run the full body. Use this when the region's tiles
   cannot be halved (unit dims) or a reduction must stay full-width.
 
+### What may appear inside an explicit-boundary region
+
+Because that body is spliced through **unchanged**, every vector op in it must
+already be per-lane — an op left at full width would run identically on both AIV
+lanes. `ValidateMixedExplicitRegion` enforces this and rejects the region with an
+actionable error naming the offending ops. A tile-producing op is accepted when
+any of the following holds:
+
+| Accepted | Why |
+| -------- | --- |
+| Consumes a `tile.aiv_shard` result (transitively) | It is in the half-width dataflow by construction. |
+| A pure generator — `tile.full` / `tile.ci` / `tile.random` (and `tile.create`, which classifies `SHARED` and so was never reportable anyway) | Its result is a function of its attributes only: it reads no tile and no memory, so per-lane replication is correct at whatever extent the author wrote. |
+| An address-carrying op — `tile.load` / `tile.slice` / `tile.extract` — whose **address** args reference the region's `aiv_id` | The author localized it explicitly, e.g. `data[base + aiv_id * HALF : ...]`. Only the offset args count (`tile.load` arg 1, `tile.slice` arg 2, `tile.extract` args 1–2) — a lane reference in a `shape` or `valid_shape` does not move the window, so it does not admit. |
+
+Anything else that classifies `VECTOR` is reported. Two consequences worth
+knowing:
+
+- A generator is accepted for **itself only** — it does not join the half-width
+  dataflow. `z = pl.full([FULL, N]); y = pl.add(z, z)` still rejects on `y`,
+  because a full-width generator must not vouch for its consumers.
+- The lane reference is trusted **only** on an addressing op. On anything else a
+  lane-derived scalar is just an operand and proves nothing about width — so
+  `pl.set_validshape(full_width_tile, 1, aiv_id * HALF)` cannot launder a full
+  tile into the region.
+
+The guard proves *intent*, not *extent*: a load at a lane-strided offset but a
+full-width extent is accepted, and the two lanes then read overlapping windows.
+That is the same trust already extended to `tile.store`, whose lane-dependent
+offset the pass never checks.
+
 Because the region is built via the generic `BeginScope`/`EndScope` and is
 non-outlined, it can be **nested** inside a `pl.range` / `pl.pipeline` loop or an
 `if`; the region path recurses into compound statements to find and lower every

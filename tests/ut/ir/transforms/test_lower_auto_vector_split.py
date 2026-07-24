@@ -21,13 +21,25 @@ These tests hand-build a minimal mixed InCore function at the
 post-InferTileMemorySpace level (memory spaces already assigned) and run the pass
 in isolation with verification disabled.
 
-The pass runs at the tile level (post-InferTileMemorySpace), so the ``@pl.program``
-DSL cannot express its input *or* its lowered output. Each transform-output test
-therefore hand-builds both the ``Before`` program and an explicit ``Expected``
-lowered program with the same helpers and asserts ``ir.assert_structural_equal``
-between the pass result and ``Expected`` (the project's mandated transform-test
-style). The two negative tests (reduce-on-split-axis, transpose hazard) keep
-``pytest.raises`` because a rejected transform produces no ``After`` IR.
+Why these tests hand-build IR instead of using the ``@pl.program`` DSL (the
+project's default transform-test style): it is NOT that the DSL cannot express
+the shapes involved — it can author both this pass's tile-level input and, via
+the outlined boundary form (``pl.aiv_shard(qk, split=1)``), its lowered output.
+The blocker is that the DSL wraps a top-level ``for aiv_id in pl.split_aiv(...)``
+in an enclosing ``pl.at``/``ScopeStmt``, and this pass does not descend into a
+ScopeStmt — by the time it runs (pass 18) OutlineIncoreScopes has long since
+removed those. So on DSL-authored input the region is never visited: it survives
+unlowered and ``ValidateMixedExplicitRegion`` never runs, which would make every
+guard test here vacuous. Reproducing pass 18's real input from the DSL needs the
+whole upstream prefix, turning a unit test into an integration test.
+
+Each transform-output test therefore hand-builds both the ``Before`` program and
+an explicit ``Expected`` lowered program with the same helpers and asserts
+``ir.assert_structural_equal`` between the pass result and ``Expected``. Negative
+tests keep ``pytest.raises`` because a rejected transform produces no ``After``
+IR. End-to-end DSL coverage of this authoring form lives in
+``tests/st/codegen/torch/test_torch_codegen_cross_core.py`` (``SplitAivShardProgram``),
+where the numerics are checked against torch.
 
 The per-op vector halving tests (load / slice / reshape / store offset /
 singleton / loop tracking / reduce-on-split-axis throw) were migrated here from
@@ -99,10 +111,10 @@ def _incore_program(params, stmts, return_types, *, mode=ir.SplitMode.UP_DOWN, n
 # ---------------------------------------------------------------------------
 # Expected-IR (lowered-form) construction helpers.
 #
-# LowerAutoVectorSplit runs at the tile level, so the @pl.program DSL cannot
-# author its output. These helpers build the *lowered* Expected the same way the
-# Before is hand-built, so each test asserts via ir.assert_structural_equal
-# against an explicit Expected program (not a python_print substring grep).
+# These build the *lowered* Expected the same way the Before is hand-built, so
+# each test asserts via ir.assert_structural_equal against an explicit Expected
+# program (not a python_print substring grep). See the module docstring for why
+# the DSL is not used to author either side.
 # ---------------------------------------------------------------------------
 
 
@@ -1784,6 +1796,273 @@ def test_mixed_explicit_implicit_region_in_while_rejected():
     )
     with pytest.raises(ValueError, match="mixes explicit"):
         _lower(program)
+
+
+# ---------------------------------------------------------------------------
+# Explicit-region admissions: values that are NOT derived from tile.aiv_shard but
+# are still per-lane by construction. Two classes are admitted — pure generators
+# (tile.full/create/ci/random) and address-carrying ops (tile.load/slice/extract)
+# whose args reference the region's lane index. The rationale for each, and for
+# why a generator is NOT added to half_tiles, lives at ScanRegionHalfWidth in
+# src/ir/transforms/lower_auto_vector_split_pass.cpp — keep it in one place.
+#
+# The explicit path splices the region body through UNCHANGED, so a positive
+# test's Expected is literally its Before minus the scope wrapper. That identity
+# is the property under test, so one helper builds both.
+# ---------------------------------------------------------------------------
+
+
+def _admission_program(span, body_fn, *, wrap, nest_in_loop=False):
+    """matmul -> explicit region -> store, with ``body_fn`` supplying the middle.
+
+    ``wrap=True`` nests the region statements in a SplitAivScopeStmt (the Before).
+    ``wrap=False`` splices them flat and stamps the region attrs (the Expected) —
+    the explicit path drops only the wrapper.
+
+    ``body_fn(span, stmts, aiv_id, qk_h, data) -> VarPtr`` appends its statements
+    and returns the tile to store. ``nest_in_loop`` puts the body + store inside a
+    ForStmt so the lane-scalar dataflow must survive the walk's loop recursion.
+    """
+    a_left = ir.Var("a_left", _tile([128, 128], mem=MS.Left), span)
+    b_right = ir.Var("b_right", _tile([128, 128], mem=MS.Right), span)
+    data = ir.Var("data", _tensor([128, 128]), span)
+    out_0 = ir.Var("out_0", _tensor([128, 128]), span)
+
+    matmul = T.matmul(a_left, b_right, span=span)
+    qk = ir.Var("qk", matmul.type, span)
+    aiv_id = _sub_var("aiv_id")
+    shard = T.aiv_shard(qk, split=1, span=span)  # UP_DOWN => [64, 128] Vec
+    qk_h = ir.Var("qk_h", shard.type, span)
+
+    inner: list[ir.Stmt] = []
+    stored = body_fn(span, inner, aiv_id, qk_h, data)
+    store = T.store(stored, [0, 0], out_0, span=span)
+    out_store = ir.Var("out_store", store.type, span)
+    inner.append(ir.AssignStmt(out_store, store, span))
+
+    region_stmts: list[ir.Stmt] = [_get_subblock(aiv_id, span), ir.AssignStmt(qk_h, shard, span)]
+    if nest_in_loop:
+        region_stmts.append(
+            ir.ForStmt(
+                ir.Var("i", _IDX, span),
+                ir.ConstInt(0, DataType.INDEX, span),
+                ir.ConstInt(2, DataType.INDEX, span),
+                ir.ConstInt(1, DataType.INDEX, span),
+                [],
+                ir.SeqStmts(inner, span),
+                [],
+                span,
+            )
+        )
+    else:
+        region_stmts.extend(inner)
+
+    params = [(a_left, _IN), (b_right, _IN), (data, _IN), (out_0, _OUT)]
+    if wrap:
+        region = ir.SplitAivScopeStmt(
+            split=ir.SplitMode.UP_DOWN, body=ir.SeqStmts(region_stmts, span), span=span
+        )
+        return _explicit_region_program(
+            [ir.AssignStmt(qk, matmul, span), region, ir.ReturnStmt([out_store], span)],
+            params,
+            [out_0.type],
+        )
+    return _expected_region_program(
+        [ir.AssignStmt(qk, matmul, span), *region_stmts, ir.ReturnStmt([out_store], span)],
+        params,
+        [out_0.type],
+    )
+
+
+def _half_generator_body(span, stmts, aiv_id, qk_h, data):
+    """``zeros = tile.full([64, 128])`` at the per-lane half extent, combined with
+    the shard result."""
+    zeros = T.full([64, 128], FP32, 0.0, span=span)
+    z = ir.Var("zeros", zeros.type, span)
+    relu = T.maximum(qk_h, z, span=span)
+    r = ir.Var("relu", relu.type, span)
+    stmts += [ir.AssignStmt(z, zeros, span), ir.AssignStmt(r, relu, span)]
+    return r
+
+
+def _lane_localized_load_body(span, stmts, aiv_id, qk_h, data):
+    """A GM load the author localized with the region's own lane index:
+    ``tile.load(data, [aiv_id * 64, 0], [64, 128])``."""
+    off = aiv_id * 64
+    o = ir.Var("row0", off.type, span)
+    load = T.load(data, [o, 0], [64, 128], target_memory=MS.Vec, span=span)
+    t = ir.Var("t", load.type, span)
+    relu = T.maximum(qk_h, t, span=span)
+    r = ir.Var("relu", relu.type, span)
+    stmts += [ir.AssignStmt(o, off, span), ir.AssignStmt(t, load, span), ir.AssignStmt(r, relu, span)]
+    return r
+
+
+def _lane_localized_slice_body(span, stmts, aiv_id, qk_h, data):
+    """A tile.slice localized via its OFFSET arg (index 2): the source is a
+    full-width Vec tile and each lane takes its own [64, 128] window."""
+    full = T.full([128, 128], FP32, 1.0, span=span)
+    f = ir.Var("full_t", full.type, span)
+    off = aiv_id * 64
+    o = ir.Var("row0", off.type, span)
+    sl = T.slice(f, [64, 128], [o, 0], span=span)
+    t = ir.Var("t", sl.type, span)
+    relu = T.maximum(qk_h, t, span=span)
+    r = ir.Var("relu", relu.type, span)
+    stmts += [
+        ir.AssignStmt(f, full, span),
+        ir.AssignStmt(o, off, span),
+        ir.AssignStmt(t, sl, span),
+        ir.AssignStmt(r, relu, span),
+    ]
+    return r
+
+
+def _lane_localized_extract_body(span, stmts, aiv_id, qk_h, data):
+    """A tile.extract localized via its index_row arg (index 1). The Mat source is
+    created in-region so it is a defined var (a free var could not be mapped by
+    structural comparison); tile.create is a generator, so it stays NEUTRAL and
+    the extract is admitted purely on its lane-referencing address arg."""
+    src_call = T.create([128, 128], FP32, MS.Mat, span=span)
+    src = ir.Var("src_mat", src_call.type, span)
+    row = aiv_id * 64
+    rv = ir.Var("row0", row.type, span)
+    ex = T.extract(src, rv, 0, [64, 128], target_memory=MS.Vec, span=span)
+    t = ir.Var("t", ex.type, span)
+    relu = T.maximum(qk_h, t, span=span)
+    r = ir.Var("relu", relu.type, span)
+    stmts += [
+        ir.AssignStmt(src, src_call, span),
+        ir.AssignStmt(rv, row, span),
+        ir.AssignStmt(t, ex, span),
+        ir.AssignStmt(r, relu, span),
+    ]
+    return r
+
+
+def _lane_ref_in_non_address_arg_body(span, stmts, aiv_id, qk_h, data):
+    """A tile.load whose OFFSET is [0, 0] — both lanes read the same base rows —
+    but which mentions aiv_id in its valid_shape. Scanning every arg instead of
+    just the address args would wrongly admit this."""
+    valid = aiv_id + 1
+    v = ir.Var("valid", valid.type, span)
+    load = T.load(data, [0, 0], [64, 128], valid_shapes=[v, 128], target_memory=MS.Vec, span=span)
+    t = ir.Var("t", load.type, span)
+    stmts += [ir.AssignStmt(v, valid, span), ir.AssignStmt(t, load, span)]
+    return t
+
+
+def _full_width_generator_body(span, stmts, aiv_id, qk_h, data):
+    """``z = tile.full([128, 128])`` at FULL width, consumed by an op that takes
+    nothing else — no shard lineage, no lane reference."""
+    zeros = T.full([128, 128], FP32, 0.0, span=span)
+    z = ir.Var("zeros", zeros.type, span)
+    add = T.add(z, z, span=span)
+    y = ir.Var("y", add.type, span)
+    stmts += [ir.AssignStmt(z, zeros, span), ir.AssignStmt(y, add, span)]
+    return y
+
+
+def _laundering_body(span, stmts, aiv_id, qk_h, data):
+    """``tile.set_validshape(full_width_tile, 1, aiv_id * 64)`` — a lane reference
+    on a NON-addressing op, which must not launder the full tile in."""
+    zeros = T.full([128, 128], FP32, 0.0, span=span)
+    z = ir.Var("zeros", zeros.type, span)
+    lane = aiv_id * 64
+    ln = ir.Var("lane", lane.type, span)
+    sv = T.set_validshape(z, 1, ln, span=span)
+    s = ir.Var("sv", sv.type, span)
+    add = T.add(s, s, span=span)
+    y = ir.Var("y", add.type, span)
+    stmts += [
+        ir.AssignStmt(z, zeros, span),
+        ir.AssignStmt(ln, lane, span),
+        ir.AssignStmt(s, sv, span),
+        ir.AssignStmt(y, add, span),
+    ]
+    return y
+
+
+def test_region_admits_half_width_generator():
+    """A pure generator authored at the per-lane half extent inside an explicit
+    region is admitted and spliced through UNCHANGED — the pass rewrites nothing
+    on the explicit path, so Expected is the Before minus the scope wrapper."""
+    span = ir.Span.unknown()
+    ir.assert_structural_equal(
+        _lower(_admission_program(span, _half_generator_body, wrap=True)),
+        _admission_program(span, _half_generator_body, wrap=False),
+    )
+
+
+def test_region_admits_lane_localized_load():
+    """An address-carrying op whose offset references the region's lane index is
+    per-lane by construction and is admitted, spliced through unchanged."""
+    span = ir.Span.unknown()
+    ir.assert_structural_equal(
+        _lower(_admission_program(span, _lane_localized_load_body, wrap=True)),
+        _admission_program(span, _lane_localized_load_body, wrap=False),
+    )
+
+
+def test_region_admits_lane_localized_load_nested_in_loop():
+    """The lane-scalar dataflow survives the walk's LOOP recursion: ``aiv_id`` is
+    bound at the region top level but the localized load sits inside a ForStmt, so
+    the scan must carry the lane set into the loop body to admit it. This is the
+    shape real kernels take (a per-lane load inside a cache-page loop)."""
+    span = ir.Span.unknown()
+    ir.assert_structural_equal(
+        _lower(_admission_program(span, _lane_localized_load_body, wrap=True, nest_in_loop=True)),
+        _admission_program(span, _lane_localized_load_body, wrap=False, nest_in_loop=True),
+    )
+
+
+def test_region_admits_lane_localized_slice():
+    """tile.slice localized through its OFFSET arg (index 2) is admitted — the
+    address-arg indices differ per op, so each addressing op needs its own case."""
+    span = ir.Span.unknown()
+    ir.assert_structural_equal(
+        _lower(_admission_program(span, _lane_localized_slice_body, wrap=True)),
+        _admission_program(span, _lane_localized_slice_body, wrap=False),
+    )
+
+
+def test_region_admits_lane_localized_extract():
+    """tile.extract localized through its index_row arg (index 1) is admitted."""
+    span = ir.Span.unknown()
+    ir.assert_structural_equal(
+        _lower(_admission_program(span, _lane_localized_extract_body, wrap=True)),
+        _admission_program(span, _lane_localized_extract_body, wrap=False),
+    )
+
+
+def test_region_rejects_lane_reference_outside_address_args():
+    """A lane reference only localizes when it lands in an op's ADDRESS args. A
+    tile.load at offset [0, 0] that mentions aiv_id only in its valid_shape has
+    BOTH lanes reading the same base rows, so it must still be reported —
+    otherwise its consumers would be trusted as half-width. NEGATIVE test."""
+    with pytest.raises(ValueError, match=r"mixes explicit.*tile\.load"):
+        _lower(_admission_program(ir.Span.unknown(), _lane_ref_in_non_address_arg_body, wrap=True))
+
+
+def test_region_rejects_consumer_of_full_width_generator():
+    """A generator is admitted for ITSELF only — it does not join the half-width
+    dataflow. So a consumer reachable from a full-width generator and from no
+    shard is still reported. Without this, ``z = tile.full([128,128]);
+    y = tile.add(z, z)`` would be silently accepted and BOTH AIV lanes would
+    compute (and store) the full tile. NEGATIVE test: no ``After`` IR."""
+    with pytest.raises(ValueError, match=r"mixes explicit.*tile\.add"):
+        _lower(_admission_program(ir.Span.unknown(), _full_width_generator_body, wrap=True))
+
+
+def test_region_rejects_lane_reference_on_non_addressing_op():
+    """A lane reference is trusted only on an ADDRESS-carrying op. A lane-derived
+    scalar reaching a non-addressing op says nothing about the result's width, so
+    ``tile.set_validshape(full_width_tile, 1, aiv_id * 64)`` must not launder a
+    full-width tile into the half-width dataflow. NEGATIVE test: no ``After``
+    IR. (A full-width load with NO lane reference is covered by
+    test_mixed_explicit_implicit_region_rejected above.)"""
+    with pytest.raises(ValueError, match=r"mixes explicit.*tile\.set_validshape"):
+        _lower(_admission_program(ir.Span.unknown(), _laundering_body, wrap=True))
 
 
 if __name__ == "__main__":
