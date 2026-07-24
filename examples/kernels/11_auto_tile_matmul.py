@@ -27,10 +27,11 @@ Orthogonally, the K (reduction) dimension picks the **K-strategy**:
   - **split-K** -- K spans >= 2 L0 blocks; each ``[m, n]`` sub-tile is its own pipelined
     K-loop (BuildSplitKGrid).
 
-The first four kernels are the oversized 2x2 matrix. The K-strategy is **shape-driven**: for
-an ``[M, N] = [256, 256]`` FP32 output the L0 chooser caps ``k = 32``, so ``K = 32`` fits L0
-in one pass (full-K) while ``K = 128`` splits into 4 K-blocks (split-K). No manual tiling --
-the compiler picks the path from the shapes and the consumer.
+The first four kernels are the oversized 2x2 matrix. The K-strategy is **shape-driven**:
+the direct-store split case uses FP32 ``K = 128``, while the Mat-scratch split case uses
+BF16 ``K = 192`` so both the PyPTO and PTOAS planners choose ``k = 64``. ``K = 32`` is the
+common full-K case. No manual tiling -- the compiler picks the path from the shapes and
+the consumer.
 
 **Fits-L0c chained matmul (cast-fold).** When the chained ``[M, N]`` intermediate *fits* L0c
 (no M/N tiling), the same Mat/L1 placement applies as a **single full-window** Acc->Mat
@@ -75,12 +76,13 @@ def ddr_full_k(a: pl.Tensor, b: pl.Tensor, out: pl.Out[pl.Tensor]):
 
 @pl.jit
 def mat_split_k(a: pl.Tensor, b: pl.Tensor, e: pl.Tensor, out: pl.Out[pl.Tensor]):
-    """``(a @ b) @ e`` -> **Mat/L1 scratch**. The ``[256,256]`` intermediate (> L0c) is
-    consumed on-chip by the second matmul, so it is M/N-tiled into an L1/Mat scratch
-    instead of spilling to DDR. The test drives this with a K where the roofline chooser
-    keeps both chained matmuls **output-stationary** so their L0 buffers pack (a K that
-    makes the producer A/B-stationary hits the #1908 offset-packing gap: ``Left buffer
-    usage exceeds``).
+    """``(a @ b) @ e`` -> **Mat/L1 scratch**, **split-K**. The ``[256,256]``
+    intermediate (> L0c) is consumed on-chip by the second matmul, so it is M/N-tiled
+    into an L1/Mat scratch instead of spilling to DDR. ``K=192`` makes both planners
+    choose the output-stationary ``k=64`` split-K producer, so its L0 buffers pack
+    against the consumer's. Without the pass's output-stationary re-choice, a K where
+    the producer initially becomes A/B-stationary would hit the #1908 offset-packing
+    gap (``Left buffer usage exceeds``).
 
     The intermediate is **bf16** — the cube accumulates in f32 (L0C) and the FIXPIPE
     writeback to L1 downcasts to bf16/f16 (the only offset Acc->Mat path on A2/A3), which
@@ -149,9 +151,9 @@ if __name__ == "__main__":
         assert torch.allclose(out, a @ b, rtol=1e-3, atol=1e-3), f"{fn.__name__} mismatch"
 
     # Mat/L1 scratch: (a @ b) @ e -> [256, 64]; bf16 operands, bf16 on-chip intermediate.
-    # K picks split-K (128) vs full-K (32). Golden models the FIXPIPE bf16 downcast of the
+    # K picks split-K (192) vs full-K (32). Golden models the FIXPIPE bf16 downcast of the
     # intermediate (f32 accumulate -> bf16 L1 -> f32 accumulate), so the tolerance is bf16.
-    for fn, K in ((mat_split_k, 128), (mat_full_k, 32)):
+    for fn, K in ((mat_split_k, 192), (mat_full_k, 32)):
         a = torch.randn(256, K, dtype=torch.bfloat16)
         b = torch.randn(K, 256, dtype=torch.bfloat16)
         e = torch.randn(256, 64, dtype=torch.bfloat16)

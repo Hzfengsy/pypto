@@ -429,47 +429,35 @@ Pass OptimizeOrchTensors();
 Pass FlattenTileNdTo2D();
 
 /**
- * @brief Auto-tile Mat-resident matmul / matmul_acc into a C-stationary K-loop
+ * @brief Auto-tile static 2D matmul / matmul_acc calls for the backend's L0
  *
- * For each ``tile.matmul`` or ``tile.matmul_acc`` whose Mat operands have
- * static 2D shape, queries ``utils::ChooseL0Tile`` against the active
- * ``BackendHandler``'s L0 capacities and rewrites the call into a single
- * ``range(0, K, k)`` loop:
+ * Queries ``utils::ChooseL0Tile`` for an ``(m, n, k, stationarity, dbC)``
+ * design point and rewrites Mat-resident operands into aligned Left/Right
+ * ``tile.extract`` operations.  K-split reductions use a 2-stage pipelined
+ * loop; a non-divisor aligned K tail is peeled into a final
+ * ``tile.matmul_acc``.
  *
- *   - For ``tile.matmul``: the loop body branches on ``ko == 0`` between
- *     ``tile.matmul`` (fresh accumulator) and ``tile.matmul_acc``
- *     (accumulating into the iter-arg).  The iter-arg init is an Acc-resident
- *     ``tile.create`` placeholder so the iter-arg / yield / return_var chain
- *     is Acc-typed end-to-end.
- *   - For ``tile.matmul_acc``: every iteration is ``tile.matmul_acc``; the
- *     iter-arg init is the caller-provided accumulator directly, so the
- *     accumulator chain is uniform from the first iteration and no if-else
- *     is needed.
+ * When the ``[M, N]`` accumulator exceeds L0c, plain ``tile.matmul`` is
+ * M/N-tiled.  A result consumed by one output store uses direct-to-GM
+ * placement; a result consumed entirely as a later matmul operand is assembled
+ * into an on-chip Mat scratch.  The Mat-scratch route also folds a compatible
+ * f32-to-bf16/f16 ``tile.cast(mode="rint")`` into the FIXPIPE writeback.
  *
- * Operand extraction uses ``tile.extract(src, idx_row, idx_col, shape,
- * target_memory=Left|Right)`` directly — the SSA-form fusion of the older
- * ``tile.slice`` (Mat-resident result) + ``tile.mov`` (Mat→Left/Right) pair.
- * No intermediate Mat-resident slice tile is materialised, and the call
- * lowers to ``pto.textract`` rather than ``pto.subview``.
+ * Full-K M/N grids may use output-, A-, or B-stationary loop orders.  L0C
+ * double-buffering is enabled under PTOAS and is available as a PyPTO planner
+ * opt-in.  Chained Mat-scratch producers remain output-stationary to avoid the
+ * allocator offset-packing limitation tracked by issue #1908.
  *
- * The K-loop is marked ``ForKind::Pipeline`` + ``pipeline_stages=2`` so the
- * downstream ``LowerPipelineLoops`` pass clones the body for a 2-deep
- * ping-pong on the per-iter Mat→Left/Right extracts.
- *
- * Supported today (extensions to follow):
- *   - ``tile.matmul`` and ``tile.matmul_acc``.  ``tile.matmul_bias`` is
- *     deferred (bias add only after the final iteration needs extra
- *     rewriting).
- *   - K tiling only (``m == M`` and ``n == N``).  Cases where the chooser
- *     selects ``m < M`` or ``n < N`` emit a ``PerfHint`` and skip.
- *   - ``K % k == 0``.  K-boundary handling is deferred.
- *
- * Already-L0-sized matmuls (chooser returns ``(M, N, K)``) are left
- * untouched.  Runs after ``FlattenTileNdTo2D``: by the time this pass runs,
- * all tile ops have static 2D shapes.
+ * Eligible calls require static 2D operands with B in Mat and A in Mat or Vec.
+ * When the chooser returns the full ``(M, N, K)`` shape, no tiling rewrite is
+ * needed, although a chained result may still be remapped to Mat by the
+ * compatible cast-fold placement above.  Other unsupported regimes are left
+ * untouched; useful deferred cases emit ``PerfHint`` diagnostics.
+ * ``tile.matmul_bias`` remains unsupported because its bias must be applied
+ * only after the final K block.
  *
  * Requirements:
- * - Input IR must have tile ops in 2D form (run FlattenTileNdTo2D first)
+ * - Input IR must have static 2D tile ops (run FlattenTileNdTo2D first)
  */
 Pass AutoTileMatmulL0();
 

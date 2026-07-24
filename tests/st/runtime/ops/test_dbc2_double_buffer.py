@@ -21,11 +21,13 @@ Under the default PyPTO planner (flag off) these shapes get one accumulator and
 would not exercise the feature.
 
 Coverage:
-  - direct-store (Acc->GM) sweep over 4 / 8 / 16-tile grids, under BOTH planners —
+  - direct-store (Acc->GM) sweep over chooser-pinned 4 / 6 / 8 / 16-tile grids,
+    under BOTH planners —
     the WAR reuse boundary (tile i+2's matmul into a buffer must wait for tile i's
     drain out of it) is enforced by ptoas sync (PTOAS) or PyPTO codegen sync (PyPTO),
     so a value check on a >=4-tile grid is the primary correctness gate for each
     allocation path;
+  - the formerly disabled PTOAS 384x256 operand-allocation case, now a 12-tile grid;
   - Mat-scratch (Acc->Mat, ``tile.assemble``) chained producer — the L1 drain path;
   - a non-divisible M/N shape — the peeled L-tail (its drains are not floated).
 
@@ -40,15 +42,56 @@ import pypto.language as pl
 import pytest
 import torch
 from harness.core.harness import DataType, PTOTestCase, TensorSpec
+from pypto import backend as _backend
+from pypto import ir, passes
+from pypto.backend import BackendType
+from pypto.pypto_core import passes as _core_passes
 from pypto.pypto_core.passes import MemoryPlanner
 
 PLATFORMS_DBC = ["a2a3", "a2a3sim"]
 
 
+def _choose_a2a3_dbc(m: int, k: int, n: int, *, bytes_a: int, bytes_b: int):
+    """Return a calibrated 910B dbC=2 design point used by this suite."""
+    cfg = _core_passes.l0_tile_chooser.L0TileConfig()
+    cfg.M, cfg.K, cfg.N = m, k, n
+    cfg.l0a_bytes = cfg.l0b_bytes = 64 * 1024
+    cfg.l0c_bytes = 128 * 1024
+    cfg.bytes_a, cfg.bytes_b, cfg.bytes_c = bytes_a, bytes_b, 4
+    cfg.allow_a_stationary = True
+    cfg.allow_b_stationary = True
+    cfg.allow_double_buffer_c = True
+    cfg.allow_k_boundary = True
+    return _core_passes.l0_tile_chooser.choose_l0_tile(cfg)
+
+
+def _choose_a2a3_fp32_dbc(m: int, n: int):
+    return _choose_a2a3_dbc(m, 64, n, bytes_a=4, bytes_b=4)
+
+
+def _printed_after_auto_tile(test_case: PTOTestCase, planner: MemoryPlanner) -> str:
+    """Lower a device case through AutoTile so structural dbC assertions match compilation."""
+    _backend.reset_for_testing()
+    _backend.set_backend_type(BackendType.Ascend910B)
+    program = test_case.get_program()
+    with passes.PassContext(
+        [],
+        memory_planner=planner,
+        enable_pypto_l0c_double_buffer=test_case.get_enable_pypto_l0c_double_buffer() or False,
+    ):
+        for make_pass in (
+            passes.convert_to_ssa,
+            passes.convert_tensor_to_tile_ops,
+            passes.lower_composite_ops,
+            passes.flatten_tile_nd_to_2d,
+            passes.auto_tile_matmul_l0,
+        ):
+            program = make_pass()(program)
+    return ir.python_print(program)
+
+
 class _DbcDirectStore(PTOTestCase):
-    """``a @ b`` -> [M, N] FP32 direct-stored to GM, full-K (K=64), tiled into a dbC=2
-    128x128 grid under PTOAS (accumulator budgeted at L0C/2).  M/N choose the grid /
-    tile count."""
+    """``a @ b`` -> [M, N] FP32 direct-stored to GM with full-K dbC=2 tiling."""
 
     __test__ = False
 
@@ -61,7 +104,12 @@ class _DbcDirectStore(PTOTestCase):
         platform: str | None = None,
         config=None,
     ):
-        super().__init__(config, platform=platform)
+        super().__init__(
+            config,
+            platform=platform,
+            memory_planner=planner,
+            enable_pypto_l0c_double_buffer=planner == MemoryPlanner.PYPTO,
+        )
         self.M, self.K, self.N = m, 64, n
         self._planner = planner
         if config is None:
@@ -69,15 +117,6 @@ class _DbcDirectStore(PTOTestCase):
             # tight; a dbC sync error corrupts values far beyond this.
             self.config.rtol = 1e-3
             self.config.atol = 1e-3
-
-    # dbC=2 is reachable under PTOAS (always on) or PyPTO (opt-in flag below).
-    def get_memory_planner(self) -> MemoryPlanner:
-        return self._planner
-
-    def get_enable_pypto_l0c_double_buffer(self) -> bool:
-        # Under PyPTO dbC=2 is the experimental opt-in; under PTOAS it is already on
-        # (the flag is ignored there).
-        return self._planner == MemoryPlanner.PYPTO
 
     def get_name(self) -> str:
         tag = "pypto" if self._planner == MemoryPlanner.PYPTO else "ptoas"
@@ -136,19 +175,29 @@ class _DbcMatScratch(PTOTestCase):
 
     __test__ = False
 
-    def __init__(self, *, platform: str | None = None, config=None):
-        super().__init__(config, platform=platform)
+    def __init__(
+        self,
+        *,
+        planner: MemoryPlanner = MemoryPlanner.PTOAS,
+        platform: str | None = None,
+        config=None,
+    ):
+        super().__init__(
+            config,
+            platform=platform,
+            memory_planner=planner,
+            enable_pypto_l0c_double_buffer=planner == MemoryPlanner.PYPTO,
+        )
         self.M, self.K, self.N, self.P = 256, 64, 256, 64
+        self._planner = planner
         if config is None:
             # bf16 operands + bf16 FIXPIPE-downcast intermediate: bf16 tolerance.
             self.config.rtol = 2e-2
             self.config.atol = 2e-2
 
-    def get_memory_planner(self) -> MemoryPlanner:
-        return MemoryPlanner.PTOAS
-
     def get_name(self) -> str:
-        return f"dbc2_mat_scratch_{self.M}x{self.K}x{self.N}"
+        tag = "pypto" if self._planner == MemoryPlanner.PYPTO else "ptoas"
+        return f"dbc2_mat_scratch_{tag}_{self.M}x{self.K}x{self.N}"
 
     def define_tensors(self) -> list[TensorSpec]:
         return [
@@ -204,76 +253,88 @@ class _DbcMatScratch(PTOTestCase):
 
 
 class TestDbc2DoubleBuffer:
-    """dbC=2 L0C double-buffer, forced onto the ptoas memory planner."""
+    """dbC=2 L0C double-buffer under the PyPTO and PTOAS memory planners."""
 
-    # Grid counts are the chooser's pick under the a2a3 128 KB-L0C dbC regime (it
-    # prefers ~2x2 splits, so 2-tile grids do not occur for these shapes); the sweep
-    # gives the device agent a drain-hiding curve — the last tile's drain is always
-    # exposed, so the hidden fraction should approach 1 as the tile count grows.
+    # Exact calibrated chooser contracts: (M, N, tile_m, tile_n, tile_count).
+    # The 144x144 case is the real odd 3x2 grid. The sweep gives the device agent
+    # a drain-hiding curve; the last tile's drain is always exposed, so the hidden
+    # fraction should approach 1 as the tile count grows.
     @pytest.mark.parametrize("platform", PLATFORMS_DBC)
     @pytest.mark.parametrize(
-        "m, n",
+        "planner",
         [
-            (256, 256),  # 128x128 tile, 2x2 ->  4 tiles  (WAR reuse boundary — primary gate)
-            # TODO(dbC2-ptoas-operand-overflow): (384, 256) [3x2 grid] compiles to 6 distinct
-            # operand memrefs; under memory_planner=PTOAS MemoryReuse is skipped, so ptoas
-            # allocates one L0A buffer per memref (6x16KB > 64KB) -> "left overflow". PyPTO's
-            # MemoryReuse coalesces these to the 2-buffer ping-pong; ptoas does not do its own
-            # operand-liveness coalescing. Not dbC-specific (reproduces at dbC=1) and not the
-            # cost model. Re-enable once operand coalescing runs under PTOAS (or InitMemRef
-            # ping-pongs the streamed operand). See KNOWN_ISSUES.
-            (256, 512),  # 128x128 tile, 2x4 ->  8 tiles
-            (512, 512),  # 128x128 tile, 4x4 -> 16 tiles  (deepest WAR stress)
+            pytest.param(MemoryPlanner.PYPTO, id="pypto"),
+            pytest.param(MemoryPlanner.PTOAS, id="ptoas"),
         ],
     )
-    def test_direct_store_dbc(self, test_runner, platform, m, n):
+    @pytest.mark.parametrize(
+        "m,n,tile_m,tile_n,tile_count",
+        [
+            (160, 160, 80, 128, 4),
+            (144, 144, 48, 128, 6),
+            (256, 256, 64, 128, 8),
+            (448, 448, 112, 128, 16),
+        ],
+    )
+    def test_direct_store_dbc(self, test_runner, platform, planner, m, n, tile_m, tile_n, tile_count):
         """Direct-store (Acc->GM) dbC=2 across a tile-count sweep; a wrong reuse-WAR
         sync would corrupt the result."""
-        result = test_runner.run(_DbcDirectStore(m, n, platform=platform))
+        choice = _choose_a2a3_fp32_dbc(m, n)
+        count = ((m + choice.m - 1) // choice.m) * ((n + choice.n - 1) // choice.n)
+        assert (choice.m, choice.n, choice.k, count) == (tile_m, tile_n, 64, tile_count)
+        assert choice.stationarity == _core_passes.l0_tile_chooser.Stationarity.OutputStationary
+        assert choice.double_buffer_c
+        result = test_runner.run(_DbcDirectStore(m, n, planner=planner, platform=platform))
+        assert result.passed, f"Test failed: {result.error}"
+
+    @pytest.mark.parametrize("platform", PLATFORMS_DBC)
+    def test_ptoas_384x256_operand_allocation(self, test_runner, platform):
+        """Formerly disabled PTOAS operand-buffer overflow, now a 6x2 (12-tile) grid."""
+        choice = _choose_a2a3_fp32_dbc(384, 256)
+        count = ((384 + choice.m - 1) // choice.m) * ((256 + choice.n - 1) // choice.n)
+        assert (choice.m, choice.n, choice.k, count) == (64, 128, 64, 12)
+        assert choice.stationarity == _core_passes.l0_tile_chooser.Stationarity.OutputStationary
+        assert choice.double_buffer_c
+        result = test_runner.run(_DbcDirectStore(384, 256, planner=MemoryPlanner.PTOAS, platform=platform))
         assert result.passed, f"Test failed: {result.error}"
 
     @pytest.mark.parametrize("platform", PLATFORMS_DBC)
     @pytest.mark.parametrize(
-        "m, n",
+        "planner",
         [
-            (256, 256),  # 128x128 tile, 2x2 ->  4 tiles  (WAR reuse boundary — primary gate)
-            (256, 512),  # 128x128 tile, 2x4 ->  8 tiles
-            (512, 512),  # 128x128 tile, 4x4 -> 16 tiles  (deepest WAR stress)
+            pytest.param(MemoryPlanner.PYPTO, id="pypto"),
+            pytest.param(MemoryPlanner.PTOAS, id="ptoas"),
         ],
     )
-    def test_direct_store_dbc_pypto(self, test_runner, platform, m, n):
-        """dbC=2 under the **PyPTO** memory planner (experimental opt-in flag): unlike
-        PTOAS (which skips MemoryReuse), here MemoryReuse's capacity gate (#1475) keeps
-        the two co-live L0C accumulators in distinct buffers via their flat depth-2
-        `pipeline_membership`. Same numerics as the PTOAS path, but the reuse-WAR is
-        enforced by PyPTO codegen sync — so this is the correctness gate for the new
-        allocation path. Compares against the same torch golden."""
-        result = test_runner.run(_DbcDirectStore(m, n, planner=MemoryPlanner.PYPTO, platform=platform))
+    def test_mat_scratch_dbc(self, test_runner, platform, planner):
+        """Mat-scratch dbC=2 L1 drain; regression for #1995's PTOAS accumulator-handle fix."""
+        choice = _choose_a2a3_dbc(256, 64, 256, bytes_a=2, bytes_b=2)
+        assert (choice.m, choice.n, choice.k) == (128, 128, 64)
+        assert choice.double_buffer_c
+        case = _DbcMatScratch(planner=planner, platform=platform)
+        printed = _printed_after_auto_tile(case, planner)
+        assert printed.count('"pipeline_double_buffer_c": True') == 1
+        result = test_runner.run(case)
         assert result.passed, f"Test failed: {result.error}"
 
-    @pytest.mark.xfail(
-        run=False,
-        reason=(
-            "dbc2_mat_scratch is wrong under PTOAS (~99% mismatch, 16185/16384), but NOT because "
-            "of the Acc->Mat assemble drain and NOT dbC-specific: the chained-matmul consumer's "
-            "K-reduction accumulator if-phi handle is split across two L0C buffers by PTO codegen "
-            "(a fresh phi handle instead of the dominating accumulator handle), so half the "
-            "reduction is dropped. run=False so a hang cannot wedge the suite. Fixed upstream by "
-            "#1961 (first-class alloc_tile / MaterializeAllocTiles unifies the handle); verified "
-            "against #1961's branch. Un-xfail after #1961 merges and device-confirms."
-        ),
+    @pytest.mark.parametrize("platform", PLATFORMS_DBC)
+    @pytest.mark.parametrize(
+        "planner",
+        [
+            pytest.param(MemoryPlanner.PYPTO, id="pypto"),
+            pytest.param(MemoryPlanner.PTOAS, id="ptoas"),
+        ],
     )
-    @pytest.mark.parametrize("platform", PLATFORMS_DBC)
-    def test_mat_scratch_dbc(self, test_runner, platform):
-        """Mat-scratch (Acc->Mat, tile.assemble) dbC=2: the L1 drain path."""
-        result = test_runner.run(_DbcMatScratch(platform=platform))
-        assert result.passed, f"Test failed: {result.error}"
-
-    @pytest.mark.parametrize("platform", PLATFORMS_DBC)
-    def test_non_divisible_tail_dbc(self, test_runner, platform):
+    def test_non_divisible_tail_dbc(self, test_runner, platform, planner):
         """Non-divisible M/N (320x320): the peeled L-shaped tail is emitted straight-line
         (its drains are not floated), so this exercises dbC interior + exposed tail."""
-        result = test_runner.run(_DbcDirectStore(320, 320, platform=platform))
+        choice = _choose_a2a3_fp32_dbc(320, 320)
+        assert (choice.m, choice.n, choice.k) == (64, 128, 64)
+        assert choice.double_buffer_c
+        case = _DbcDirectStore(320, 320, planner=planner, platform=platform)
+        printed = _printed_after_auto_tile(case, planner)
+        assert printed.count('"pipeline_double_buffer_c": True') == 1
+        result = test_runner.run(case)
         assert result.passed, f"Test failed: {result.error}"
 
 

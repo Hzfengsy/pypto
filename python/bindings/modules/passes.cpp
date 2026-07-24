@@ -461,20 +461,15 @@ void BindPass(nb::module_& m) {
              "Merges all dimensions except the last into a single dimension.\n"
              "E.g., tile [A, B, C] becomes [A*B, C]. Only converts 3D+ tiles.");
   passes.def("auto_tile_matmul_l0", &pass::AutoTileMatmulL0,
-             "Create a pass that auto-tiles Mat-resident tile.matmul / tile.matmul_acc into a\n"
-             "C-stationary K-loop\n\n"
-             "Rewrites each tile.matmul or tile.matmul_acc whose Mat operands have static 2D\n"
-             "shape into a range(0, K, k) loop. For tile.matmul the body branches on `ko == 0`\n"
-             "between tile.matmul (fresh accumulator) and tile.matmul_acc (accumulating). For\n"
-             "tile.matmul_acc the body is uniform — every iteration is tile.matmul_acc with the\n"
-             "iter-arg init = caller's accumulator. The K-loop is marked ForKind::Pipeline +\n"
-             "pipeline_stages=2 so LowerPipelineLoops produces a 2-deep ping-pong. Already-L0-\n"
-             "sized matmuls are left untouched. tile.matmul_bias is not yet supported. The tile\n"
-             "(m,n,k,stationarity) comes from a roofline cost-model search: besides the K-loop\n"
-             "the pass emits M/N output tiling (direct-store grid or on-chip Mat-scratch\n"
-             "assemble), a non-divisor-K boundary peel for 16-aligned K, and operand-stationary\n"
-             "(A/B-stationary) schedules. Non-16-aligned K and other deferred regimes emit a\n"
-             "PerfHint and are left untouched.");
+             "Create a pass that auto-tiles static 2D tile.matmul / tile.matmul_acc for L0\n\n"
+             "The active backend's roofline chooser selects (m,n,k,stationarity,dbC). K-split\n"
+             "reductions use a 2-stage pipelined loop and peel a supported non-divisor aligned\n"
+             "tail. Plain tile.matmul may also use an M/N grid with direct-GM placement or an\n"
+             "on-chip Mat scratch for chained matmul consumers; compatible f32->bf16/f16 rint\n"
+             "casts fold into the FIXPIPE writeback. Full-K grids support output-, A-, and\n"
+             "B-stationary schedules. dbC=2 is enabled under PTOAS and available as a PyPTO\n"
+             "planner opt-in. Already-L0-sized and unsupported regimes are left untouched;\n"
+             "useful deferred cases emit PerfHint diagnostics. tile.matmul_bias is deferred.");
   passes.def("canonicalize_tile_slice", &pass::CanonicalizeTileSlice,
              "Create a pass that lowers Mat-resident tile.slice into tile.extract\n\n"
              "A tile.slice whose result tile is Mem.Mat (e.g. a batch-page slice emitted by\n"

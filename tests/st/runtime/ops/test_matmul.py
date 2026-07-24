@@ -23,7 +23,75 @@ import pytest
 import torch
 from examples.kernels.matmul import matmul_acc_64
 from harness.core.harness import PLATFORMS, DataType, PTOTestCase, TensorSpec
+from pypto import backend as _backend
+from pypto import ir, passes
+from pypto.backend import BackendType
+from pypto.pypto_core import passes as _core_passes
+from pypto.pypto_core.passes import MemoryPlanner
 from pypto.runtime.runner import RunConfig
+
+
+def _planner_tag(planner: MemoryPlanner | None) -> str:
+    return "ptoas" if planner == MemoryPlanner.PTOAS else "pypto"
+
+
+_AUTOL0_PLANNERS = [
+    pytest.param(MemoryPlanner.PYPTO, id="pypto"),
+    pytest.param(MemoryPlanner.PTOAS, id="ptoas"),
+]
+
+
+def _choose_a2a3_l0(
+    m: int,
+    k: int,
+    n: int,
+    *,
+    planner: MemoryPlanner,
+    bytes_a: int,
+    bytes_b: int,
+) -> _core_passes.l0_tile_chooser.L0TileResult:
+    """Mirror AutoTileMatmulL0's calibrated 910B chooser configuration.
+
+    The device tests assert this design point before checking numerics, so a
+    cost-model change cannot silently turn a named K-split / A-stationary /
+    B-stationary case into a different schedule while leaving the golden pass.
+    """
+    cfg = _core_passes.l0_tile_chooser.L0TileConfig()
+    cfg.M, cfg.K, cfg.N = m, k, n
+    cfg.l0a_bytes = cfg.l0b_bytes = 64 * 1024
+    cfg.l0c_bytes = 128 * 1024
+    cfg.bytes_a, cfg.bytes_b, cfg.bytes_c = bytes_a, bytes_b, 4
+    cfg.allow_a_stationary = True
+    cfg.allow_b_stationary = True
+    cfg.allow_double_buffer_c = planner == MemoryPlanner.PTOAS
+    cfg.allow_k_boundary = True
+    return _core_passes.l0_tile_chooser.choose_l0_tile(cfg)
+
+
+def _printed_through_auto_tile(program: Any, planner: MemoryPlanner) -> str:
+    """Run the production tensor-to-tile prefix through AutoTile for structural checks."""
+    _backend.reset_for_testing()
+    _backend.set_backend_type(BackendType.Ascend910B)
+    with passes.PassContext([], memory_planner=planner):
+        for make_pass in (
+            passes.inline_functions,
+            passes.unroll_loops,
+            passes.ctrl_flow_transform,
+            passes.convert_to_ssa,
+            passes.simplify,
+            passes.normalize_stmt_structure,
+            passes.flatten_call_expr,
+            passes.outline_hierarchy_scopes,
+            passes.outline_incore_scopes,
+            passes.outline_cluster_scopes,
+            passes.convert_tensor_to_tile_ops,
+            passes.optimize_orch_tensors,
+            passes.lower_composite_ops,
+            passes.flatten_tile_nd_to_2d,
+            passes.auto_tile_matmul_l0,
+        ):
+            program = make_pass()(program)
+    return ir.python_print(program)
 
 
 class TestMatmul(PTOTestCase):
@@ -272,21 +340,30 @@ class TestMatmulAutoL0(PTOTestCase):
 
     Unlike ``TestMatmul`` (which moves to Left/Right explicitly and gives the
     pass nothing to do), this case calls ``pl.matmul`` on L1 tiles, mirroring
-    the pattern used in models such as qwen3_decode.  K is sized so the
-    chooser must split: with FP32 + double-buffered L0a/L0b on 910B
-    (effective 32 KB each), K=128 forces k=64 and a 2-iter K-loop.
+    the pattern used in models such as qwen3_decode. The parametrized shapes
+    are chooser-pinned to a K-only split under both memory planners.
     """
 
     __test__ = False
 
-    def __init__(self, m: int = 64, k: int = 128, n: int = 128, *, platform: str | None = None, config=None):
-        super().__init__(config, platform=platform)
+    def __init__(
+        self,
+        m: int = 64,
+        k: int = 128,
+        n: int = 128,
+        *,
+        memory_planner: MemoryPlanner | None = None,
+        platform: str | None = None,
+        config=None,
+    ):
+        super().__init__(config, platform=platform, memory_planner=memory_planner)
         self.M = m
         self.K = k
         self.N = n
+        self._planner = memory_planner
 
     def get_name(self) -> str:
-        return f"matmul_autol0_{self.M}x{self.K}x{self.N}"
+        return f"matmul_autol0_{_planner_tag(self._planner)}_{self.M}x{self.K}x{self.N}"
 
     def define_tensors(self) -> list[TensorSpec]:
         return [
@@ -339,14 +416,24 @@ class TestMatmulAutoL0BF16(PTOTestCase):
 
     __test__ = False
 
-    def __init__(self, m: int = 16, k: int = 128, n: int = 256, *, platform: str | None = None, config=None):
-        super().__init__(config, platform=platform)
+    def __init__(
+        self,
+        m: int = 16,
+        k: int = 128,
+        n: int = 256,
+        *,
+        memory_planner: MemoryPlanner | None = None,
+        platform: str | None = None,
+        config=None,
+    ):
+        super().__init__(config, platform=platform, memory_planner=memory_planner)
         self.M = m
         self.K = k
         self.N = n
+        self._planner = memory_planner
 
     def get_name(self) -> str:
-        return f"matmul_autol0_bf16_{self.M}x{self.K}x{self.N}"
+        return f"matmul_autol0_bf16_{_planner_tag(self._planner)}_{self.M}x{self.K}x{self.N}"
 
     def define_tensors(self) -> list[TensorSpec]:
         return [
@@ -410,14 +497,24 @@ class TestMatmulAutoL0NonAlignedK(PTOTestCase):
 
     __test__ = False
 
-    def __init__(self, m: int = 128, k: int = 688, n: int = 192, *, platform: str | None = None, config=None):
-        super().__init__(config, platform=platform)
+    def __init__(
+        self,
+        m: int = 128,
+        k: int = 688,
+        n: int = 192,
+        *,
+        memory_planner: MemoryPlanner | None = None,
+        platform: str | None = None,
+        config=None,
+    ):
+        super().__init__(config, platform=platform, memory_planner=memory_planner)
         self.M = m
         self.K = k
         self.N = n
+        self._planner = memory_planner
 
     def get_name(self) -> str:
-        return f"matmul_autol0_nonaligned_k_{self.M}x{self.K}x{self.N}"
+        return f"matmul_autol0_nonaligned_k_{_planner_tag(self._planner)}_{self.M}x{self.K}x{self.N}"
 
     def define_tensors(self) -> list[TensorSpec]:
         return [
@@ -459,24 +556,34 @@ class TestMatmulAutoL0NonAlignedK(PTOTestCase):
 
 
 class TestMatmulAutoL0AStationary(PTOTestCase):
-    """BF16 matmul where the roofline chooser picks A-stationary (k == K).
+    """BF16 matmul whose planner-specific shape selects A-stationary (k == K).
 
-    M=272, N=272, K=64 (bf16): the [272, 272] FP32 output exceeds L0c, so the pass
-    tiles M/N; with k == K == 64 the chooser holds the full A panel [272, 64]
-    single-buffered in L0A (A-stationary) and streams B double-buffered, realized
-    as a ``ForKind::Sequential`` outer loop over the moving N grid + a pipelined
-    inner loop.  Validates the operand-stationary schedule numerically on device."""
+    The held A panel is single-buffered in L0A while B streams double-buffered.
+    The emitted schedule is a sequential outer M loop and pipelined inner N
+    loop. PyPTO and PTOAS use different shapes because PTOAS also searches
+    dbC=2 design points.
+    """
 
     __test__ = False
 
-    def __init__(self, m: int = 272, k: int = 64, n: int = 272, *, platform: str | None = None, config=None):
-        super().__init__(config, platform=platform)
+    def __init__(
+        self,
+        m: int = 272,
+        k: int = 64,
+        n: int = 272,
+        *,
+        memory_planner: MemoryPlanner | None = None,
+        platform: str | None = None,
+        config=None,
+    ):
+        super().__init__(config, platform=platform, memory_planner=memory_planner)
         self.M = m
         self.K = k
         self.N = n
+        self._planner = memory_planner
 
     def get_name(self) -> str:
-        return f"matmul_autol0_a_stationary_{self.M}x{self.K}x{self.N}"
+        return f"matmul_autol0_a_stationary_{_planner_tag(self._planner)}_{self.M}x{self.K}x{self.N}"
 
     def define_tensors(self) -> list[TensorSpec]:
         return [
@@ -538,17 +645,21 @@ class TestChainedMatmulMatScratch(PTOTestCase):
         nmid: int = 256,
         n: int = 64,
         *,
+        memory_planner: MemoryPlanner | None = None,
         platform: str | None = None,
         config=None,
     ):
-        super().__init__(config, platform=platform)
+        super().__init__(config, platform=platform, memory_planner=memory_planner)
         self.M = m
         self.K = k
         self.NMID = nmid
         self.N = n
+        self._planner = memory_planner
 
     def get_name(self) -> str:
-        return f"chained_matmul_mat_scratch_{self.M}x{self.K}x{self.NMID}x{self.N}"
+        return (
+            f"chained_matmul_mat_scratch_{_planner_tag(self._planner)}_{self.M}x{self.K}x{self.NMID}x{self.N}"
+        )
 
     def define_tensors(self) -> list[TensorSpec]:
         M, K, NMID, N = self.M, self.K, self.NMID, self.N
@@ -613,24 +724,34 @@ class TestChainedMatmulMatScratch(PTOTestCase):
 
 
 class TestMatmulAutoL0BStationary(PTOTestCase):
-    """BF16 matmul where the chooser picks B-stationary — the mirror of A-stationary.
+    """BF16 matmul whose planner-specific shape selects B-stationary.
 
-    M=256, N=272, K=64 (bf16): the [256, 272] FP32 output exceeds L0c, so the pass
-    tiles M/N; with k == K == 64 the chooser holds the full B panel [64, 272]
-    single-buffered in L0B (B-stationary) and streams A double-buffered, realized as a
-    Sequential outer (N) loop + a pipelined inner (M) loop.  Validates the held-B
-    operand-stationary schedule on device."""
+    The held B panel is single-buffered in L0B while A streams double-buffered.
+    The emitted schedule is a sequential outer N loop and pipelined inner M
+    loop. PyPTO and PTOAS use different shapes because PTOAS also searches
+    dbC=2 design points.
+    """
 
     __test__ = False
 
-    def __init__(self, m: int = 256, k: int = 64, n: int = 272, *, platform: str | None = None, config=None):
-        super().__init__(config, platform=platform)
+    def __init__(
+        self,
+        m: int = 256,
+        k: int = 64,
+        n: int = 272,
+        *,
+        memory_planner: MemoryPlanner | None = None,
+        platform: str | None = None,
+        config=None,
+    ):
+        super().__init__(config, platform=platform, memory_planner=memory_planner)
         self.M = m
         self.K = k
         self.N = n
+        self._planner = memory_planner
 
     def get_name(self) -> str:
-        return f"matmul_autol0_b_stationary_{self.M}x{self.K}x{self.N}"
+        return f"matmul_autol0_b_stationary_{_planner_tag(self._planner)}_{self.M}x{self.K}x{self.N}"
 
     def define_tensors(self) -> list[TensorSpec]:
         return [
@@ -681,14 +802,24 @@ class TestMatmulAutoL0MNGrid(PTOTestCase):
 
     __test__ = False
 
-    def __init__(self, m: int = 512, k: int = 64, n: int = 512, *, platform: str | None = None, config=None):
-        super().__init__(config, platform=platform)
+    def __init__(
+        self,
+        m: int = 512,
+        k: int = 64,
+        n: int = 512,
+        *,
+        memory_planner: MemoryPlanner | None = None,
+        platform: str | None = None,
+        config=None,
+    ):
+        super().__init__(config, platform=platform, memory_planner=memory_planner)
         self.M = m
         self.K = k
         self.N = n
+        self._planner = memory_planner
 
     def get_name(self) -> str:
-        return f"matmul_autol0_mn_grid_{self.M}x{self.K}x{self.N}"
+        return f"matmul_autol0_mn_grid_{_planner_tag(self._planner)}_{self.M}x{self.K}x{self.N}"
 
     def define_tensors(self) -> list[TensorSpec]:
         return [
@@ -739,14 +870,24 @@ class TestMatmulAutoL0MNBoundaryPeel(PTOTestCase):
 
     __test__ = False
 
-    def __init__(self, m: int = 272, k: int = 32, n: int = 416, *, platform: str | None = None, config=None):
-        super().__init__(config, platform=platform)
+    def __init__(
+        self,
+        m: int = 272,
+        k: int = 32,
+        n: int = 416,
+        *,
+        memory_planner: MemoryPlanner | None = None,
+        platform: str | None = None,
+        config=None,
+    ):
+        super().__init__(config, platform=platform, memory_planner=memory_planner)
         self.M = m
         self.K = k
         self.N = n
+        self._planner = memory_planner
 
     def get_name(self) -> str:
-        return f"matmul_autol0_mn_boundary_peel_{self.M}x{self.K}x{self.N}"
+        return f"matmul_autol0_mn_boundary_peel_{_planner_tag(self._planner)}_{self.M}x{self.K}x{self.N}"
 
     def define_tensors(self) -> list[TensorSpec]:
         return [
@@ -806,18 +947,23 @@ class TestMatmulOuterPipelinedBF16(PTOTestCase):
         n: int = 256,
         num_chunks: int = 8,
         *,
+        memory_planner: MemoryPlanner | None = None,
         platform: str | None = None,
         config=None,
     ):
-        super().__init__(config, platform=platform)
+        super().__init__(config, platform=platform, memory_planner=memory_planner)
         self.M = m
         self.K_CHUNK = k_chunk
         self.N = n
         self.NUM_CHUNKS = num_chunks
         self.K = k_chunk * num_chunks
+        self._planner = memory_planner
 
     def get_name(self) -> str:
-        return f"matmul_outer_pipe_bf16_{self.M}x{self.K}x{self.N}_chunks{self.NUM_CHUNKS}"
+        return (
+            f"matmul_outer_pipe_bf16_{_planner_tag(self._planner)}_"
+            f"{self.M}x{self.K}x{self.N}_chunks{self.NUM_CHUNKS}"
+        )
 
     def define_tensors(self) -> list[TensorSpec]:
         return [
@@ -1087,22 +1233,22 @@ class TestPipelineMatmulAccGateUp(PTOTestCase):
 
 _MATMUL_SHAPES = [(64, 64, 64), (128, 64, 128), (64, 128, 64)]
 _TRANSPOSE_SHAPES = [(64, 64, 64), (128, 64, 128), (64, 128, 64), (32, 64, 32)]
-# Shapes chosen so AutoTileMatmulL0 must K-split (FP32, double-buffered L0a/b
-# = 32 KB effective): K=128 with N=128 exceeds L0b at k=128, forcing k=64 and
-# splitting the K-loop in two.  K-split accumulates in a different order than
-# the torch.matmul reference, so per-element FP32 rounding can drift by up to
-# ~K * eps_fp32 (≈1.5e-5 at K=128).  Golden tolerance is loosened to 1e-4 for
-# these shapes — see _AUTOL0_RTOL / _AUTOL0_ATOL below.
-_AUTOL0_SHAPES = [
-    (64, 128, 128),
-    (128, 128, 128),
-    (128, 128, 64),
-    (64, 128, 256),
+# Every row is (M, K, N, chosen k). The current calibrated chooser returns
+# (M, N, chosen_k) under BOTH planners, so these are K-only splits rather than
+# already-fitting or full-K M/N grids. The assertion in test_matmul_autol0
+# locks that contract before the device golden runs.
+_AUTOL0_K_SPLIT_SHAPES = [
+    (16, 128, 128, 64),
+    (64, 192, 128, 64),
+    (64, 256, 256, 32),
+    (128, 384, 64, 64),
 ]
-# Tolerance for AutoL0 K-split: HW reduces K=64 chunks in a different order
-# than torch's BLAS reference, so the strict 1e-5 default is too tight.
+# Tolerance for AutoL0 K-split: HW reduces K chunks in a different order than
+# torch's BLAS reference. The resulting FP32 drift scales with K and reaches
+# ~1.6e-5 for the K=384 coverage near cancellation, where rtol contributes
+# little; keep a strict relative tolerance but allow the expected absolute drift.
 _AUTOL0_RTOL = 1e-4
-_AUTOL0_ATOL = 1e-5
+_AUTOL0_ATOL = 5e-5
 # BF16 matmul mirroring qwen3_decode kv_proj/q_proj per-matmul shape
 # (BATCH=16, K_CHUNK=128, OUT_CHUNK=256). Same 2-iter K-loop, BF16 inputs +
 # FP32 accumulator.
@@ -1372,45 +1518,98 @@ class TestMatmulOperations:
             f"matmul_acc_64 failed: max diff = {(c - expected).abs().max().item()}"
         )
 
+    @pytest.mark.platforms("a2a3", "a2a3sim")
     @pytest.mark.parametrize("platform", PLATFORMS)
-    @pytest.mark.parametrize("m,k,n", _AUTOL0_SHAPES)
-    def test_matmul_autol0(self, test_runner, platform, m, k, n):
-        """Matmul on Mat-resident operands — exercises AutoTileMatmulL0 K-split."""
+    @pytest.mark.parametrize("planner", _AUTOL0_PLANNERS)
+    @pytest.mark.parametrize("m,k,n,l0_k", _AUTOL0_K_SPLIT_SHAPES)
+    def test_matmul_autol0(self, test_runner, platform, planner, m, k, n, l0_k):
+        """910B FP32 operands — genuine K-only AutoTile split under both planners."""
+        choice = _choose_a2a3_l0(m, k, n, planner=planner, bytes_a=4, bytes_b=4)
+        assert (choice.m, choice.n, choice.k) == (m, n, l0_k), (
+            f"expected K-only tile {(m, n, l0_k)} under {planner}, got {(choice.m, choice.n, choice.k)}"
+        )
+        assert choice.stationarity == _core_passes.l0_tile_chooser.Stationarity.OutputStationary
+        assert choice.k < k, "the system case must exercise a real K split"
         cfg = RunConfig(platform=platform, rtol=_AUTOL0_RTOL, atol=_AUTOL0_ATOL)
-        result = test_runner.run(TestMatmulAutoL0(m=m, k=k, n=n, platform=platform, config=cfg))
+        result = test_runner.run(
+            TestMatmulAutoL0(
+                m=m,
+                k=k,
+                n=n,
+                memory_planner=planner,
+                platform=platform,
+                config=cfg,
+            )
+        )
         assert result.passed, f"Test failed: {result.error}"
 
     @pytest.mark.parametrize("platform", PLATFORMS)
+    @pytest.mark.parametrize("planner", _AUTOL0_PLANNERS)
     @pytest.mark.parametrize("m,k,n", _AUTOL0_BF16_SHAPES)
-    def test_matmul_autol0_bf16(self, test_runner, platform, m, k, n):
+    def test_matmul_autol0_bf16(self, test_runner, platform, planner, m, k, n):
         """BF16 matmul on Mat-resident operands — qwen3 kv_proj per-matmul shape."""
         cfg = RunConfig(platform=platform, rtol=_AUTOL0_RTOL, atol=_AUTOL0_ATOL)
-        result = test_runner.run(TestMatmulAutoL0BF16(m=m, k=k, n=n, platform=platform, config=cfg))
+        result = test_runner.run(
+            TestMatmulAutoL0BF16(
+                m=m,
+                k=k,
+                n=n,
+                memory_planner=planner,
+                platform=platform,
+                config=cfg,
+            )
+        )
         assert result.passed, f"Test failed: {result.error}"
 
     # --- Roofline-chooser paths: K-boundary peel, operand-stationary, Mat-scratch ---
 
     @pytest.mark.parametrize("platform", PLATFORMS)
-    def test_matmul_autol0_nonaligned_k(self, test_runner, platform):
+    @pytest.mark.parametrize("planner", _AUTOL0_PLANNERS)
+    def test_matmul_autol0_nonaligned_k(self, test_runner, platform, planner):
         """Non-divisor k (128x688x192): AutoTileMatmulL0 pipelines the 8 full k=80
         blocks and peels a straight-line matmul_acc tail of 48 (all 16-aligned).
         Validates the K-boundary peel numerically on device. (N=192 keeps the pick on
         the k=80 codegen-clean peel; see the case class docstring.)"""
         cfg = RunConfig(platform=platform, rtol=2e-3, atol=2e-3)
-        result = test_runner.run(TestMatmulAutoL0NonAlignedK(platform=platform, config=cfg))
+        result = test_runner.run(
+            TestMatmulAutoL0NonAlignedK(
+                memory_planner=planner,
+                platform=platform,
+                config=cfg,
+            )
+        )
         assert result.passed, f"Test failed: {result.error}"
 
+    @pytest.mark.platforms("a2a3", "a2a3sim")
     @pytest.mark.parametrize("platform", PLATFORMS)
-    def test_matmul_autol0_a_stationary(self, test_runner, platform):
-        """Operand-stationary L0 schedule (272x272x64): the chooser holds the full A
-        panel single-buffered (A-stationary) and streams B double-buffered, realized
-        as a Sequential outer + pipelined inner loop. Validates it on device."""
+    @pytest.mark.parametrize(
+        "planner,m,k,n,expected_tile",
+        [
+            pytest.param(MemoryPlanner.PYPTO, 256, 128, 544, (256, 128, 128), id="pypto"),
+            pytest.param(MemoryPlanner.PTOAS, 384, 256, 128, (128, 64, 256), id="ptoas"),
+        ],
+    )
+    def test_matmul_autol0_a_stationary(self, test_runner, platform, planner, m, k, n, expected_tile):
+        """Planner-pinned A-stationary schedule; sequential outer M, pipelined inner N."""
+        choice = _choose_a2a3_l0(m, k, n, planner=planner, bytes_a=2, bytes_b=2)
+        assert (choice.m, choice.n, choice.k) == expected_tile
+        assert choice.stationarity == _core_passes.l0_tile_chooser.Stationarity.AStationary
         cfg = RunConfig(platform=platform, rtol=2e-3, atol=2e-3)
-        result = test_runner.run(TestMatmulAutoL0AStationary(platform=platform, config=cfg))
+        result = test_runner.run(
+            TestMatmulAutoL0AStationary(
+                m=m,
+                k=k,
+                n=n,
+                memory_planner=planner,
+                platform=platform,
+                config=cfg,
+            )
+        )
         assert result.passed, f"Test failed: {result.error}"
 
     @pytest.mark.parametrize("platform", PLATFORMS)
-    def test_chained_matmul_mat_scratch(self, test_runner, platform):
+    @pytest.mark.parametrize("planner", _AUTOL0_PLANNERS)
+    def test_chained_matmul_mat_scratch(self, test_runner, platform, planner):
         """Chained (a@b)@e with the oversized intermediate kept on-chip in an L1/Mat
         scratch (per-sub-tile Acc->Mat assembles, bf16 downcast fused), consumed by
         the second matmul from L1 — no DDR round-trip. Validates the Mat-scratch
@@ -1418,46 +1617,107 @@ class TestMatmulOperations:
         bf16 intermediate keeps the output O(1) (see define_tensors) -- a per-element
         allclose at rtol=atol=2e-2 is then robust on the chain's cancellation elements."""
         cfg = RunConfig(platform=platform, rtol=2e-2, atol=2e-2)
-        result = test_runner.run(TestChainedMatmulMatScratch(platform=platform, config=cfg))
+        result = test_runner.run(
+            TestChainedMatmulMatScratch(
+                memory_planner=planner,
+                platform=platform,
+                config=cfg,
+            )
+        )
         assert result.passed, f"Test failed: {result.error}"
 
+    @pytest.mark.platforms("a2a3", "a2a3sim")
     @pytest.mark.parametrize("platform", PLATFORMS)
-    def test_matmul_autol0_b_stationary(self, test_runner, platform):
-        """B-stationary held-operand schedule (256x272x64) — mirror of A-stationary:
-        the full B panel is single-buffered in L0B, A streams double-buffered."""
+    @pytest.mark.parametrize(
+        "planner,m,k,n,expected_tile",
+        [
+            pytest.param(MemoryPlanner.PYPTO, 192, 64, 512, (64, 512, 64), id="pypto"),
+            pytest.param(MemoryPlanner.PTOAS, 64, 80, 288, (32, 256, 80), id="ptoas"),
+        ],
+    )
+    def test_matmul_autol0_b_stationary(self, test_runner, platform, planner, m, k, n, expected_tile):
+        """Planner-pinned B-stationary schedule; sequential outer N, pipelined inner M."""
+        choice = _choose_a2a3_l0(m, k, n, planner=planner, bytes_a=2, bytes_b=2)
+        assert (choice.m, choice.n, choice.k) == expected_tile
+        assert choice.stationarity == _core_passes.l0_tile_chooser.Stationarity.BStationary
         cfg = RunConfig(platform=platform, rtol=2e-3, atol=2e-3)
-        result = test_runner.run(TestMatmulAutoL0BStationary(platform=platform, config=cfg))
+        result = test_runner.run(
+            TestMatmulAutoL0BStationary(
+                m=m,
+                k=k,
+                n=n,
+                memory_planner=planner,
+                platform=platform,
+                config=cfg,
+            )
+        )
         assert result.passed, f"Test failed: {result.error}"
 
     @pytest.mark.parametrize("platform", PLATFORMS)
-    def test_matmul_autol0_mn_grid(self, test_runner, platform):
+    @pytest.mark.parametrize("planner", _AUTOL0_PLANNERS)
+    def test_matmul_autol0_mn_grid(self, test_runner, platform, planner):
         """Output-stationary M/N grid stored to DDR (512x512x64) — the DirectGmPlacer
         path on a large output (the other AutoL0 s-tests are K-only)."""
         cfg = RunConfig(platform=platform, rtol=2e-3, atol=2e-3)
-        result = test_runner.run(TestMatmulAutoL0MNGrid(platform=platform, config=cfg))
+        result = test_runner.run(
+            TestMatmulAutoL0MNGrid(
+                memory_planner=planner,
+                platform=platform,
+                config=cfg,
+            )
+        )
         assert result.passed, f"Test failed: {result.error}"
 
     @pytest.mark.parametrize("platform", PLATFORMS)
-    def test_matmul_autol0_mn_boundary_peel(self, test_runner, platform):
+    @pytest.mark.parametrize("planner", _AUTOL0_PLANNERS)
+    def test_matmul_autol0_mn_boundary_peel(self, test_runner, platform, planner):
         """M/N grid whose tile does not divide M/N (272x416x32) — the L-shaped boundary
         peeled into straight-line partial tiles."""
         cfg = RunConfig(platform=platform, rtol=2e-3, atol=2e-3)
-        result = test_runner.run(TestMatmulAutoL0MNBoundaryPeel(platform=platform, config=cfg))
+        result = test_runner.run(
+            TestMatmulAutoL0MNBoundaryPeel(
+                memory_planner=planner,
+                platform=platform,
+                config=cfg,
+            )
+        )
         assert result.passed, f"Test failed: {result.error}"
 
-    @pytest.mark.skip(
-        reason="Reproducer for the qwen3_decode runtime hang: outer "
-        "pl.pipeline(stage=2) + if/else matmul/matmul_acc, with "
-        "AutoTileMatmulL0 K-tiling inside, hangs at runtime on a2a3. "
-        "PTO output is structurally correct; suspect ptoas (simpler) "
-        "synchronization codegen for nested branched pipelines. See "
-        "KNOWN_ISSUES.md."
-    )
     @pytest.mark.parametrize("platform", PLATFORMS)
-    def test_matmul_outer_pipelined_bf16(self, test_runner, platform):
+    @pytest.mark.parametrize("planner", _AUTOL0_PLANNERS)
+    def test_matmul_outer_pipelined_bf16(self, test_runner, platform, planner):
         """qwen3 kv_proj-shaped pattern: outer pl.pipeline(stage=2) wrapping
-        if/else matmul/matmul_acc with AutoTileMatmulL0 K-tiling inside."""
-        result = test_runner.run(TestMatmulOuterPipelinedBF16(platform=platform))
+        if/else matmul/matmul_acc with AutoTileMatmulL0 K-tiling inside. This was
+        previously skipped for a device hang; run it under both planners to guard
+        the loop-carried accumulator and nested-pipeline fixes."""
+        cfg = RunConfig(platform=platform, rtol=2e-3, atol=2e-3)
+        case = TestMatmulOuterPipelinedBF16(
+            memory_planner=planner,
+            platform=platform,
+            config=cfg,
+        )
+        choice = _choose_a2a3_l0(
+            case.M,
+            case.K_CHUNK,
+            case.N,
+            planner=planner,
+            bytes_a=2,
+            bytes_b=2,
+        )
+        assert choice.k < case.K_CHUNK, "the inner per-chunk matmul must be K-tiled"
+        printed = _printed_through_auto_tile(case.get_program(), planner)
+        outer_pipeline = f"pl.pipeline({case.NUM_CHUNKS}, stage=2"
+        inner_pipeline = f"pl.pipeline(0, {case.K_CHUNK}, {choice.k},"
+        assert printed.count(outer_pipeline) == 1
+        assert printed.count(inner_pipeline) == 2, "both outer if/else branches need an inner K pipeline"
+        lines = printed.splitlines()
+        outer_i = next(i for i, line in enumerate(lines) if outer_pipeline in line)
+        inner_indices = [i for i, line in enumerate(lines) if inner_pipeline in line]
+        outer_indent = len(lines[outer_i]) - len(lines[outer_i].lstrip())
+        assert all(
+            i > outer_i and len(lines[i]) - len(lines[i].lstrip()) > outer_indent for i in inner_indices
+        )
+        result = test_runner.run(case)
         assert result.passed, f"Test failed: {result.error}"
 
     @pytest.mark.parametrize("platform", PLATFORMS)

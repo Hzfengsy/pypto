@@ -72,41 +72,40 @@
 /// -------------------------------
 /// When ``ChooseL0Tile`` returns ``m < M`` or ``n < N`` the ``[M, N]`` output
 /// Acc overflows L0c.  The operands are already Mat-resident, so only the
-/// output overflows: for a plain ``tile.matmul`` whose result is consumed by a
-/// single 2D ``tile.store(c, base, out)`` (the direct-store path), the pass
-/// unrolls the output into a ``ceil(M/m) x ceil(N/n)`` grid and emits, per
-/// sub-tile origin ``(mi, ni)``, the ``[m_eff, n_eff]`` (partial on the
-/// boundary) sub-tile compute followed by
-/// ``tile.store(c_sub, [base_r + mi, base_c + ni], out_prev)``.  Each sub-tile
-/// uses the pipelined K-loop above when K spans >= 2 L0 blocks, or — when
-/// ``k == K`` (the full K fits L0a/L0b at once) — a single straight-line
-/// ``tile.matmul``, emitted as **nested pipelined loops** over the divisible
-/// interior so ``LowerPipelineLoops`` double-buffers the operand extracts (see
-/// ``BuildFullKPipelined``; the partial boundary is peeled into a straight-line
-/// tail, and the stationary axis is auto-picked by panel cost).  The stores
-/// chain the output tensor in SSA form; the final store's result replaces the
-/// original store downstream.  Boundary sub-tiles use static partial extents, so
-/// ``m`` / ``n`` need not divide ``M`` / ``N``.
+/// output overflows. For plain ``tile.matmul``, the pass emits a
+/// ``ceil(M/m) x ceil(N/n)`` grid and hands each ``[m_eff, n_eff]`` Acc result to
+/// a placement strategy: either direct-store to the sole 2D
+/// ``tile.store(c, base, out)`` consumer, or assembly into an on-chip Mat scratch
+/// when every use is a later matmul operand. Each sub-tile uses the pipelined
+/// K-loop above when K spans >= 2 L0 blocks, or — when ``k == K`` (the full K
+/// fits L0a/L0b at once) — a single straight-line ``tile.matmul`` emitted inside
+/// **nested pipelined loops** over the divisible interior so
+/// ``LowerPipelineLoops`` double-buffers the operand extracts (see
+/// ``BuildFullKPipelined``). The partial boundary is peeled into a
+/// straight-line tail, so ``m`` / ``n`` need not divide ``M`` / ``N``.
 ///
 /// Supported today:
 ///   * ``tile.matmul`` and ``tile.matmul_acc``.  ``tile.matmul_bias`` is
 ///     deferred — bias add only after the final iteration needs extra
 ///     rewriting that is not yet implemented.
 ///   * K tiling (``m == M and n == N``) for ``tile.matmul`` and
-///     ``tile.matmul_acc``; M/N tiling for plain ``tile.matmul`` with a single
-///     2D ``tile.store`` consumer (the direct-store path), with either a
-///     pipelined K-loop or a straight-line single-K-block (``k == K``) per
-///     sub-tile.  M/N tiling of ``tile.matmul_acc`` (needs per-sub-tile
-///     accumulator slicing), of a Vec left operand, or of a result consumed
-///     on-chip (not by a single 2D store) is deferred — those emit a
-///     ``PerfHint`` and skip.
+///     ``tile.matmul_acc``; M/N tiling for plain ``tile.matmul`` with either a
+///     direct-store or Mat-scratch placement, with a pipelined K-loop or a
+///     straight-line single-K-block (``k == K``) per sub-tile.
+///     M/N tiling of ``tile.matmul_acc`` (needs per-sub-tile accumulator
+///     slicing), a Vec left operand, or a mixed/non-matmul on-chip consumer is
+///     deferred with a ``PerfHint``.
+///   * A compatible f32-to-bf16/f16 ``tile.cast(mode="rint")`` feeding only
+///     matmul operands is folded into the Acc-to-Mat FIXPIPE writeback.
 ///   * Any 16-aligned K.  When the chosen ``k`` does not divide ``K``
 ///     (``allow_k_boundary``) the K-loop peels a partial last block of width
 ///     ``K - (K/k)*k``; with K and k both 16-aligned the tail is itself 16-aligned
 ///     -- an ordinary matmul_acc block (ptoas requires 16-aligned tile cols).
 ///
-/// Already-L0-sized matmuls (chooser returns ``(M, N, K)``) are left
-/// untouched.
+/// When the chooser returns ``(M, N, K)``, the matmul itself needs no tiling
+/// rewrite.  Its result may still participate in the fits-L0c chained
+/// cast-fold, which remaps the compatible downcast to a full-window Mat
+/// scratch.
 
 #include <algorithm>
 #include <any>
@@ -483,10 +482,11 @@ struct MatmulTiling {
   /// budgeted at L0C/2 so two co-live [m, n] Acc tiles fit, and BuildFullKPipelined
   /// tags the moving loop with kPipelineDoubleBufferCAttr so CanonicalizeIOOrder
   /// floats the drains past the next matmul, keeping the two tiles co-live.  With
-  /// MemoryReuse skipped (ptoas planner) InitMemRef keeps the two overlapping-live-
-  /// range buffers distinct and ptoas places them, hiding tile i's drain behind tile
-  /// i+1's MAD.  Set from L0TileResult::double_buffer_c; only true under the ptoas
-  /// memory planner, and only for full-K tiles (see the assert in AnalyzeMatmul).
+  /// Under PTOAS, InitMemRef keeps the overlapping-live-range buffers distinct
+  /// and ptoas places them. Under the PyPTO opt-in, the flat depth-2 pipeline
+  /// membership prevents MemoryReuse from coalescing them. Set from
+  /// L0TileResult::double_buffer_c; only true for full-K tiles (see the assert
+  /// in AnalyzeMatmul).
   bool double_buffer_c = false;
   [[nodiscard]] bool is_acc() const { return acc_init != nullptr; }
   /// True when the chosen L0 tile is smaller than the [M, N] output on either
@@ -645,13 +645,10 @@ std::optional<MatmulTiling> AnalyzeMatmul(const AssignStmtPtr& assign, std::vect
   cfg.allow_a_stationary = !force_output_stationary;
   cfg.allow_b_stationary = !force_output_stationary;
   // L0C double-buffering (dbC=2): the chooser budgets the accumulator at L0C/2 and
-  // scores the drain-hidden wall (max(C_load, C_mad, C_drain)) so tile i's FIXPIPE
-  // drain overlaps tile i+1's MAD.  This needs two *co-live* L0C accumulators, and
-  // the co-live pair only survives under the ptoas memory planner: PTOAS skips
-  // MemoryReuse, whose opportunistic reuse over-coalesces the two overlapping-live-
-  // range accumulators back into one buffer.  With MemoryReuse skipped, InitMemRef
-  // keeps the two buffers distinct and ptoas assigns their physical offsets (any
-  // correct allocator must separate overlapping live ranges).
+  // scores the drain-hidden wall so tile i's FIXPIPE drain overlaps tile i+1's
+  // MAD. This needs two *co-live* L0C accumulators. Under PTOAS, MemoryReuse is
+  // skipped, InitMemRef keeps the buffers distinct, and ptoas assigns their
+  // physical offsets.
   //
   // Under the PyPTO planner dbC=2 is an experimental opt-in (PassContext flag,
   // default OFF). It now works there because the pipeline-membership tagger gives
@@ -797,9 +794,8 @@ class SiblingUseCounter : public IRVisitor {
   // is essential — a scratch fed to ``matmul_acc`` arg 0 would be an illegal
   // Mat-for-Acc substitution and must stay deferred.
   void VisitExpr_(const CallPtr& op) override {
-    const std::string& name = op->op_ ? op->op_->name_ : std::string();
-    const bool is_mm = name == "tile.matmul";
-    const bool is_acc = name == "tile.matmul_acc";
+    const bool is_mm = IsOp(op, "tile.matmul");
+    const bool is_acc = IsOp(op, "tile.matmul_acc");
     for (size_t i = 0; i < op->args_.size(); ++i) {
       const bool operand_pos = (is_mm && (i == 0 || i == 1)) || (is_acc && (i == 1 || i == 2));
       const bool prev = in_matmul_operand_;
@@ -867,12 +863,10 @@ struct MNFold {
 /// Where each computed ``[m_eff, n_eff]`` Acc sub-tile is placed.  The M/N grid
 /// builders (``BuildFullKPipelined`` interior+tail, ``BuildSplitKGrid`` K-loop
 /// grid) are placement-agnostic: they compute each sub-tile's Acc result and
-/// hand it to a ``SubtilePlacer``, which stores it to a DDR output tensor
-/// (``DirectGmPlacer`` — the only placement supported today).  The placer
-/// threads its chained output Var in traversal order and yields the final Var
-/// via ``PlaceAt``.  The abstraction is kept (rather than inlining the single
-/// placer) so additional placements can be added without touching the grid
-/// builders.
+/// hand it to a ``SubtilePlacer``. ``DirectGmPlacer`` stores to a DDR output;
+/// ``MatScratchPlacer`` assembles into an on-chip Mat scratch for a chained
+/// matmul consumer. Each placer threads its chained output Var in traversal
+/// order and yields the final Var via ``PlaceAt``.
 class SubtilePlacer {
  public:
   virtual ~SubtilePlacer() = default;
@@ -927,8 +921,9 @@ class DirectGmPlacer : public SubtilePlacer {
 /// result in an L1/Mat scratch instead of storing it to a DDR tensor, so a
 /// matmul-operand consumer reads it on-chip.  ``Init`` creates the scratch (mirrors
 /// ``BuildAccInit`` but in ``Mat``); each ``PlaceAt`` assembles a sub-tile in place:
-/// ``scratch_{k+1} = tile.assemble(scratch_k, sub, [row_off, col_off])`` — Acc→Mat,
-/// lowering to ``pto.subview`` + ``pto.tmov`` (the codegen landed in PR #1860).
+/// ``scratch_{k+1} = tile.assemble(scratch_k, sub, [row_off, col_off])`` — Acc→Mat.
+/// A low-precision bf16/f16 scratch lowers to FIXPIPE ``pto.tinsert``; a
+/// supported same-dtype full-window assemble uses ``pto.subview`` + ``pto.tmov``.
 /// ``tile.assemble`` is ``set_output_memory_inherit_input()``, so the chain shares
 /// one Mat base before MemoryReuse runs (no full-scratch copy per insert).
 ///
@@ -1036,7 +1031,7 @@ std::pair<std::vector<StmtPtr>, VarPtr> BuildFullKPipelined(const MatmulTiling& 
   // chooser already made that bandwidth-weighted choice while scoring the wall
   // (LoadCycles' min-hoist) and recorded it in `os_holds_a`, so we obey it here
   // rather than re-derive from raw bytes — the two objectives disagree under the
-  // ~200:132 L0A:L0B bandwidth ratio, and diverging would emit a different loop
+  // ~130:85 L0A:L0B bandwidth ratio, and diverging would emit a different loop
   // order than the wall was scored under.
   const bool a_stationary = t.stationarity == utils::Stationarity::kAStationary;
   const bool b_stationary = t.stationarity == utils::Stationarity::kBStationary;
@@ -1081,12 +1076,12 @@ std::pair<std::vector<StmtPtr>, VarPtr> BuildFullKPipelined(const MatmulTiling& 
     // the next matmul overwrites it.  dbC=2 (double_buffer_c) instead sets the
     // stronger double_buffer_c attr, which floats *both* stores below *both*
     // matmuls (matmul c, matmul c₁, store c, store c₁) so the two [m, n] Acc tiles
-    // stay co-live; the chooser budgeted them at L0C/2 so both fit.  With MemoryReuse
-    // skipped (ptoas planner) InitMemRef keeps the two overlapping-live-range buffers
-    // distinct and ptoas places them, so tile i's FIXPIPE drain overlaps tile i+1's
-    // MAD.  Absent (⇒ false) under the pypto planner, where MemoryReuse coalesces the
-    // pair to one accumulator.  The moving-operand extract is double-buffered (Load
-    // tier, hoisted) in both schedules.
+    // stay co-live; the chooser budgeted them at L0C/2 so both fit. Under PTOAS,
+    // MemoryReuse is skipped and ptoas places the distinct live ranges. Under
+    // the PyPTO opt-in, flat depth-2 pipeline membership keeps MemoryReuse from
+    // coalescing the pair. In both cases tile i's FIXPIPE drain overlaps tile
+    // i+1's MAD. The moving-operand extract is double-buffered (Load tier,
+    // hoisted) in both schedules.
     std::vector<std::pair<std::string, std::any>> inner_attrs = {{kPipelineStagesAttr, /*pipeline_stages=*/2},
                                                                  {kPipelineOverlapStoresAttr, false}};
     // Only dbC=2 loops carry the attr (absent ⇒ false), so non-dbC=2 emit is
@@ -1169,18 +1164,18 @@ std::pair<std::vector<StmtPtr>, VarPtr> BuildSplitKGrid(const MatmulTiling& t, S
 /// L0c into a ``ceil(M/m) x ceil(N/n)`` grid of sub-tile matmuls, each computing
 /// an ``[m, n]`` (partial on the boundary) Acc result.  Operands are already
 /// Mat-resident, so only the output Acc overflows; sub-tiling keeps every Acc
-/// tile within L0c.  Only the direct-store consumer is supported today:
+/// tile within L0c. This helper handles the direct-store consumer:
 ///
 ///   * **Direct-store** — the sole consumer is a 2D ``tile.store(c, base, out)``:
 ///     each sub-tile stores straight to ``out[mi:, ni:]`` (the DDR-output case
 ///     our solver kernels need).  The store is folded in and emitted at the
 ///     store site.
 ///
+/// The Mat-scratch alternative is handled earlier by ``TryFoldMatScratch``.
 /// ``result_uses`` / ``store_stmt`` come from the precomputed SiblingIndex.
-/// Returns nullopt (with a PerfHint) when the consumer is not a single 2D
-/// store — ``matmul_acc`` (caller-supplied [M, N] accumulator), a Vec left
-/// operand, and a result consumed on-chip (not by a single 2D store) are all
-/// deferred.
+/// Returns nullopt (with a PerfHint) when neither placement applies —
+/// ``matmul_acc`` (caller-supplied [M, N] accumulator), a Vec left operand,
+/// and mixed/non-matmul on-chip consumers are deferred.
 std::optional<MNFold> TryFoldMNTiling(const MatmulTiling& t, int result_uses, const AssignStmt* store_stmt,
                                       std::vector<Diagnostic>& hints) {
   const Span sp = t.assign->span_;
@@ -1488,8 +1483,9 @@ class AutoTileMutator : public IRMutator {
         if (auto tiling = AnalyzeMatmul(assign, hints)) {
           if (!tiling->needs_mn_tiling()) {
             // Whole output fits L0c — tile K only.  k < K here (k == K with
-            // m == M, n == N would be already-L0-sized and skipped above); the
-            // chooser may return a non-divisor k that BuildKLoopRewrite peels.
+            // m == M, n == N needs no matmul tiling and was skipped by
+            // AnalyzeMatmul); the chooser may return a non-divisor k that
+            // BuildKLoopRewrite peels.
             INTERNAL_CHECK_SPAN(tiling->k < tiling->K, tiling->assign->span_)
                 << "Internal error: K-only tiling expects k < K (K=" << tiling->K << ", k=" << tiling->k
                 << ")";

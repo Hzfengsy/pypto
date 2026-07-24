@@ -462,33 +462,23 @@ def flatten_tile_nd_to_2d() -> Pass:
     """Create a pass that flattens ND tile ops to 2D in InCore functions."""
 
 def auto_tile_matmul_l0() -> Pass:
-    """Create a pass that auto-tiles Mat-resident matmul / matmul_acc into a C-stationary K-loop.
+    """Create a pass that auto-tiles static 2D ``tile.matmul`` / ``tile.matmul_acc`` for L0.
 
-    Rewrites each ``tile.matmul`` or ``tile.matmul_acc`` whose Mat operands
-    have static 2D shape into a ``range(0, K, k)`` loop:
+    The active backend's roofline chooser selects
+    ``(m, n, k, stationarity, dbC)``. K-split reductions use a 2-stage
+    pipelined loop and peel a supported non-divisor aligned tail. Plain
+    ``tile.matmul`` may also use an M/N grid with direct-GM placement or an
+    on-chip Mat scratch for chained matmul consumers; compatible
+    f32-to-bf16/f16 ``rint`` casts fold into the FIXPIPE writeback.
 
-    * For ``tile.matmul``, the loop body branches on ``ko == 0`` between
-      ``tile.matmul`` (fresh accumulator) and ``tile.matmul_acc``
-      (accumulating into the iter-arg).
-    * For ``tile.matmul_acc``, every iteration is ``tile.matmul_acc`` with
-      the iter-arg init set to the caller's accumulator — the chain is
-      uniform from the first iteration so no if-else is needed.
-
-    The L0 tile shape ``(m, n, k)`` is chosen by ``utils.choose_l0_tile``
-    from the active backend's L0 capacities. The K-loop is marked
-    ``ForKind.Pipeline`` with ``pipeline_stages=2`` so the downstream
-    ``LowerPipelineLoops`` pass produces a 2-deep ping-pong on the
-    auto-inserted Mat→Left/Right moves. Already-L0-sized matmuls are left
-    untouched.
-
-    Supported today: ``tile.matmul`` and ``tile.matmul_acc``
-    (``tile.matmul_bias`` is deferred). The chooser is a roofline cost-model
-    search over ``(m, n, k, stationarity)``; besides the K-loop it emits
-    **M/N output tiling** (a direct-store grid, or an on-chip **Mat-scratch**
-    assemble when the result is consumed as a matmul operand), a
-    **non-divisor-K boundary peel** for 16-aligned K, and **operand-stationary**
-    (A/B-stationary) schedules. Non-16-aligned K and the other deferred regimes
-    emit a perf hint and are left untouched.
+    Full-K grids support output-, A-, and B-stationary schedules. dbC=2 is
+    enabled under PTOAS and available as a PyPTO planner opt-in. Eligible calls
+    require static 2D operands with B in Mat and A in Mat or Vec. When the
+    chooser returns the full ``(M, N, K)`` shape, no tiling rewrite is needed,
+    although a chained result may still be remapped to Mat by the compatible
+    cast-fold placement above. Other unsupported regimes are left untouched;
+    useful deferred cases emit ``PerfHint`` diagnostics. ``tile.matmul_bias``
+    is deferred.
     """
 
 def canonicalize_tile_slice() -> Pass:

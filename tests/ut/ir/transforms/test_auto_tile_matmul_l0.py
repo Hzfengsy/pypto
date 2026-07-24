@@ -1365,6 +1365,245 @@ class TestAutoTileMatmulL0MNTiling:
             f"B-stationary numerics mismatch: max abs diff {(out - expected).abs().max().item():.3e}"
         )
 
+    @pytest.mark.parametrize("planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.PTOAS])
+    @pytest.mark.parametrize(
+        ("M", "K", "N", "tile_k"),
+        [
+            (16, 128, 128, 64),
+            (64, 192, 128, 64),
+            (64, 256, 256, 32),
+            (128, 384, 64, 64),
+        ],
+    )
+    def test_system_k_split_shapes_emit_k_only_loop(self, planner, M, K, N, tile_k):
+        """Structural contract for the FP32 system-test matrix.
+
+        Every shape must remain a K-only split under both planners: one K
+        pipeline, at least one matmul_acc, and no M/N grid loop.
+        """
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[M, K], pl.FP32],
+                rhs: pl.Tensor[[K, N], pl.FP32],
+                out: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+            ) -> pl.Tensor[[M, N], pl.FP32]:
+                lhs_mat: pl.Tile[[M, K], pl.FP32, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [M, K], target_memory=pl.Mem.Mat
+                )
+                rhs_mat: pl.Tile[[K, N], pl.FP32, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [K, N], target_memory=pl.Mem.Mat
+                )
+                c: pl.Tile[[M, N], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lhs_mat, rhs_mat)
+                out = pl.store(c, [0, 0], out)
+                return out
+
+        with passes.PassContext([], memory_planner=planner):
+            After = passes.auto_tile_matmul_l0()(Before)
+        printed = ir.python_print(After)
+        assert printed.count("pl.pipeline(") == 1
+        assert "pl.range(" not in printed
+        assert f"pl.pipeline(0, {K}, {tile_k}," in printed
+        assert "pl.tile.matmul_acc(" in printed
+        _assert_ssa_valid(After, f"test_system_k_split_{planner}_{M}_{K}_{N}")
+
+    @pytest.mark.parametrize(
+        ("planner", "M", "K", "N", "held_m", "outer_loop", "inner_loop", "double_buffer_c"),
+        [
+            (
+                passes.MemoryPlanner.PYPTO,
+                256,
+                128,
+                544,
+                256,
+                "pl.range(0, 256, 256,",
+                "pl.pipeline(0, 512, 128,",
+                False,
+            ),
+            (
+                passes.MemoryPlanner.PTOAS,
+                384,
+                256,
+                128,
+                128,
+                "pl.range(0, 384, 128,",
+                "pl.pipeline(0, 128, 64,",
+                True,
+            ),
+        ],
+    )
+    def test_system_a_stationary_shapes_emit_held_a(
+        self, planner, M, K, N, held_m, outer_loop, inner_loop, double_buffer_c
+    ):
+        """Planner-specific A-stationary shapes reuse held A across the moving loop."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[M, K], pl.BF16],
+                rhs: pl.Tensor[[K, N], pl.BF16],
+                out: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+            ) -> pl.Tensor[[M, N], pl.FP32]:
+                lhs_mat: pl.Tile[[M, K], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [M, K], target_memory=pl.Mem.Mat
+                )
+                rhs_mat: pl.Tile[[K, N], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [K, N], target_memory=pl.Mem.Mat
+                )
+                c: pl.Tile[[M, N], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lhs_mat, rhs_mat)
+                out = pl.store(c, [0, 0], out)
+                return out
+
+        with passes.PassContext([], memory_planner=planner):
+            After = passes.auto_tile_matmul_l0()(Before)
+        printed = ir.python_print(After)
+        assert printed.count("pl.range(") == 1
+        assert printed.count("pl.pipeline(") == 1
+        assert outer_loop in printed
+        assert inner_loop in printed
+        lines = printed.splitlines()
+        outer_i = next(i for i, line in enumerate(lines) if outer_loop in line)
+        inner_i = next(i for i, line in enumerate(lines) if inner_loop in line)
+        assert outer_i < inner_i
+        held_region = "\n".join(lines[outer_i + 1 : inner_i])
+        assert "pl.tile.extract(" in held_region
+        assert f"[{held_m}, {K}]" in held_region
+        assert "target_memory=pl.Mem.Left" in held_region
+        assert ("pipeline_double_buffer_c" in printed) == double_buffer_c
+        _assert_ssa_valid(After, f"test_system_a_stationary_{planner}")
+
+    @pytest.mark.parametrize(
+        ("planner", "M", "K", "N", "held_n", "outer_loop", "inner_loop", "double_buffer_c"),
+        [
+            (
+                passes.MemoryPlanner.PYPTO,
+                192,
+                64,
+                512,
+                512,
+                "pl.range(0, 512, 512,",
+                "pl.pipeline(0, 192, 64,",
+                False,
+            ),
+            (
+                passes.MemoryPlanner.PTOAS,
+                64,
+                80,
+                288,
+                256,
+                "pl.range(0, 256, 256,",
+                "pl.pipeline(0, 64, 32,",
+                True,
+            ),
+        ],
+    )
+    def test_system_b_stationary_shapes_emit_held_b(
+        self, planner, M, K, N, held_n, outer_loop, inner_loop, double_buffer_c
+    ):
+        """Planner-specific B-stationary system shapes keep B in the outer loop."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[M, K], pl.BF16],
+                rhs: pl.Tensor[[K, N], pl.BF16],
+                out: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+            ) -> pl.Tensor[[M, N], pl.FP32]:
+                lhs_mat: pl.Tile[[M, K], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [M, K], target_memory=pl.Mem.Mat
+                )
+                rhs_mat: pl.Tile[[K, N], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [K, N], target_memory=pl.Mem.Mat
+                )
+                c: pl.Tile[[M, N], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lhs_mat, rhs_mat)
+                out = pl.store(c, [0, 0], out)
+                return out
+
+        with passes.PassContext([], memory_planner=planner):
+            After = passes.auto_tile_matmul_l0()(Before)
+        printed = ir.python_print(After)
+        assert printed.count("pl.range(") == 1
+        assert printed.count("pl.pipeline(") == 1
+        assert outer_loop in printed
+        assert inner_loop in printed
+        lines = printed.splitlines()
+        outer_i = next(i for i, line in enumerate(lines) if outer_loop in line)
+        inner_i = next(i for i, line in enumerate(lines) if inner_loop in line)
+        assert outer_i < inner_i
+        held_region = "\n".join(lines[outer_i + 1 : inner_i])
+        assert "pl.tile.extract(" in held_region
+        assert f"[{K}, {held_n}]" in held_region
+        assert "target_memory=pl.Mem.Right" in held_region
+        assert ("pipeline_double_buffer_c" in printed) == double_buffer_c
+        _assert_ssa_valid(After, f"test_system_b_stationary_{planner}")
+
+    @pytest.mark.parametrize(
+        ("planner", "pypto_dbc"),
+        [
+            (passes.MemoryPlanner.PYPTO, True),
+            (passes.MemoryPlanner.PTOAS, False),
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("M", "N", "tile_m", "tile_n"),
+        [
+            (160, 160, 80, 128),
+            (144, 144, 48, 128),
+            (256, 256, 64, 128),
+            (448, 448, 112, 128),
+            (384, 256, 64, 128),
+        ],
+    )
+    def test_system_dbc_shapes_emit_expected_fp32_tile(self, planner, pypto_dbc, M, N, tile_m, tile_n):
+        """Structural lock for the direct-store dbC system-test geometries."""
+        K = 64
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[M, K], pl.FP32],
+                rhs: pl.Tensor[[K, N], pl.FP32],
+                out: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+            ) -> pl.Tensor[[M, N], pl.FP32]:
+                lhs_mat: pl.Tile[[M, K], pl.FP32, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [M, K], target_memory=pl.Mem.Mat
+                )
+                rhs_mat: pl.Tile[[K, N], pl.FP32, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [K, N], target_memory=pl.Mem.Mat
+                )
+                c: pl.Tile[[M, N], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lhs_mat, rhs_mat)
+                out = pl.store(c, [0, 0], out)
+                return out
+
+        with passes.PassContext(
+            [],
+            memory_planner=planner,
+            enable_pypto_l0c_double_buffer=pypto_dbc,
+        ):
+            After = passes.auto_tile_matmul_l0()(Before)
+        printed = ir.python_print(After)
+        assert f"[{tile_m}, {K}], target_memory=pl.Mem.Left" in printed
+        assert f"[{K}, {tile_n}], target_memory=pl.Mem.Right" in printed
+        assert "pipeline_double_buffer_c" in printed
+        _assert_ssa_valid(After, f"test_system_dbc_{planner}_{M}_{N}")
+
     def test_full_k_direct_gm_keeps_one_l0c_accumulator(self):
         """Full-K direct-GM tiling keeps **one** L0C accumulator through the whole
         pipeline.  The stage-2 inner loop sets ``overlap_stores=false`` so
@@ -1845,8 +2084,8 @@ class TestAutoTileMatmulL0MatScratch:
     When an oversized ``[M, N]`` matmul result is consumed *only* as a matmul operand
     (a chained matmul), the pass tiles the output into a ``tile.create(target=Mat)``
     scratch via per-sub-tile ``tile.assemble`` (Acc→Mat) and keeps it on-chip for the
-    consumer, instead of the direct-GM store path.  K-split only for now — the
-    constant-offset grid satisfies ``tile.assemble``'s literal-offset requirement."""
+    consumer, instead of the direct-GM store path. Split-K uses a constant-offset
+    grid; full-K uses pipelined loop-variable offsets."""
 
     def test_chained_matmul_uses_mat_scratch(self):
         """An oversized producer feeding a matmul: the pass assembles the result into an
@@ -1973,6 +2212,76 @@ class TestAutoTileMatmulL0MatScratch:
         from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
 
         assert PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Before) is not None
+
+    def test_misaligned_n_mat_scratch_roundtrips(self):
+        """A misaligned-N Mat-scratch boundary tail survives print -> parse.
+
+        The 128x272 producer exceeds L0c and is consumed only by the second
+        matmul, so AutoTile emits an output-stationary Mat-scratch grid with a
+        partial N boundary. This exact shape previously exposed a printer/parser
+        mismatch in an if/else tail variable.
+        """
+        import re  # noqa: PLC0415
+
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+        M, K, N = 128, 64, 272
+
+        cfg = passes.l0_tile_chooser.L0TileConfig()
+        cfg.M, cfg.K, cfg.N = M, K, N
+        cfg.l0a_bytes = cfg.l0b_bytes = 64 * 1024
+        cfg.l0c_bytes = 128 * 1024
+        cfg.bytes_a = cfg.bytes_b = 2
+        cfg.bytes_c = 4
+        cfg.allow_a_stationary = True
+        cfg.allow_b_stationary = True
+        cfg.allow_k_boundary = True
+        choice = passes.l0_tile_chooser.choose_l0_tile(cfg)
+        assert choice.stationarity == passes.l0_tile_chooser.Stationarity.OutputStationary
+        assert N % choice.n != 0, f"expected a partial-N tail, but tile n={choice.n} divides N={N}"
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[M, K], pl.BF16],
+                b: pl.Tensor[[K, N], pl.BF16],
+                e: pl.Tensor[[N, 64], pl.BF16],
+                out: pl.Out[pl.Tensor[[M, 64], pl.FP32]],
+            ) -> pl.Tensor[[M, 64], pl.FP32]:
+                c = pl.matmul(a, b, out_dtype=pl.FP32)
+                cb = pl.cast(c, pl.BF16, mode="rint")
+                d = pl.matmul(cb, e, out_dtype=pl.FP32)
+                out = pl.assemble(out, d, [0, 0])
+                return out
+
+        lowered = _lower_to_tile_ops(Before)
+        with passes.PassContext([ir.make_roundtrip_instrument()]):
+            After = passes.auto_tile_matmul_l0()(lowered)
+
+        printed = ir.python_print(After)
+        assert printed.count("pl.tile.assemble(") >= 2, "expected a multi-tile Mat-scratch placement"
+        tail_offset = N - N % choice.n
+        tail_match = re.search(
+            rf"(?P<tail>[A-Za-z_]\w*):[^\n]*=\s*pl\.tile\.assemble\([^\n]*\[0, {tail_offset}\]\)",
+            printed,
+        )
+        assert tail_match, "expected the partial-N Mat-scratch assemble at the boundary offset"
+        tail_var = tail_match.group("tail")
+        tail_extract = re.search(
+            rf"pl\.tile\.extract\(\s*{re.escape(tail_var)},.*?target_memory=pl\.Mem\.Left",
+            printed,
+            re.DOTALL,
+        )
+        assert tail_extract, "the consumer K-loop must read the completed partial-N scratch variable"
+        if_pos = printed.find("if ", tail_extract.end())
+        else_pos = printed.find("else:", if_pos)
+        assert tail_extract.end() < if_pos < else_pos, (
+            "expected the partial-N scratch variable to feed the consumer's if/else K-loop"
+        )
+        assert "pl.tile.cast(" not in printed, "the bf16 downcast must be folded into the Mat scratch"
+        _assert_ssa_valid(After, "test_misaligned_n_mat_scratch_roundtrip")
 
     def test_chained_matmul_exceeding_mat_capacity_deferred(self):
         """The conservative Mat-capacity gate: a bf16 chained matmul whose result is
