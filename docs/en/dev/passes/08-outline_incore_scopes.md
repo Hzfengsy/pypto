@@ -48,6 +48,32 @@ program_outlined = outline_pass(program)
    - Call to outlined function with input arguments
    - AssignStmt for each output variable
 6. **Add to Program**: Add outlined function to program's function list
+7. **Promote the parent**: an Opaque parent that outlined at least one scope becomes
+   `Orchestration` — and its param dyn-dim reads are folded first (below)
+
+**Param dyn-dim reads fold on promotion**: a tensor's declared extent *is* its
+runtime extent, so `pl.tensor.dim(a, 0)` on a param whose axis is a `pl.dynamic`
+symbol mints a *second* IR name for one quantity, and shapes built from the copy
+no longer compare equal to shapes built from the symbol. The DSL parser folds
+that read onto the symbol (`ASTParser._fold_tensor_dim`), but only in an
+Orchestration body — that is where Orchestration codegen defines the symbol from
+the param's task-arg descriptor, and where the fold is therefore sound. A body
+written as `Opaque` keeps the read, so this pass folds it at the moment it
+promotes the function, *before* outlining:
+
+```python
+# Opaque parent, as written                # after promotion
+m = pl.tensor.dim(a, 0)                    # (binding folded away)
+with pl.spmd(m // 16):                     with pl.spmd(M_DYN // 16):
+    ...                                        ...
+```
+
+Folding before the outliner runs means the promoted body reaches it in the same
+shape the parser hands an already-Orchestration function, so both paths produce
+identical IR. Without it the pass emits IR that no longer parses back to itself
+(the printed `tensor.dim` binding vanishes on reparse), breaking print→parse
+round-trip verification. Reads the parser would not fold are left alone: a
+constant extent, a runtime axis, or a symbol the signature does not declare.
 
 **Live-in, not `uses \ defs`**: the input set is computed flow-sensitively
 (`UpwardExposedUseCollector`). A plain set difference is wrong for a captured

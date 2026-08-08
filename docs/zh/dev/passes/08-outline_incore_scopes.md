@@ -48,6 +48,30 @@ program_outlined = outline_pass(program)
    - 带有输入参数的提取函数调用
    - 每个输出变量对应一个 AssignStmt
 6. **添加到程序**：将提取的函数添加到程序的函数列表中
+7. **提升父函数**：至少提取出一个作用域的 Opaque 父函数将变为 `Orchestration`——
+   并在此之前先折叠其参数动态维度读取（见下）
+
+**参数动态维度读取在提升时折叠**：tensor 声明的 extent *就是*它的运行期
+extent，因此对以 `pl.dynamic` 符号为某一轴的参数调用 `pl.tensor.dim(a, 0)`，会
+为同一个量再造出**第二个** IR 名字，由该副本构造的 shape 也就不再与由符号构造
+的 shape 结构相等。DSL 解析器会把该读取折叠到符号上
+（`ASTParser._fold_tensor_dim`），但仅限 Orchestration 函数体——只有在那里
+Orchestration codegen 才会从参数的 task-arg 描述符定义该符号，折叠才是可靠的。
+写成 `Opaque` 的函数体会保留该读取，因此本 pass 在提升该函数的那一刻、**在提取
+之前**完成折叠：
+
+```python
+# 写法为 Opaque 的父函数                      # 提升之后
+m = pl.tensor.dim(a, 0)                    # （绑定语句已折叠消失）
+with pl.spmd(m // 16):                     with pl.spmd(M_DYN // 16):
+    ...                                        ...
+```
+
+在提取器运行前折叠，意味着被提升的函数体进入提取器时，与解析器交给一个本就是
+Orchestration 的函数的形态完全一致，两条路径产出相同的 IR。若不折叠，本 pass 产
+出的 IR 将无法再解析回自身（打印出的 `tensor.dim` 绑定在重新解析时消失），从而
+破坏 print→parse 往返验证。解析器不会折叠的读取同样保持原样：常量 extent、运行期
+轴，或并非该签名所声明的符号。
 
 **使用 live-in 而非 `uses \ defs`**：输入集合按流敏感方式计算
 （`UpwardExposedUseCollector`）。对于「先读取、再以同名重新绑定」的被捕获
