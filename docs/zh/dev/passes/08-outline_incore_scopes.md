@@ -9,7 +9,9 @@
 **前置条件**：
 
 - 输入 IR 必须为静态单赋值 (SSA) 形式（需先运行 ConvertToSSA）；该 Pass 保持（产生）SSAForm
-- 仅处理 Opaque 函数（InCore 函数保持不变）
+- 处理 Opaque 与 Orchestration 函数（InCore 函数保持不变）。当解析器将
+  `for i in pl.spmd(...)` 这类高层构造展开时，Orchestration 函数同样会携带
+  InCore 作用域；至少提取出一个作用域的 Opaque 父函数会被提升为 Orchestration
 
 **使用时机**：在 ConvertToSSA 之后运行，当需要将 InCore 计算区域提取为独立的可调用函数时使用。
 
@@ -36,7 +38,8 @@ program_outlined = outline_pass(program)
 
 ## 算法
 
-1. **扫描 InCore 作用域**：在 Opaque 函数中查找所有 `InCoreScopeStmt` 节点
+1. **扫描 InCore 作用域**：在 Opaque 与 Orchestration 函数中查找所有
+   `InCoreScopeStmt` 节点
 2. **分析输入**：收集作用域的 *live-in*（活跃入口）集合——作用域体在（重新）定义
    某变量之前就读取它，说明该变量的入口值来自调用方
 3. **分析输出**：确定在作用域之后仍被使用的内部定义（在作用域内定义、在作用域外使用的变量）
@@ -157,7 +160,7 @@ class Before:
 ```python
 @pl.program
 class After:
-    @pl.function  # Opaque function
+    @pl.function(type=pl.FunctionType.Orchestration)  # promoted from Opaque
     def main(self, x: Tensor[[64], FP32]) -> Tensor[[64], FP32]:
         y = x + 1
 

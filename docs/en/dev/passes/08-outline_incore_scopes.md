@@ -9,7 +9,10 @@ This pass transforms `InCoreScopeStmt` nodes into separate `Function(InCore)` de
 **Requirements**:
 
 - Input IR must be in SSA form (run ConvertToSSA first); SSAForm is preserved (produced) by this pass
-- Only processes Opaque functions (InCore functions are left unchanged)
+- Processes Opaque and Orchestration functions (InCore functions are left
+  unchanged). An Orchestration function carries InCore scopes when the parser
+  desugars a high-level construct such as `for i in pl.spmd(...)`; an Opaque
+  parent that outlines at least one scope is promoted to Orchestration
 
 **When to use**: Run after ConvertToSSA when you need to extract InCore computation regions into separate callable functions.
 
@@ -36,7 +39,8 @@ program_outlined = outline_pass(program)
 
 ## Algorithm
 
-1. **Scan for InCore Scopes**: Find all `InCoreScopeStmt` nodes in Opaque functions
+1. **Scan for InCore Scopes**: Find all `InCoreScopeStmt` nodes in Opaque and
+   Orchestration functions
 2. **Analyze Inputs**: Collect the scope's *live-in* set — variables the body reads
    before it (re)defines them, so their incoming value comes from the caller
 3. **Analyze Outputs**: Determine internal definitions used after scope (variables defined inside, used outside)
@@ -166,7 +170,7 @@ class Before:
 ```python
 @pl.program
 class After:
-    @pl.function  # Opaque function
+    @pl.function(type=pl.FunctionType.Orchestration)  # promoted from Opaque
     def main(self, x: Tensor[[64], FP32]) -> Tensor[[64], FP32]:
         y = x + 1
 
