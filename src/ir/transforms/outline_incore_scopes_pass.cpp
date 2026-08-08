@@ -85,27 +85,45 @@ ExprPtr FoldedDimExtent(const AssignStmtPtr& assign, const std::unordered_set<co
   return (sym && symbols.count(sym.get()) > 0) ? extent : nullptr;
 }
 
-/// Drops each foldable ``tensor.dim`` binding and records its name -> extent.
+/// Drops each foldable ``tensor.dim`` binding, rewriting its uses to the extent.
+///
+/// Folding is transitive: substituting one folded read into a local tensor's
+/// shape is what exposes a *later* read of that tensor, as in
+/// ``m = dim(a, 0); t = create([m, 128]); n = dim(t, 0)`` — once ``t`` is typed
+/// ``[M, 128]``, ``n`` names ``M`` too, and the parser folds it on reparse. A
+/// collect-then-substitute pair would miss ``n`` and leave exactly the roundtrip
+/// mismatch this fold exists to remove.
+///
+/// One forward traversal reaches that fixed point because the body is in SSA
+/// form, so every definition precedes its uses: the base mutator rewrites this
+/// statement's operands (and the Var refs inside their types) from the folds
+/// recorded so far, and the rewritten statement is what gets tested.
 class DimReadFolder : public IRMutator {
  public:
   explicit DimReadFolder(std::unordered_set<const Var*> symbols) : symbols_(std::move(symbols)) {}
 
-  [[nodiscard]] const std::unordered_map<const Var*, ExprPtr>& fold_map() const { return fold_map_; }
+  [[nodiscard]] bool folded_any() const { return folded_any_; }
 
  protected:
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
-    if (auto extent = FoldedDimExtent(op, symbols_)) {
-      fold_map_[op->var_.get()] = extent;
+    auto rewritten = IRMutator::VisitStmt_(op);
+    auto assign = As<AssignStmt>(rewritten);
+    if (!assign) return rewritten;
+    if (auto extent = FoldedDimExtent(assign, symbols_)) {
+      // Overrides any old->fresh entry the base visit recorded for this LHS:
+      // the binding is going away, so its uses must reach the extent itself.
+      var_remap_[op->var_.get()] = extent;
+      folded_any_ = true;
       // Empty SeqStmts is the statement-deletion idiom: the parent's
       // SeqStmts::Flatten splices it out of the surrounding list.
       return std::make_shared<SeqStmts>(std::vector<StmtPtr>{}, op->span_);
     }
-    return IRMutator::VisitStmt_(op);
+    return rewritten;
   }
 
  private:
   std::unordered_set<const Var*> symbols_;
-  std::unordered_map<const Var*, ExprPtr> fold_map_;
+  bool folded_any_ = false;
 };
 
 /// Whether this body still carries an InCore scope — the same condition under
@@ -133,9 +151,7 @@ StmtPtr FoldParamDimReads(const std::vector<VarPtr>& params, const StmtPtr& body
   if (symbols.empty()) return body;
   DimReadFolder folder(std::move(symbols));
   auto folded = folder.VisitStmt(body);
-  if (folder.fold_map().empty()) return body;
-  // Definitions are dropped first, so substitution only ever rewrites uses.
-  return Substitute(folded, folder.fold_map());
+  return folder.folded_any() ? folded : body;
 }
 
 }  // namespace

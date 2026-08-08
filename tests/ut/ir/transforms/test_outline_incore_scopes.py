@@ -13,7 +13,9 @@ import pypto
 import pypto.language as pl
 import pytest
 from pypto import DataType, ir, passes
+from pypto.ir.printer import python_print
 from pypto.language.parser.diagnostics.exceptions import ParserSyntaxError
+from pypto.language.parser.text_parser import parse as text_parse
 
 
 class TestOutlineIncoreScopes:
@@ -2159,6 +2161,42 @@ class TestPromotionFoldsParamDimReads:
 
         assert self._dim_reads(self._main_stmts(After)) == []
         ir.assert_structural_equal(After, ExpectedAfter)
+
+    def test_promotion_folds_transitive_dim_read(self):
+        """A read exposed *by* an earlier fold folds too, in the same pass.
+
+        Folding ``m`` retypes the local ``tmp`` from ``[m, 128]`` to ``[M_DYN, 128]``,
+        which makes ``n = tensor.dim(tmp, 0)`` foldable in turn. Missing that second
+        read leaves the printed IR parsing back to one statement fewer -- exactly the
+        roundtrip mismatch this fold exists to remove.
+        """
+        M_DYN = self.M_DYN
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Opaque)
+            def main(
+                self,
+                a: pl.Tensor[[M_DYN, 128], pl.FP32],
+                out: pl.InOut[pl.Tensor[[M_DYN, 128], pl.FP32]],
+            ) -> pl.Tensor[[M_DYN, 128], pl.FP32]:
+                m = pl.tensor.dim(a, 0)
+                tmp: pl.Tensor[[M_DYN, 128], pl.FP32] = pl.create_tensor([m, 128], dtype=pl.FP32)
+                n = pl.tensor.dim(tmp, 0)
+                with pl.spmd(n // 16):
+                    i = pl.tile.get_block_idx()
+                    t: pl.Tile[[16, 128], pl.FP32] = pl.load(a, [i * 16, 0], [16, 128])
+                    out = pl.store(pl.add(t, t), [i * 16, 0], out)
+                return out
+
+        with passes.PassContext([]):
+            After = passes.outline_incore_scopes()(passes.convert_to_ssa()(Before))
+
+        assert self._dim_reads(self._main_stmts(After)) == []
+
+        # The invariant itself: the emitted IR parses back to itself.
+        printed = python_print(After, format=False)
+        ir.assert_structural_equal(After, text_parse(printed, filename="<roundtrip>"))
 
     def test_promotion_folds_symbol_used_inside_incore_body(self):
         """A read consumed *inside* the scope folds too, and is captured as the symbol."""
