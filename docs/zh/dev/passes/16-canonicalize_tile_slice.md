@@ -180,6 +180,29 @@ scaled:   pl.Tile[[16, 1], pl.FP32, pl.Mem.Vec] = pl.tile.muls(head_ext, 0.5)
 
 **测试**：`tests/ut/ir/transforms/test_canonicalize_tile_slice.py`
 
+## Acc 累加器窗口
+
+本 pass 还会**拒绝**一种它无法修复的形状。L0C 采用 NZ 布局：`[M, N]` tile 的
+block `(r_b, c_b)` 位于 `(c_b * M/16 + r_b) * fractal`。因此，只有当窗口覆盖父
+tile 的全部行范围，或落在单个 16 列 block 之内时，它才是连续的。跨多个列 block
+的 `Acc` tile 的行窗口是跨步的，而 MAD 从裸指针紧凑地写出目的地、没有目的地
+stride，于是第一个列 block 之后的每个列 block 都会落到错误的行 tile 上——而且是
+静默的，每个行 tile 只有前 16 列是正确的。
+
+与上面的 Vec 情形不同，这里没有可用的修复手段：`Acc` 窗口无法拷出再拷回，因为内存
+图中没有任何路径指向 `Acc`。因此，当 matmul 的累加器操作数是非连续的 `Acc` 窗口
+时，会抛出 `ValueError`，并在错误信息中给出可用的写法——两者只差在切分的轴上：把
+累加器按 `[rows, N * tiles]` 分配，然后切列。
+
+该检查以算子注册表的 `set_output_reuses_input` 为作用域，因此无需逐一列举即可覆盖
+`tile.matmul_acc` / `tile.gemv_acc` / `tile.matmul_mx_acc`。对于无法证明的情况它
+保持静默：符号化的 extent、非 `Acc` 布局，或无法证明落在单个 block 内的动态列偏移。
+
+这是针对上游缺陷（[hw-native-sys/pto-isa#253](https://github.com/hw-native-sys/pto-isa/issues/253)）
+的规避，而不是 DSL 的固有属性——`TMATMUL_ACC_IMPL` 把目的地退化为裸 `.data()`
+指针，并从左操作数取 `m`，因此 `TileRes::Rows` 从未被读取。若 pto-isa 支持了目的地
+stride，应放宽或删除该拒绝，而不是把它保留为长期规则。
+
 ## Pass 属性
 
 | 属性 | 取值 |
@@ -200,8 +223,9 @@ scaled:   pl.Tile[[16, 1], pl.FP32, pl.Mem.Vec] = pl.tile.muls(head_ext, 0.5)
 | 喂给普通 call、继承地址无法证明按 32 字节对齐的 Vec `tile.slice` | 替换为 `tile.extract(target_memory=Vec)`；删除 slice（#1789） |
 | 喂给普通 call、继承地址可证明按 32 字节对齐的 Vec `tile.slice` | 保持原样；继续使用零拷贝 subview |
 | 链式 Mat `tile.slice`（slice 的 slice） | 剥离；累加偏移 |
-| 带 `valid_shape` / `drop_dims` 的 `tile.slice` | 跳过（不是普通窗口）。若这样的 slice 同时不满足上述任一恒等拷贝条件——动态偏移（例如降秩的 `t[i]`）或非连续窗口——并喂给 col-expand op，codegen 会以 `INTERNAL_CHECK` 直接报错，而不是生成会破坏源 tile 的代码 |
-| 其他位于 Left/Right/Acc 的 `tile.slice` | 不处理（无匹配的消费者） |
+| 带 `valid_shape` / `drop_dims` 的 `tile.slice` | 跳过（不是普通窗口）。若这样的 slice 同时不满足上述任一恒等拷贝条件——动态偏移（例如降秩的 `t[i]`）或非连续窗口——并喂给 col-expand op，codegen 会以 `INTERNAL_CHECK` 直接报错，而不是生成会破坏源 tile 的代码。上面的 Acc 累加器检查对这类 slice 仍然生效：它只需要物理基址和偏移，而这些信息对每个窗口都会记录，与是否可规范化无关 |
+| 用作 matmul **累加器**、且窗口既不覆盖父 tile 全部行范围、也不落在单个 16 列 block 内的 `Acc` `tile.slice` | **拒绝**并抛出 `ValueError`，错误信息给出切列的写法——MAD 没有目的地 stride，该写入会静默落到错误的行 tile 上（pto-isa#253） |
+| 其他位于 Left/Right/Acc 的 `tile.slice`，含**连续**的 Acc 累加器窗口 | 不处理（无匹配的消费者） |
 | 不含规范 `tile.slice` 的 function | 原样返回 |
 
 ## 参见

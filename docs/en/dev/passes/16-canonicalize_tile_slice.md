@@ -55,7 +55,7 @@ For each InCore-typed function, in three phases:
 
 2. **Rewrite consumers** — for each slice:
    - **`tile.extract(slice, ir, ic, shape)`** → `tile.extract(base, ir + off_row, ic + off_col, shape)`. The extract reads the slice's source directly; the index add is constant-folded when both terms are `ConstInt`.
-   - **`tile.matmul` / `tile.matmul_acc` / `tile.matmul_bias` operand** (Mat slices only) → the operand is replaced by a fresh `tile.extract(base, off_row, off_col, slice_shape, target_memory=Left|Right)` — `Left` for the lhs operand, `Right` for the rhs. (The `tile.matmul_acc` accumulator operand is `Acc`-resident and never a Mat slice.)
+   - **`tile.matmul` / `tile.matmul_acc` / `tile.matmul_bias` operand** (Mat slices only) → the operand is replaced by a fresh `tile.extract(base, off_row, off_col, slice_shape, target_memory=Left|Right)` — `Left` for the lhs operand, `Right` for the rhs. (The `tile.matmul_acc` accumulator operand is `Acc`-resident and never a Mat slice, so it is not rewritten here; it is instead checked for L0C contiguity — see [Acc accumulator windows](#acc-accumulator-windows).)
    - **`tile.col_expand_*` operand** (Vec slices only) → when the lazy `pto.textract` would not be an identity copy — a dynamic offset, or a window that is not contiguous in the base tile (more than one row *and* narrower than the base) — the operand is replaced by a fresh `tile.extract(base, off_row, off_col, slice_shape, target_memory=Vec)`. Both operands are checked. Contiguous const-offset windows are left untouched.
    - **Ordinary call operand** (Vec slices only, in either an `AssignStmt` or an `EvalStmt`) → compute `(base_byte_offset * 8 + (off_row * base_cols + off_col) * storage_bits) mod 256`. A known concrete MemRef byte offset is included before the modulo calculation; the allocation-planning sentinel is treated as an aligned root, while a non-constant base offset is not statically provable. Scalar SSA definitions are followed through aliases, addition/subtraction, and multiplication to prove aligned dynamic multiples. If the result is nonzero or cannot be proved, replace the operand by a fresh `tile.extract(base, off_row, off_col, slice_shape, target_memory=Vec)`. `tile.slice` itself is skipped so chained views can be peeled, and `tile.extract` uses the direct folding rule above.
    - **SSA escape** (Vec slices only) → an unaligned slice assigned through a plain alias is materialized at the alias definition. An unaligned loop initializer is materialized before the loop and substituted through its `IterArg`; an unaligned value carried by `yield` is materialized before the yield. This prevents aliases and loop-carried identities from bypassing the ordinary-call lookup.
@@ -180,6 +180,33 @@ By contrast, FP32 column 8 is 32 bytes from the source base and remains a zero-c
 
 **Tests**: `tests/ut/ir/transforms/test_canonicalize_tile_slice.py`
 
+## Acc accumulator windows
+
+The pass also **rejects** one shape it cannot repair. L0C is NZ: block
+`(r_b, c_b)` of an `[M, N]` tile sits at `(c_b * M/16 + r_b) * fractal`. A window
+is therefore contiguous only when it spans the parent's full row extent, or lies
+inside a single 16-column block. A row window of a multi-block-column `Acc` tile
+is strided, and the MAD writes its destination compactly from a bare pointer with
+no destination stride, so every block column past the first lands in the wrong
+row tile — silently, with only the first 16 columns of each row tile correct.
+
+Unlike the Vec cases above there is no repair available: an `Acc` window cannot be
+copied out and back, because nothing in the memory graph points into `Acc`. So a
+matmul accumulator operand that is a non-contiguous `Acc` window raises a
+`ValueError` naming the working spelling, which differs only by the sliced axis —
+pack the accumulator as `[rows, N * tiles]` and slice columns.
+
+The check is scoped by the op registry's `set_output_reuses_input`, so it covers
+`tile.matmul_acc` / `tile.gemv_acc` / `tile.matmul_mx_acc` without naming them. It
+stays silent on anything it cannot prove: a symbolic extent, a non-`Acc` layout,
+or a dynamic column offset it cannot show stays inside one block.
+
+This is a workaround for an upstream defect ([hw-native-sys/pto-isa#253](https://github.com/hw-native-sys/pto-isa/issues/253)),
+not a property of the DSL — `TMATMUL_ACC_IMPL` forwards the destination as a bare
+`.data()` pointer and takes `m` from the left operand, so `TileRes::Rows` is never
+read. If pto-isa gains a destination stride, this rejection should be relaxed or
+deleted rather than kept.
+
 ## Pass Properties
 
 | Property | Value |
@@ -200,8 +227,9 @@ By contrast, FP32 column 8 is 32 bytes from the source base and remains a zero-c
 | Vec `tile.slice` feeding an ordinary call, inherited address not provably 32-byte aligned | Replaced by `tile.extract(target_memory=Vec)`; slice dropped (#1789) |
 | Vec `tile.slice` feeding an ordinary call, inherited address provably 32-byte aligned | Untouched; keeps the zero-copy subview |
 | Chained Mat `tile.slice` (slice of a slice) | Peeled; offsets accumulated |
-| `tile.slice` with `valid_shape` / `drop_dims` | Skipped (not a plain window). If such a slice *also* fails either identity-copy condition above — a dynamic offset (e.g. a rank-reducing `t[i]`) or a non-contiguous window — while feeding a col-expand op, codegen rejects it with an `INTERNAL_CHECK` rather than emitting the source-corrupting materialization |
-| Other Left/Right/Acc-resident `tile.slice` | Untouched (no matching consumer) |
+| `tile.slice` with `valid_shape` / `drop_dims` | Skipped (not a plain window). If such a slice *also* fails either identity-copy condition above — a dynamic offset (e.g. a rank-reducing `t[i]`) or a non-contiguous window — while feeding a col-expand op, codegen rejects it with an `INTERNAL_CHECK` rather than emitting the source-corrupting materialization. The Acc accumulator check above still applies to such a slice: it needs only the physical base and offset, which are recorded for every window regardless of canonicalization eligibility |
+| `Acc`-resident `tile.slice` used as a matmul **accumulator**, window neither spanning the parent's full row extent nor inside one 16-column block | **Rejected** with a `ValueError` naming the column-slice spelling — the MAD has no destination stride, so the write would silently land in the wrong row tile (pto-isa#253) |
+| Other Left/Right/Acc-resident `tile.slice`, including a *contiguous* Acc accumulator window | Untouched (no matching consumer) |
 | Functions with no canonical `tile.slice` | Returned unchanged |
 
 ## See also

@@ -37,7 +37,6 @@
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/storage_size.h"
 #include "pypto/ir/tile_view_semantics.h"
-#include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/type.h"
 #include "src/backend/common/pto_ops_internal.h"
@@ -146,9 +145,11 @@ static std::string MakeTileAssembleCodegenPTO(const CallPtr& op, codegen::Codege
   // side-effect list, so dropping the use would let DCE delete the very
   // computation that filled the window.
   if (const auto* src_view = codegen.GetSubviewMaterialization(src)) {
-    auto src_rows = ir::As<ir::ConstInt>(source_tile_type->shape_[0]);
-    auto src_cols =
-        source_tile_type->shape_.size() > 1 ? ir::As<ir::ConstInt>(source_tile_type->shape_[1]) : nullptr;
+    // Guard the rank before indexing: this runs ahead of the 2-D check further
+    // down, so a rank-0 source would otherwise index an empty shape vector.
+    const bool src_is_2d = source_tile_type->shape_.size() >= 2;
+    auto src_rows = src_is_2d ? ir::As<ir::ConstInt>(source_tile_type->shape_[0]) : nullptr;
+    auto src_cols = src_is_2d ? ir::As<ir::ConstInt>(source_tile_type->shape_[1]) : nullptr;
     const bool same_window =
         src_view->source_ssa == dst && src_view->row_off_ssa == row_off && src_view->col_off_ssa == col_off;
     // The subview must cover the whole window the assemble writes, not part of

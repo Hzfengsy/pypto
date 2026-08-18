@@ -1513,35 +1513,76 @@ class TestAccAccumulatorSliceContiguity:
     first 16 columns of each row tile land correctly.
     """
 
-    def _kernel(self, acc_shape, slice_shape, offset):
+    def _kernel(self, acc_shape, slice_shape, offset, valid_shape=None):
         """`acc[offset]` of shape `slice_shape` accumulates `a[M, K] @ b[K, N]`,
         with M/N taken from `slice_shape` so the matmul's own shape check passes
-        and the contiguity guard is what decides the outcome."""
+        and the contiguity guard is what decides the outcome.
+
+        `valid_shape` selects the 4-arg `tile.slice` form, which is not
+        rewrite-eligible. The branch is resolved here in Python rather than in
+        the kernel body: a `None` closure variable and an `is` comparison are
+        both outside what the DSL parser accepts.
+        """
         rows, cols = slice_shape
         k = 64
 
-        @pl.program
-        class Prog:
-            @pl.function(type=pl.FunctionType.InCore)
-            def kernel(
-                self,
-                x: pl.Tensor[[rows, k], pl.FP16],
-                w: pl.Tensor[[k, cols], pl.FP16],
-                out: pl.Out[pl.Tensor[acc_shape, pl.FP32]],
-            ) -> pl.Tensor[acc_shape, pl.FP32]:
-                x_mat: pl.Tile[[rows, k], pl.FP16, pl.Mem.Mat] = pl.tile.load(
-                    x, [0, 0], [rows, k], target_memory=pl.Mem.Mat
-                )
-                a: pl.Tile[[rows, k], pl.FP16, pl.Mem.Left] = pl.tile.move(x_mat, target_memory=pl.Mem.Left)
-                w_mat: pl.Tile[[k, cols], pl.FP16, pl.Mem.Mat] = pl.tile.load(
-                    w, [0, 0], [k, cols], target_memory=pl.Mem.Mat
-                )
-                b: pl.Tile[[k, cols], pl.FP16, pl.Mem.Right] = pl.tile.move(w_mat, target_memory=pl.Mem.Right)
-                acc = pl.tile.create(acc_shape, pl.FP32, target_memory=pl.Mem.Acc)
-                acc_win = pl.tile.slice(acc, slice_shape, offset)
-                acc_new = pl.tile.matmul_acc(acc_win, a, b)
-                out = pl.tile.store(acc_new, [0, 0], out)
-                return out
+        if valid_shape is None:
+
+            @pl.program
+            class Prog:
+                @pl.function(type=pl.FunctionType.InCore)
+                def kernel(
+                    self,
+                    x: pl.Tensor[[rows, k], pl.FP16],
+                    w: pl.Tensor[[k, cols], pl.FP16],
+                    out: pl.Out[pl.Tensor[acc_shape, pl.FP32]],
+                ) -> pl.Tensor[acc_shape, pl.FP32]:
+                    x_mat: pl.Tile[[rows, k], pl.FP16, pl.Mem.Mat] = pl.tile.load(
+                        x, [0, 0], [rows, k], target_memory=pl.Mem.Mat
+                    )
+                    a: pl.Tile[[rows, k], pl.FP16, pl.Mem.Left] = pl.tile.move(
+                        x_mat, target_memory=pl.Mem.Left
+                    )
+                    w_mat: pl.Tile[[k, cols], pl.FP16, pl.Mem.Mat] = pl.tile.load(
+                        w, [0, 0], [k, cols], target_memory=pl.Mem.Mat
+                    )
+                    b: pl.Tile[[k, cols], pl.FP16, pl.Mem.Right] = pl.tile.move(
+                        w_mat, target_memory=pl.Mem.Right
+                    )
+                    acc = pl.tile.create(acc_shape, pl.FP32, target_memory=pl.Mem.Acc)
+                    acc_win = pl.tile.slice(acc, slice_shape, offset)
+                    acc_new = pl.tile.matmul_acc(acc_win, a, b)
+                    out = pl.tile.store(acc_new, [0, 0], out)
+                    return out
+
+        else:
+
+            @pl.program
+            class Prog:
+                @pl.function(type=pl.FunctionType.InCore)
+                def kernel(
+                    self,
+                    x: pl.Tensor[[rows, k], pl.FP16],
+                    w: pl.Tensor[[k, cols], pl.FP16],
+                    out: pl.Out[pl.Tensor[acc_shape, pl.FP32]],
+                ) -> pl.Tensor[acc_shape, pl.FP32]:
+                    x_mat: pl.Tile[[rows, k], pl.FP16, pl.Mem.Mat] = pl.tile.load(
+                        x, [0, 0], [rows, k], target_memory=pl.Mem.Mat
+                    )
+                    a: pl.Tile[[rows, k], pl.FP16, pl.Mem.Left] = pl.tile.move(
+                        x_mat, target_memory=pl.Mem.Left
+                    )
+                    w_mat: pl.Tile[[k, cols], pl.FP16, pl.Mem.Mat] = pl.tile.load(
+                        w, [0, 0], [k, cols], target_memory=pl.Mem.Mat
+                    )
+                    b: pl.Tile[[k, cols], pl.FP16, pl.Mem.Right] = pl.tile.move(
+                        w_mat, target_memory=pl.Mem.Right
+                    )
+                    acc = pl.tile.create(acc_shape, pl.FP32, target_memory=pl.Mem.Acc)
+                    acc_win = pl.tile.slice(acc, slice_shape, offset, valid_shape)
+                    acc_new = pl.tile.matmul_acc(acc_win, a, b)
+                    out = pl.tile.store(acc_new, [0, 0], out)
+                    return out
 
         return Prog
 
@@ -1563,6 +1604,22 @@ class TestAccAccumulatorSliceContiguity:
         block column to mis-stride."""
         prog = self._kernel([32, 16], [16, 16], [16, 0])
         _run_pass(prog)
+
+    def test_narrow_window_straddling_two_blocks_rejected(self):
+        """Width alone does not make a window safe. A [16, 16] window at column
+        offset 8 covers columns 8-23, straddling two 16-column L0C blocks, so
+        the MAD's compact write still mis-strides the second one."""
+        prog = self._kernel([32, 32], [16, 16], [16, 8])
+        with pytest.raises(ValueError, match="not contiguous in L0C's block layout"):
+            _run_pass(prog)
+
+    def test_row_window_with_explicit_valid_shape_rejected(self):
+        """A slice carrying an explicit valid_shape is not rewrite-eligible, but
+        it reaches the MAD with the same broken stride, so the guard must still
+        see it."""
+        prog = self._kernel([32, 32], [16, 32], [16, 0], valid_shape=[16, 32])
+        with pytest.raises(ValueError, match="not contiguous in L0C's block layout"):
+            _run_pass(prog)
 
 
 if __name__ == "__main__":

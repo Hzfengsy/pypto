@@ -227,15 +227,20 @@ int64_t KnownMultipleModuloAlignment(const ExprPtr& expr,
 /// peeled base/offset.  `known` holds slices collected so far; a slice whose
 /// source is itself a recorded slice is peeled through it (offsets summed), so
 /// `base` is always a non-slice tile.
-std::optional<SliceInfo> ParseCanonicalSlice(const AssignStmtPtr& assign,
-                                             const std::unordered_map<const Var*, SliceInfo>& known,
-                                             const std::unordered_map<const Var*, ExprPtr>& known_consts) {
+std::optional<SliceInfo> ParseSliceWindow(const AssignStmtPtr& assign,
+                                          const std::unordered_map<const Var*, SliceInfo>& known,
+                                          const std::unordered_map<const Var*, ExprPtr>& known_consts,
+                                          bool require_canonical) {
   if (!assign || !assign->var_) return std::nullopt;
   auto call = As<Call>(assign->value_);
   if (!call || !call->op_ || !IsOp(call, "tile.slice")) return std::nullopt;
-  // Only canonical 3-arg slices (input, shape, offset).  A slice carrying
-  // valid_shape / drop_dims is not a plain window and is left untouched.
-  if (call->args_.size() != 3) return std::nullopt;
+  // Rewriting is restricted to canonical 3-arg slices (input, shape, offset): a
+  // slice carrying valid_shape / drop_dims is not a plain window, so the
+  // canonicalization rules below do not apply to it.  The Acc safety check has
+  // no such restriction — it only needs the physical base and offset, and a
+  // non-canonical slice miscompiles exactly the same way — so it parses with
+  // `require_canonical = false`.
+  if (require_canonical ? call->args_.size() != 3 : call->args_.size() < 3) return std::nullopt;
 
   auto src = AsVarLike(call->args_[0]);
   if (!src) return std::nullopt;
@@ -259,6 +264,13 @@ std::optional<SliceInfo> ParseCanonicalSlice(const AssignStmtPtr& assign,
     off_col = MakeCanonicalIndexAdd(it->second.off_col, off_col, assign->span_);
   }
   return SliceInfo{base, off_row, off_col, memory_space, is_mat};
+}
+
+/// Rewrite-eligible slices only — the input to every canonicalization below.
+std::optional<SliceInfo> ParseCanonicalSlice(const AssignStmtPtr& assign,
+                                             const std::unordered_map<const Var*, SliceInfo>& known,
+                                             const std::unordered_map<const Var*, ExprPtr>& known_consts) {
+  return ParseSliceWindow(assign, known, known_consts, /*require_canonical=*/true);
 }
 
 /// Number of columns in one L0C fractal box (1024 B / 4 B per INT32|FP32 = 16x16).
@@ -320,11 +332,29 @@ void CheckAccumulatorSliceContiguous(const AssignStmtPtr& assign,
   if (!view_rows || !view_cols || !parent_rows) return;
 
   if (view_rows->value_ == parent_rows->value_) return;  // spans the full row extent
-  if (view_cols->value_ <= kAccBlockCols) return;        // a single block column
+
+  // A narrow window is safe only when it lies *inside* one 16-column block:
+  // there is then no second block column for the MAD's compact write to
+  // mis-stride. Width alone is not enough — a [16, 16] window at column offset
+  // 8 of a [32, 32] accumulator straddles two blocks and corrupts the parent
+  // exactly like a wider one. A dynamic offset cannot be proven and is
+  // rejected rather than assumed.
+  if (view_cols->value_ <= kAccBlockCols) {
+    auto off_col = As<ConstInt>(slice->second.off_col);
+    if (off_col && off_col->value_ >= 0 &&
+        off_col->value_ / kAccBlockCols == (off_col->value_ + view_cols->value_ - 1) / kAccBlockCols) {
+      return;
+    }
+  }
+
+  // The parent's column extent is only needed to describe the tile; keep it out
+  // of the decision so a symbolic N is still rejected rather than dereferenced.
+  auto parent_cols = As<ConstInt>(parent->shape_[1]);
+  const std::string parent_cols_text = parent_cols ? std::to_string(parent_cols->value_) : std::string("?");
 
   CHECK_SPAN(false, call->span_)
       << call->op_->name_ << ": the accumulator is a " << view_rows->value_ << "x" << view_cols->value_
-      << " row window of a " << parent_rows->value_ << "x" << As<ConstInt>(parent->shape_[1])->value_
+      << " row window of a " << parent_rows->value_ << "x" << parent_cols_text
       << " Acc (L0C) tile, which is not contiguous in L0C's block layout and cannot be a matmul "
          "destination — the hardware MAD writes its result compactly and has no destination stride, "
          "so only the first "
@@ -343,6 +373,12 @@ class SliceCollector : public IRVisitor {
  public:
   std::unordered_map<const Var*, SliceInfo> slices;
   std::unordered_map<const Var*, ExprPtr> scalar_defs;
+  /// Every `tile.slice` window, canonical or not.  `slices` drives the
+  /// rewrites and is therefore restricted to the canonical 3-arg form; the Acc
+  /// safety check needs the physical base and offset of *any* window, since a
+  /// slice carrying an explicit valid_shape reaches the MAD with exactly the
+  /// same broken stride.
+  std::unordered_map<const Var*, SliceInfo> windows;
 
  protected:
   void VisitStmt_(const AssignStmtPtr& op) override {
@@ -355,11 +391,14 @@ class SliceCollector : public IRVisitor {
         if (it != known_consts_.end()) known_consts_.emplace(op->var_.get(), it->second);
       }
     }
+    if (auto window = ParseSliceWindow(op, windows, known_consts_, /*require_canonical=*/false)) {
+      windows.emplace(op->var_.get(), *window);
+    }
     if (auto info = ParseCanonicalSlice(op, slices, known_consts_)) {
       slices.emplace(op->var_.get(), *info);
       return;
     }
-    CheckAccumulatorSliceContiguous(op, slices);
+    CheckAccumulatorSliceContiguous(op, windows);
   }
 
  private:
