@@ -25,6 +25,7 @@ After the MemRef-mirror redesign:
 from importlib import resources
 from typing import Any, cast
 
+import pypto
 import pytest
 from pypto import DataType, ir
 from pypto.ir.op.distributed import system_ops as dist_system_ops
@@ -1814,7 +1815,9 @@ def test_tile_put_rejects_stage_larger_than_transfer():
     # 128 cols > 64 transfer cols.
     stage = _make_tile_var("stage", [16, 128], DataType.FP16, span)
 
-    with pytest.raises(ValueError, match="must fit within"):
+    # InternalError, not ValueError: pld.tile.put is materialised by ConvertTensorToTileOps
+    # and its staging tile is compiler-created, so an oversized stage is a pass bug.
+    with pytest.raises(pypto.InternalError, match="must fit within"):
         dist_tile_ops.put(dst, peer, src, stage, atomic=ir.AtomicType.None_, span=span)
 
 
@@ -2169,7 +2172,8 @@ def test_tile_get_rejects_stage_larger_than_transfer():
     # 32 rows > 16 transfer rows.
     stage = _make_tile_var("stage", [32, 64], DataType.FP16, span)
 
-    with pytest.raises(ValueError, match="must fit within"):
+    # InternalError, not ValueError: see the put sibling above.
+    with pytest.raises(pypto.InternalError, match="must fit within"):
         dist_tile_ops.get(dst, peer, src, stage, span=span)
 
 

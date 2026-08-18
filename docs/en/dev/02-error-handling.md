@@ -67,6 +67,55 @@ stricter — it rejects anything other than `0` or `1` — so stick to those two
 path — `libbacktrace`, `nanobind`, libc, the C++ standard library, and the `error.h` / `logging.h`
 throw sites (`kFileNameFilter` in `src/core/backtrace.cpp`).
 
+### Augmenting an error without flattening it
+
+An intermediate frame often wants to add context to an error already in flight — the op registry
+appends the IR span to every type-deduction failure, so a message thrown deep inside a deduction
+function still names the offending DSL line. Catching `const Error&` and constructing a fresh
+exception does that, but at two costs: the concrete type collapses to whatever the catcher throws,
+and the stack trace captured at the original throw is replaced by the catcher's own.
+
+Use `Error::RethrowWithMessage` instead. It is virtual and every subclass overrides it, so the
+exception rethrows as its own type carrying the frames of the original throw:
+
+```cpp
+try {
+  result_type = deduce_type_fn(args, kwargs);
+} catch (const Error& e) {
+  // Concrete type and original trace survive; only the message changes.
+  e.RethrowWithMessage(std::string(e.what()) + LocationSuffix(span));
+} catch (const std::exception& e) {
+  // Non-PyPTO exceptions carry no PyPTO trace to keep.
+  throw ValueError(std::string(e.what()) + LocationSuffix(span));
+}
+```
+
+Catching `const std::exception&` alone is the trap: `InternalError`, `TypeError` and `IndexError`
+all derive from `Error : std::runtime_error`, so a single handler that rethrows `ValueError`
+silently flattens every one of them — erasing the `CHECK` / `INTERNAL_CHECK` distinction for
+everything below the catch, and defeating the ordered translator chain in
+`python/bindings/modules/error.cpp` before it can run.
+
+**Adding a new `Error` subclass?** End the class body with `PYPTO_ERROR_RETHROW_SUPPORT(YourError)`,
+which defines the trace-adopting constructor and the override. A subclass that omits it still
+compiles, but rethrows as a plain `Error`. A subclass carrying extra state needs a hand-written
+override so that state survives too — `VerificationError` is the worked example.
+
+The Python parser has the mirror-image trap. Its handlers wrap stray exceptions as source-located
+`ParserError`s, which would re-hide an `InternalError` the moment it escaped C++. Every broad
+`except Exception` on the parse path therefore re-raises `BUG_CLASS_EXCEPTIONS`
+(`python/pypto/language/parser/diagnostics/exceptions.py`) first:
+
+```python
+except ParserError:
+    raise
+except BUG_CLASS_EXCEPTIONS:
+    # Compiler bug, not a bad kernel - surface it with its type and trace intact.
+    raise
+except Exception as e:
+    raise InvalidOperationError(...) from e
+```
+
 ### Platform support for stack traces
 
 `3rdparty/libbacktrace` tracks upstream [ianlancetaylor/libbacktrace](https://github.com/ianlancetaylor/libbacktrace).

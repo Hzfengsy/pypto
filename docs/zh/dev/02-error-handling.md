@@ -65,6 +65,51 @@ PTO_BACKTRACE=1 python my_kernel.py   # 所有错误都显示 C++ 栈帧，而�
 libc、C++ 标准库，以及 `error.h` / `logging.h` 中的抛出点（见 `src/core/backtrace.cpp` 的
 `kFileNameFilter`）。
 
+### 在不丢失类型的前提下补充错误信息
+
+中间栈帧常常需要为正在传播的异常补充上下文 —— 算子注册表会为每一次类型推导失败附加 IR span,
+使得深埋在推导函数内部抛出的消息仍然能指向出错的 DSL 行。用 `catch (const Error&)` 再构造一个新
+异常也能做到,但代价有两个:具体异常类型会塌缩成捕获方抛出的那一种,并且原始抛出点捕获的栈回溯
+会被捕获方自己的栈回溯替换掉。
+
+请改用 `Error::RethrowWithMessage`。它是虚函数,每个子类都做了覆写,因此异常会以自身的类型、
+携带原始抛出点的栈帧重新抛出:
+
+```cpp
+try {
+  result_type = deduce_type_fn(args, kwargs);
+} catch (const Error& e) {
+  // 具体类型与原始栈回溯都得以保留,只有消息发生变化。
+  e.RethrowWithMessage(std::string(e.what()) + LocationSuffix(span));
+} catch (const std::exception& e) {
+  // 非 PyPTO 异常本就没有可保留的 PyPTO 栈回溯。
+  throw ValueError(std::string(e.what()) + LocationSuffix(span));
+}
+```
+
+只写 `catch (const std::exception&)` 是典型陷阱:`InternalError`、`TypeError` 和 `IndexError` 都
+派生自 `Error : std::runtime_error`,因此单个重新抛出 `ValueError` 的处理块会把它们统统压平 ——
+这既抹掉了捕获点之下所有代码的 `CHECK` / `INTERNAL_CHECK` 区分,也让
+`python/bindings/modules/error.cpp` 中按派生程度排序的转换链根本没有机会生效。
+
+**新增 `Error` 子类时?** 在类体末尾加上 `PYPTO_ERROR_RETHROW_SUPPORT(YourError)`,它会定义沿用
+既有栈回溯的构造函数和覆写。缺少它仍可编译,但重新抛出时会退化为普通 `Error`。带额外状态的子类
+需要手写覆写以保住这些状态 —— `VerificationError` 就是现成的示例。
+
+Python 解析器有一个镜像陷阱。它的处理块会把漏出的异常包装成带源码位置的 `ParserError`,一旦
+`InternalError` 从 C++ 逃逸出来就会被重新隐藏。因此解析路径上每一个宽泛的 `except Exception` 都
+会先重新抛出 `BUG_CLASS_EXCEPTIONS`(`python/pypto/language/parser/diagnostics/exceptions.py`):
+
+```python
+except ParserError:
+    raise
+except BUG_CLASS_EXCEPTIONS:
+    # Compiler bug, not a bad kernel - surface it with its type and trace intact.
+    raise
+except Exception as e:
+    raise InvalidOperationError(...) from e
+```
+
 ### 栈回溯的平台支持
 
 `3rdparty/libbacktrace` 跟随上游 [ianlancetaylor/libbacktrace](https://github.com/ianlancetaylor/libbacktrace)。

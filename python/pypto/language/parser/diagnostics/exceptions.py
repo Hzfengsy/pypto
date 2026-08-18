@@ -9,7 +9,16 @@
 
 """Parser error exceptions with rich diagnostic information."""
 
-from pypto.pypto_core import ir
+from typing import Final
+
+from pypto.pypto_core import InternalError, ir
+
+# Bug-class exceptions: a failed internal invariant is a PyPTO bug, not a bad kernel.
+# Re-wrapping one as a user-facing ParserError hides both its type and the C++ traceback
+# that diagnoses it, so every parser handler that broadly catches `Exception` lets these
+# through untouched. See `.claude/rules/error-checking.md` for the CHECK /
+# INTERNAL_CHECK split this preserves.
+BUG_CLASS_EXCEPTIONS: Final = (InternalError, AssertionError)
 
 
 class ParserError(Exception):

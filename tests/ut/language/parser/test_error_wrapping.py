@@ -15,9 +15,11 @@ subclasses with source location information, rather than escaping as raw
 tracebacks.
 """
 
+import pypto
 import pypto.language as pl
 import pytest
 from pypto import ir
+from pypto.language.op import tensor_ops as _dsl_tensor
 from pypto.language.parser.diagnostics import (
     InvalidOperationError,
     ParserError,
@@ -179,6 +181,73 @@ class TestTypeMismatchReassignment:
                 t = pl.create_tensor([16, 16], dtype=pl.FP32)  # noqa: F841
                 t = pl.create_tensor([4, 4], dtype=pl.FP32)  # different shape  # noqa: F841
                 return x
+
+
+class TestBugClassErrorsAreNotWrapped:
+    """Bug-class exceptions must escape the parser with type and traceback intact.
+
+    The parser wraps stray exceptions as user-facing ParserErrors so a bad kernel gets
+    a source-located diagnostic. A failed internal invariant is not a bad kernel - it is
+    a PyPTO bug, and wrapping it hides both the `InternalError` type and the C++ stack
+    trace that diagnoses it. Every broad `except Exception` on the parse path therefore
+    lets `BUG_CLASS_EXCEPTIONS` through first.
+    """
+
+    @staticmethod
+    def _raise_internal(*args, **kwargs):
+        raise pypto.InternalError("Internal error: synthetic pass bug")
+
+    def test_internal_error_from_op_is_not_wrapped(self, monkeypatch):
+        """`_dispatch_op` re-raises rather than producing an InvalidOperationError."""
+        monkeypatch.setattr(_dsl_tensor, "cast", self._raise_internal)
+
+        with pytest.raises(pypto.InternalError, match="synthetic pass bug"):
+
+            @pl.function
+            def bad_kernel(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.BF16]:
+                result: pl.Tensor[[64], pl.BF16] = pl.tensor.cast(x, target_type=pl.BF16)
+                return result
+
+    def test_internal_error_is_not_a_parser_error(self, monkeypatch):
+        """Guards the specific regression: it must not be catchable as ParserError."""
+        monkeypatch.setattr(_dsl_tensor, "cast", self._raise_internal)
+
+        with pytest.raises(pypto.InternalError) as exc_info:
+
+            @pl.function
+            def bad_kernel(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.BF16]:
+                result: pl.Tensor[[64], pl.BF16] = pl.tensor.cast(x, target_type=pl.BF16)
+                return result
+
+        assert not isinstance(exc_info.value, ParserError)
+
+    def test_internal_error_survives_program_parsing(self, monkeypatch):
+        """The @pl.program wrapper passes it through too, not just @pl.function."""
+        monkeypatch.setattr(_dsl_tensor, "cast", self._raise_internal)
+
+        with pytest.raises(pypto.InternalError, match="synthetic pass bug"):
+
+            @pl.program
+            class BadProgram:
+                @pl.function
+                def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.BF16]:
+                    result: pl.Tensor[[64], pl.BF16] = pl.tensor.cast(x, target_type=pl.BF16)
+                    return result
+
+    def test_user_errors_are_still_wrapped(self, monkeypatch):
+        """The passthrough must not leak ordinary user errors past the diagnostic layer."""
+
+        def _raise_value(*args, **kwargs):
+            raise ValueError("Invalid rounding mode 99")
+
+        monkeypatch.setattr(_dsl_tensor, "cast", _raise_value)
+
+        with pytest.raises(InvalidOperationError, match="Invalid rounding mode"):
+
+            @pl.function
+            def bad_kernel(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.BF16]:
+                result: pl.Tensor[[64], pl.BF16] = pl.tensor.cast(x, target_type=pl.BF16)
+                return result
 
 
 if __name__ == "__main__":
