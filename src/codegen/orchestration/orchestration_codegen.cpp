@@ -1605,16 +1605,28 @@ class OrchestrationStmtCodegen : public CodegenBase {
   /// hard-coded ``i < stop`` silently compiles a descending loop into zero
   /// iterations. When the step is a compile-time constant its sign picks the
   /// operator directly, which keeps the overwhelmingly common ascending case
-  /// emitting exactly the same text as before; a runtime step falls back to a
-  /// sign test evaluated per iteration.
+  /// emitting exactly the same text as before.
+  ///
+  /// A zero step must yield zero iterations, matching
+  /// ``transform_utils::ComputeStaticTripCount``. Letting it pick either
+  /// comparison emits ``i += 0`` under a condition that can hold, i.e. a loop
+  /// that never terminates. So the constant case tests the sign three ways, and
+  /// the runtime case requires a non-zero step in *both* direction branches
+  /// rather than treating "not positive" as "negative".
   void EmitForLoopHeader(const std::string& loop_var, const std::string& start_expr,
                          const std::string& stop_expr, const std::string& step_expr, const ExprPtr& step) {
     std::string cond;
     if (auto const_step = transform_utils::EvalConstInt(step)) {
-      cond = loop_var + (*const_step < 0 ? " > " : " < ") + stop_expr;
+      if (*const_step > 0) {
+        cond = loop_var + " < " + stop_expr;
+      } else if (*const_step < 0) {
+        cond = loop_var + " > " + stop_expr;
+      } else {
+        cond = "false";
+      }
     } else {
-      cond = "((" + step_expr + ") > 0 ? " + loop_var + " < " + stop_expr + " : " + loop_var + " > " +
-             stop_expr + ")";
+      cond = "(((" + step_expr + ") > 0 && " + loop_var + " < " + stop_expr + ") || ((" + step_expr +
+             ") < 0 && " + loop_var + " > " + stop_expr + "))";
     }
     EmitIndentedLine("for (int64_t " + loop_var + " = " + start_expr + "; " + cond + "; " + loop_var +
                      " += " + step_expr + ") {");

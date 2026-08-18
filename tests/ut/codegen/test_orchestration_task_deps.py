@@ -559,10 +559,50 @@ def test_descending_parallel_loop_emits_descending_cpp_loop():
     assert down_header, down
     assert down_header.group(2) == ">", down
 
-    # Both directions have a static trip count of 4, so neither may fall back to
+    # Both directions have a static trip count of 4, so both must size their
+    # compiler-dep fan-in as a fixed PTO2TaskId[4] and neither may fall back to
     # the dynamic vector path (whose capacity expression also evaluated to 0).
-    for code in (up, down):
-        assert "std::vector<PTO2TaskId>" not in code, code
+    for label, code in (("ascending", up), ("descending", down)):
+        assert re.search(r"PTO2TaskId \w+\[4\]", code), (label, code)
+        assert "std::vector<PTO2TaskId>" not in code, (label, code)
+
+
+def test_zero_step_loop_emits_a_terminating_condition():
+    """A zero step must produce zero iterations, never a non-terminating loop.
+
+    Review catch on #2427: picking the comparison from `step < 0` alone sent a
+    constant zero step down the `<` branch, emitting `for (i = 0; i < N; i += 0)`
+    — an infinite loop in the generated orchestration function. A zero step is
+    zero-trip per `ComputeStaticTripCount`, so the emitted condition must agree.
+    """
+
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend910B)
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.AIV)
+        def fill(self, out: pl.Out[pl.Tensor[[64], pl.FP32]]) -> pl.Tensor[[64], pl.FP32]:
+            return out
+
+        @pl.function(type=pl.FunctionType.AIV)
+        def consume(self, q: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+            return q
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(self, q: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+            q_c = q
+            for _i, (q_c,) in pl.parallel(0, 4, 0, init_values=(q_c,)):
+                q_c = self.fill(q_c)
+                q_c = pl.yield_(q_c)
+            return self.consume(q_c)
+
+    code = _generate_orch_full_pipeline(P, analyze_auto_scopes_for_deps=True)
+
+    # Whatever else it does, it must not emit a loop that both steps by zero and
+    # has a condition that can hold.
+    for header in re.findall(r"for \(int64_t \w+ = [^;]+; ([^;]+); \w+ \+= 0\)", code):
+        assert header.strip() == "false", code
 
 
 def test_compiler_derived_deps_for_dynamic_parallel_tensor_carriers_share_phase_barrier():

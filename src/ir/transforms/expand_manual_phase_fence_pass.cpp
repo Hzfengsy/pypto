@@ -350,7 +350,7 @@ class ManualPhaseFenceMutator : public IRMutator {
     MergeLoopSafetyInfo(index, summary);
     if (!include_consumers) return;
     const auto trip_count = transform_utils::EvalConstTripCount(for_stmt);
-    if (trip_count.value_or(0) <= 0) return;
+    if (!trip_count.has_value() || *trip_count <= 0) return;
     for (const Var* key : summary.dep_array_order) {
       auto it = summary.dep_arrays.find(key);
       if (it == summary.dep_arrays.end()) continue;
@@ -401,9 +401,10 @@ class ManualPhaseFenceMutator : public IRMutator {
 
     const bool is_parallel = for_stmt->kind_ == ForKind::Parallel;
     const auto trip_count = transform_utils::EvalConstTripCount(for_stmt);
-    if (is_parallel && trip_count.value_or(0) <= 0) return decisions;
-    if (for_stmt->kind_ == ForKind::Sequential && trip_count.has_value() && *trip_count <= 0)
+    if (is_parallel && (!trip_count.has_value() || *trip_count <= 0)) return decisions;
+    if (for_stmt->kind_ == ForKind::Sequential && trip_count.has_value() && *trip_count <= 0) {
       return decisions;
+    }
 
     for (const auto& iter_arg : for_stmt->iter_args_) {
       if (iter_arg) current_iter_args.insert(iter_arg.get());
@@ -420,7 +421,7 @@ class ManualPhaseFenceMutator : public IRMutator {
         continue;
       }
       int64_t consumers = info.consumer_count;
-      if (trip_count.value_or(0) > 0) consumers *= *trip_count;
+      if (trip_count.has_value() && *trip_count > 0) consumers *= *trip_count;
       try_add(dep_array, dep_array, consumers, info.consumers);
     }
 
