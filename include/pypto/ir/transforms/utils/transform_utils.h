@@ -148,21 +148,48 @@ inline CallPtr AsCallOrSubmitView(const ExprPtr& expr) {
   return nullptr;
 }
 
-/// Constant-evaluate @p expr if it is a ``ConstInt``; ``nullopt`` otherwise.
+/// Constant-evaluate @p expr if it is a ``ConstInt``, or a ``Neg`` of one;
+/// ``nullopt`` otherwise.
+///
+/// The ``Neg`` case matters for negative literals: the DSL parser folds
+/// ``-1`` to ``ConstInt(-1)`` and ``Simplify`` const-folds ``Neg`` as well, but
+/// IR built through the builder API or parsed from ``.pto`` before the first
+/// ``Simplify`` can still carry ``Neg(ConstInt(1))``. Peeking through it keeps
+/// constant detection independent of how far the pipeline has run.
 inline std::optional<int64_t> EvalConstInt(const ExprPtr& expr) {
   if (auto ci = As<ConstInt>(expr)) return ci->value_;
+  if (auto neg = As<Neg>(expr)) {
+    if (auto inner = As<ConstInt>(neg->operand_)) return -inner->value_;
+  }
   return std::nullopt;
 }
 
+/// Trip count of a loop with compile-time bounds @p start / @p stop / @p step.
+///
+/// Direction-aware: handles ascending (``step > 0``) and descending
+/// (``step < 0``) loops alike, and returns 0 for an empty or zero-step loop.
+/// ``ForStmt::step_`` carries no sign restriction, and ``pl.range(64, 0, -1)``
+/// is valid DSL, so a positive-step-only formula silently mis-answers a loop
+/// whose trip count is perfectly well-defined.
+inline int64_t ComputeStaticTripCount(int64_t start, int64_t stop, int64_t step) {
+  if (step > 0 && start < stop) return (stop - start + step - 1) / step;
+  if (step < 0 && start > stop) return (start - stop + (-step) - 1) / (-step);
+  return 0;
+}
+
 /// Return the const trip count of @p for_stmt when start/stop/step are all
-/// ``ConstInt`` and step is positive; 0 otherwise.
-inline int64_t EvalConstTripCount(const ForStmtPtr& for_stmt) {
+/// compile-time integers; ``nullopt`` when any bound is not.
+///
+/// The optional is load-bearing: "the bounds are not compile-time constants"
+/// and "the loop provably runs zero times" are different propositions, and
+/// callers that fall back to a dynamic path must not conflate them. Callers
+/// that only threshold-compare can use ``.value_or(0)``.
+inline std::optional<int64_t> EvalConstTripCount(const ForStmtPtr& for_stmt) {
   auto start = EvalConstInt(for_stmt->start_);
   auto stop = EvalConstInt(for_stmt->stop_);
   auto step = EvalConstInt(for_stmt->step_);
-  if (!start || !stop || !step || *step <= 0) return 0;
-  int64_t trip = (*stop - *start + *step - 1) / *step;
-  return trip > 0 ? trip : 0;
+  if (!start || !stop || !step) return std::nullopt;
+  return ComputeStaticTripCount(*start, *stop, *step);
 }
 
 /// Peek through a leading compiler-inserted ``RuntimeScopeStmt`` so structural

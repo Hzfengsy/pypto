@@ -282,7 +282,7 @@ int64_t ResolveArrayCarrySize(const ForStmtPtr& for_stmt, size_t idx) {
   if (idx >= for_stmt->iter_args_.size()) return 0;
   if (!IsTaskIdScalar(for_stmt->iter_args_[idx])) return 0;
   if (for_stmt->kind_ == ForKind::Parallel) {
-    return transform_utils::EvalConstTripCount(for_stmt);
+    return transform_utils::EvalConstTripCount(for_stmt).value_or(0);
   }
   if (for_stmt->kind_ != ForKind::Sequential) return 0;
   auto yield = transform_utils::GetLastYieldStmt(transform_utils::UnwrapAutoScope(for_stmt->body_));

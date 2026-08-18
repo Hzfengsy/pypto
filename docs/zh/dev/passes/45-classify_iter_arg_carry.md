@@ -97,6 +97,11 @@ must have a statically-known trip count. ...
 
 该诊断在本 pass 阶段抛出，早于 codegen。
 
+“静态可知”指的是*边界*而非方向：`ForStmt::step_` 没有符号限制，因此像
+`pl.parallel(4, 0, -1)` 这样的递减循环 trip count 同样是常量 4，其定长数组的大小与
+`pl.parallel(4)` 完全一致。只有边界本身非常量（例如 `n` 为 `Scalar` 的
+`pl.parallel(n)`）才会触发上面的报错。
+
 ## Pass 属性
 
 | - | 属性 |

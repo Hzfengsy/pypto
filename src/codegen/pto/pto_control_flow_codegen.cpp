@@ -24,6 +24,7 @@
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
+#include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
 
 namespace pypto {
@@ -531,6 +532,39 @@ void PTOCodegen::VisitStmt_(const ForStmtPtr& op) {
       << "Internal error: ForKind::Pipeline reached codegen — LowerPipelineLoops "
       << "and CanonicalizeIOOrder should have demoted it to Sequential. "
       << "The pipeline is incomplete.";
+
+  // Device loops lower to MLIR ``scf.for``, which iterates lower -> upper bound
+  // and is defined for a positive step only. A descending ``ForStmt`` has no
+  // faithful lowering: emitting it verbatim yields a zero-trip ``scf.for`` that
+  // the assembler folds away, silently discarding the loop body. Surface it as
+  // a user-facing limitation instead of miscompiling.
+  //
+  // Tracking: ptoas issue hw-native-sys/PTOAS#1288 — ptoas does not enforce
+  // ``scf.for``'s "constant step operand must be positive" verifier invariant
+  // (a negative step drops the body, a zero step emits ``i += 0``). How that
+  // issue is resolved decides this check's fate:
+  //
+  //   * ptoas gains descending-loop support (normalizing lb -> ub with a
+  //     derived induction variable) — delete this check, the lowering above
+  //     becomes correct as-is.
+  //   * ptoas only adds the verifier rejection — KEEP this check. It still
+  //     earns its place by failing earlier, naming the user's loop via the
+  //     ``Span``, and telling them how to rewrite it, rather than surfacing an
+  //     assembler error against generated ``.pto`` the user never wrote.
+  //
+  // Only a compile-time step is checked. A runtime step that turns out negative
+  // still lowers to the same ill-defined ``scf.for``; proving its sign needs the
+  // arith analyzer and is left for the normalizing rewrite that would lift this
+  // restriction altogether. Orchestration functions emit C++ directly and are
+  // unaffected — they support descending loops natively.
+  if (auto const_step = ir::transform_utils::EvalConstInt(op->step_)) {
+    CHECK_SPAN(*const_step > 0, op->span_)
+        << "loops in device functions must have a positive step, but this loop steps by " << *const_step
+        << ". Device code lowers to MLIR 'scf.for', which only counts upward. "
+           "Rewrite the loop in ascending form and invert the index in the body — "
+           "replace 'for i in pl.range(64, 0, -1)' with 'for t in pl.range(0, 64)' plus "
+           "'i = 64 - t'. Orchestration functions support descending loops directly.";
+  }
 
   // Evaluate loop bounds and ensure they are index-typed for scf.for.
   // EmitCastToIndex is a no-op when the bound is already DataType::INDEX

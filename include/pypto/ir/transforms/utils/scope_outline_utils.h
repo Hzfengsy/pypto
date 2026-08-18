@@ -235,7 +235,7 @@ class DeferredWaitContractValidator {
       // needs no statically known trip count. Returning before the arithmetic
       // below also keeps `trip_count` out of the divisor when it is unknown.
       if (!body_result.has_deferred_wait) return body_result;
-      auto trip_count = transform_utils::EvalConstTripCount(loop);
+      auto trip_count = transform_utils::EvalConstTripCount(loop).value_or(0);
       CHECK_SPAN(trip_count > 0, stmt->span_)
           << "deferred waiter registration loop must have a statically known positive trip count "
              "so the per-waiter condition budget can be proved";

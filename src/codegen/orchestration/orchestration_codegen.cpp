@@ -884,10 +884,22 @@ class OrchestrationStmtCodegen : public CodegenBase {
           collection.data_name = ReserveSyntheticEmitName("dynamic_compiler_dep_tids");
           collection.count_name = ReserveSyntheticEmitName(collection.data_name + "_count");
           const std::string capacity_name = ReserveSyntheticEmitName(collection.data_name + "_capacity");
-          EmitIndentedLine("const int64_t " + capacity_name + " = ((((" + step_expr + ") > 0 && (" +
-                           stop_expr + ") > (" + start_expr + ")) ? (((" + stop_expr + ") - (" + start_expr +
-                           ") + (" + step_expr + ") - 1) / (" + step_expr + ")) : 0) * " +
-                           std::to_string(dynamic_compiler_dep_slots_per_iter) + ");");
+          // Bind the bounds to locals first: each appears several times in the
+          // trip-count expression, and the loop may descend, so the emitted
+          // formula needs both branches. Mirrors
+          // ``transform_utils::ComputeStaticTripCount`` — keep the two in sync.
+          const std::string cap_start = ReserveSyntheticEmitName(capacity_name + "_start");
+          const std::string cap_stop = ReserveSyntheticEmitName(capacity_name + "_stop");
+          const std::string cap_step = ReserveSyntheticEmitName(capacity_name + "_step");
+          EmitIndentedLine("const int64_t " + cap_start + " = " + start_expr + ";");
+          EmitIndentedLine("const int64_t " + cap_stop + " = " + stop_expr + ";");
+          EmitIndentedLine("const int64_t " + cap_step + " = " + step_expr + ";");
+          EmitIndentedLine("const int64_t " + capacity_name + " = ((" + cap_step + " > 0 && " + cap_start +
+                           " < " + cap_stop + ") ? ((" + cap_stop + " - " + cap_start + " + " + cap_step +
+                           " - 1) / " + cap_step + ") : (" + cap_step + " < 0 && " + cap_start + " > " +
+                           cap_stop + ") ? ((" + cap_start + " - " + cap_stop + " + (-" + cap_step +
+                           ") - 1) / (-" + cap_step + ")) : 0) * " +
+                           std::to_string(dynamic_compiler_dep_slots_per_iter) + ";");
           const std::string profile_start_name =
               ReserveSyntheticEmitName(collection.data_name + "_profile_start");
           EmitIndentedLine("#if SIMPLER_ORCH_PROFILING");
@@ -917,7 +929,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
       manual_task_id_map_by_key_[TaskIdHoistKey(edge)] = barrier_tid;
     }
 
-    EmitForLoopHeader(loop_var, start_expr, stop_expr, step_expr);
+    EmitForLoopHeader(loop_var, start_expr, stop_expr, step_expr, for_stmt->step_);
     {
       IndentGuard indent_guard(Active());
       PushCppScope();
@@ -1586,10 +1598,26 @@ class OrchestrationStmtCodegen : public CodegenBase {
 
   void EmitBlankLine() { Active().EmitLine(""); }
 
+  /// Emit the C++ ``for`` header for a ForStmt.
+  ///
+  /// The continuation test depends on the sign of the step: ``ForStmt::step_``
+  /// carries no sign restriction and ``pl.range(64, 0, -1)`` is valid DSL, so a
+  /// hard-coded ``i < stop`` silently compiles a descending loop into zero
+  /// iterations. When the step is a compile-time constant its sign picks the
+  /// operator directly, which keeps the overwhelmingly common ascending case
+  /// emitting exactly the same text as before; a runtime step falls back to a
+  /// sign test evaluated per iteration.
   void EmitForLoopHeader(const std::string& loop_var, const std::string& start_expr,
-                         const std::string& stop_expr, const std::string& step_expr) {
-    EmitIndentedLine("for (int64_t " + loop_var + " = " + start_expr + "; " + loop_var + " < " + stop_expr +
-                     "; " + loop_var + " += " + step_expr + ") {");
+                         const std::string& stop_expr, const std::string& step_expr, const ExprPtr& step) {
+    std::string cond;
+    if (auto const_step = transform_utils::EvalConstInt(step)) {
+      cond = loop_var + (*const_step < 0 ? " > " : " < ") + stop_expr;
+    } else {
+      cond = "((" + step_expr + ") > 0 ? " + loop_var + " < " + stop_expr + " : " + loop_var + " > " +
+             stop_expr + ")";
+    }
+    EmitIndentedLine("for (int64_t " + loop_var + " = " + start_expr + "; " + cond + "; " + loop_var +
+                     " += " + step_expr + ") {");
   }
 
   void EmitArrayCopyLoop(int64_t extent, const std::string& dst_array, const std::string& src_array,

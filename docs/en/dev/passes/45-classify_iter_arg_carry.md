@@ -104,6 +104,12 @@ must have a statically-known trip count. ...
 
 The diagnostic surfaces during this pass, before codegen runs.
 
+"Statically-known" is about the *bounds*, not the direction: `ForStmt::step_`
+carries no sign restriction, so a descending loop such as `pl.parallel(4, 0, -1)`
+has a constant trip count of 4 and is sized exactly like `pl.parallel(4)`. Only a
+loop with a genuinely non-constant bound (`pl.parallel(n)` for a `Scalar` `n`)
+raises the error above.
+
 ## Pass properties
 
 | - | Properties |

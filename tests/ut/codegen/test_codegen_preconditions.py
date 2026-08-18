@@ -13,6 +13,7 @@ import pypto.language.distributed as pld
 import pytest
 from pypto import backend, codegen, passes
 from pypto.backend import BackendType
+from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 
 
 @pytest.fixture(autouse=True)
@@ -47,6 +48,74 @@ def test_distributed_codegen_requires_comm_domain_materialization_when_distribut
     cg = codegen.DistributedCodegen()
     with pytest.raises(pypto.InternalError, match="DistributedCodegen preconditions"):
         cg.generate(program)
+
+
+def test_device_kernel_rejects_descending_loop():
+    """A descending loop in a device function must fail loudly, not silently.
+
+    Regression: device code lowers to MLIR ``scf.for``, which counts upward
+    only. A ``pl.range(8, 0, -1)`` was transcribed verbatim into
+    ``scf.for %i = 8 to 0 step -1`` — a zero-trip loop that ptoas folded away,
+    dropping the entire loop body with no diagnostic from any stage. The kernel
+    loaded its input, computed nothing, and stored.
+
+    Tracked upstream as ptoas issue hw-native-sys/PTOAS#1288. If ptoas gains
+    descending-loop support this test (and the check it covers) should be
+    replaced by one asserting the loop lowers correctly; if ptoas merely starts
+    rejecting the step, this stays as the earlier, better-located diagnostic.
+    """
+    n = 64
+
+    @pl.program
+    class Descending:
+        @pl.function(type=pl.FunctionType.AIV)
+        def kern(
+            self,
+            x: pl.Tensor[[n, n], pl.FP32],
+            out: pl.Out[pl.Tensor[[n, n], pl.FP32]],
+        ) -> pl.Tensor[[n, n], pl.FP32]:
+            acc: pl.Tile[[n, n], pl.FP32] = pl.load(x, [0, 0], [n, n])
+            for _i, (acc,) in pl.range(8, 0, -1, init_values=(acc,)):
+                acc = pl.add(acc, acc)
+                acc = pl.yield_(acc)
+            return pl.store(acc, [0, 0], out)
+
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend910B)
+    optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Descending)
+
+    with pytest.raises(ValueError, match="must have a positive step"):
+        codegen.PTOCodegen().generate(optimized)
+
+
+def test_device_kernel_accepts_ascending_loop():
+    """The ascending counterpart of the descending-loop rejection still lowers.
+
+    Guards the rejection above against over-reach: only a non-positive constant
+    step is refused.
+    """
+    n = 64
+
+    @pl.program
+    class Ascending:
+        @pl.function(type=pl.FunctionType.AIV)
+        def kern(
+            self,
+            x: pl.Tensor[[n, n], pl.FP32],
+            out: pl.Out[pl.Tensor[[n, n], pl.FP32]],
+        ) -> pl.Tensor[[n, n], pl.FP32]:
+            acc: pl.Tile[[n, n], pl.FP32] = pl.load(x, [0, 0], [n, n])
+            for _i, (acc,) in pl.range(0, 8, 1, init_values=(acc,)):
+                acc = pl.add(acc, acc)
+                acc = pl.yield_(acc)
+            return pl.store(acc, [0, 0], out)
+
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend910B)
+    optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Ascending)
+
+    mlir = codegen.PTOCodegen().generate(optimized)
+    assert "scf.for" in mlir, mlir
 
 
 def test_orchestration_codegen_precondition_entry_point():

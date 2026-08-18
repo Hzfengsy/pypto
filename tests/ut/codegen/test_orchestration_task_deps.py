@@ -510,6 +510,61 @@ def test_compiler_derived_deps_for_dynamic_trip_tensor_carrier_falls_back():
     assert ".set_dependencies(" not in code
 
 
+def test_descending_parallel_loop_emits_descending_cpp_loop():
+    """Regression: a descending ``pl.parallel`` must not compile to a dead loop.
+
+    ``EvalConstTripCount`` returned 0 for any ``step <= 0``, and the emitted C++
+    repeated the same positive-step assumption twice more: the fan-in capacity
+    expression evaluated to 0, and ``EmitForLoopHeader`` hard-coded ``i < stop``
+    so ``for (i = 4; i < 0; i += -1)`` ran zero times. The kernel silently
+    submitted nothing.
+
+    Both directions run 4 times, so both must take the static ``PTO2TaskId[4]``
+    path and emit a loop whose condition actually admits iterations.
+    """
+
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend910B)
+
+    def build(start, stop, step):
+        @pl.program
+        class P:
+            @pl.function(type=pl.FunctionType.AIV)
+            def fill(self, out: pl.Out[pl.Tensor[[64], pl.FP32]]) -> pl.Tensor[[64], pl.FP32]:
+                return out
+
+            @pl.function(type=pl.FunctionType.AIV)
+            def consume(self, q: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return q
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, q: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                q_c = q
+                for _i, (q_c,) in pl.parallel(start, stop, step, init_values=(q_c,)):
+                    q_c = self.fill(q_c)
+                    q_c = pl.yield_(q_c)
+                return self.consume(q_c)
+
+        return P
+
+    up = _generate_orch_full_pipeline(build(0, 4, 1), analyze_auto_scopes_for_deps=True)
+    down = _generate_orch_full_pipeline(build(4, 0, -1), analyze_auto_scopes_for_deps=True)
+
+    # The ascending case must be byte-for-byte unchanged in its loop header:
+    # a constant positive step still emits the plain ``<`` form.
+    assert re.search(r"for \(int64_t \w+ = 0; \w+ < 4; \w+ \+= 1\)", up), up
+
+    # The descending case must test ``>``, not ``<`` — otherwise it never runs.
+    down_header = re.search(r"for \(int64_t (\w+) = 4; \1 ([<>]) 0; \1 \+= -1\)", down)
+    assert down_header, down
+    assert down_header.group(2) == ">", down
+
+    # Both directions have a static trip count of 4, so neither may fall back to
+    # the dynamic vector path (whose capacity expression also evaluated to 0).
+    for code in (up, down):
+        assert "std::vector<PTO2TaskId>" not in code, code
+
+
 def test_compiler_derived_deps_for_dynamic_parallel_tensor_carriers_share_phase_barrier():
     """Dynamic parallel tensor producers in one phase should share one dummy barrier."""
 
