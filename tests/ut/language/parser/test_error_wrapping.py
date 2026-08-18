@@ -208,6 +208,28 @@ class TestBugClassErrorsAreNotWrapped:
                 result: pl.Tensor[[64], pl.BF16] = pl.tensor.cast(x, target_type=pl.BF16)
                 return result
 
+    def test_assertion_error_from_op_is_not_wrapped(self, monkeypatch):
+        """The other arm of BUG_CLASS_EXCEPTIONS.
+
+        A bare `AssertionError` is bug-class for the same reason `InternalError` is, and
+        pytest's own machinery depends on it propagating - wrapping one would turn a
+        failed assertion anywhere under the parser into a confusing kernel diagnostic.
+        """
+
+        def _raise_assertion(*args, **kwargs):
+            raise AssertionError("synthetic failed assertion")
+
+        monkeypatch.setattr(_dsl_tensor, "cast", _raise_assertion)
+
+        with pytest.raises(AssertionError, match="synthetic failed assertion") as exc_info:
+
+            @pl.function
+            def bad_kernel(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.BF16]:
+                result: pl.Tensor[[64], pl.BF16] = pl.tensor.cast(x, target_type=pl.BF16)
+                return result
+
+        assert not isinstance(exc_info.value, ParserError)
+
     def test_internal_error_is_not_a_parser_error(self, monkeypatch):
         """Guards the specific regression: it must not be catchable as ParserError."""
         monkeypatch.setattr(_dsl_tensor, "cast", self._raise_internal)

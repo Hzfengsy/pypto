@@ -958,9 +958,22 @@ class TestDeduceTypeExceptionPassthrough:
         assert "kernel.py:12:15" in str(exc_info.value)
 
     def test_unknown_span_appends_no_location(self):
-        with pytest.raises(pypto.InternalError) as exc_info:
-            ir.create_op_call("test.deduce_raises_internal", [self._arg()], ir.Span.unknown())
-        assert "always fails" in str(exc_info.value)
+        """An unknown span adds nothing - not a rendered placeholder.
+
+        `Span.unknown()` stringifies to ":-1:-1", so a merely-substring assertion would
+        stay green if the guard in LocationSuffix were dropped. Comparing the two messages
+        for exact equality pins the behaviour in both directions instead: the located one
+        must differ by the suffix and nothing else. Uses the TypeError op because it is
+        user-class, so neither message carries a traceback that would need filtering.
+        """
+        with pytest.raises(TypeError) as unknown_info:
+            ir.create_op_call("test.deduce_raises_type", [self._arg()], ir.Span.unknown())
+        with pytest.raises(TypeError) as located_info:
+            ir.create_op_call("test.deduce_raises_type", [self._arg()], ir.Span("kernel.py", 12, 15))
+
+        unknown_message = str(unknown_info.value)
+        assert unknown_message == "test.deduce_raises_type always fails"
+        assert str(located_info.value) == f"{unknown_message} at kernel.py:12:15"
 
     def test_type_error_is_not_flattened(self):
         """The user-error half of the contract: TypeError stays a TypeError."""

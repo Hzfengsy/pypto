@@ -498,6 +498,7 @@ class TestRethrowWithMessage:
         assert "replacement" in message
         assert "original" not in message
 
+    @pytest.mark.skipif(_MACOS, reason="macOS cannot symbolize a CPython MH_BUNDLE extension module")
     @pytest.mark.parametrize("kind", ["InternalError", "AssertionError"])
     def test_bug_class_keeps_the_original_throw_site(self, kind: str, no_backtrace_env: None):
         """The trace keeps the frame that threw, below the frame that caught and rethrew.
@@ -516,6 +517,7 @@ class TestRethrowWithMessage:
             f"expected both the throw and rethrow frames, got {len(binding_frames)} in: {files}"
         )
 
+    @pytest.mark.skipif(_MACOS, reason="macOS cannot symbolize a CPython MH_BUNDLE extension module")
     def test_direct_raise_has_one_frame_at_the_throw_site(self, no_backtrace_env: None):
         """Baseline for the test above: a plain raise contributes exactly one binding frame."""
         with pytest.raises(pypto.InternalError) as exc_info:
