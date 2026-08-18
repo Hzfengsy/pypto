@@ -116,6 +116,11 @@ except Exception as e:
     raise InvalidOperationError(...) from e
 ```
 
+This covers speculative evaluations too, where the broad handler *swallows* rather than
+wraps (`try: ... except Exception: pass`, then fall through to another strategy). Those
+are the worse case: a swallowed `InternalError` is replaced by whatever unrelated error
+the fall-through path raises next.
+
 ### Platform support for stack traces
 
 `3rdparty/libbacktrace` tracks upstream [ianlancetaylor/libbacktrace](https://github.com/ianlancetaylor/libbacktrace).

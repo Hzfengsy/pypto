@@ -110,6 +110,10 @@ except Exception as e:
     raise InvalidOperationError(...) from e
 ```
 
+这同样适用于推测性求值 —— 那里的宽泛处理块是把异常**吞掉**而非包装(`try: ... except
+Exception: pass`,然后回退到其他解析策略)。这种情况反而更糟:被吞掉的 `InternalError`
+会被回退路径接下来抛出的、毫不相干的错误取代。
+
 ### 栈回溯的平台支持
 
 `3rdparty/libbacktrace` 跟随上游 [ianlancetaylor/libbacktrace](https://github.com/ianlancetaylor/libbacktrace)。

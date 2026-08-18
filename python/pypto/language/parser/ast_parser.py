@@ -8723,6 +8723,11 @@ class ASTParser:
             value = self.expr_evaluator.eval_expr(attr)
             if isinstance(value, ir.MemorySpace):
                 return ir.ConstInt(value.value, DataType.INDEX, self.span_tracker.get_span(attr))
+        except BUG_CLASS_EXCEPTIONS:
+            # This eval is speculative, so its failure is normally not worth reporting - but a
+            # failed internal invariant is, and swallowing it here would replace the diagnostic
+            # with the unrelated "standalone attribute access" error raised below.
+            raise
         except Exception:
             pass
         # This might be accessing a DataType enum or similar

@@ -234,6 +234,45 @@ class TestBugClassErrorsAreNotWrapped:
                     result: pl.Tensor[[64], pl.BF16] = pl.tensor.cast(x, target_type=pl.BF16)
                     return result
 
+    def test_internal_error_from_closure_eval_is_not_wrapped(self, monkeypatch):
+        """`ExprEvaluator.eval_expr` re-raises instead of producing a ParserTypeError.
+
+        A compile-time closure expression can call into PyPTO and trip an internal
+        invariant; wrapping that as "Failed to evaluate expression" erases both the type
+        and the trace.
+        """
+
+        class _Boom:
+            @property
+            def value(self):
+                raise pypto.InternalError("Internal error: synthetic pass bug")
+
+        boom = _Boom()
+
+        with pytest.raises(pypto.InternalError, match="synthetic pass bug"):
+
+            @pl.function
+            def bad_kernel(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                result: pl.Tensor[[64], pl.FP32] = pl.tensor.adds(x, boom.value)
+                return result
+
+    def test_ordinary_eval_failure_is_still_wrapped(self):
+        """The passthrough must not leak ordinary eval failures past the diagnostics."""
+
+        class _BadValue:
+            @property
+            def value(self):
+                raise ValueError("not a compile-time constant")
+
+        bad = _BadValue()
+
+        with pytest.raises(ParserError):
+
+            @pl.function
+            def bad_kernel(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                result: pl.Tensor[[64], pl.FP32] = pl.tensor.adds(x, bad.value)
+                return result
+
     def test_user_errors_are_still_wrapped(self, monkeypatch):
         """The passthrough must not leak ordinary user errors past the diagnostic layer."""
 
