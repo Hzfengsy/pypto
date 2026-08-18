@@ -54,7 +54,6 @@ class MatmulAccPlain:
         self,
         lhs: pl.Tensor[[16, 16], pl.FP32],
         rhs: pl.Tensor[[16, 16], pl.FP32],
-        acc: pl.Tensor[[16, 16], pl.FP32],
         output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
     ) -> pl.Tensor[[16, 16], pl.FP32]:
         lhs_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(
@@ -63,8 +62,8 @@ class MatmulAccPlain:
         rhs_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(
             rhs, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat
         )
-        acc_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(
-            acc, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat
+        acc_tile: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Acc] = pl.tile.create(
+            [16, 16], pl.FP32, target_memory=pl.MemorySpace.Acc
         )
         out_tile: pl.Tile[[16, 16], pl.FP32] = pl.tile.matmul_acc(acc_tile, lhs_tile, rhs_tile)
         return pl.store(out_tile, [0, 0], output)
@@ -79,7 +78,6 @@ class MatmulAccInitTrue:
         self,
         lhs: pl.Tensor[[16, 16], pl.FP32],
         rhs: pl.Tensor[[16, 16], pl.FP32],
-        acc: pl.Tensor[[16, 16], pl.FP32],
         output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
     ) -> pl.Tensor[[16, 16], pl.FP32]:
         lhs_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(
@@ -88,8 +86,8 @@ class MatmulAccInitTrue:
         rhs_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(
             rhs, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat
         )
-        acc_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(
-            acc, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat
+        acc_tile: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Acc] = pl.tile.create(
+            [16, 16], pl.FP32, target_memory=pl.MemorySpace.Acc
         )
         out_tile: pl.Tile[[16, 16], pl.FP32] = pl.tile.matmul_acc(
             acc_tile, lhs_tile, rhs_tile, init_cond=True
@@ -106,7 +104,6 @@ class MatmulAccInitFalse:
         self,
         lhs: pl.Tensor[[16, 16], pl.FP32],
         rhs: pl.Tensor[[16, 16], pl.FP32],
-        acc: pl.Tensor[[16, 16], pl.FP32],
         output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
     ) -> pl.Tensor[[16, 16], pl.FP32]:
         lhs_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(
@@ -115,8 +112,8 @@ class MatmulAccInitFalse:
         rhs_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(
             rhs, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat
         )
-        acc_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(
-            acc, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat
+        acc_tile: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Acc] = pl.tile.create(
+            [16, 16], pl.FP32, target_memory=pl.MemorySpace.Acc
         )
         out_tile: pl.Tile[[16, 16], pl.FP32] = pl.tile.matmul_acc(
             acc_tile, lhs_tile, rhs_tile, init_cond=False
@@ -208,8 +205,8 @@ def test_non_boolean_init_cond_is_rejected():
                 rhs_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(
                     rhs, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat
                 )
-                acc_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(
-                    acc, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat
+                acc_tile: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Acc] = pl.tile.create(
+                    [16, 16], pl.FP32, target_memory=pl.MemorySpace.Acc
                 )
                 # An index, not a predicate — must be rejected rather than
                 # silently reinterpreted as a truth value.
