@@ -386,8 +386,32 @@ class StructuralHasher {
   template <typename NodePtr>
   result_type HashNodeImpl(const NodePtr& node);
 
+  /// Hash a Var-like back-reference the way ``EqualVar`` compares it: identity
+  /// only, never fields.
+  ///
+  /// ``EqualType`` routes ``DistributedTensorType::window_buffer_`` through
+  /// ``EqualVar``, which under auto-mapping accepts any two buffers a
+  /// consistent bijection allows, regardless of their ``size_`` or staging
+  /// flags. Hashing the node itself (``HashNode``) would mix those fields in
+  /// and make two buffers ``structural_equal`` accepts hash apart, breaking the
+  /// equal-implies-equal-hash contract.
+  ///
+  /// Memoised separately from ``hash_value_map_`` (which caches full-node
+  /// hashes) so repeated references to one buffer agree, mirroring EqualVar's
+  /// stable variable mapping.
+  result_type HashVarIdentity(const VarPtr& var) {
+    INTERNAL_CHECK(var) << "structural_hash encountered null Var back-reference";
+    auto it = var_identity_map_.find(var);
+    if (it != var_identity_map_.end()) return it->second;
+    result_type h = enable_auto_mapping_ ? static_cast<result_type>(free_var_counter_++)
+                                         : static_cast<result_type>(var->UniqueId());
+    var_identity_map_.emplace(var, h);
+    return h;
+  }
+
   bool enable_auto_mapping_;
   std::unordered_map<IRNodePtr, result_type> hash_value_map_;
+  std::unordered_map<VarPtr, result_type> var_identity_map_;
   int64_t free_var_counter_ = 0;
   std::vector<std::string> field_name_stack_;
   std::vector<std::string> node_type_stack_;
@@ -475,16 +499,18 @@ StructuralHasher::result_type StructuralHasher::HashType(const TypePtr& type) {
       h = hash_combine(h, static_cast<result_type>(0));  // indicate absence
     }
     // DistributedTensorType-only back-reference to its source WindowBuffer.
-    // Mix in presence + Var identity (HashNode dispatches the WindowBuffer Var
-    // path) so two same-shape / same-dtype DistributedTensorTypes built from
-    // different WindowBuffers hash apart.
+    // Mix in presence + Var identity so two same-shape / same-dtype
+    // DistributedTensorTypes built from different WindowBuffers hash apart.
+    // Identity only, via HashVarIdentity: EqualType compares this field with
+    // EqualVar, so hashing the buffer's fields would break equal => equal-hash
+    // under auto-mapping (see HashVarIdentity).
     if (type->GetKind() == ObjectKind::DistributedTensorType) {
       auto dt = std::static_pointer_cast<const DistributedTensorType>(type);
       if (dt->window_buffer_.has_value()) {
         h = hash_combine(h, static_cast<result_type>(1));
         INTERNAL_CHECK(*dt->window_buffer_)
             << "structural_hash encountered null window_buffer in DistributedTensorType";
-        h = hash_combine(h, HashNode(*dt->window_buffer_));
+        h = hash_combine(h, HashVarIdentity(*dt->window_buffer_));
       } else {
         h = hash_combine(h, static_cast<result_type>(0));
       }

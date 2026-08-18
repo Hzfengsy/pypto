@@ -464,6 +464,51 @@ class TestHashTypeLadderParity:
         assert not ir.structural_equal(first, second)
         assert hash(first) != hash(second)
 
+    @pytest.mark.parametrize("kind", sorted(_TYPE_FACTORIES))
+    def test_structural_equal_implies_equal_hash_under_auto_mapping(self, kind: str):
+        """The contract must hold in auto-mapping mode too.
+
+        ``EqualType`` compares ``DistributedTensorType::window_buffer_`` with
+        ``EqualVar``, which under auto-mapping accepts any two buffers a
+        consistent bijection allows -- ignoring their fields. So the hash must
+        mix in the buffer's *identity* only; hashing the node would fold in
+        ``size_`` and the staging flags and make equal types hash apart.
+        """
+        make = _TYPE_FACTORIES[kind]
+        lhs, rhs = make(), make()
+        assert ir.structural_equal(lhs, rhs, enable_auto_mapping=True)
+        assert ir.structural_hash(lhs, enable_auto_mapping=True) == ir.structural_hash(
+            rhs, enable_auto_mapping=True
+        )
+
+    def test_auto_mapped_window_buffers_of_different_size_hash_together(self):
+        """Regression: differing buffer fields must not split the hash.
+
+        Under auto-mapping these two types are ``structural_equal`` (EqualVar
+        maps the buffers), so they must hash alike even though the buffers
+        differ in size and staging flags.
+        """
+        first = ir.DistributedTensorType(
+            _dims(64),
+            DataType.FP32,
+            ir.WindowBuffer(ir.Var("a", ir.PtrType(), _span()), ir.ConstInt(64, DataType.INT64, _span())),
+        )
+        second = ir.DistributedTensorType(
+            _dims(64),
+            DataType.FP32,
+            ir.WindowBuffer(
+                ir.Var("b", ir.PtrType(), _span()),
+                ir.ConstInt(4096, DataType.INT64, _span()),
+                True,
+                True,
+                _span(),
+            ),
+        )
+        assert ir.structural_equal(first, second, enable_auto_mapping=True)
+        assert ir.structural_hash(first, enable_auto_mapping=True) == ir.structural_hash(
+            second, enable_auto_mapping=True
+        )
+
     def test_window_buffer_presence_participates_in_the_hash(self):
         without = ir.DistributedTensorType(_dims(64), DataType.FP32)
         with_wb = ir.DistributedTensorType(_dims(64), DataType.FP32, _SHARED_WINDOW_BUFFER)
