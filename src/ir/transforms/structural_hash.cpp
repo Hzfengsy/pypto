@@ -440,7 +440,13 @@ StructuralHasher::result_type StructuralHasher::HashType(const TypePtr& type) {
       dtype = CanonicalizeForSyntaxScalarDtype(dtype);
     }
     h = hash_combine(h, static_cast<result_type>(std::hash<uint8_t>{}(dtype.Code())));
-  } else if (auto tensor_type = As<TensorType>(type)) {
+  } else if (type->GetKind() == ObjectKind::TensorType ||
+             type->GetKind() == ObjectKind::DistributedTensorType) {
+    // DistributedTensorType is a TensorType subclass with its own ObjectKind, so
+    // As<TensorType>(dt) is nullptr by design (kind_traits.h). Match the explicit
+    // disjunction the sibling ladders use (structural_equal.cpp:1023) and share the
+    // field hashing via static_cast; TypeName() above already separates the kinds.
+    auto tensor_type = std::static_pointer_cast<const TensorType>(type);
     h = hash_combine(h, static_cast<result_type>(std::hash<uint8_t>{}(tensor_type->dtype_.Code())));
     h = hash_combine(h, static_cast<result_type>(tensor_type->shape_.size()));
     for (const auto& dim : tensor_type->shape_) {
@@ -539,6 +545,12 @@ StructuralHasher::result_type StructuralHasher::HashType(const TypePtr& type) {
       INTERNAL_CHECK(t) << "structural_hash encountered null type in TupleType";
       h = hash_combine(h, HashType(t));
     }
+  } else if (auto array_type = As<ArrayType>(type)) {
+    // Mirrors EqualType's ArrayType branch (structural_equal.cpp:1271): dtype +
+    // single-axis extent are the only semantic fields.
+    h = hash_combine(h, static_cast<result_type>(std::hash<uint8_t>{}(array_type->dtype_.Code())));
+    INTERNAL_CHECK(array_type->extent()) << "structural_hash encountered null extent in ArrayType";
+    h = hash_combine(h, HashNode(array_type->extent()));
   } else if (IsA<MemRefType>(type) || IsA<UnknownType>(type) || IsA<PtrType>(type) ||
              IsA<WindowBufferType>(type) || IsA<CommCtxType>(type) || IsA<PrefetchAsyncContextType>(type) ||
              IsA<AsyncEventType>(type) || IsA<AsyncSessionType>(type)) {
