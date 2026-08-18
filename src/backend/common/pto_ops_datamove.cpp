@@ -37,6 +37,7 @@
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/storage_size.h"
 #include "pypto/ir/tile_view_semantics.h"
+#include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/type.h"
 #include "src/backend/common/pto_ops_internal.h"
@@ -124,6 +125,42 @@ static std::string MakeTileAssembleCodegenPTO(const CallPtr& op, codegen::Codege
       << offset_tuple->elements_.size();
   std::string row_off = codegen.GetExprAsCode(offset_tuple->elements_[0]);
   std::string col_off = codegen.GetExprAsCode(offset_tuple->elements_[1]);
+
+  // Self-copy: the source *is* the destination window. `tile.slice` lowers to a
+  // `pto.subview` and registers its (base, row, col) SSAs, so when the source
+  // resolves to a subview of this very `dst` at this very offset, the data is
+  // already in place and the `pto.tmov` below would copy a buffer onto itself.
+  //
+  // This is what an accumulate-into-a-sub-slice becomes once the accumulator
+  // shares the destination's memory space: `tile.matmul_acc` reuses its
+  // accumulator operand's buffer (`set_output_reuses_input(0)`), so the MAD has
+  // already written the window. For an Acc destination the move is not merely
+  // redundant but *illegal* — the ISA has no L0C->L0C `tmov`.
+  //
+  // Matched on the emitted SSA rather than on MemRefs because AllocateMemoryAddr
+  // has already folded a slice's dynamic byte offset down to the bare base by
+  // this point (a dynamic address is not renderable at `pto.alloc_tile addr`);
+  // the subview op is where that offset still lives. Detecting it here rather
+  // than folding the assemble away in the IR also keeps the source's def-use
+  // edge intact — `tile.matmul_acc` is not on dead_code_elimination's
+  // side-effect list, so dropping the use would let DCE delete the very
+  // computation that filled the window.
+  if (const auto* src_view = codegen.GetSubviewMaterialization(src)) {
+    auto src_rows = ir::As<ir::ConstInt>(source_tile_type->shape_[0]);
+    auto src_cols =
+        source_tile_type->shape_.size() > 1 ? ir::As<ir::ConstInt>(source_tile_type->shape_[1]) : nullptr;
+    const bool same_window =
+        src_view->source_ssa == dst && src_view->row_off_ssa == row_off && src_view->col_off_ssa == col_off;
+    // The subview must cover the whole window the assemble writes, not part of
+    // it — otherwise the bytes outside the source's extent still need the move.
+    const bool covers_window = src_rows && src_cols && src_view->view_rows == src_rows->value_ &&
+                               src_view->view_cols == src_cols->value_;
+    // An already-materialized subview no longer denotes the window: its data was
+    // repacked into a separate buffer, so the move back is real.
+    if (same_window && covers_window && !src_view->emitted) {
+      return "";
+    }
+  }
 
   // pto.subview is a view, so writing into the dst_view only affects the
   // [row, col]+sizes window.  Data outside that window must already be present
