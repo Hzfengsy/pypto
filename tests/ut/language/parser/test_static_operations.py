@@ -431,6 +431,20 @@ class TestConciseErrorMessage:
         exc = ValueError("")
         assert concise_error_message(exc) == ""
 
+    def test_empty_message_with_traceback_is_not_called_a_check(self):
+        """Only a stripped check tail earns the fallback -- an empty message keeps its own.
+
+        ``GetFullMessage()`` always appends a traceback block (or the "no stack trace"
+        note), so a bare ``pypto::ValueError("")`` under ``PTO_BACKTRACE=1`` also strips
+        to empty. Naming that a silent backend check would report a check that never ran
+        and tell the user to enable a flag they already have on.
+        """
+        with_trace = ValueError("\n\nC++ Traceback (most recent call last):\n  frame0")
+        assert concise_error_message(with_trace) == ""
+
+        no_symbols = ValueError("\n\nNo stack trace available. \n(Tip: Build with Debug)")
+        assert concise_error_message(no_symbols) == ""
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

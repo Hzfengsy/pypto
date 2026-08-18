@@ -155,10 +155,10 @@ def concise_error_message(exc: Exception) -> str:
     A check that fired without a ``<<`` message leaves nothing behind once its tail
     is stripped; that reports as :data:`_UNSPECIFIED_CHECK_MESSAGE` rather than as an
     empty string, because an empty bold ``Error:`` header is strictly worse than the
-    C++ noise it replaced.
+    C++ noise it replaced. An exception that was simply raised with an empty message
+    keeps its empty message -- only a stripped check tail earns the fallback.
     """
-    raw = str(exc)
-    msg = raw
+    msg = str(exc)
     # Strip "C++ Traceback ..." block appended by GetFullMessage()
     pos = msg.find("\n\nC++ Traceback")
     if pos != -1:
@@ -172,14 +172,22 @@ def concise_error_message(exc: Exception) -> str:
     # precedes it is the ``<<`` payload the op wrote for the user. FatalLogger emits the
     # "\n" unconditionally, so a message-less check puts the rfind hit at 0 -- that
     # truncation is what empties the message, handled by the fallback below.
+    stripped_check_tail = False
     if msg.startswith(_CHECK_TAIL_MARKER):
         msg = ""
+        stripped_check_tail = True
     else:
         pos = msg.rfind("\n" + _CHECK_TAIL_MARKER)
         if pos != -1:
             msg = msg[:pos]
+            stripped_check_tail = True
     msg = msg.strip()
-    if not msg and raw.strip():
+    # Gate on the tail actually having been removed, not on "something was there before":
+    # `GetFullMessage()` always appends a traceback (or the "no stack trace" note), so a
+    # bare `pypto::ValueError("")` under PTO_BACKTRACE=1 also strips to empty -- and calling
+    # that a silent backend check would name a check that never ran, while telling the user
+    # to enable a flag they already have on.
+    if not msg and stripped_check_tail:
         return _UNSPECIFIED_CHECK_MESSAGE
     return msg
 
