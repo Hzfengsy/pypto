@@ -1501,5 +1501,69 @@ class TestNoOp:
         ir.assert_structural_equal(_run_pass(Before), Before)
 
 
+class TestAccAccumulatorSliceContiguity:
+    """A matmul accumulator that is a strided window of an Acc (L0C) tile is
+    rejected.
+
+    L0C is NZ with block ``(r_b, c_b)`` of an ``[M, N]`` tile at
+    ``(c_b * M/16 + r_b) * fractal``, so a window is contiguous only when it
+    spans the parent's full row extent or occupies a single 16-column block.
+    The MAD writes its destination compactly from a bare pointer and has no
+    destination stride, so a strided window silently miscompiles — only the
+    first 16 columns of each row tile land correctly.
+    """
+
+    def _kernel(self, acc_shape, slice_shape, offset):
+        """`acc[offset]` of shape `slice_shape` accumulates `a[M, K] @ b[K, N]`,
+        with M/N taken from `slice_shape` so the matmul's own shape check passes
+        and the contiguity guard is what decides the outcome."""
+        rows, cols = slice_shape
+        k = 64
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[rows, k], pl.FP16],
+                w: pl.Tensor[[k, cols], pl.FP16],
+                out: pl.Out[pl.Tensor[acc_shape, pl.FP32]],
+            ) -> pl.Tensor[acc_shape, pl.FP32]:
+                x_mat: pl.Tile[[rows, k], pl.FP16, pl.Mem.Mat] = pl.tile.load(
+                    x, [0, 0], [rows, k], target_memory=pl.Mem.Mat
+                )
+                a: pl.Tile[[rows, k], pl.FP16, pl.Mem.Left] = pl.tile.move(x_mat, target_memory=pl.Mem.Left)
+                w_mat: pl.Tile[[k, cols], pl.FP16, pl.Mem.Mat] = pl.tile.load(
+                    w, [0, 0], [k, cols], target_memory=pl.Mem.Mat
+                )
+                b: pl.Tile[[k, cols], pl.FP16, pl.Mem.Right] = pl.tile.move(w_mat, target_memory=pl.Mem.Right)
+                acc = pl.tile.create(acc_shape, pl.FP32, target_memory=pl.Mem.Acc)
+                acc_win = pl.tile.slice(acc, slice_shape, offset)
+                acc_new = pl.tile.matmul_acc(acc_win, a, b)
+                out = pl.tile.store(acc_new, [0, 0], out)
+                return out
+
+        return Prog
+
+    def test_row_window_of_multi_block_column_acc_rejected(self):
+        """A [16, 32] row window of a [32, 32] Acc tile spans neither the full
+        row extent (16 != 32) nor a single block column (32 > 16)."""
+        prog = self._kernel([32, 32], [16, 32], [16, 0])
+        with pytest.raises(ValueError, match="not contiguous in L0C's block layout"):
+            _run_pass(prog)
+
+    def test_full_row_extent_window_accepted(self):
+        """A column window spans every row, so compact and parent strides
+        coincide and the discarded geometry does not matter."""
+        prog = self._kernel([16, 64], [16, 32], [0, 32])
+        _run_pass(prog)
+
+    def test_single_block_column_window_accepted(self):
+        """A 16-column window occupies one block column, so there is no second
+        block column to mis-stride."""
+        prog = self._kernel([32, 16], [16, 16], [16, 0])
+        _run_pass(prog)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
