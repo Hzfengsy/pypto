@@ -141,6 +141,44 @@ REGISTER_OP("tensor.matmul")
 M/N/K 装箱严格兼容，同时允许累加器的有效 M/N 矩形以及 rhs 的有效 K 包含 PTO 根据
 lhs M/K 与 rhs N 实际计算的较小矩形。
 
+#### 条件式累加器初始化（`init_cond`）
+
+`tile.matmul_acc` 与 `tensor.matmul_acc` 接受一个可选的第四操作数 `init_cond`：
+一个 BOOL 标量，用于逐次执行地选择累加器是被 `lhs @ rhs` **覆写**还是被累加。
+这就是 split-K 的 `k == 0` 惯用法，它同时省去了清零累加器与剥离首个 K 步的需要：
+
+```python
+acc = pl.tile.create([16, N], pl.INT32, target_memory=pl.Mem.Acc)
+for k0 in pl.pipeline(0, K, K_TILE, stage=2):
+    ...
+    acc = pl.tile.matmul_acc(acc, a_left, b_right, init_cond=(k0 == 0))
+```
+
+该谓词是位置操作数而非 registry kwarg，因为它可能依赖循环变量，而 kwarg 只承载
+编译期常量。作为操作数注册也意味着它像其他 SSA 值一样参与 use-def 链。
+
+降级方式取决于谓词是否在编译期已知：
+
+| `init_cond` | 生成代码 |
+| ----------- | -------- |
+| 缺省，或字面量 `False` | `pto.tmatmul.acc ins(dst, lhs, rhs) outs(dst)` |
+| 字面量 `True` | `pto.tmatmul ins(lhs, rhs) outs(dst)` |
+| 运行期谓词 | `scf.if cond { pto.tmatmul } else { pto.tmatmul.acc }` |
+
+ISA 将该语义承载为 MAD 指令 Xt 寄存器的第 63 位（`cmatrixInit`），因此硬件本身
+无需分支；分支的来源是 `pto.tmatmul` 与 `pto.tmatmul.acc` 是两个独立算子、且不带
+init 操作数。由于 `matmul_acc` 是原地操作（`set_output_reuses_input(0)`），两个分
+支写入同一缓冲区，`scf.if` 不产生返回值 —— Acc tile 上不会生成 phi。
+
+两项限制，均以显式诊断而非静默丢弃的方式处理：
+
+- **拒绝 rank > 2**。批量形式在 `FlattenTileNdTo2D` 中会展开为多次
+  `tile.matmul_acc` 调用，无处安放逐调用的谓词。请改为在 batch 维上循环。
+- **`AutoTileMatmulL0` 不对带谓词的调用做 L0 切分**。该 pass 匹配 3 操作数的
+  `tile.matmul_acc`，因此 4 操作数形式会自动跳过并保持原样 —— 这正是手工管理
+  split-K 所期望的。超尺寸的带谓词累加因而由编写者负责，这与超尺寸的无谓词
+  `tile.matmul_acc` 现有行为一致。
+
 在 tile 层，`tile.batch_matmul` 为 `TileType` 操作数提供批量语义。它接受 rank >= 2 的
 tile，广播前导批量维度，并保持与 `tile.matmul` 相同的纯操作数接口风格。如果批量操作数
 需要转置语义，可以通过两种等价方式表达：在输入上显式使用 `tile.transpose(...)`，或在

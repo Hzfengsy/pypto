@@ -183,7 +183,7 @@ from pypto.pypto_core.ir import (
     TileLayout,
 )
 
-from ..typing import IntLike, Scalar, Tensor, Tile
+from ..typing import BoolLike, IntLike, Scalar, Tensor, Tile, predicate_to_expr
 from .system_ops import (  # noqa: F401
     tpop_from_aic,
     tpop_from_aiv,
@@ -1219,18 +1219,33 @@ def batch_matmul(lhs: Tile, rhs: Tile) -> Tile:
     return Tile(expr=call_expr)
 
 
-def matmul_acc(acc: Tile, lhs: Tile, rhs: Tile) -> Tile:
+def matmul_acc(acc: Tile, lhs: Tile, rhs: Tile, init_cond: BoolLike | None = None) -> Tile:
     """Matrix multiplication with accumulation: acc += lhs @ rhs.
+
+    ``init_cond`` makes the accumulator's initial value conditional: on the steps
+    where it holds, ``acc`` is overwritten with ``lhs @ rhs`` rather than
+    accumulated into. This is the split-K idiom, and it removes the need to zero
+    the accumulator or to peel the first K step::
+
+        for k0 in pl.pipeline(0, K, K_TILE):
+            acc_t = pl.tile.slice(acc, [ROW_TILE, N], [t0, 0])
+            pl.tile.matmul_acc(acc_t, a, b, init_cond=(k0 == 0))
+
+    A literal ``True`` / ``False`` selects one form at compile time; a runtime
+    predicate lowers to a branch over the two, with no phi on the accumulator.
 
     Args:
         acc: Accumulator tile
         lhs: Left-hand side tile
         rhs: Right-hand side tile
+        init_cond: Optional predicate selecting overwrite over accumulate
 
     Returns:
         Tile wrapping the matmul_acc operation
     """
-    call_expr = _ir_ops.matmul_acc(acc.unwrap(), lhs.unwrap(), rhs.unwrap())
+    call_expr = _ir_ops.matmul_acc(
+        acc.unwrap(), lhs.unwrap(), rhs.unwrap(), init_cond=predicate_to_expr(init_cond)
+    )
     return Tile(expr=call_expr)
 
 

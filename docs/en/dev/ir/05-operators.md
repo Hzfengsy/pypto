@@ -151,6 +151,51 @@ exact physical M/N/K box compatibility while allowing the accumulator's valid
 M/N rectangle and the rhs valid K extent to contain the smaller rectangle PTO
 computes from lhs M/K and rhs N.
 
+#### Conditional accumulator initialization (`init_cond`)
+
+`tile.matmul_acc` and `tensor.matmul_acc` take an optional fourth operand,
+`init_cond`: a BOOL scalar that selects, per execution, whether the accumulator
+is *overwritten* with `lhs @ rhs` or accumulated into. It is the split-K
+`k == 0` idiom, and it removes the need either to zero the accumulator or to
+peel the first K step:
+
+```python
+acc = pl.tile.create([16, N], pl.INT32, target_memory=pl.Mem.Acc)
+for k0 in pl.pipeline(0, K, K_TILE, stage=2):
+    ...
+    acc = pl.tile.matmul_acc(acc, a_left, b_right, init_cond=(k0 == 0))
+```
+
+The predicate is a positional operand rather than a registry kwarg because it
+may be loop-dependent; kwargs carry only compile-time constants. Registering it
+as an operand also means it participates in the use-def chain like any other
+SSA value.
+
+Lowering depends on whether the predicate is known at compile time:
+
+| `init_cond` | Emitted |
+| ----------- | ------- |
+| absent, or literal `False` | `pto.tmatmul.acc ins(dst, lhs, rhs) outs(dst)` |
+| literal `True` | `pto.tmatmul ins(lhs, rhs) outs(dst)` |
+| runtime predicate | `scf.if cond { pto.tmatmul } else { pto.tmatmul.acc }` |
+
+The ISA carries this as bit 63 (`cmatrixInit`) of the MAD's Xt register, so the
+hardware needs no branch; `pto.tmatmul` and `pto.tmatmul.acc` are distinct ops
+with no init operand, hence the branch. Because `matmul_acc` is in place
+(`set_output_reuses_input(0)`), both arms write the same buffer and the `scf.if`
+yields no value — no phi is materialized on the Acc tile.
+
+Two limitations, both diagnosed rather than silently dropped:
+
+- **Rank > 2 is rejected.** The batched form expands into several
+  `tile.matmul_acc` calls inside `FlattenTileNdTo2D`, which has no place to
+  thread a per-call predicate. Loop over the batch dimension instead.
+- **`AutoTileMatmulL0` does not tile a predicated call.** That pass matches on a
+  3-operand `tile.matmul_acc`, so a 4-operand one opts out and is left as
+  written — which is what a hand-managed split-K wants. An oversized predicated
+  accumulate is therefore the author's responsibility, exactly as an oversized
+  unpredicated `tile.matmul_acc` already is.
+
 At the tile layer, `tile.batch_matmul` provides batched semantics for
 `TileType` operands. It accepts rank >= 2 tiles, broadcasts the leading batch
 dimensions, and keeps the same operand-only interface style as `tile.matmul`.

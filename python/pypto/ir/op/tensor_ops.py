@@ -466,8 +466,15 @@ def matmul_acc(
     a_trans: bool = False,
     b_trans: bool = False,
     span: Span | None = None,
+    *,
+    init_cond: Expr | None = None,
 ) -> Call:
     """Matrix multiplication with accumulation: acc = acc + lhs @ rhs.
+
+    With ``init_cond``, the accumulator's initial value is conditional: on the
+    steps where the predicate holds, ``acc`` is overwritten with ``lhs @ rhs``
+    instead of accumulated into (the split-K ``k == 0`` idiom). Only 2D operands
+    support the predicate.
 
     Args:
         acc: Accumulator tensor
@@ -476,13 +483,15 @@ def matmul_acc(
         a_trans: Whether to transpose lhs
         b_trans: Whether to transpose rhs
         span: Optional source span for debugging (auto-captured if not provided)
+        init_cond: Optional BOOL scalar predicate selecting overwrite over accumulate
 
     Returns:
         Call expression for matrix multiplication with accumulation
     """
     actual_span = _get_span_or_capture(span)
     kwargs: dict[str, Any] = {"a_trans": a_trans, "b_trans": b_trans}
-    return _ir_core.create_op_call("tensor.matmul_acc", [acc, lhs, rhs], kwargs, actual_span)
+    args = [acc, lhs, rhs] if init_cond is None else [acc, lhs, rhs, init_cond]
+    return _ir_core.create_op_call("tensor.matmul_acc", args, kwargs, actual_span)
 
 
 def mul(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:

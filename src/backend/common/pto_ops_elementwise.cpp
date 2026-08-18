@@ -969,10 +969,19 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
   // guarantees that the output shares the MemRef of the accumulator input
   // (via set_output_reuses_input), so we use the result buffer (dst) as the
   // accumulator operand instead of the IR-level input arg.
-  auto make_acc_codegen = [](const std::string& pto_op) {
-    return [pto_op](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) -> std::string {
+  //
+  // The optional `init_cond` operand (args_[3]) makes the accumulator's initial
+  // value conditional: where it holds, `dst` is overwritten with `lhs @ rhs`
+  // rather than accumulated into.  The ISA carries this as one bit of the MAD's
+  // Xt register, but the `pto.*` tile ops expose it only as the choice between
+  // the accumulating and the non-accumulating op, so a runtime predicate lowers
+  // to a branch over the two.  No phi is needed: both arms write `dst` in place.
+  auto make_acc_codegen = [](const std::string& pto_op, const std::string& init_pto_op) {
+    return [pto_op, init_pto_op](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) -> std::string {
       auto& codegen = AsPto(codegen_base);
-      CHECK(op->args_.size() == 3) << pto_op << " requires 3 arguments: acc, lhs, rhs";
+      CHECK(op->args_.size() == 3 || op->args_.size() == 4)
+          << pto_op << " requires 3 arguments (acc, lhs, rhs) or 4 with init_cond, but got "
+          << op->args_.size();
 
       std::string dst = codegen.GetCurrentResultTarget();
       std::string lhs = codegen.GetExprAsCode(op->args_[1]);
@@ -980,24 +989,63 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
       std::string dst_type = codegen.GetCurrentResultTileBufTypeString();
       std::string lhs_type = codegen.GetExprTypeAnnotation(op->args_[1]);
       std::string rhs_type = codegen.GetExprTypeAnnotation(op->args_[2]);
+      const std::string acc_phase = GemvAccPhaseAttr(op);
 
-      std::ostringstream acc_inst;
-      acc_inst << pto_op << " ins(" << dst << ", " << lhs << ", " << rhs;
-      std::vector<std::string> ins_type_parts;
-      for (const auto& t : {dst_type, lhs_type, rhs_type}) {
-        if (!t.empty()) ins_type_parts.push_back(t);
-      }
-      if (!ins_type_parts.empty()) {
-        acc_inst << " : ";
-        for (size_t i = 0; i < ins_type_parts.size(); ++i) {
-          if (i > 0) acc_inst << ", ";
-          acc_inst << ins_type_parts[i];
+      // ins() carries the accumulator only on the accumulating form; the
+      // initializing form reads lhs/rhs alone and writes dst from scratch.
+      auto build = [&](bool initializing) {
+        std::vector<std::string> operands = {lhs, rhs};
+        std::vector<std::string> types = {lhs_type, rhs_type};
+        if (!initializing) {
+          operands.insert(operands.begin(), dst);
+          types.insert(types.begin(), dst_type);
         }
+        std::ostringstream inst;
+        inst << (initializing ? init_pto_op : pto_op) << " ins(";
+        for (size_t i = 0; i < operands.size(); ++i) {
+          if (i > 0) inst << ", ";
+          inst << operands[i];
+        }
+        std::vector<std::string> present;
+        for (const auto& t : types) {
+          if (!t.empty()) present.push_back(t);
+        }
+        if (!present.empty()) {
+          inst << " : ";
+          for (size_t i = 0; i < present.size(); ++i) {
+            if (i > 0) inst << ", ";
+            inst << present[i];
+          }
+        }
+        inst << ") outs(" << dst;
+        if (!dst_type.empty()) inst << " : " << dst_type;
+        inst << ")" << acc_phase;
+        return inst.str();
+      };
+
+      if (op->args_.size() == 3) {
+        codegen.Emit(build(/*initializing=*/false));
+        return "";
       }
-      acc_inst << ") outs(" << dst;
-      if (!dst_type.empty()) acc_inst << " : " << dst_type;
-      acc_inst << ")" << GemvAccPhaseAttr(op);
-      codegen.Emit(acc_inst.str());
+
+      // A literal predicate picks one arm outright; only a runtime one branches.
+      if (auto init_const = As<ir::ConstInt>(op->args_[3])) {
+        codegen.Emit(build(/*initializing=*/init_const->value_ != 0));
+        return "";
+      }
+
+      // Resolve the condition before opening the region so any instruction its
+      // evaluation emits lands outside (and so dominates) both arms.
+      std::string cond = codegen.GetExprAsCode(op->args_[3]);
+      codegen.EmitStructural("scf.if " + cond + " {");
+      codegen.IncreaseIndent();
+      codegen.Emit(build(/*initializing=*/true));
+      codegen.DecreaseIndent();
+      codegen.EmitStructural("} else {");
+      codegen.IncreaseIndent();
+      codegen.Emit(build(/*initializing=*/false));
+      codegen.DecreaseIndent();
+      codegen.EmitStructural("}");
       return "";
     };
   };
@@ -1047,11 +1095,11 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
     };
   };
 
-  reg("tile.matmul_acc", make_acc_codegen("pto.tmatmul.acc"));
+  reg("tile.matmul_acc", make_acc_codegen("pto.tmatmul.acc", "pto.tmatmul"));
   reg("tile.gemv", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
     return MakeGemvCodegenPTO("pto.tgemv", 2, op, codegen);
   });
-  reg("tile.gemv_acc", make_acc_codegen("pto.tgemv.acc"));
+  reg("tile.gemv_acc", make_acc_codegen("pto.tgemv.acc", "pto.tgemv"));
   reg("tile.matmul_mx_acc", make_mx_acc_codegen("pto.tmatmul.mx.acc"));
   reg("tile.gemv_bias", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
     return MakeGemvCodegenPTO("pto.tgemv.bias", 3, op, codegen);

@@ -1799,24 +1799,39 @@ def matmul(lhs: Expr, rhs: Expr, span: Span | None = None) -> Call:
     return _ir_core.create_op_call("tile.matmul", [lhs, rhs], {}, actual_span)
 
 
-def matmul_acc(acc: Expr, lhs: Expr, rhs: Expr, span: Span | None = None) -> Call:
+def matmul_acc(
+    acc: Expr,
+    lhs: Expr,
+    rhs: Expr,
+    span: Span | None = None,
+    *,
+    init_cond: Expr | None = None,
+) -> Call:
     """Matrix multiplication with accumulation.
 
     Performs matrix multiplication and accumulates the result: acc = acc + lhs @ rhs.
     This is commonly used in loop-based matrix multiplication where results are
     accumulated over the K dimension.
 
+    With ``init_cond``, the accumulator's initial value is conditional: on the
+    steps where the predicate holds, ``acc`` is overwritten with ``lhs @ rhs``
+    instead of accumulated into. This is the split-K ``k == 0`` idiom, and it
+    keeps the accumulator single-def where a hand-written if/else would put a
+    phi on an in-place Acc buffer.
+
     Args:
         acc: Accumulator tile (TileType) to accumulate into
         lhs: Left-hand side tile (TileType)
         rhs: Right-hand side tile (TileType)
         span: Optional source span for debugging (auto-captured if not provided)
+        init_cond: Optional BOOL scalar predicate selecting overwrite over accumulate
 
     Returns:
         Call expression for matrix multiplication with accumulation
     """
     actual_span = _get_span_or_capture(span)
-    return _ir_core.create_op_call("tile.matmul_acc", [acc, lhs, rhs], {}, actual_span)
+    args = [acc, lhs, rhs] if init_cond is None else [acc, lhs, rhs, init_cond]
+    return _ir_core.create_op_call("tile.matmul_acc", args, {}, actual_span)
 
 
 def matmul_bias(lhs: Expr, rhs: Expr, bias: Expr, span: Span | None = None) -> Call:

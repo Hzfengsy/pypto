@@ -129,7 +129,7 @@ from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir_core
 from pypto.pypto_core.ir import AtomicType, Expr, MemorySpace, PadValue, PtrType, TensorLayout
 
-from ..typing import IntLike, Scalar, Tensor
+from ..typing import BoolLike, IntLike, Scalar, Tensor, predicate_to_expr
 
 # Bound TypeVar lets slice / assemble propagate the caller's concrete tensor
 # class (Tensor or its DistributedTensor subclass) through to the return type.
@@ -666,8 +666,22 @@ def matmul_acc(
     rhs: Tensor,
     a_trans: bool = False,
     b_trans: bool = False,
+    init_cond: BoolLike | None = None,
 ) -> Tensor:
     """Matrix multiplication with accumulation: acc += lhs @ rhs.
+
+    ``init_cond`` makes the accumulator's initial value conditional: on the steps
+    where it holds, ``acc`` is overwritten with ``lhs @ rhs`` rather than
+    accumulated into. This is the split-K idiom, and it removes the need to zero
+    the accumulator or to peel the first K step::
+
+        for k0 in pl.pipeline(0, K, K_TILE):
+            acc[t0 : t0 + R, :] = pl.matmul_acc(
+                acc[t0 : t0 + R, :], x_k, w_k, b_trans=True, init_cond=(k0 == 0)
+            )
+
+    Only 2D operands support the predicate; loop over the batch dimension
+    instead of passing higher-rank operands alongside ``init_cond``.
 
     Args:
         acc: Accumulator tensor
@@ -675,11 +689,19 @@ def matmul_acc(
         rhs: Right-hand side tensor
         a_trans: Whether to transpose lhs
         b_trans: Whether to transpose rhs
+        init_cond: Optional predicate selecting overwrite over accumulate
 
     Returns:
         Tensor wrapping the matmul_acc operation
     """
-    call_expr = _ir_ops.matmul_acc(acc.unwrap(), lhs.unwrap(), rhs.unwrap(), a_trans, b_trans)
+    call_expr = _ir_ops.matmul_acc(
+        acc.unwrap(),
+        lhs.unwrap(),
+        rhs.unwrap(),
+        a_trans,
+        b_trans,
+        init_cond=predicate_to_expr(init_cond),
+    )
     return Tensor(expr=call_expr)
 
 
