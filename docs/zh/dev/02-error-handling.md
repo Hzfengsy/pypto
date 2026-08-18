@@ -92,6 +92,17 @@ CHECK_SPAN(shape.size() == 2, span) << "tensor.matmul: only 2D inputs are suppor
 
 `span` 参数遵循与 `INTERNAL_CHECK_SPAN` 相同的安全规则:它仅在失败时求值,但在失败路径中是无条件求值的。因此 span 来源必须在失败点可以安全求值(典型如局部 `Span` 变量或已确认非空的兄弟 IR 节点)。
 
+#### `Check failed:` 尾部在抵达 DSL 用户前会被剥离
+
+`FatalLogger::~FatalLogger` 会给**每一条**检查消息(包括 `CHECK`)追加 `\nCheck failed: <表达式> at <文件>:<行号>`。该尾部包含 C++ 表达式和构建机器上的绝对路径 —— 调试 PyPTO 时有用,但对于只是写错了 kernel 的用户而言纯属噪声。由于渲染器会把整条消息拼进加粗的 `Error:` 标题,未剥离的尾部会夹在标题与指向用户源码的 `-->` 箭头之间。
+
+因此,DSL 解析器在把面向用户的后端异常包装成 `ParserError` 之前,会先经过 `concise_error_message()`(`python/pypto/language/parser/diagnostics/exceptions.py`)。原始文本仍可通过 `PTO_BACKTRACE=1` 获取 —— 它会打印 Python 回溯,其中以 `__cause__` 携带原始异常。
+
+对算子作者的两点影响:
+
+- **务必为 `CHECK` 提供 `<<` 消息。** 尾部被剥离后,裸写的 `CHECK(cond);` 将无话可说,用户只会看到"后端检查未提供消息"这样的通用占位文本,而非可据以修正的错误。
+- **不要为了绕开尾部而手写 `throw pypto::ValueError(...)`。** 该变通做法早于解析器侧的剥离机制,对 DSL 可达的检查已无必要。
+
 ### 内部不变式检查 — `INTERNAL_CHECK_SPAN`
 
 当违反内部不变式时抛出 `InternalError`。始终附加 IR 节点的 `Span`，使错误消息包含用户源代码位置：

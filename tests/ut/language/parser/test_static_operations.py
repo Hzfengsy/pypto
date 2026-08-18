@@ -390,10 +390,41 @@ class TestConciseErrorMessage:
         assert concise_error_message(exc) == "user message"
 
     def test_strips_check_failed_at_start(self):
-        """Test stripping when Check failed: is the entire message."""
+        """A check that fired with no ``<<`` payload reports the fallback, never an empty string."""
         msg = "Check failed: dim > 0 at src/foo.cpp:42"
         exc = ValueError(msg)
-        assert concise_error_message(exc) == "Internal backend check failed"
+        result = concise_error_message(exc)
+        assert result
+        assert "Check failed" not in result
+        assert "PTO_BACKTRACE=1" in result
+
+    def test_message_less_check_does_not_return_empty(self):
+        """The shape a real message-less CHECK produces: FatalLogger always emits the newline.
+
+        ``CHECK(cond);`` with no ``<<`` puts the tail at offset 1, so truncating at the
+        newline leaves nothing -- which would render as an empty bold ``Error:`` header.
+        """
+        msg = (
+            "\nCheck failed: lhs_scale_type && lhs_scale_type->shape_.size() == 2 at "
+            "/home/u/pypto/src/ir/op/tile_ops/matmul_mx.cpp:202 at kernel.py:9:3"
+        )
+        exc = ValueError(msg)
+        result = concise_error_message(exc)
+        assert result
+        assert "Check failed" not in result
+        assert ".cpp" not in result
+
+    def test_check_span_message_keeps_its_payload(self):
+        """CHECK_SPAN puts its IR span before the newline, so the payload must survive."""
+        msg = (
+            "The operator tile.slice requires a 2D operand [kernel.py:9:3]"
+            "\nCheck failed: x at f.cpp:1 at kernel.py:9:3"
+        )
+        exc = ValueError(msg)
+        result = concise_error_message(exc)
+        assert "The operator tile.slice requires a 2D operand" in result
+        assert "Check failed" not in result
+        assert "f.cpp" not in result
 
     def test_empty_message(self):
         """Test with empty exception message."""

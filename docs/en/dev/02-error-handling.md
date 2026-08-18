@@ -95,6 +95,17 @@ CHECK_SPAN(shape.size() == 2, span) << "tensor.matmul: only 2D inputs are suppor
 
 The `span` argument follows the same safety rule as `INTERNAL_CHECK_SPAN`: it is evaluated only on failure, but unconditionally evaluated there. The span source must therefore be safe to dereference at the failure point (typically a local `Span` variable or a sibling IR node known non-null).
 
+#### The `Check failed:` tail is stripped before it reaches DSL users
+
+`FatalLogger::~FatalLogger` appends `\nCheck failed: <expr> at <file>:<line>` to **every** check message, `CHECK` included. That tail names a C++ expression and an absolute build-machine path — useful when debugging PyPTO, noise for someone whose kernel is simply invalid. Since the renderer splices the whole message into its bold `Error:` header, an unstripped tail lands between the header and the `-->` arrow pointing at the user's own source.
+
+The DSL parser therefore routes a user-facing backend exception through `concise_error_message()` (`python/pypto/language/parser/diagnostics/exceptions.py`) before wrapping it in a `ParserError`. The raw text stays reachable via `PTO_BACKTRACE=1`, which prints the Python traceback carrying the original exception as `__cause__`.
+
+Two consequences for op authors:
+
+- **Always give `CHECK` a `<<` message.** Once the tail is stripped, a bare `CHECK(cond);` has nothing left to say, and the user gets a generic "backend check reported no message" placeholder instead of an actionable error.
+- **Do not hand-roll `throw pypto::ValueError(...)` to dodge the tail.** That workaround predates the parser-side strip and is no longer needed for DSL-reachable checks.
+
 ### Internal invariant checks — `INTERNAL_CHECK_SPAN`
 
 Throw `InternalError` when an internal invariant is violated. Always attach the IR node's `Span` so the error message includes the user's source location:

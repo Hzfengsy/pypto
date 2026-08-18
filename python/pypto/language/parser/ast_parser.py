@@ -1213,7 +1213,9 @@ class ASTParser:
         try:
             self.builder.add_function_attrs(attrs)
         except ValueError as exc:
-            raise ParserSyntaxError(str(exc), span=span, hint=None) from exc
+            # The duplicate-key rejection is a C++ ``CHECK`` in IRBuilder::AddFunctionAttrs,
+            # so strip FatalLogger's implementation-facing tail before it reaches the header.
+            raise ParserSyntaxError(concise_error_message(exc), span=span, hint=None) from exc
 
     def _parse_func_attr_value(self, key: str, value_node: ast.expr) -> Any:
         """Reconstruct one ``pl.func_attr`` value from its Python AST node.
@@ -8249,7 +8251,15 @@ class ASTParser:
             # rounding mode ...")``). Make sure the surfaced error always names
             # the op so users can locate the bad call. When any operand was a
             # Scalar, append a hint pointing at Python operators.
-            msg = str(e)
+            #
+            # Sanitize first: most ops type-check in C++, and a ``CHECK`` throws
+            # ``pypto::ValueError`` -- so backend op-validation failures land *here*, not
+            # in the ``except Exception`` branch below. Their message still carries
+            # FatalLogger's "Check failed: <C++ expr> at <absolute path>.cpp:<line>" tail,
+            # which the renderer would splice into the bold ``Error:`` header ahead of the
+            # ``-->`` source arrow. It stays reachable through ``__cause__`` under
+            # PTO_BACKTRACE=1. A pure-Python ValueError has no tail, so this is a no-op.
+            msg = concise_error_message(e)
             if not msg.startswith(f"pl.{op_name}") and not msg.startswith(f"{module_name}.{op_name}"):
                 msg = f"{module_name} operation '{op_name}': {msg}"
             hint = self._scalar_operand_hint(args, kwargs)

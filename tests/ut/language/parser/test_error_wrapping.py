@@ -23,6 +23,7 @@ from pypto.language.parser.diagnostics import (
     ParserError,
     ParserTypeError,
 )
+from pypto.language.parser.diagnostics.renderer import ErrorRenderer
 
 
 class TestOpErrorWrapping:
@@ -97,6 +98,70 @@ class TestOpErrorWrapping:
             def unknown(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
                 result: pl.Tensor[[64], pl.FP32] = pl.nonexistent_op(x)  # type: ignore
                 return result
+
+
+class TestBackendCheckMessageSanitized:
+    """A C++ CHECK must not leak FatalLogger's tail into the user-facing diagnostic.
+
+    Most ops type-check in C++. ``CHECK`` throws ``pypto::ValueError``, which surfaces in
+    Python as a plain ``ValueError`` whose message still carries the tail
+    ``FatalLogger::~FatalLogger`` appends: "Check failed: <C++ expr> at <abs path>.cpp:<line>".
+    Left in, the renderer splices it into the bold ``Error:`` header, ahead of the ``-->``
+    arrow that points at the user's own source.
+    """
+
+    @staticmethod
+    def _mismatched_matmul():
+        """Build a kernel whose only fault is FP16 x FP32 matmul operands.
+
+        Drives the CHECK in src/ir/op/tile_ops/matmul.cpp -- the DSL wrapper does no dtype
+        checking of its own, so validation happens in the backend type-deduction function.
+        """
+
+        @pl.function
+        def bad(
+            t1: pl.Tensor[[64, 64], pl.FP16],
+            t2: pl.Tensor[[64, 64], pl.FP32],
+            out: pl.Tensor[[64, 64], pl.FP32],
+        ) -> pl.Tensor[[64, 64], pl.FP32]:
+            a: pl.Tile[[64, 64], pl.FP16] = pl.tile.load(t1, offsets=[0, 0], shapes=[64, 64])
+            b: pl.Tile[[64, 64], pl.FP32] = pl.tile.load(t2, offsets=[0, 0], shapes=[64, 64])
+            c: pl.Tile[[64, 64], pl.FP32] = pl.tile.matmul(a, b)
+            result: pl.Tensor[[64, 64], pl.FP32] = pl.tile.store(c, offsets=[0, 0], output_tensor=out)
+            return result
+
+        return bad
+
+    def test_cpp_check_error_does_not_leak_check_failed_tail(self):
+        """The header carries the op's own message -- not the C++ expression or path."""
+        with pytest.raises(InvalidOperationError) as exc_info:
+            self._mismatched_matmul()
+
+        message = exc_info.value.message
+        assert "Check failed" not in message
+        assert ".cpp" not in message
+        assert "src/ir/op" not in message
+        # Positive half: a future over-eager strip that eats the whole message fails here.
+        assert "identical lhs and rhs data types" in message
+        assert "pl.tile operation 'matmul'" in message
+
+    def test_cpp_check_detail_survives_on_the_cause(self):
+        """The tail is hidden, not destroyed -- PTO_BACKTRACE=1 still reaches it."""
+        with pytest.raises(InvalidOperationError) as exc_info:
+            self._mismatched_matmul()
+
+        cause = exc_info.value.__cause__
+        assert isinstance(cause, ValueError)
+        assert "Check failed" in str(cause)
+
+    def test_rendered_header_is_followed_immediately_by_the_location_arrow(self):
+        """Nothing may sit between the ``Error:`` header and the ``-->`` source arrow."""
+        with pytest.raises(InvalidOperationError) as exc_info:
+            self._mismatched_matmul()
+
+        lines = ErrorRenderer(use_color=False).render(exc_info.value).split("\n")
+        assert lines[0].startswith("Error:")
+        assert lines[1].lstrip().startswith("-->")
 
 
 class TestProgramCatchAll:
