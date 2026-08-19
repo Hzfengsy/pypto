@@ -101,6 +101,40 @@ def test_quoting_edge_cases_do_not_desync_the_scanner(tmp_path: Path, source: st
     assert _rules(tmp_path, source) == ["B"]
 
 
+@pytest.mark.parametrize(
+    "source, expected",
+    [
+        # The reported case: emitter code builds target syntax from raw literals whose body
+        # carries unpaired quotes. Scanning one as an ordinary literal desynchronizes the
+        # masker and silently hides every check after it.
+        ('os << R"(", dtype="opaque", count=)" << n;\nCHECK(op->args_.size() == 1) << "x";', ["B"]),
+        # The mirror failure: arity text inside a raw literal is data, not code.
+        ('const char* s = R"(CHECK(op->args_.size() == 1))";', []),
+        # A custom delimiter must terminate on its own )delim" and nothing shorter.
+        (
+            'auto s = R"d(" CHECK(op->args_.size()==2) )d";\nCHECK(op->args_.size() == 3) << "y";',
+            ["B"],
+        ),
+        # Encoding-prefixed raw literals are raw too.
+        (
+            'auto a = u8R"(")"; auto b = uR"(")";\n'
+            'auto c = UR"(")"; auto d = LR"(")";\n'
+            'CHECK(op->args_.size() == 1) << "z";',
+            ["B"],
+        ),
+        # An identifier merely ending in R does not open a raw literal.
+        ('MYR"abc";\nCHECK(op->args_.size() == 1) << "w";', ["B"]),
+        # A raw-string message still carries its text to rule A.
+        ('CHECK(foo) << R"(Internal error: bad)";', ["A"]),
+        # A malformed literal must not hang or crash the scan.
+        ('auto s = R"(never closed\nCHECK(op->args_.size() == 1);', []),
+    ],
+)
+def test_raw_string_literals_are_masked(tmp_path: Path, source: str, expected: list[str]) -> None:
+    """C++ raw literals may contain unpaired quotes; the masker must skip their bodies whole."""
+    assert _rules(tmp_path, source) == expected
+
+
 def test_repository_is_clean() -> None:
     """The emitter trees must stay classified correctly; this is the gate itself."""
     root = Path(__file__).resolve().parents[3]

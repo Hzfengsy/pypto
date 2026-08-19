@@ -33,6 +33,11 @@ macro statement at a time (balanced predicate parens, then to the terminating ``
 fixed-line-window scan instead reports adjacent ``INTERNAL_CHECK_SPAN`` lines that legitimately
 say "Internal error" -- ``pto_ops_crosscore.cpp`` and ``scope_outline_utils.h`` both have that
 shape.
+
+C++ raw string literals get their own masking pass. Emitter code builds target syntax out of
+literals such as ``R"(", dtype="opaque", count=)"`` (``distributed_codegen.cpp``), whose body
+carries unpaired quotes. Scanning those as ordinary literals desynchronizes the masker, which
+both hides real checks after the literal and can report text inside one as code.
 """
 
 import argparse
@@ -113,6 +118,50 @@ def _blank_block_comment(text: str, out: list[str], i: int, n: int) -> int:
     return i
 
 
+# C++ raw-string prefixes, longest first so `u8R` wins over `R`.
+_RAW_PREFIXES = ("u8R", "LR", "uR", "UR", "R")
+
+# A raw-string delimiter is at most 16 characters and excludes whitespace,
+# parentheses and backslash.
+_RAW_DELIM_MAX = 16
+
+
+def _raw_prefix_start(text: str, quote: int) -> int:
+    """Offset where a raw-string prefix ending at *quote* begins, or -1 for none."""
+    for prefix in _RAW_PREFIXES:
+        start = quote - len(prefix)
+        if start < 0 or text[start:quote] != prefix:
+            continue
+        before = text[start - 1] if start > 0 else ""
+        if not (before.isalnum() or before == "_"):
+            return start
+    return -1
+
+
+def _blank_raw_string(text: str, out: list[str], i: int, n: int) -> tuple[int, int, int] | None:
+    """Blank a raw string literal ``R"delim( ... )delim"`` opening at *i*.
+
+    Returns ``(offset past the literal, content start, content end)``, or None when the
+    literal is malformed, so the caller can fall back to ordinary quote handling.
+    """
+    j = i + 1
+    while j < n and text[j] != "(" and (j - i - 1) < _RAW_DELIM_MAX:
+        if text[j].isspace() or text[j] in ")\\":
+            return None
+        j += 1
+    if j >= n or text[j] != "(":
+        return None
+    terminator = ")" + text[i + 1 : j] + '"'
+    body = j + 1
+    end = text.find(terminator, body)
+    stop = n if end == -1 else end + len(terminator)
+    end = n if end == -1 else end
+    for k in range(i + 1, min(stop, n)):
+        if text[k] != "\n":
+            out[k] = " "
+    return stop, body, min(end, n)
+
+
 def _blank_quoted(text: str, out: list[str], i: int, n: int, quote: str) -> tuple[int, int]:
     """Blank the contents of a ``quote``-delimited literal starting at its opening quote.
 
@@ -148,8 +197,15 @@ def _blank_comments_and_strings(text: str) -> tuple[str, list[tuple[int, int]]]:
         elif ch == "/" and nxt == "*":
             i = _blank_block_comment(text, out, i, n)
         elif ch == '"':
-            i, start = _blank_quoted(text, out, i, n, '"')
-            strings.append((start, min(i - 1, n)))
+            raw = None
+            if _raw_prefix_start(text, i) >= 0:
+                raw = _blank_raw_string(text, out, i, n)
+            if raw is not None:
+                i, body_start, body_end = raw
+                strings.append((body_start, body_end))
+            else:
+                i, start = _blank_quoted(text, out, i, n, '"')
+                strings.append((start, min(i - 1, n)))
         elif ch == "'":
             i, _ = _blank_quoted(text, out, i, n, "'")
         else:

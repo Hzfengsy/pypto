@@ -245,6 +245,10 @@ Pass 处理的 IR 已被早期 pass 验证过。Pass 中的失败不变式因此
 | 不支持的 dtype x 后端组合、不支持的特性组合 | `CHECK_SPAN` | dtype 和后端由用户选择,消息应给出解决办法 |
 | 用户传入的 kwarg 取值(如 `tensor.create` 的 `init_value`) | `CHECK_SPAN` | 没有上游 pass 对其加以约束 |
 
+上表是策略,而非对当前代码树的描述:参数个数的清理已经完成,但这两个目录中仍有约 34 处
+post-`As<T>()` 检查是 `CHECK`。该清理需要逐点判断 —— 其中若干紧邻断言 `ValueError` 的测试 ——
+因此留作后续工作,而非机械替换;下文的 lint 也刻意不标记它们。
+
 在所有发射器注册宏中 `op` 都是 `const ir::CallPtr&`,因此 `op->span_` 始终在作用域内,
 `_SPAN` 形式几乎总是可用 —— 它能补上这些位置原本缺失的 IR 源码位置。
 

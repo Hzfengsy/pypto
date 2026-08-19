@@ -251,6 +251,11 @@ the whole pass pipeline, so an invariant that fails there cannot have come from 
 | Unsupported dtype x backend, unsupported feature combination | `CHECK_SPAN` | The user chose the dtype and the backend; the message should name the remedy |
 | A user-supplied kwarg's value (e.g. `tensor.create`'s `init_value`) | `CHECK_SPAN` | No upstream pass constrains it |
 
+The table is the policy, not a description of the current tree: the argument-count sweep is done,
+but roughly 34 post-`As<T>()` checks in these two directories are still `CHECK`. That sweep needs
+per-site judgment — several sit beside tests that assert `ValueError` — so it was left for a
+follow-up rather than done mechanically, and the lint below deliberately does not flag them.
+
 `op` is a `const ir::CallPtr&` in every emitter registration macro, so `op->span_` is in scope and
 the `_SPAN` form is almost always available — it attaches the IR source location these sites would
 otherwise lack.
