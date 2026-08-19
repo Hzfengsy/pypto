@@ -17,7 +17,7 @@ C++ inheritance doesn't help here: `IterArg` is a subclass of `Var`, but `IterAr
 | `ExprPtr` that may be `Var` or `IterArg` | Treat both as `Var` | `AsVarLike(expr)` (returns `VarPtr`) | `As<Var>(expr)` — misses `IterArg` |
 | Visitor override for both `Var` and `IterArg` | Single handler for both | Override `VisitVarLike_` | Override `VisitExpr_(VarPtr)` only — `IterArg` dispatches separately |
 
-`MemRef` is intentionally **excluded** from `AsVarLike` — `MemRef` has scope/storage semantics that don't fit the Var-bound-name model. Use `As<MemRef>()` directly.
+`MemRef` and `WindowBuffer` are intentionally **excluded** from `AsVarLike` — they carry allocation-source / window-slot semantics that don't fit the Var-bound-name model. Use `As<MemRef>()` / `As<WindowBuffer>()` directly. Both are still listed in `KindTrait<Expr>`, so `As<Expr>()` matches them.
 
 ## Examples
 
