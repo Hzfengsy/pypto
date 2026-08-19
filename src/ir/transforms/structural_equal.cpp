@@ -1489,32 +1489,21 @@ bool StructuralEqualImpl<AssertMode>::EqualWindowBuffer(const WindowBufferPtr& l
     return false;
   }
 
-  // 2. WindowBuffer-specific fields.
-  if (!EqualVar(lhs->base_, rhs->base_)) {
-    if constexpr (AssertMode) {
-      ThrowMismatch("WindowBuffer base mismatch", std::static_pointer_cast<const IRNode>(lhs),
-                    std::static_pointer_cast<const IRNode>(rhs));
-    }
-    return false;
-  }
-  if (!Equal(lhs->size_, rhs->size_)) {
-    return false;
-  }
-  if (lhs->load_from_host_ != rhs->load_from_host_) {
-    if constexpr (AssertMode) {
-      ThrowMismatch("WindowBuffer load_from_host mismatch", std::static_pointer_cast<const IRNode>(lhs),
-                    std::static_pointer_cast<const IRNode>(rhs));
-    }
-    return false;
-  }
-  if (lhs->store_to_host_ != rhs->store_to_host_) {
-    if constexpr (AssertMode) {
-      ThrowMismatch("WindowBuffer store_to_host mismatch", std::static_pointer_cast<const IRNode>(lhs),
-                    std::static_pointer_cast<const IRNode>(rhs));
-    }
-    return false;
-  }
-  return true;
+  // 2. Remaining fields (base_, size_, the staging flags) through the reflection
+  //    visitor, exactly as the generic EQUAL_DISPATCH(WindowBuffer) path did
+  //    before this arm existed. Comparing them by hand here would drop the field
+  //    name from the mismatch path -- assert_structural_equal would report a bare
+  //    `value` instead of `size.value` -- and would silently skip any field added
+  //    to WindowBuffer later. The transparent_depth_ save/reset and the
+  //    node_type_stack_ push mirror EQUAL_DISPATCH so field names are recorded
+  //    even when this node is reached from inside a SeqStmts / Program.
+  node_type_stack_.emplace_back("WindowBuffer");
+  int saved_depth = transparent_depth_;
+  transparent_depth_ = 0;
+  bool result = EqualWithFields(lhs, rhs);
+  transparent_depth_ = saved_depth;
+  node_type_stack_.pop_back();
+  return result;
 }
 
 // Explicit template instantiations

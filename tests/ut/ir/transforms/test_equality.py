@@ -1719,6 +1719,21 @@ class TestWindowBufferIdentity:
         assert not ir.structural_equal(lhs, rhs)
         assert ir.structural_hash(lhs) != ir.structural_hash(rhs)
 
+    def test_size_mismatch_still_reports_the_field_path(self):
+        """Field names must survive the hand-written identity arm.
+
+        The arm bypasses the ``EQUAL_DISPATCH`` reflection visitor, which is
+        what pushes ``size`` onto the mismatch path. Comparing the fields by
+        hand instead would degrade ``assert_structural_equal``'s diagnostic to
+        a bare ``value``, dropping the very location the API promises.
+        """
+        base = ir.Var("win", ir.PtrType(), self._span())
+        first, second = self._buffer(base, 4096), self._buffer(base, 8192)
+
+        with pytest.raises(ValueError) as exc_info:
+            ir.assert_structural_equal(first, second, enable_auto_mapping=True)
+        assert "size.value" in str(exc_info.value).split("\n")[0]
+
     def test_a_slot_and_its_type_back_reference_are_cross_checked(self):
         """A buffer's identity must tie its definition to its uses.
 
