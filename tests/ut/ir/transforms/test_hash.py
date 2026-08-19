@@ -515,6 +515,26 @@ class TestHashTypeLadderParity:
         assert not ir.structural_equal(without, with_wb)
         assert hash(without) != hash(with_wb)
 
+    def test_tensor_view_pad_participates_in_the_hash(self):
+        """``EqualType`` compares ``TensorView::pad``, so ``HashType`` must fold it in.
+
+        The sibling ``TileView`` branch always hashed its own ``pad``; the
+        ``TensorView`` branch stopped at ``layout``. That left the contract
+        intact (a field in equality but not the hash only widens the collision
+        class) but made padded tensor views needlessly collision-prone.
+        """
+
+        def make(pad: ir.PadValue) -> ir.TensorType:
+            return ir.TensorType(
+                [64, 1],
+                DataType.FP32,
+                tensor_view=ir.TensorView([1, 1], ir.TensorLayout.ND, [32, 1], pad),
+            )
+
+        null_pad, zero_pad = make(ir.PadValue.null), make(ir.PadValue.zero)
+        assert not ir.structural_equal(null_pad, zero_pad)
+        assert hash(null_pad) != hash(zero_pad)
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -495,6 +495,10 @@ StructuralHasher::result_type StructuralHasher::HashType(const TypePtr& type) {
       }
       // Hash layout
       h = hash_combine(h, static_cast<result_type>(tv.layout));
+      // Hash pad — EqualType compares TensorView::pad, and the sibling TileView
+      // branch below hashes its own pad; omitting it here only made TensorType
+      // hashing needlessly coarse.
+      h = hash_combine(h, static_cast<result_type>(tv.pad));
     } else {
       h = hash_combine(h, static_cast<result_type>(0));  // indicate absence
     }
