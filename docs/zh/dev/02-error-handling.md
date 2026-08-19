@@ -232,6 +232,31 @@ CHECK_SPAN(args.size() == 2, span) << "tensor.matmul requires 2 args";
 
 Pass 处理的 IR 已被早期 pass 验证过。Pass 中的失败不变式因此几乎总是表明**编译器 bug**,而非用户错误 —— 应使用 `INTERNAL_CHECK_SPAN` / `INTERNAL_UNREACHABLE_SPAN`。仅当确实需要将文档化的用户限制(例如 "4D scatter_update 尚未下沉,请使用 2D")作为用户错误暴露时,才使用 `CHECK_SPAN`。如果不确定,自问:消息读起来是 "这是 PyPTO bug,请上报" 还是 "请修改你的代码"?
 
+### Codegen 与后端发射器内部
+
+同样的推理在这里更无疑义。`src/codegen` 和 `src/backend` 运行在整条 pass 流水线**之后**,
+因此其中失败的不变式不可能来自用户输入:
+
+| 类别 | 结论 | 原因 |
+| ---- | ---- | ---- |
+| 参数个数(`op->args_.size() == N`) | `INTERNAL_CHECK_SPAN` | 参数个数由算子定义固定,并在 IR 构造期由注册表的类型推导函数强制校验 |
+| `As<T>()` 向下转型的结果 | `INTERNAL_CHECK_SPAN` | 操作数类型在类型推导阶段已确定,并由验证器复查 |
+| Codegen 内部簿记(SSA 名字、偏移映射) | `INTERNAL_CHECK` | 由 codegen 自身填充,用户无法触及 |
+| 不支持的 dtype x 后端组合、不支持的特性组合 | `CHECK_SPAN` | dtype 和后端由用户选择,消息应给出解决办法 |
+| 用户传入的 kwarg 取值(如 `tensor.create` 的 `init_value`) | `CHECK_SPAN` | 没有上游 pass 对其加以约束 |
+
+在所有发射器注册宏中 `op` 都是 `const ir::CallPtr&`,因此 `op->span_` 始终在作用域内,
+`_SPAN` 形式几乎总是可用 —— 它能补上这些位置原本缺失的 IR 源码位置。
+
+**一处刻意的例外。** `ChooseL0Tile`(`src/ir/transforms/utils/l0_tile_chooser.cpp`)故意用
+`CHECK` 抛出它的拒绝:`AutoTileMatmulL0` 专门捕获 `pypto::ValueError`,以便发出性能提示
+PH-AT-005 并原样保留该 matmul。由于 `InternalError` 是 `ValueError` 的**兄弟类**而非子类,
+转换这些检查会把优雅跳过变成未捕获的中止。
+
+这些位置在设计上无法从 Python 触达,因此没有任何运行期测试能守住该分类。
+`tests/lint/check_emitter_check_classification.py`(已接入 `.pre-commit-config.yaml`)是守卫:
+它会拒绝两棵树中消息含 "Internal error" 的 `CHECK`,以及针对调用参数个数的 `CHECK`。
+
 ## 相关文档
 
 - [IR 概述 — 源码位置跟踪](ir/00-overview.md)

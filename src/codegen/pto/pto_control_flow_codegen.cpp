@@ -67,13 +67,13 @@ static std::string JoinPairs(const std::vector<std::string>& lhs, const std::str
 // ========================================================================
 
 void PTOCodegen::VisitStmt_(const EvalStmtPtr& op) {
-  INTERNAL_CHECK_SPAN(op != nullptr, op->span_) << "Internal error: null EvalStmt";
+  INTERNAL_CHECK(op != nullptr) << "Internal error: null EvalStmt";
   INTERNAL_CHECK_SPAN(op->expr_ != nullptr, op->span_) << "Internal error: EvalStmt has null expression";
   VisitExpr(op->expr_);
 }
 
 void PTOCodegen::VisitStmt_(const YieldStmtPtr& op) {
-  INTERNAL_CHECK_SPAN(op != nullptr, op->span_) << "Internal error: null YieldStmt";
+  INTERNAL_CHECK(op != nullptr) << "Internal error: null YieldStmt";
 
   if (op->value_.empty()) {
     return;
@@ -211,7 +211,7 @@ bool IsDefinedInBranch(const ir::Var* var, const StmtPtr& body) {
 }  // namespace
 
 void PTOCodegen::VisitStmt_(const IfStmtPtr& op) {
-  INTERNAL_CHECK_SPAN(op != nullptr, op->span_) << "Internal error: null IfStmt";
+  INTERNAL_CHECK(op != nullptr) << "Internal error: null IfStmt";
   INTERNAL_CHECK_SPAN(op->condition_ != nullptr, op->span_) << "Internal error: IfStmt has null condition";
   INTERNAL_CHECK_SPAN(op->then_body_ != nullptr, op->span_) << "Internal error: IfStmt has null then_body";
 
@@ -516,11 +516,11 @@ void PTOCodegen::VisitStmt_(const IfStmtPtr& op) {
 }
 
 void PTOCodegen::VisitStmt_(const ForStmtPtr& op) {
-  INTERNAL_CHECK_SPAN(op != nullptr, op->span_) << "Internal error: null ForStmt";
+  INTERNAL_CHECK(op != nullptr) << "Internal error: null ForStmt";
   INTERNAL_CHECK_SPAN(op->loop_var_ != nullptr, op->span_) << "Internal error: ForStmt has null loop_var";
   INTERNAL_CHECK_SPAN(op->body_ != nullptr, op->span_) << "Internal error: ForStmt has null body";
 
-  CHECK(op->iter_args_.size() == op->return_vars_.size())
+  INTERNAL_CHECK_SPAN(op->iter_args_.size() == op->return_vars_.size(), op->span_)
       << "ForStmt iter_args size (" << op->iter_args_.size() << ") must equal return_vars size ("
       << op->return_vars_.size() << ")";
 
@@ -696,11 +696,11 @@ void PTOCodegen::VisitStmt_(const ForStmtPtr& op) {
 }
 
 void PTOCodegen::VisitStmt_(const WhileStmtPtr& op) {
-  INTERNAL_CHECK_SPAN(op != nullptr, op->span_) << "Internal error: null WhileStmt";
+  INTERNAL_CHECK(op != nullptr) << "Internal error: null WhileStmt";
   INTERNAL_CHECK_SPAN(op->condition_ != nullptr, op->span_) << "Internal error: WhileStmt has null condition";
   INTERNAL_CHECK_SPAN(op->body_ != nullptr, op->span_) << "Internal error: WhileStmt has null body";
 
-  CHECK(op->iter_args_.size() == op->return_vars_.size())
+  INTERNAL_CHECK_SPAN(op->iter_args_.size() == op->return_vars_.size(), op->span_)
       << "WhileStmt iter_args size (" << op->iter_args_.size() << ") must equal return_vars size ("
       << op->return_vars_.size() << ")";
 

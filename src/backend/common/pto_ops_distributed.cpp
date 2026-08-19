@@ -359,7 +359,7 @@ static std::string MakeRemoteLoadCodegenPTO(const CallPtr& op, codegen::CodegenB
 // reshape.
 static std::string MakeRemoteStoreCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
-  CHECK(op->args_.size() == 4)
+  INTERNAL_CHECK_SPAN(op->args_.size() == 4, op->span_)
       << "pld.tile.remote_store requires 4 arguments (src_tile, target, peer, offsets), got "
       << op->args_.size();
 
@@ -460,9 +460,10 @@ static std::string MakeRemoteStoreCodegenPTO(const CallPtr& op, codegen::Codegen
 //   pto.comm.tnotify(<pview>, <value>) {notifyOp = #pto<notify_op (set|atomic_add)>}
 static std::string MakeNotifyCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
-  CHECK(op->args_.size() == 4) << "pld.system.notify requires 4 arguments (target, peer, offsets, "
-                                  "value), got "
-                               << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == 4, op->span_)
+      << "pld.system.notify requires 4 arguments (target, peer, offsets, "
+         "value), got "
+      << op->args_.size();
 
   auto binding = ResolveDistTensorBinding(op->args_[0], codegen, "pld.system.notify");
   auto offsets_tuple = As<ir::MakeTuple>(op->args_[2]);
@@ -520,8 +521,8 @@ static std::string MakeNotifyCodegenPTO(const CallPtr& op, codegen::CodegenBase&
 //   pto.comm.twait(<pview>, <expected>) {cmp = #pto<wait_cmp (eq|ge)>}
 static std::string MakeWaitCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
-  CHECK(op->args_.size() == 3) << "pld.system.wait requires 3 arguments (signal, offsets, expected), got "
-                               << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == 3, op->span_)
+      << "pld.system.wait requires 3 arguments (signal, offsets, expected), got " << op->args_.size();
 
   auto signal_var = AsVarLike(op->args_[0]);
   CHECK(signal_var) << "pld.system.wait signal must be a Var-like expression";
@@ -798,7 +799,7 @@ static std::string MakeDeferWaitCodegenPTO(const CallPtr& op, codegen::CodegenBa
 static std::string MakePutCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
   const size_t n = op->args_.size();
-  CHECK(n == 4 || n == 5 || n == 7 || n == 8)
+  INTERNAL_CHECK_SPAN(n == 4 || n == 5 || n == 7 || n == 8, op->span_)
       << "pld.tile.put requires 4/5 (single/double stage, full-slice) or 7/8 (single/double stage, "
          "subregion) arguments (dst, peer, src, stage[, stage2][, dst_offsets, src_offsets, shape]), got "
       << n;
@@ -942,7 +943,7 @@ static std::string MakePutCodegenPTO(const CallPtr& op, codegen::CodegenBase& co
 static std::string MakeGetCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
   const size_t n = op->args_.size();
-  CHECK(n == 4 || n == 5 || n == 7 || n == 8)
+  INTERNAL_CHECK_SPAN(n == 4 || n == 5 || n == 7 || n == 8, op->span_)
       << "pld.tile.get requires 4/5 (single/double stage, full-slice) or 7/8 (single/double stage, "
          "subregion) arguments (dst, peer, src, stage[, stage2][, dst_offsets, src_offsets, shape]), got "
       << n;
@@ -1110,8 +1111,8 @@ void RegisterDistributedOps(Backend& backend, const std::unordered_set<std::stri
   reg("pld.system.get_comm_ctx",
       [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) -> std::string {
         auto& cg = AsPto(codegen_base);
-        CHECK(op->args_.size() == 1) << "pld.system.get_comm_ctx expects exactly 1 argument, got "
-                                     << op->args_.size();
+        INTERNAL_CHECK_SPAN(op->args_.size() == 1, op->span_)
+            << "pld.system.get_comm_ctx expects exactly 1 argument, got " << op->args_.size();
         auto var = ir::AsVarLike(op->args_[0]);
         CHECK(var) << "pld.system.get_comm_ctx expects a Var (DistributedTensor param), got "
                    << op->args_[0]->TypeName();
@@ -1131,7 +1132,8 @@ void RegisterDistributedOps(Backend& backend, const std::unordered_set<std::stri
   // (rankId, rankNum) u64 slot via ``pto.load_scalar`` + ``arith.trunci``.
   reg("pld.system.rank", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) -> std::string {
     auto& cg = AsPto(codegen_base);
-    CHECK(op->args_.size() == 1) << "pld.system.rank expects exactly 1 argument, got " << op->args_.size();
+    INTERNAL_CHECK_SPAN(op->args_.size() == 1, op->span_)
+        << "pld.system.rank expects exactly 1 argument, got " << op->args_.size();
     std::string ctx_ssa = cg.GetExprAsCode(op->args_[0]);
     std::string rk_pair = EmitLoadRankPair(cg, ctx_ssa);
     std::string rk = cg.GetCurrentResultTarget();
@@ -1146,7 +1148,8 @@ void RegisterDistributedOps(Backend& backend, const std::unordered_set<std::stri
   // i64 right by 32 instead of issuing a second pto.load_scalar.
   reg("pld.system.nranks", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) -> std::string {
     auto& cg = AsPto(codegen_base);
-    CHECK(op->args_.size() == 1) << "pld.system.nranks expects exactly 1 argument, got " << op->args_.size();
+    INTERNAL_CHECK_SPAN(op->args_.size() == 1, op->span_)
+        << "pld.system.nranks expects exactly 1 argument, got " << op->args_.size();
     namespace cl = codegen::distributed::comm_layout;
     static_assert(cl::kRankNumOffset == cl::kRankIdOffset + 4,
                   "pld.system.nranks codegen assumes rankNum sits in the high 32 bits of rankId's i64 slot");

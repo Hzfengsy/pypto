@@ -202,8 +202,8 @@ static std::string MakeTileSelCodegenPTO(const CallPtr& op, codegen::CodegenBase
 // address before codegen (required at --pto-level=level3).
 static std::string MakeTileTransposeCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
-  CHECK(op->args_.size() == 4) << "tile.transpose requires 4 arguments (src, axis0, axis1, tmp), got "
-                               << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == 4, op->span_)
+      << "tile.transpose requires 4 arguments (src, axis0, axis1, tmp), got " << op->args_.size();
 
   std::string src_ssa = codegen.GetExprAsCode(op->args_[0]);
   std::string src_type = codegen.GetExprTypeAnnotation(op->args_[0]);
@@ -237,8 +237,8 @@ struct SingleOperandOp {
 static std::string MakeSingleOperandCodegenPTO(const SingleOperandOp& spec, const CallPtr& op,
                                                codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
-  CHECK(op->args_.size() == 2) << spec.ir_name << " requires 2 arguments" << spec.arg_desc << ", got "
-                               << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == 2, op->span_)
+      << spec.ir_name << " requires 2 arguments" << spec.arg_desc << ", got " << op->args_.size();
   const ir::ExprPtr& operand = op->args_[spec.operand_idx];
   EmitInsOuts(codegen, spec.pto_op,
               {{codegen.GetExprAsCode(operand), codegen.GetExprTypeAnnotation(operand)}});
@@ -308,8 +308,9 @@ static std::string MakeAssignCodegenPTO(const std::string& pto_op_name, const Ca
 static std::string MakeCiCodegenPTO(const std::string& pto_op_name, const CallPtr& op,
                                     codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
-  CHECK(op->args_.size() == 2) << "Operation:[" << pto_op_name
-                               << "] requires 2 arguments (start, shape), but got " << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == 2, op->span_)
+      << "Operation:[" << pto_op_name << "] requires 2 arguments (start, shape), but got "
+      << op->args_.size();
   bool descending = op->GetKwarg<bool>("descending");
   std::string src = codegen.GetExprAsCode(op->args_[0]);
   std::string src_type = codegen.GetExprTypeAnnotation(op->args_[0]);
@@ -334,7 +335,7 @@ static std::string MakeCiCodegenPTO(const std::string& pto_op_name, const CallPt
 // Shape and optional valid_shape operands are type-only and are not emitted.
 static std::string MakeTriCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
-  CHECK(op->args_.size() == 2 || op->args_.size() == 3)
+  INTERNAL_CHECK_SPAN(op->args_.size() == 2 || op->args_.size() == 3, op->span_)
       << "Operation:[pto.ttri] requires 2 or 3 arguments (diagonal, shape, [valid_shape]), but got "
       << op->args_.size();
   auto result_type = As<ir::TileType>(op->GetType());
@@ -404,7 +405,7 @@ static std::string MakeGatherbCodegenPTO(const CallPtr& op, codegen::CodegenBase
 static std::string MakeRandomCodegenPTO(const std::string& pto_op_name, const CallPtr& op,
                                         codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
-  CHECK(op->args_.size() == 7 || op->args_.size() == 8)
+  INTERNAL_CHECK_SPAN(op->args_.size() == 7 || op->args_.size() == 8, op->span_)
       << "Operation:[" << pto_op_name
       << "] requires 7 or 8 arguments (key0, key1, counter0, counter1, counter2, "
          "counter3, shape, [valid_shape]), but got "
@@ -445,8 +446,8 @@ static std::string MakeRandomCodegenPTO(const std::string& pto_op_name, const Ca
 static std::string MakePrintCodegenPTO(const std::string& pto_op_name, const CallPtr& op,
                                        codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
-  CHECK(op->args_.size() == 1) << "Operation:" << pto_op_name << "] requires 1 argument, but got "
-                               << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == 1, op->span_)
+      << "Operation:" << pto_op_name << "] requires 1 argument, but got " << op->args_.size();
   std::string src = codegen.GetExprAsCode(op->args_[0]);
   codegen.Emit(pto_op_name + " ins(" + src + " | !pto.partition_tensor_view<MxNxdtype>)");
   return "";
@@ -764,7 +765,8 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
     auto reg_entry = backend.RegisterOp("tile.row_expand_add");
     reg_entry.f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
       const size_t arity = op->args_.size();
-      CHECK(arity == 2 || arity == 3) << "tile.row_expand_add requires 2 or 3 arguments, but got " << arity;
+      INTERNAL_CHECK_SPAN(arity == 2 || arity == 3, op->span_)
+          << "tile.row_expand_add requires 2 or 3 arguments, but got " << arity;
       return MakeNaryCodegenPTO("pto.trowexpandadd", arity, op, codegen);
     });
   }
@@ -782,7 +784,8 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
   // format.
   reg("tile.move", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
     auto& codegen = AsPto(codegen_base);
-    CHECK(op->args_.size() == 1) << "tile.move requires 1 argument, got " << op->args_.size();
+    INTERNAL_CHECK_SPAN(op->args_.size() == 1, op->span_)
+        << "tile.move requires 1 argument, got " << op->args_.size();
 
     // Under memory_planner=PtoAS there is no baked address: AllocateMemoryAddr is
     // skipped and every `byte_offset_` is still the -1 sentinel, so the offset
@@ -884,7 +887,8 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
     backend.RegisterOp("tile.rsqrt")
         .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
           size_t arity = op->args_.size();
-          CHECK(arity == 1 || arity == 2) << "tile.rsqrt requires 1 or 2 arguments, but got " << arity;
+          INTERNAL_CHECK_SPAN(arity == 1 || arity == 2, op->span_)
+              << "tile.rsqrt requires 1 or 2 arguments, but got " << arity;
           return MakeNaryCodegenPTO("pto.trsqrt", arity, op, codegen);
         })
         .set_input_layout(0, ir::TileLayout::row_major)
@@ -898,7 +902,7 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
     backend.RegisterOp("tile.col_sum")
         .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
           auto& codegen = AsPto(codegen_base);
-          CHECK(op->args_.size() == 1 || op->args_.size() == 2)
+          INTERNAL_CHECK_SPAN(op->args_.size() == 1 || op->args_.size() == 2, op->span_)
               << "tile.col_sum requires 1 or 2 arguments, but got " << op->args_.size();
           std::string config_attr = op->args_.size() == 2 ? " {isBinary = true}" : "";
           codegen.Emit("pto.tcolsum " + GenerateInsOutsClause(op, codegen, config_attr));
@@ -984,12 +988,9 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
     return [pto_op, init_pto_op, supports_init_cond](const ir::CallPtr& op,
                                                      codegen::CodegenBase& codegen_base) -> std::string {
       auto& codegen = AsPto(codegen_base);
-      const size_t max_args = supports_init_cond ? 4 : 3;
-      CHECK(op->args_.size() == 3 || (supports_init_cond && op->args_.size() == 4))
+      INTERNAL_CHECK_SPAN(op->args_.size() == 3 || (supports_init_cond && op->args_.size() == 4), op->span_)
           << pto_op << " requires 3 arguments (acc, lhs, rhs)"
           << (supports_init_cond ? " or 4 with init_cond" : "") << ", but got " << op->args_.size();
-      INTERNAL_CHECK(op->args_.size() <= max_args)
-          << "Internal error: " << pto_op << " arity exceeds what this codegen accepts";
 
       std::string dst = codegen.GetCurrentResultTarget();
       std::string lhs = codegen.GetExprAsCode(op->args_[1]);
@@ -1069,9 +1070,9 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
   auto make_mx_acc_codegen = [](const std::string& pto_op) {
     return [pto_op](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) -> std::string {
       auto& codegen = AsPto(codegen_base);
-      CHECK(op->args_.size() == 5) << pto_op
-                                   << " requires 5 arguments: acc, lhs, lhs_scale, rhs, rhs_scale, but got "
-                                   << op->args_.size();
+      INTERNAL_CHECK_SPAN(op->args_.size() == 5, op->span_)
+          << pto_op << " requires 5 arguments: acc, lhs, lhs_scale, rhs, rhs_scale, but got "
+          << op->args_.size();
 
       std::string dst = codegen.GetCurrentResultTarget();
       INTERNAL_CHECK(!dst.empty()) << "Internal error: " << pto_op

@@ -1988,7 +1988,7 @@ std::string PTOCodegen::GetGMSlotBufferSSAForPipe(int pipe_id, int dir_mask) {
   }
 
   auto offset_it = gm_slot_buffer_offsets_.find(key);
-  CHECK(offset_it != gm_slot_buffer_offsets_.end())
+  INTERNAL_CHECK(offset_it != gm_slot_buffer_offsets_.end())
       << "Internal error: missing GM slot buffer offset for frontend pipe id " << pipe_id << " and dir_mask "
       << dir_mask;
   const int64_t byte_offset = offset_it->second;

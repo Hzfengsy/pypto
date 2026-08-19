@@ -73,8 +73,8 @@ using pto_ops_detail::MaterializeSubviewOperandIfNeeded;
 // Arguments: args[0] = target (destination base), args[1] = source, args[2] = offset MakeTuple
 static std::string MakeTileAssembleCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
-  CHECK(op->args_.size() == 3) << "tile.assemble requires 3 arguments (target, source, offset), got "
-                               << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == 3, op->span_)
+      << "tile.assemble requires 3 arguments (target, source, offset), got " << op->args_.size();
 
   auto target_tile_type = ir::As<ir::TileType>(op->args_[0]->GetType());
   auto source_tile_type = ir::As<ir::TileType>(op->args_[1]->GetType());
@@ -345,7 +345,7 @@ static std::string MakeTileAssembleCodegenPTO(const CallPtr& op, codegen::Codege
 // so only the valid side, and the GM partition_view sizes, can be dynamic.
 static std::string MakeGatherRowCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
-  CHECK(op->args_.size() == 5 || op->args_.size() == 6)
+  INTERNAL_CHECK_SPAN(op->args_.size() == 5 || op->args_.size() == 6, op->span_)
       << "tile.gather_row requires 5-6 arguments "
          "(dst, src, dst_offset, src_offset, shapes[, valid_shape]), got "
       << op->args_.size();
@@ -528,8 +528,8 @@ static std::string MakeGatherRowCodegenPTO(const CallPtr& op, codegen::CodegenBa
 static std::string MakeSort32CodegenPTO(const std::string& pto_op_name, const CallPtr& op,
                                         codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
-  CHECK(op->args_.size() == 2) << "Operation:[" << pto_op_name
-                               << "] requires 2 arguments (src, idx), but got " << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == 2, op->span_)
+      << "Operation:[" << pto_op_name << "] requires 2 arguments (src, idx), but got " << op->args_.size();
 
   std::string src = codegen.GetExprAsCode(op->args_[0]);
   std::string idx = codegen.GetExprAsCode(op->args_[1]);
@@ -562,7 +562,8 @@ static std::string MakeSort32CodegenPTO(const std::string& pto_op_name, const Ca
 //   ins(src, {maskPattern = #pto.mask_pattern<Pxxxx>} : src_type, "row") outs(dst : dst_type)
 static std::string MakeGatherMaskCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
-  CHECK(op->args_.size() == 1) << "tile.gather_mask requires 1 argument (src), but got " << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == 1, op->span_)
+      << "tile.gather_mask requires 1 argument (src), but got " << op->args_.size();
 
   int pattern = op->GetKwarg<int>("mask_pattern");
   CHECK(pattern >= 1 && pattern < static_cast<int>(mask_patterns.size()))
@@ -601,8 +602,8 @@ static std::string MakeGatherMaskCodegenPTO(const CallPtr& op, codegen::CodegenB
 // must resolve their own DPS targets — done via ResolveTupleResultElements.
 static std::string MakeGatherCompareCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
-  CHECK(op->args_.size() == 3) << "tile.gather_compare requires 3 arguments (src, kvalue, tmp), but got "
-                               << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == 3, op->span_)
+      << "tile.gather_compare requires 3 arguments (src, kvalue, tmp), but got " << op->args_.size();
 
   ir::VarPtr tuple_var = codegen.GetCurrentResultVar();
   INTERNAL_CHECK_SPAN(tuple_var, op->span_)
@@ -662,8 +663,8 @@ static std::string MakeGatherCompareCodegenPTO(const CallPtr& op, codegen::Codeg
 // only src in ins(); dst is the outs() scale tile (address = src_addr >> SHIFT).
 static std::string MakeTGetScaleAddrCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
-  CHECK(op->args_.size() == 2) << op->op_->name_ << " requires 2 arguments (dst_scale, src), but got "
-                               << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == 2, op->span_)
+      << op->op_->name_ << " requires 2 arguments (dst_scale, src), but got " << op->args_.size();
 
   std::string src = codegen.GetExprAsCode(op->args_[1]);
   std::string src_ty = codegen.GetExprTypeAnnotation(op->args_[1]);
@@ -701,8 +702,8 @@ static std::string MakeTGetScaleAddrCodegenPTO(const CallPtr& op, codegen::Codeg
 // GetCurrentResultTarget() returns the same SSA as args_[0].
 static std::string MakeScatterCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
-  CHECK(op->args_.size() == 3) << "tile.scatter requires 3 arguments (dst, src, indexes), but got "
-                               << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == 3, op->span_)
+      << "tile.scatter requires 3 arguments (dst, src, indexes), but got " << op->args_.size();
 
   std::string src = codegen.GetExprAsCode(op->args_[1]);
   std::string idx = codegen.GetExprAsCode(op->args_[2]);
@@ -760,8 +761,8 @@ static std::string MakeScatterCodegenPTO(const CallPtr& op, codegen::CodegenBase
 // within each row, which PTOAS v0.55 names the "row" axis.
 static std::string MakeScatterMaskCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
-  CHECK(op->args_.size() == 2) << "tile.scatter_mask requires 2 arguments (dst, src), but got "
-                               << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == 2, op->span_)
+      << "tile.scatter_mask requires 2 arguments (dst, src), but got " << op->args_.size();
 
   int pattern = op->GetKwarg<int>("mask_pattern");
   CHECK(pattern >= 1 && pattern < static_cast<int>(mask_patterns.size()))
@@ -813,7 +814,7 @@ static std::string MakeScatterMaskCodegenPTO(const CallPtr& op, codegen::Codegen
 static std::string MakeMrgSortCodegenPTO(const std::string& pto_op_name, const CallPtr& op,
                                          codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
-  CHECK(op->args_.size() >= 3 && op->args_.size() <= 5)
+  INTERNAL_CHECK_SPAN(op->args_.size() >= 3 && op->args_.size() <= 5, op->span_)
       << "Operation:[" << pto_op_name << "] requires 3-5 arguments (2-4 srcs + tmp), but got "
       << op->args_.size();
 
@@ -872,8 +873,9 @@ static std::string MakeMrgSortCodegenPTO(const std::string& pto_op_name, const C
 static std::string MakeMrgSort1CodegenPTO(const std::string& pto_op_name, const CallPtr& op,
                                           codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
-  CHECK(op->args_.size() == 2) << "Operation:[" << pto_op_name
-                               << "] requires 2 arguments (src, block_len), but got " << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == 2, op->span_)
+      << "Operation:[" << pto_op_name << "] requires 2 arguments (src, block_len), but got "
+      << op->args_.size();
 
   std::string src = codegen.GetExprAsCode(op->args_[0]);
   std::string src_type = codegen.GetExprTypeAnnotation(op->args_[0]);
@@ -1025,7 +1027,7 @@ void RegisterDataMoveOps(Backend& backend, const std::unordered_set<std::string>
     // reflected in the result tile-buf type) — the pto.subview sizes/offset come
     // from the full-rank shape/offset tuples, so codegen ignores it. An empty
     // 4th MakeTuple is the "no valid_shape" sentinel that pairs with drop_dims.
-    CHECK(op->args_.size() >= 3 && op->args_.size() <= 5)
+    INTERNAL_CHECK_SPAN(op->args_.size() >= 3 && op->args_.size() <= 5, op->span_)
         << "Operation:[tile.slice] requires 3-5 arguments (tile, shape, offset[, valid_shape[, "
            "drop_dims]]), but got "
         << op->args_.size();
@@ -1212,7 +1214,7 @@ void RegisterDataMoveOps(Backend& backend, const std::unordered_set<std::string>
 
   reg("tile.extract", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
     auto& codegen = AsPto(codegen_base);
-    CHECK(op->args_.size() == 4)
+    INTERNAL_CHECK_SPAN(op->args_.size() == 4, op->span_)
         << "tile.extract requires 4 arguments (src, index_row, index_col, shape), but got "
         << op->args_.size();
 
@@ -1255,8 +1257,8 @@ void RegisterDataMoveOps(Backend& backend, const std::unordered_set<std::string>
 
   reg("tile.reshape", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
     auto& codegen = AsPto(codegen_base);
-    CHECK(op->args_.size() == 2) << "Operation:[tile.reshape] requires 2 arguments (tile, shape), but got "
-                                 << op->args_.size();
+    INTERNAL_CHECK_SPAN(op->args_.size() == 2, op->span_)
+        << "Operation:[tile.reshape] requires 2 arguments (tile, shape), but got " << op->args_.size();
     std::string result_target = codegen.GetCurrentResultTarget();
 
     // Derive the result type from the result var's TileType so a MemRef-less
@@ -1336,8 +1338,8 @@ void RegisterDataMoveOps(Backend& backend, const std::unordered_set<std::string>
     //    which owns no buffer) and the PTOAS planner, where addr-less aliased
     //    vars collapse onto ONE tile_buf handle: the second alloc_tile that
     //    would have carried the transposed layout is never emitted.
-    CHECK(op->args_.size() == 1) << "Operation:[tile.transpose_view] requires 1 argument (tile), but got "
-                                 << op->args_.size();
+    INTERNAL_CHECK_SPAN(op->args_.size() == 1, op->span_)
+        << "Operation:[tile.transpose_view] requires 1 argument (tile), but got " << op->args_.size();
     auto& codegen = AsPto(codegen_base);
     std::string result_target = codegen.GetCurrentResultTarget();
 
@@ -1366,7 +1368,7 @@ void RegisterDataMoveOps(Backend& backend, const std::unordered_set<std::string>
 
   reg("tile.set_validshape", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
     auto& codegen = AsPto(codegen_base);
-    CHECK(op->args_.size() == 3)
+    INTERNAL_CHECK_SPAN(op->args_.size() == 3, op->span_)
         << "tile.set_validshape requires 3 arguments (tile, valid_rows, valid_cols), but got "
         << op->args_.size();
 

@@ -238,6 +238,34 @@ CHECK_SPAN(args.size() == 2, span) << "tensor.matmul requires 2 args";
 
 Passes operate on IR that has already been verified by earlier passes. A failed invariant inside a pass therefore almost always indicates a **compiler bug**, not a user error — use `INTERNAL_CHECK_SPAN` / `INTERNAL_UNREACHABLE_SPAN`. Reserve `CHECK_SPAN` for genuine user-facing limitations that the user can work around (e.g. "4D scatter_update is not yet lowered — use 2D"). If you're unsure, ask: *would the message read "this is a PyPTO bug, please report" or "please change your code"?*
 
+### Inside codegen and backend emitters
+
+The same reasoning applies with less room for doubt. `src/codegen` and `src/backend` run *after*
+the whole pass pipeline, so an invariant that fails there cannot have come from user input:
+
+| Class | Verdict | Why |
+| ----- | ------- | --- |
+| Argument count (`op->args_.size() == N`) | `INTERNAL_CHECK_SPAN` | Arity is fixed by the op definition and enforced by the registry's deduce-type function at IR-construction time |
+| Result of an `As<T>()` downcast | `INTERNAL_CHECK_SPAN` | The operand type was settled during type deduction and re-checked by the verifier |
+| Codegen-internal bookkeeping (SSA names, offset maps) | `INTERNAL_CHECK` | Populated by codegen itself; no user-reachable input |
+| Unsupported dtype x backend, unsupported feature combination | `CHECK_SPAN` | The user chose the dtype and the backend; the message should name the remedy |
+| A user-supplied kwarg's value (e.g. `tensor.create`'s `init_value`) | `CHECK_SPAN` | No upstream pass constrains it |
+
+`op` is a `const ir::CallPtr&` in every emitter registration macro, so `op->span_` is in scope and
+the `_SPAN` form is almost always available — it attaches the IR source location these sites would
+otherwise lack.
+
+**One deliberate exception.** `ChooseL0Tile` (`src/ir/transforms/utils/l0_tile_chooser.cpp`) raises
+its rejections as `CHECK`s on purpose: `AutoTileMatmulL0` catches `pypto::ValueError` specifically
+in order to emit perf hint PH-AT-005 and leave the matmul untouched. Because `InternalError` is a
+*sibling* of `ValueError` rather than a subclass, converting those checks would turn a graceful
+skip into an uncaught abort.
+
+These sites are unreachable from Python by construction, so no runtime test can hold the
+classification in place. `tests/lint/check_emitter_check_classification.py` (wired into
+`.pre-commit-config.yaml`) is the guard: it rejects a `CHECK` in either tree whose message says
+"Internal error", and a `CHECK` on a call's argument count.
+
 ## Related
 
 - [IR Overview — Source Location Tracking](ir/00-overview.md)

@@ -217,7 +217,8 @@ static std::string MakeTpushCodegenPTO(const char* target, const CallPtr& op,
   auto& codegen = AsPto(codegen_base);
   const std::string op_name = std::string("tpush_to_") + target;
 
-  CHECK(op->args_.size() == 1) << op_name << " requires 1 argument (tile), got " << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == 1, op->span_)
+      << op_name << " requires 1 argument (tile), got " << op->args_.size();
   auto tile = AsVarLike(op->args_[0]);
   INTERNAL_CHECK_SPAN(tile, op->span_) << op_name << " first argument must be a Var or IterArg";
 
@@ -252,7 +253,8 @@ static std::string MakeTpopCodegenPTO(const char* target, const CallPtr& op,
   auto& codegen = AsPto(codegen_base);
   const std::string op_name = std::string("tpop_from_") + target;
 
-  CHECK(op->args_.size() == 0) << op_name << " takes no arguments, got " << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == 0, op->span_)
+      << op_name << " takes no arguments, got " << op->args_.size();
 
   const int split = op->GetKwarg<int>("split", 0);
   CHECK(split >= 0 && split <= 2) << op_name
@@ -357,8 +359,8 @@ static std::string MakeTfreeCodegenPTO(const char* target, const CallPtr& op,
   auto& codegen = AsPto(codegen_base);
   const std::string op_name = std::string("tfree_to_") + target;
 
-  CHECK(op->args_.size() == 1) << op_name << " requires 1 argument (tile from tpop), got "
-                               << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == 1, op->span_)
+      << op_name << " requires 1 argument (tile from tpop), got " << op->args_.size();
   INTERNAL_CHECK_SPAN(op->HasKwarg("split"), op->span_)
       << "Internal error: system." << op_name
       << " is missing its 'split' kwarg; StampTfreeSplit must "
@@ -410,9 +412,8 @@ static std::string MakeInitializePipeCodegenPTO(const char* target, const CallPt
   auto& codegen = AsPto(codegen_base);
   const std::string op_name = std::string(target) + "_initialize_pipe";
 
-  CHECK(op->args_.size() == 2) << op_name
-                               << " requires 2 arguments (c2v_consumer_buf, v2c_consumer_buf), got "
-                               << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == 2, op->span_)
+      << op_name << " requires 2 arguments (c2v_consumer_buf, v2c_consumer_buf), got " << op->args_.size();
   const int dir_mask = op->GetKwarg<int>("dir_mask", -1);
   const int slot_size = op->GetKwarg<int>("slot_size", -1);
   CHECK(dir_mask >= 0) << op_name << " requires 'dir_mask' attribute";
@@ -537,7 +538,8 @@ void RegisterCrossCoreOps(Backend& backend, const std::unordered_set<std::string
 
   reg("system.reserve_buffer", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
     auto& codegen = AsPto(codegen_base);
-    CHECK(op->args_.size() == 0) << "reserve_buffer takes no arguments, got " << op->args_.size();
+    INTERNAL_CHECK_SPAN(op->args_.size() == 0, op->span_)
+        << "reserve_buffer takes no arguments, got " << op->args_.size();
 
     const auto name = op->GetKwarg<std::string>("name");
     const int size = op->GetKwarg<int>("size", -1);
@@ -580,7 +582,8 @@ void RegisterCrossCoreOps(Backend& backend, const std::unordered_set<std::string
 
   reg("system.import_peer_buffer", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
     auto& codegen = AsPto(codegen_base);
-    CHECK(op->args_.size() == 0) << "import_peer_buffer takes no arguments, got " << op->args_.size();
+    INTERNAL_CHECK_SPAN(op->args_.size() == 0, op->span_)
+        << "import_peer_buffer takes no arguments, got " << op->args_.size();
 
     const auto name = op->GetKwarg<std::string>("name");
     const auto peer_func = op->GetKwarg<std::string>("peer_func");
@@ -612,7 +615,8 @@ void RegisterCrossCoreOps(Backend& backend, const std::unordered_set<std::string
         << "system.syncall: core_type must be aiv_only|aic_only|mix, got " << core_type;
 
     if (mode == "hard") {
-      CHECK(op->args_.empty()) << "system.syncall (hard form) takes no arguments, got " << op->args_.size();
+      INTERNAL_CHECK_SPAN(op->args_.empty(), op->span_)
+          << "system.syncall (hard form) takes no arguments, got " << op->args_.size();
       codegen.Emit("pto.syncall() mode = #pto.sync_all_mode<hard>, core_type = #pto.sync_core_type<" +
                    core_type + ">");
       return std::string("");
@@ -622,7 +626,7 @@ void RegisterCrossCoreOps(Backend& backend, const std::unordered_set<std::string
     // The current PTO-ISA uses one soft operand ABI for every participant set:
     // [gm_workspace] or [gm_workspace, used_cores]. Omitting used_cores asks
     // PTO-ISA to derive the participant count from the launch configuration.
-    CHECK(op->args_.size() == 1 || op->args_.size() == 2)
+    INTERNAL_CHECK_SPAN(op->args_.size() == 1 || op->args_.size() == 2, op->span_)
         << "system.syncall (soft " << core_type << ") requires gm_workspace and optional used_cores, got "
         << op->args_.size() << " operands";
 

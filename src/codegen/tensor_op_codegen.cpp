@@ -184,7 +184,7 @@ REGISTER_ORCHESTRATION_OP(tensor_read, ("tensor.read")) {
   // while other runtimes may synchronize with a producer. Using the API
   // uniformly preserves that policy and avoids the type-unsafe raw deref via
   // buffer.addr that a direct static_cast<T*>(ptr)[idx] would imply.
-  CHECK(op->args_.size() == 2) << "tensor.read requires 2 arguments";
+  INTERNAL_CHECK_SPAN(op->args_.size() == 2, op->span_) << "tensor.read requires 2 arguments";
 
   std::string input_name = codegen.TryGetVarName(op->args_[0]);
   CHECK(!input_name.empty()) << "tensor.read input must be a variable";
@@ -233,7 +233,7 @@ REGISTER_ORCHESTRATION_OP(tensor_write, ("tensor.write")) {
   // host view of an external tensor and does not support task-produced tensors,
   // while other runtimes may synchronize with producers and consumers. This is
   // the same reason tensor.read uses get_tensor_data<T>() instead of a raw store.
-  CHECK(op->args_.size() == 3) << "tensor.write requires 3 arguments";
+  INTERNAL_CHECK_SPAN(op->args_.size() == 3, op->span_) << "tensor.write requires 3 arguments";
 
   std::string input_name = codegen.TryGetVarName(op->args_[0]);
   CHECK(!input_name.empty()) << "tensor.write input must be a variable";
@@ -281,7 +281,7 @@ REGISTER_ORCHESTRATION_OP(tensor_slice, ("tensor.slice")) {
   // tensor.slice(input, shape_tuple, offset_tuple[, valid_shape_tuple[, drop_dims_tuple]])
   // -> Generate a runtime view and, for rank-reducing scalar indices, reshape away
   // the statically-unit axes recorded in drop_dims.
-  CHECK(op->args_.size() >= 3 && op->args_.size() <= 5)
+  INTERNAL_CHECK_SPAN(op->args_.size() >= 3 && op->args_.size() <= 5, op->span_)
       << "tensor.slice requires 3 to 5 arguments (input, shape, offset[, valid_shape[, drop_dims]])";
 
   std::string input_name = codegen.TryGetVarName(op->args_[0]);
@@ -427,7 +427,7 @@ REGISTER_ORCHESTRATION_OP(tensor_slice, ("tensor.slice")) {
 REGISTER_ORCHESTRATION_OP(tensor_reshape, ("tensor.reshape")) {
   // tensor.reshape(input, shape_tuple[, valid_shape_tuple]) -> Generate shape array variable and call
   // .reshape() on the runtime ChipTensor (see runtime/.../tensor.h: ChipTensor::reshape).
-  CHECK(op->args_.size() == 2 || op->args_.size() == 3)
+  INTERNAL_CHECK_SPAN(op->args_.size() == 2 || op->args_.size() == 3, op->span_)
       << "tensor.reshape requires 2 or 3 arguments (input, shape[, valid_shape])";
 
   std::string input_name = codegen.TryGetVarName(op->args_[0]);
@@ -483,7 +483,7 @@ REGISTER_ORCHESTRATION_OP(tensor_transpose, ("tensor.transpose")) {
   // The optional 4th `valid_shape` argument from the IR op is intentionally
   // ignored at the orchestration layer (it only affects IR metadata, mirroring
   // how tensor.reshape handles valid_shape here).
-  CHECK(op->args_.size() == 3 || op->args_.size() == 4)
+  INTERNAL_CHECK_SPAN(op->args_.size() == 3 || op->args_.size() == 4, op->span_)
       << "tensor.transpose requires 3 or 4 arguments (input, axis1, axis2[, valid_shape])";
 
   std::string input_name = codegen.TryGetVarName(op->args_[0]);

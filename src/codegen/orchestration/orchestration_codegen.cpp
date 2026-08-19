@@ -2397,7 +2397,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
     CHECK_SPAN(read && IsOp(read, "tensor.read") && konst, pred->span_)
         << "Submit dispatch predicate must compare a tensor element (a tensor.read, e.g. t[i]) against "
            "an integer literal; got neither side in that form";
-    CHECK_SPAN(read->args_.size() >= 2, read->span_)
+    INTERNAL_CHECK_SPAN(read->args_.size() >= 2, read->span_)
         << "tensor.read in a dispatch predicate must have a tensor and an index list";
 
     // tensor.read(tensor, MakeTuple(i0, i1, ...)) — arg 0 is the tensor, arg 1

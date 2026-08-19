@@ -409,7 +409,7 @@ REGISTER_DISTRIBUTED_OP(builtin_tensor_all_to_all_v, "builtin.tensor.all_to_all_
 REGISTER_DISTRIBUTED_OP(tensor_slice, "tensor.slice") {
   auto& dist_codegen = dynamic_cast<DistributedCodegen&>(codegen);
 
-  CHECK(op->args_.size() == 3 || op->args_.size() == 4 || op->args_.size() == 5)
+  INTERNAL_CHECK_SPAN(op->args_.size() == 3 || op->args_.size() == 4 || op->args_.size() == 5, op->span_)
       << "tensor.slice host_orch codegen expects 3-5 args (input, shape, offset[, valid_shape[, "
          "drop_dims]]), "
          "got "
