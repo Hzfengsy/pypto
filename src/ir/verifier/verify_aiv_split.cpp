@@ -39,7 +39,7 @@ namespace {
 
 /// Function attr recording that ``OutlineIncoreScopes`` minted this InCore
 /// function by outlining a CORE_GROUP scope that held ``pl.split_aiv`` regions.
-/// Written in ``scope_outline_utils.h`` and re-stamped by ``LowerAutoVectorSplit``;
+/// Written in ``scope_outline_utils.cpp`` and re-stamped by ``LowerAutoVectorSplit``;
 /// read here as the provenance signal for check (h). Kept as a literal for the
 /// same reason both producers do — it is a plain attr key, not an operator name.
 constexpr const char* kSplitAivAttr = "split_aiv";
@@ -306,7 +306,7 @@ class SplitAivStructuralVerifier : public IRVisitor {
   // case: that function is the one OutlineIncoreScopes MADE by outlining a scope
   // that held the region. The IR records that provenance directly — the outliner
   // stamps `split_aiv` on every function it mints from a region-bearing scope
-  // (`scope_outline_utils.h`, and LowerAutoVectorSplit re-stamps it) — so the
+  // (`scope_outline_utils.cpp`, and LowerAutoVectorSplit re-stamps it) — so the
   // check is "InCore function carrying a region, but not one the outliner
   // produced".
   //

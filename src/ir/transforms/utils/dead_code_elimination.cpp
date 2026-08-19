@@ -28,7 +28,6 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/utils/loop_state_repair.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
-#include "pypto/ir/transforms/utils/scope_outline_utils.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/transforms/utils/var_collectors.h"
 #include "pypto/ir/type.h"
@@ -114,7 +113,7 @@ void FindLiveRootsRecursiveImpl(const std::vector<StmtPtr>& stmts, const Removab
                                 std::unordered_set<const Var*>& live) {
   auto collect_expr_refs = [&](const ExprPtr& expr) {
     if (!expr) return;
-    outline_utils::VarDefUseCollector collector;
+    var_collectors::VarDefUseCollector collector;
     collector.VisitExpr(expr);
     live.insert(collector.var_uses.begin(), collector.var_uses.end());
   };
@@ -134,7 +133,7 @@ void FindLiveRootsRecursiveImpl(const std::vector<StmtPtr>& stmts, const Removab
                    std::dynamic_pointer_cast<const ReturnStmt>(stmt) ||
                    std::dynamic_pointer_cast<const YieldStmt>(stmt);
     if (is_leaf && !is_removable(stmt)) {
-      outline_utils::VarDefUseCollector collector;
+      var_collectors::VarDefUseCollector collector;
       collector.VisitStmt(stmt);
       auto all_refs = collector.GetAllVarRefs();
       live.insert(all_refs.begin(), all_refs.end());
@@ -373,7 +372,7 @@ std::vector<StmtPtr> EliminateDeadCodeCore(const std::vector<StmtPtr>& stmts,
   std::vector<std::unordered_set<const Var*>> assign_uses;
   assign_uses.reserve(all_assigns.size());
   for (const auto& assign : all_assigns) {
-    outline_utils::VarDefUseCollector collector;
+    var_collectors::VarDefUseCollector collector;
     collector.VisitExpr(assign->value_);
     auto uses = std::move(collector.var_uses);
     // A Var can also be referenced from a TYPE, not just from an expression: a
@@ -644,7 +643,7 @@ std::vector<StmtPtr> EliminateDeadIfReturnVars(const std::vector<StmtPtr>& stmts
     // visitor walks ScopeStmt attrs via VisitScopeAttrs and Submit::deps_
     // through Call/Submit traversal, so all known reference channels are
     // covered without extra plumbing.
-    outline_utils::VarDefUseCollector collector;
+    var_collectors::VarDefUseCollector collector;
     for (const auto& s : cur) collector.VisitStmt(s);
 
     bool changed = false;

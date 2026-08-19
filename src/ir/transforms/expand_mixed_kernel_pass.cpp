@@ -48,11 +48,11 @@
 #include "pypto/ir/transforms/utils/cross_core_pipe.h"
 #include "pypto/ir/transforms/utils/dead_code_elimination.h"
 #include "pypto/ir/transforms/utils/deep_clone_utils.h"
+#include "pypto/ir/transforms/utils/deferred_wait_contract.h"
 #include "pypto/ir/transforms/utils/loop_state_repair.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/op_predicates.h"
 #include "pypto/ir/transforms/utils/return_lineage_utils.h"
-#include "pypto/ir/transforms/utils/scope_outline_utils.h"
 #include "pypto/ir/transforms/utils/split_axis_utils.h"
 #include "pypto/ir/transforms/utils/tpop_tfree_finalizer.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
@@ -1320,7 +1320,7 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
   // references to the fresh parameter corresponding to the store's output tensor.
   {
     // Collect all vars defined in the AIV body
-    outline_utils::VarDefUseCollector aiv_def_collector;
+    var_collectors::VarDefUseCollector aiv_def_collector;
     auto aiv_body_stmt = MakeBody(aiv_final, func->span_);
     aiv_def_collector.VisitStmt(aiv_body_stmt);
 
