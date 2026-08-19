@@ -152,6 +152,19 @@ CHECK_SPAN(shape.size() == 2, span) << "tensor.matmul: only 2D inputs are suppor
 - **务必为 `CHECK` 提供 `<<` 消息。** 尾部被剥离后,裸写的 `CHECK(cond);` 将无话可说,用户只会看到"后端检查未提供消息"这样的通用占位文本,而非可据以修正的错误。
 - **不要为了绕开尾部而手写 `throw pypto::ValueError(...)`。** 该变通做法早于解析器侧的剥离机制,对 DSL 可达的检查已无必要。
 
+#### `CHECK_SPAN` 的位置信息同样会被剥离,但仅限箭头可以取而代之的场合
+
+`FatalLogger` 把 `*_SPAN` 系列宏的 `[<文件>:<行号>:<列号>]` 位置写在那个换行符**之前**,因此它属于 payload 的一部分,能在尾部剥离后存活下来 —— 于是加粗标题中间出现一条绝对路径。更糟的是,它未必与下方的 `-->` 箭头一致:检查的 span 是传给它的那个 IR 节点(往往是某个**操作数的定义处**),而箭头指向的是调用点。
+
+`concise_error_message(exc, strip_trailing_span=True)` 会把它去掉。该参数是可选开关,因为只有当调用方有更合适的位置展示来源时,移除它才是安全的:
+
+| 调用点 | `strip_trailing_span` | 原因 |
+| ------ | --------------------- | ---- |
+| `_dispatch_op` / `_dispatch_ir_builder_op`(`ast_parser.py`) | `True` | 抛出时带 `span=` —— 渲染器的箭头与代码片段已能定位失败的调用 |
+| 解析函数的包装层(`decorator.py`) | `False`(默认) | 抛出时不带 `span=`,内联位置是用户唯一能拿到的来源 |
+
+剥离动作以"`Check failed:` 尾部确实被移除"为前提。只有 `FatalLogger` 会写出内联位置,且它总是同时写出尾部 —— 因此一条恰好以方括号包裹的冒号分隔整数结尾的纯 Python 消息(例如扩展切片)绝不会被误伤。
+
 ### 内部不变式检查 — `INTERNAL_CHECK_SPAN`
 
 当违反内部不变式时抛出 `InternalError`。始终附加 IR 节点的 `Span`，使错误消息包含用户源代码位置：

@@ -426,6 +426,50 @@ class TestConciseErrorMessage:
         assert "Check failed" not in result
         assert "f.cpp" not in result
 
+    def test_trailing_span_is_kept_by_default(self):
+        """``strip_trailing_span`` is opt-in: callers that raise without a ``span=`` keep it.
+
+        ``decorator.py``'s parse-function wrappers are those callers -- the inline location
+        is the only one their ``ParserError`` can offer the user.
+        """
+        msg = "The operator tile.row_max requires a 2D operand [kernel.py:9:3]\nCheck failed: x at f.cpp:1"
+        assert concise_error_message(ValueError(msg)).endswith("[kernel.py:9:3]")
+
+    def test_strip_trailing_span_removes_the_inline_location(self):
+        """Opted in, the ``CHECK_SPAN`` location leaves the header; the payload stays whole."""
+        msg = (
+            "The operator tile.row_max requires a 2D operand [/abs/path/kernel.py:9:3]"
+            "\nCheck failed: x at /abs/path/src/ir/op/tile_ops/reduction.cpp:88"
+        )
+        result = concise_error_message(ValueError(msg), strip_trailing_span=True)
+        assert result == "The operator tile.row_max requires a 2D operand"
+
+    def test_strip_trailing_span_accepts_the_negative_column_sentinel(self):
+        """``Span`` renders an unknown column as ``-1``; that form must strip too."""
+        msg = "Bad operand [/abs/path/kernel.py:9:-1]\nCheck failed: x at f.cpp:1"
+        result = concise_error_message(ValueError(msg), strip_trailing_span=True)
+        assert result == "Bad operand"
+
+    def test_strip_trailing_span_leaves_a_plain_python_message_alone(self):
+        """No ``Check failed:`` tail means no ``FatalLogger`` span -- so nothing to strip.
+
+        Guards the one way this could corrupt a message: a pure-Python error whose text
+        happens to end in bracketed colon-separated integers (an extended slice, say).
+        """
+        exc = ValueError("step must divide the extent, got a[0:64:3]")
+        assert (
+            concise_error_message(exc, strip_trailing_span=True)
+            == "step must divide the extent, got a[0:64:3]"
+        )
+
+    def test_strip_trailing_span_on_message_less_check_reports_the_fallback(self):
+        """A payload that is *only* a span strips to empty -- which must not render bare."""
+        msg = " [/abs/path/kernel.py:9:3]\nCheck failed: tmp_type at f.cpp:88"
+        result = concise_error_message(ValueError(msg), strip_trailing_span=True)
+        assert result
+        assert "kernel.py" not in result
+        assert "PTO_BACKTRACE=1" in result
+
     def test_empty_message(self):
         """Test with empty exception message."""
         exc = ValueError("")

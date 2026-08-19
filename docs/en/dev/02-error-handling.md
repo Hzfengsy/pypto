@@ -160,6 +160,19 @@ Two consequences for op authors:
 - **Always give `CHECK` a `<<` message.** Once the tail is stripped, a bare `CHECK(cond);` has nothing left to say, and the user gets a generic "backend check reported no message" placeholder instead of an actionable error.
 - **Do not hand-roll `throw pypto::ValueError(...)` to dodge the tail.** That workaround predates the parser-side strip and is no longer needed for DSL-reachable checks.
 
+#### A `CHECK_SPAN` location is stripped too, but only where the arrow replaces it
+
+`FatalLogger` writes the `*_SPAN` macros' `[<file>:<line>:<column>]` location *before* that newline, so it is part of the payload and survives the tail strip — an absolute path in the middle of the bold header. Worse, it need not agree with the `-->` arrow underneath: the check's span is whatever IR node it was handed, often an *operand's definition*, while the arrow is the call site.
+
+`concise_error_message(exc, strip_trailing_span=True)` drops it. The parameter is opt-in because removing the location is only safe when the caller has a better place to show one:
+
+| Call site | `strip_trailing_span` | Why |
+| --------- | --------------------- | --- |
+| `_dispatch_op` / `_dispatch_ir_builder_op` (`ast_parser.py`) | `True` | Raises with `span=` — the renderer's arrow and code snippet locate the failing call |
+| Parse-function wrappers (`decorator.py`) | `False` (default) | Raises with no `span=`, so the inline location is the only one the user would get |
+
+The strip is gated on the `Check failed:` tail actually having been removed. Only `FatalLogger` emits the inline location, and it always emits the tail alongside — so a pure-Python message that happens to end in bracketed colon-separated integers (an extended slice, say) is never touched.
+
 ### Internal invariant checks — `INTERNAL_CHECK_SPAN`
 
 Throw `InternalError` when an internal invariant is violated. Always attach the IR node's `Span` so the error message includes the user's source location:

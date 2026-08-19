@@ -166,6 +166,67 @@ class TestBackendCheckMessageSanitized:
         assert lines[1].lstrip().startswith("-->")
 
 
+class TestCheckSpanLocationStrippedFromHeader:
+    """A ``CHECK_SPAN`` must not print its location inline in the bold ``Error:`` header.
+
+    ``FatalLogger::~FatalLogger`` (``include/pypto/core/logging.h``) appends
+    ``[<file>:<line>:<column>]`` *before* the newline that starts the ``Check failed:``
+    tail, so the span's **absolute** path survives that tail's strip and lands in the
+    header. The ``-->`` arrow below it already names a location -- and a different one,
+    since the check's span is whatever IR node it was handed (here the ``tmp`` operand's
+    definition) while the arrow is the call site.
+    """
+
+    @staticmethod
+    def _mismatched_row_max():
+        """Build a kernel whose only fault is an FP16 scratch tile for an FP32 reduction.
+
+        Drives the CHECK_SPAN in src/ir/op/tile_ops/reduction.cpp, which passes
+        ``args[1]->span_`` -- the ``tmp`` definition, one line above the failing call.
+        """
+
+        @pl.function
+        def bad(t: pl.Tensor[[64, 64], pl.FP32]) -> pl.Tile[[64, 1], pl.FP32]:
+            a: pl.Tile[[64, 64], pl.FP32] = pl.tile.load(t, offsets=[0, 0], shapes=[64, 64])
+            tmp: pl.Tile[[64, 64], pl.FP16] = pl.tile.create([64, 64], pl.FP16)
+            m: pl.Tile[[64, 1], pl.FP32] = pl.tile.row_max(a, tmp)
+            return m
+
+        return bad
+
+    def test_header_carries_no_inline_source_location(self):
+        """The op's message survives; the bracketed path it ended with does not."""
+        with pytest.raises(InvalidOperationError) as exc_info:
+            self._mismatched_row_max()
+
+        message = exc_info.value.message
+        assert "test_error_wrapping.py" not in message
+        assert not message.rstrip().endswith("]")
+        # Positive half: an over-eager strip that eats the payload fails here.
+        assert "tmp_tile dtype fp16 and input dtype fp32" in message
+
+    def test_rendered_diagnostic_still_locates_the_failing_call(self):
+        """Dropping the inline span costs no location -- the arrow and snippet remain."""
+        with pytest.raises(InvalidOperationError) as exc_info:
+            self._mismatched_row_max()
+
+        lines = ErrorRenderer(use_color=False).render(exc_info.value).split("\n")
+        assert lines[0].startswith("Error:")
+        assert "test_error_wrapping.py" not in lines[0]
+        assert lines[1].lstrip().startswith("--> ")
+        assert "test_error_wrapping.py" in lines[1]
+        assert any("pl.tile.row_max(a, tmp)" in line for line in lines)
+
+    def test_span_detail_survives_on_the_cause(self):
+        """The location is hidden from the header, not destroyed."""
+        with pytest.raises(InvalidOperationError) as exc_info:
+            self._mismatched_row_max()
+
+        cause = exc_info.value.__cause__
+        assert isinstance(cause, ValueError)
+        assert "test_error_wrapping.py" in str(cause)
+
+
 class TestProgramCatchAll:
     """Tests that @pl.program wraps unexpected exceptions like @pl.function does."""
 

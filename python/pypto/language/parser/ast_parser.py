@@ -8263,14 +8263,23 @@ class ASTParser:
             # which the renderer would splice into the bold ``Error:`` header ahead of the
             # ``-->`` source arrow. It stays reachable through ``__cause__`` under
             # PTO_BACKTRACE=1. A pure-Python ValueError has no tail, so this is a no-op.
-            msg = concise_error_message(e)
+            # ``strip_trailing_span`` additionally drops the ``[<file>:<line>:<col>]`` a
+            # ``CHECK_SPAN`` leaves in the payload: we raise with ``span=`` below, so the
+            # arrow and snippet locate the call anyway, and the inline copy is an absolute
+            # path in the middle of the header (often naming an operand's *definition*,
+            # not the call, which reads as a contradiction against the arrow).
+            msg = concise_error_message(e, strip_trailing_span=True)
             if not msg.startswith(f"pl.{op_name}") and not msg.startswith(f"{module_name}.{op_name}"):
                 msg = f"{module_name} operation '{op_name}': {msg}"
             hint = self._scalar_operand_hint(args, kwargs)
             raise InvalidOperationError(msg, span=span, hint=hint) from e
         except Exception as e:
+            # ``span=`` below gives the renderer its ``-->`` arrow, so strip the inline
+            # ``[<file>:<line>:<col>]`` a ``CHECK_SPAN`` leaves in the payload rather than
+            # printing an absolute path inside the bold ``Error:`` header.
             raise InvalidOperationError(
-                f"Error in {module_name} operation '{op_name}': {concise_error_message(e)}",
+                f"Error in {module_name} operation '{op_name}': "
+                f"{concise_error_message(e, strip_trailing_span=True)}",
                 span=span,
             ) from e
 
@@ -8420,8 +8429,12 @@ class ASTParser:
             # Compiler bug, not a bad kernel - surface it with its type and trace intact.
             raise
         except Exception as e:
+            # ``span=`` below gives the renderer its ``-->`` arrow, so strip the inline
+            # ``[<file>:<line>:<col>]`` a ``CHECK_SPAN`` leaves in the payload rather than
+            # printing an absolute path inside the bold ``Error:`` header.
             raise InvalidOperationError(
-                f"Error in {module_name} operation '{op_name}': {concise_error_message(e)}",
+                f"Error in {module_name} operation '{op_name}': "
+                f"{concise_error_message(e, strip_trailing_span=True)}",
                 span=span,
             ) from e
 

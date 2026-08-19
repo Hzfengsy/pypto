@@ -9,6 +9,7 @@
 
 """Parser error exceptions with rich diagnostic information."""
 
+import re
 from typing import Final
 
 from pypto.pypto_core import InternalError, ir
@@ -152,8 +153,16 @@ _UNSPECIFIED_CHECK_MESSAGE = (
     "(re-run with PTO_BACKTRACE=1 to see which check failed)"
 )
 
+# The ``[<file>:<line>:<column>]`` suffix ``FatalLogger::~FatalLogger``
+# (``include/pypto/core/logging.h``) appends for the ``*_SPAN`` check macros, written
+# *before* the newline that starts the ``Check failed:`` tail and therefore surviving the
+# tail strip below. ``Span::is_valid()`` guarantees a positive line; the column is either
+# positive or the ``-1`` sentinel. ``[^\[\]]*`` keeps the filename from eating an earlier
+# bracket, and the anchor keeps the match to the very end of the payload.
+_TRAILING_SPAN_RE: Final = re.compile(r"\s*\[[^\[\]]*:\d+:-?\d+\]\Z")
 
-def concise_error_message(exc: Exception) -> str:
+
+def concise_error_message(exc: Exception, strip_trailing_span: bool = False) -> str:
     """Extract a concise user-facing message from an exception.
 
     Strips C++ internal details (stack traces and CHECK macro output) that are
@@ -166,6 +175,20 @@ def concise_error_message(exc: Exception) -> str:
     empty string, because an empty bold ``Error:`` header is strictly worse than the
     C++ noise it replaced. An exception that was simply raised with an empty message
     keeps its empty message -- only a stripped check tail earns the fallback.
+
+    Args:
+        exc: Exception to extract the user-facing message from.
+        strip_trailing_span: Also drop the ``[<file>:<line>:<column>]`` location that a
+            ``CHECK_SPAN`` / ``INTERNAL_CHECK_SPAN`` leaves at the end of the payload.
+            Opt-in, because the caller must have a better place to show the location:
+            pass it only when the resulting :class:`ParserError` carries a ``span=`` of
+            its own, so the renderer's ``-->`` arrow and code snippet still point the
+            user at a source line. Callers that raise without a span (the parse-function
+            wrappers in ``decorator.py``) must leave it off -- the inline location is the
+            only one the user would get.
+
+    Returns:
+        The user-facing message, free of C++ traceback and ``Check failed:`` noise.
     """
     msg = str(exc)
     # Strip "C++ Traceback ..." block appended by GetFullMessage()
@@ -190,6 +213,11 @@ def concise_error_message(exc: Exception) -> str:
         if pos != -1:
             msg = msg[:pos]
             stripped_check_tail = True
+    # Gated on the tail: only FatalLogger writes the inline span, and it always writes the
+    # tail alongside it. A pure-Python message that happens to end in bracketed
+    # colon-separated integers (a slice, say) is therefore never touched.
+    if strip_trailing_span and stripped_check_tail:
+        msg = _TRAILING_SPAN_RE.sub("", msg)
     msg = msg.strip()
     # Gate on the tail actually having been removed, not on "something was there before":
     # `GetFullMessage()` always appends a traceback (or the "no stack trace" note), so a
