@@ -59,10 +59,11 @@ def test_device_kernel_rejects_descending_loop():
     dropping the entire loop body with no diagnostic from any stage. The kernel
     loaded its input, computed nothing, and stored.
 
-    Tracked upstream as ptoas issue hw-native-sys/PTOAS#1288. If ptoas gains
-    descending-loop support this test (and the check it covers) should be
-    replaced by one asserting the loop lowers correctly; if ptoas merely starts
-    rejecting the step, this stays as the earlier, better-located diagnostic.
+    The PTOAS team has confirmed they will not support a non-positive
+    ``scf.for`` step in the foreseeable future — hw-native-sys/PTOAS#1288 will
+    be closed by adding the missing assertion only. So this rejection is
+    permanent, and the test stays: even once that assertion ships, the PyPTO
+    check fires earlier and names the user's loop instead of generated ``.pto``.
     """
     n = 64
 

@@ -539,23 +539,24 @@ void PTOCodegen::VisitStmt_(const ForStmtPtr& op) {
   // the assembler folds away, silently discarding the loop body. Surface it as
   // a user-facing limitation instead of miscompiling.
   //
-  // Tracking: ptoas issue hw-native-sys/PTOAS#1288 — ptoas does not enforce
-  // ``scf.for``'s "constant step operand must be positive" verifier invariant
-  // (a negative step drops the body, a zero step emits ``i += 0``). How that
-  // issue is resolved decides this check's fate:
+  // This check is permanent, not a workaround pending an assembler fix. The
+  // PTOAS team has confirmed they will not support a non-positive ``scf.for``
+  // step in the foreseeable future; hw-native-sys/PTOAS#1288 will be closed by
+  // adding the missing assertion only (today ptoas silently accepts such a
+  // step — a negative one drops the body, a zero one emits ``i += 0``). So a
+  // descending device loop stays unrepresentable, and this check is the only
+  // thing standing between the user and a silently empty kernel.
   //
-  //   * ptoas gains descending-loop support (normalizing lb -> ub with a
-  //     derived induction variable) — delete this check, the lowering above
-  //     becomes correct as-is.
-  //   * ptoas only adds the verifier rejection — KEEP this check. It still
-  //     earns its place by failing earlier, naming the user's loop via the
-  //     ``Span``, and telling them how to rewrite it, rather than surfacing an
-  //     assembler error against generated ``.pto`` the user never wrote.
+  // Keep it even once that assertion ships: it fires earlier, names the user's
+  // loop through the ``Span``, and says how to rewrite it, whereas the
+  // assembler can only report against generated ``.pto`` the user never wrote.
   //
   // Only a compile-time step is checked. A runtime step that turns out negative
   // still lowers to the same ill-defined ``scf.for``; proving its sign needs the
-  // arith analyzer and is left for the normalizing rewrite that would lift this
-  // restriction altogether. Orchestration functions emit C++ directly and are
+  // arith analyzer. Closing that gap would mean normalizing descending loops to
+  // ascending form here (deriving the induction variable from an ascending
+  // counter), which is the only route to supporting them at all now that the
+  // assembler will not. Orchestration functions emit C++ directly and are
   // unaffected — they support descending loops natively.
   if (auto const_step = ir::transform_utils::EvalConstInt(op->step_)) {
     CHECK_SPAN(*const_step > 0, op->span_)
