@@ -13,11 +13,11 @@
 #define PYPTO_IR_TRANSFORMS_UTILS_DEFERRED_WAIT_CONTRACT_H_
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <utility>
 
-#include "pypto/core/error.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"

@@ -20,6 +20,7 @@
 #include <utility>
 #include <vector>
 
+#include "pypto/core/error.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/program.h"
@@ -28,7 +29,6 @@
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/type.h"
-#include "pypto/ir/verifier/verifier.h"
 
 namespace pypto {
 namespace ir {
