@@ -33,6 +33,8 @@ __all__ = [
     "minimum",
     "exp",
     "log",
+    "sin",
+    "cos",
     "neg",
     "abs",
     "recip",
@@ -93,12 +95,17 @@ __all__ = [
     "set_validshape",
     "read",
     "write",
+    "assemble",
+    "gather_row",
+    "scatter_update",
+    "sort32",
+    "mrgsort",
 ]
 
 from pypto.ir.utils import _elem_dtype, _get_span_or_capture, resolve_cast_mode
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir_core
-from pypto.pypto_core.ir import PadValue
+from pypto.pypto_core.ir import AtomicType, PadValue
 
 from ..typing import BoolLike, IntLike, Scalar, Tensor, Tile
 from . import tensor_ops as _tensor
@@ -546,6 +553,24 @@ def log(input: T, high_precision: bool = False) -> T:
     if isinstance(input, Tile):
         return _tile.log(input, high_precision=high_precision)
     raise TypeError(f"pl.log: expected Tensor or Tile, got {type(input).__name__}")
+
+
+def sin(input: T) -> T:
+    """Element-wise sine (input in radians), dispatched by input type. FP32 only."""
+    if isinstance(input, Tensor):
+        return _tensor.sin(input)
+    if isinstance(input, Tile):
+        return _tile.sin(input)
+    raise TypeError(f"pl.sin: expected Tensor or Tile, got {type(input).__name__}")
+
+
+def cos(input: T) -> T:
+    """Element-wise cosine (input in radians), dispatched by input type. FP32 only."""
+    if isinstance(input, Tensor):
+        return _tensor.cos(input)
+    if isinstance(input, Tile):
+        return _tile.cos(input)
+    raise TypeError(f"pl.cos: expected Tensor or Tile, got {type(input).__name__}")
 
 
 def neg(input: T) -> T:
@@ -1571,3 +1596,119 @@ def write(
     if isinstance(dst, Tile):
         return _tile.write(dst, offset, value)
     raise TypeError(f"pl.write: expected Tensor or Tile, got {type(dst).__name__}")
+
+
+# ---------------------------------------------------------------------------
+# Sub-region write / gather / scatter / sort with type dispatch
+# ---------------------------------------------------------------------------
+
+# Remedy for the Tensor-only ``atomic`` combine mode on ``assemble``.
+_TILE_ATOMIC_REMEDY = (
+    "An atomic combine needs a global-memory destination, and a tile-to-tile assemble has "
+    "none. Write the accumulation into a Tensor target instead — inside an InCore function "
+    "that is pl.assemble(out_tensor, tile, offset, atomic=...)."
+)
+
+
+@overload
+def assemble(
+    target: Tensor, source: Tensor, offset: Sequence[IntLike], *, atomic: AtomicType = ...
+) -> Tensor: ...
+@overload
+def assemble(
+    target: Tile, source: Tile, offset: Sequence[IntLike], *, atomic: Literal[AtomicType.None_] = ...
+) -> Tile: ...
+def assemble(target, source, offset, *, atomic: AtomicType = AtomicType.None_):
+    """Write ``source`` into ``target`` at ``offset``, dispatched by target type.
+
+    ``atomic`` is Tensor-only: the combine lowers to an atomic-add store into
+    global memory, which a tile-to-tile assemble has no destination for. Passing
+    the documented default keeps working on both paths; any other value with a
+    Tile target raises.
+    """
+    if isinstance(target, Tensor) and isinstance(source, Tensor):
+        return _tensor.assemble(target, source, offset, atomic=atomic)
+    if isinstance(target, Tile) and isinstance(source, Tile):
+        _reject_tile_unsupported("assemble", atomic=(atomic != AtomicType.None_, _TILE_ATOMIC_REMEDY))
+        return _tile.assemble(target, source, offset)
+    _raise_type_dispatch_error("assemble", target, source)
+
+
+def gather_row(  # noqa: PLR0913
+    dst: T,
+    src: Tensor,
+    dst_offset: Sequence[IntLike],
+    src_offset: Sequence[IntLike],
+    shapes: Sequence[IntLike],
+    transpose: bool = False,
+    *,
+    valid_shape: Sequence[IntLike] | None = None,
+) -> T:
+    """Gather one GM row into a sub-region of an on-chip accumulator (DPS).
+
+    Dispatched on ``dst`` — the destination accumulator. ``src`` is a ``Tensor``
+    on both paths: this op always reads from global memory, so it is the
+    destination, not the source, that names the level.
+    """
+    args = (src, dst_offset, src_offset, shapes, transpose)
+    if isinstance(dst, Tensor):
+        return _tensor.gather_row(dst, *args, valid_shape=valid_shape)
+    if isinstance(dst, Tile):
+        return _tile.gather_row(dst, *args, valid_shape=valid_shape)
+    raise TypeError(f"pl.gather_row: expected Tensor or Tile destination, got {type(dst).__name__}")
+
+
+def scatter_update(input: T, *args: Any, **kwargs: Any) -> T:
+    """Update rows at positions given by a 2D index, dispatched by input type.
+
+    Accepts the same flexible call shapes as either level's wrapper — the
+    positional/keyword forms are identical on both, so the arguments are
+    forwarded unchanged.
+    """
+    if isinstance(input, Tensor):
+        return _tensor.scatter_update(input, *args, **kwargs)
+    if isinstance(input, Tile):
+        return _tile.scatter_update(input, *args, **kwargs)
+    raise TypeError(f"pl.scatter_update: expected Tensor or Tile, got {type(input).__name__}")
+
+
+def sort32(src: T, idx: T) -> T:
+    """Sort fixed 32-element blocks, permuting ``idx`` alongside ``src``.
+
+    Dispatched by input type. Returns sorted value-index pairs with a doubled
+    last dimension.
+    """
+    if isinstance(src, Tensor) and isinstance(idx, Tensor):
+        return _tensor.sort32(src, idx)
+    if isinstance(src, Tile) and isinstance(idx, Tile):
+        return _tile.sort32(src, idx)
+    _raise_type_dispatch_error("sort32", src, idx)
+
+
+def mrgsort(  # noqa: PLR0913
+    src0: T,
+    src1: T | None = None,
+    src2: T | None = None,
+    src3: T | None = None,
+    tmp: T | None = None,
+    *,
+    exhausted: bool = False,
+    block_len: int | Scalar | None = None,
+) -> T:
+    """Merge sort — format1 (single-list) or format2 (2-4 way), dispatched by input type.
+
+    ``tmp`` is Tile-only: at tensor level the scratch buffer is synthesized
+    during Tensor-to-Tile lowering, so passing one is rejected rather than
+    silently dropped. The tile path's format2 requires it, and ``pl.tile.mrgsort``
+    raises with the per-format guidance when it is missing.
+
+    ``exhausted`` is keyword-only here. The tile wrapper also accepts it as a
+    sixth positional argument; that spelling stays available as
+    ``pl.tile.mrgsort(...)``.
+    """
+    if isinstance(src0, Tensor):
+        _reject_tmp_for_tensor("mrgsort", tmp)
+        return _tensor.mrgsort(src0, src1, src2, src3, exhausted=exhausted, block_len=block_len)
+    if isinstance(src0, Tile):
+        return _tile.mrgsort(src0, src1, src2, src3, tmp, exhausted, block_len=block_len)
+    raise TypeError(f"pl.mrgsort: expected Tensor or Tile, got {type(src0).__name__}")

@@ -41,30 +41,28 @@ from .system_ops import (
     tpush_to_aic,
     tpush_to_aiv,
 )
+from .tensor_ops import ci as arange
+from .tensor_ops import create as create_tensor
 
-# Promoted tensor-only ops (accessible as pl.create_tensor, etc.)
+# Promoted tensor-only ops (accessible as pl.create_tensor, etc.). Names that
+# also exist at tile level are re-exported below from ``unified_ops`` instead so
+# the Tensor/Tile dispatch wins — keep this block to names the tile layer does
+# not define, or whose tile twin takes a signature no dispatcher can reconcile
+# (``gather`` / ``scatter``), or that carry no operand to dispatch on at all
+# (``full``, ``random``, and the block-identity queries).
 from .tensor_ops import (
-    assemble,
-    cos,
     create_l1,
     dim,
     expand_clone,
     full,
     gather,
-    gather_row,
     get_block_idx,
     get_block_num,
     get_subblock_idx,
-    mrgsort,
     paged_gather,
     random,
     scatter,
-    scatter_update,
-    sin,
-    sort32,
 )
-from .tensor_ops import ci as arange
-from .tensor_ops import create as create_tensor
 
 # Promoted tile-only ops (accessible as pl.load, etc.). ``abs`` and the
 # bitwise family are re-exported below from ``unified_ops`` instead so the
@@ -116,6 +114,7 @@ from .unified_ops import (
     add,
     and_,
     ands,
+    assemble,
     batch_matmul,
     cast,
     cmp,
@@ -134,6 +133,7 @@ from .unified_ops import (
     col_prod,
     col_sum,
     concat,
+    cos,
     div,
     exp,
     expands,
@@ -141,11 +141,13 @@ from .unified_ops import (
     fillpad_expand,
     fmod,
     fmods,
+    gather_row,
     log,
     matmul,
     matmul_acc,
     maximum,
     minimum,
+    mrgsort,
     mul,
     neg,
     not_,
@@ -174,12 +176,15 @@ from .unified_ops import (
     row_prod,
     row_sum,
     rsqrt,
+    scatter_update,
     set_validshape,
     shl,
     shls,
     shr,
     shrs,
+    sin,
     slice,
+    sort32,
     sqrt,
     sub,
     transpose,
@@ -301,27 +306,28 @@ __all__ = [
     "sel",
     "sels",
     "tri",
+    # Unified dispatch (also defined at tile level)
+    "assemble",
+    "cos",
+    "gather_row",
+    "mrgsort",
+    "scatter_update",
+    "sin",
+    "sort32",
     # Promoted tensor-only
     "arange",
     "create_tensor",
-    "assemble",
-    "cos",
     "dim",
     "expand_clone",
     "full",
     "scatter",
-    "scatter_update",
-    "sin",
     "gather",
     "paged_gather",
     "random",
     "create_l1",
-    "gather_row",
     "get_block_idx",
     "get_block_num",
     "get_subblock_idx",
-    "mrgsort",
-    "sort32",
     # Promoted system ops
     "aic_initialize_pipe",
     "aiv_initialize_pipe",

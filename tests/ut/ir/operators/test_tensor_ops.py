@@ -4646,13 +4646,75 @@ class TestTensorCiOp:
     def test_top_level_arange_is_tensor_ci(self):
         assert pl.arange is pl.tensor.ci
 
-    def test_top_level_sort32_is_tensor_sort32(self):
-        assert pl.sort32 is pl.tensor.sort32
+    def test_top_level_sort32_dispatches_on_operand_level(self):
+        """``pl.sort32`` dispatches; it is not ``pl.tensor.sort32`` under a shorter name."""
+        assert pl.sort32 is not pl.tensor.sort32
 
-    def test_top_level_mrgsort_is_tensor_mrgsort(self):
-        assert pl.mrgsort is pl.tensor.mrgsort
+        @pl.program
+        class TensorProgram:
+            @pl.function
+            def main(
+                self,
+                src: pl.Tensor[[8, 32], pl.FP32],
+                idx: pl.Tensor[[8, 32], pl.UINT32],
+            ) -> pl.Tensor[[8, 64], pl.FP32]:
+                return pl.sort32(src, idx)
+
+        @pl.program
+        class TileProgram:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                src: pl.Tensor[[8, 32], pl.FP32],
+                idx: pl.Tensor[[8, 32], pl.UINT32],
+                output: pl.Tensor[[8, 64], pl.FP32],
+            ) -> pl.Tensor[[8, 64], pl.FP32]:
+                src_tile: pl.Tile[[8, 32], pl.FP32] = pl.load(src, [0, 0], [8, 32])
+                idx_tile: pl.Tile[[8, 32], pl.UINT32] = pl.load(idx, [0, 0], [8, 32])
+                out_tile: pl.Tile[[8, 64], pl.FP32] = pl.sort32(src_tile, idx_tile)
+                return pl.store(out_tile, [0, 0], output)
+
+        assert "tensor.sort32" in str(TensorProgram)
+        assert "tile.sort32" in str(TileProgram)
+
+    def test_top_level_mrgsort_dispatches_on_operand_level(self):
+        """``pl.mrgsort`` dispatches; it is not ``pl.tensor.mrgsort`` under a shorter name."""
+        assert pl.mrgsort is not pl.tensor.mrgsort
+
+        @pl.program
+        class TensorProgram:
+            @pl.function
+            def main(self, src: pl.Tensor[[1, 128], pl.FP32]) -> pl.Tensor[[1, 128], pl.FP32]:
+                return pl.mrgsort(src, block_len=64)
+
+        @pl.program
+        class TileProgram:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                src: pl.Tensor[[1, 128], pl.FP32],
+                output: pl.Tensor[[1, 128], pl.FP32],
+            ) -> pl.Tensor[[1, 128], pl.FP32]:
+                src_tile: pl.Tile[[1, 128], pl.FP32] = pl.load(src, [0, 0], [1, 128])
+                out_tile: pl.Tile[[1, 128], pl.FP32] = pl.mrgsort(src_tile, block_len=64)
+                return pl.store(out_tile, [0, 0], output)
+
+        assert "tensor.mrgsort" in str(TensorProgram)
+        assert "tile.mrgsort" in str(TileProgram)
+
+    def test_top_level_mrgsort_rejects_tmp_on_tensor_path(self):
+        """The Tile-only scratch operand raises rather than being silently dropped."""
+        span = ir.Span.unknown()
+        shape = [ir.ConstInt(1, DataType.INT32, span), ir.ConstInt(128, DataType.INT32, span)]
+        src0 = pl.Tensor(expr=ir.Var("src0", ir.TensorType(shape, DataType.FP32), span))
+        src1 = pl.Tensor(expr=ir.Var("src1", ir.TensorType(shape, DataType.FP32), span))
+        tmp = pl.Tensor(expr=ir.Var("tmp", ir.TensorType(shape, DataType.FP32), span))
+
+        with pytest.raises(TypeError, match="must not pass tmp"):
+            pl.mrgsort(src0, src1, tmp=tmp)
 
     def test_top_level_gather_is_tensor_gather(self):
+        """``gather``'s tile and tensor signatures diverge, so it stays tensor-bound."""
         assert pl.gather is pl.tensor.gather
 
 
