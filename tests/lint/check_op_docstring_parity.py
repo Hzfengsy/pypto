@@ -48,8 +48,12 @@ Scope and deliberate limits:
 
 * Only module-level functions defined in *both* layers of the same namespace are paired. A helper
   that exists on one side only, or a name re-exported from elsewhere, is not this check's business.
-* A pair where either docstring is missing entirely is skipped -- "every public op has a docstring"
-  is a different check, and ``ruff``'s pydocstyle rules already cover part of it.
+* A DSL wrapper with *no* docstring at all is reported, not skipped: it is the extreme of the same
+  defect, since the published page then renders an empty description. Nothing else catches it --
+  ``[tool.ruff.lint] select`` is ``PL, I, E, W, F, UP``, so pydocstyle (``D``) is not enabled. No op
+  is in that state today; the check is here so the first one cannot land quietly.
+* A pair whose *IR* docstring is missing is skipped -- there is then nothing to carry across, and
+  "every internal wrapper is documented" is a different check.
 * Overloads (``@typing.overload`` stubs) are ignored; only the implementation carries the docstring.
 """
 
@@ -75,11 +79,19 @@ SECTION_RE = re.compile(
 SIGNATURE_SECTIONS = frozenset({"Args", "Arguments", "Returns", "Yields"})
 
 # Pairs where the IR body is genuinely carried by the DSL docstring, just not as a body paragraph.
-# Each entry is "<namespace>.<op>: <why>". Add to this only when the DSL copy really does state the
-# same fact somewhere else -- not to silence an op whose explanation was dropped.
+# Each entry maps "<namespace>.<op>" to (why, marker): `marker` is a substring the DSL docstring must
+# still contain for the exemption to hold, so removing the explanation the exemption was granted for
+# re-arms the check instead of passing silently. Add an entry only when the DSL copy really does
+# state the same fact somewhere else -- not to silence an op whose explanation was dropped.
 ALLOWLIST = {
-    "system.import_peer_buffer": "IR body states the INT32 result type; the DSL copy states it in Returns:.",
-    "system.reserve_buffer": "IR body states the INT32 result type; the DSL copy states it in Returns:.",
+    "system.import_peer_buffer": (
+        "IR body states the INT32 result type; the DSL copy states it in Returns:.",
+        "``pl.Scalar[pl.INT32]``",
+    ),
+    "system.reserve_buffer": (
+        "IR body states the INT32 result type; the DSL copy states it in Returns:.",
+        "``pl.Scalar[pl.INT32]``",
+    ),
 }
 
 
@@ -172,10 +184,10 @@ def body_is_parameter_notes(ir_doc: str, ir_node: FunctionNode, dsl_doc: str) ->
     return True
 
 
-def documented_functions(path: Path) -> dict[str, tuple[FunctionNode, str]]:
-    """Map public module-level function name -> (node, docstring), skipping overload stubs."""
+def public_functions(path: Path) -> dict[str, tuple[FunctionNode, str | None]]:
+    """Map public module-level function name -> (node, docstring or None), skipping overload stubs."""
     tree = ast.parse(path.read_text(encoding="utf-8"))
-    out: dict[str, tuple[FunctionNode, str]] = {}
+    out: dict[str, tuple[FunctionNode, str | None]] = {}
     for node in tree.body:
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
@@ -187,33 +199,57 @@ def documented_functions(path: Path) -> dict[str, tuple[FunctionNode, str]]:
             for d in node.decorator_list
         ):
             continue
-        doc = ast.get_docstring(node, clean=True)
-        if doc:
-            out[node.name] = (node, doc)
+        out[node.name] = (node, ast.get_docstring(node, clean=True))
     return out
 
 
-def find_violations(root_dir: Path) -> list[tuple[str, str, int, str]]:
-    """Return (namespace, op, dsl lineno, dsl relative path) for each dropped explanation."""
+def find_violations(root_dir: Path) -> list[tuple[str, str, int, str, str]]:
+    """Return (namespace, op, dsl lineno, dsl relative path, what went wrong) per violation."""
     violations = []
     for namespace in NAMESPACES:
         ir_path = root_dir / "python" / "pypto" / "ir" / "op" / f"{namespace}_ops.py"
         dsl_path = root_dir / "python" / "pypto" / "language" / "op" / f"{namespace}_ops.py"
         if not (ir_path.is_file() and dsl_path.is_file()):
             continue
-        ir_funcs = documented_functions(ir_path)
-        dsl_funcs = documented_functions(dsl_path)
+        ir_funcs = public_functions(ir_path)
+        dsl_funcs = public_functions(dsl_path)
+        rel = dsl_path.relative_to(root_dir).as_posix()
         for name in sorted(ir_funcs.keys() & dsl_funcs.keys()):
-            if f"{namespace}.{name}" in ALLOWLIST:
-                continue
             ir_node, ir_doc = ir_funcs[name]
             dsl_node, dsl_doc = dsl_funcs[name]
+            if ir_doc is None:
+                continue  # nothing to carry across
+
+            # The extreme of the same defect: the published wrapper has no description at all,
+            # so the API page renders empty. Nothing else catches this -- pydocstyle is not
+            # among the ruff rules this repo selects.
+            if dsl_doc is None:
+                violations.append((namespace, name, dsl_node.lineno, rel, "has no docstring at all"))
+                continue
+
+            exemption = ALLOWLIST.get(f"{namespace}.{name}")
+            if exemption is not None:
+                marker = exemption[1]
+                if marker in dsl_doc:
+                    continue
+                violations.append(
+                    (
+                        namespace,
+                        name,
+                        dsl_node.lineno,
+                        rel,
+                        f"is allowlisted, but its docstring no longer contains {marker}",
+                    )
+                )
+                continue
+
             if not has_body(ir_doc) or has_body(dsl_doc):
                 continue
             if body_is_parameter_notes(ir_doc, ir_node, dsl_doc):
                 continue
-            rel = dsl_path.relative_to(root_dir).as_posix()
-            violations.append((namespace, name, dsl_node.lineno, rel))
+            violations.append(
+                (namespace, name, dsl_node.lineno, rel, "drops the explanation its IR twin carries")
+            )
     return violations
 
 
@@ -229,12 +265,12 @@ def main() -> int:
     root_dir = args.root.resolve()
 
     violations = find_violations(root_dir)
-    for namespace, name, lineno, rel in violations:
-        print(f"{rel}:{lineno}: pl.{namespace}.{name} drops the explanation its IR twin carries")
+    for namespace, name, lineno, rel, problem in violations:
+        print(f"{rel}:{lineno}: pl.{namespace}.{name} {problem}")
 
     if violations:
         print(
-            f"\nFound {len(violations)} op wrapper(s) whose published docstring lost its explanation.\n"
+            f"\nFound {len(violations)} op wrapper(s) whose published docstring is worse than its twin.\n"
             "The DSL wrapper in python/pypto/language/op/ is what users read -- it is rendered into\n"
             "docs/en/user/api/ -- while python/pypto/ir/op/ is internal. When the internal copy\n"
             "explains a shape rule, a broadcasting rule or a dtype restriction, the published copy\n"
@@ -244,7 +280,8 @@ def main() -> int:
             "Do NOT assign __doc__ from the IR wrapper at import time: mkdocstrings reads the\n"
             "source statically through griffe, so a runtime-assigned __doc__ renders empty.\n\n"
             "If the DSL copy genuinely states the same fact elsewhere (in Returns:, say), add\n"
-            f'"<namespace>.<op>" to ALLOWLIST in {Path(__file__).name} with the reason.',
+            f'"<namespace>.<op>" to ALLOWLIST in {Path(__file__).name} as (reason, marker), where the'
+            " marker is a substring the DSL docstring must keep for the exemption to hold.",
             file=sys.stderr,
         )
         return 1
