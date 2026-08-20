@@ -76,10 +76,18 @@ SCAN_ROOTS = ("include", "src", "python")
 # key once. ``.pyi`` stubs are outside the scan by construction -- only ``.py`` is parsed.
 EXEMPT = frozenset({CPP_DECL, PY_DECL})
 
-# ``inline constexpr const char* kAttrFoo = "foo";`` in function.h.
+# ``inline constexpr const char* kAttrFoo = "foo";`` in function.h. The ``*`` binds loosely so the
+# ``const char *kAttrFoo`` spelling matches too -- clang-format normalises it, but a declaration this
+# pattern missed would be skipped in silence rather than reported, which is the one failure this
+# lint must not have. ``CPP_DECL_SANITY_RE`` below closes the rest of that hole.
 CPP_DECL_RE = re.compile(
-    r'^\s*inline\s+constexpr\s+const\s+char\*\s+(kAttr\w+)\s*=\s*"([^"]+)"\s*;', re.MULTILINE
+    r'^\s*inline\s+constexpr\s+const\s+char\s*\*\s*(kAttr\w+)\s*=\s*"([^"]+)"\s*;', re.MULTILINE
 )
+
+# Anything that declares a ``kAttr...`` constant, however spelled. Every match must also be matched
+# by ``CPP_DECL_RE``; one that is not means the strict pattern has drifted from the header and a key
+# is going unpoliced, so it is reported rather than ignored.
+CPP_DECL_SANITY_RE = re.compile(r"^.*\b(kAttr\w+)\s*=\s*\"", re.MULTILINE)
 
 # ``FOO_ATTR = "foo"`` in _function_attrs.py.
 PY_DECL_RE = re.compile(r'^([A-Z][A-Z0-9_]*_ATTR)\s*=\s*"([^"]+)"\s*$', re.MULTILINE)
@@ -139,12 +147,21 @@ def strip_cpp_comments(text: str) -> str:
 def parse_declarations(root: Path) -> tuple[dict[str, str], dict[str, str], list[str]]:
     """Return (cpp ident->key, python ident->key, errors)."""
     errors: list[str] = []
-    cpp_text = (root / CPP_DECL).read_text(encoding="utf-8")
-    cpp = {m.group(1): m.group(2) for m in CPP_DECL_RE.finditer(strip_cpp_comments(cpp_text))}
+    cpp_text = strip_cpp_comments((root / CPP_DECL).read_text(encoding="utf-8"))
+    cpp = {m.group(1): m.group(2) for m in CPP_DECL_RE.finditer(cpp_text)}
     py_text = (root / PY_DECL).read_text(encoding="utf-8")
     py = {m.group(1): m.group(2) for m in PY_DECL_RE.finditer(py_text)}
     if not cpp:
         errors.append(f'{CPP_DECL}: no `inline constexpr const char* kAttr... = "...";` declarations found')
+    # A key the strict pattern missed would be skipped in silence -- ``if not cpp`` cannot fire while
+    # the other keys still match. Report the mismatch instead of parsing a partial list.
+    for m in CPP_DECL_SANITY_RE.finditer(cpp_text):
+        if m.group(1) not in cpp:
+            errors.append(
+                f"{CPP_DECL}: `{m.group(1)}` is declared in a form CPP_DECL_RE does not match, so it "
+                f'would go unpoliced -- write it as `inline constexpr const char* {m.group(1)} = "...";` '
+                f"or widen the pattern"
+            )
     if not py:
         errors.append(f'{PY_DECL}: no `..._ATTR = "..."` declarations found')
     return cpp, py, errors
