@@ -411,7 +411,13 @@ class HardSyncallOccupancyVerifierImpl : public PropertyVerifier {
     // satisfiable; a mix / aic_only barrier waits for CUBE cores that no AIV-only
     // launch provides. (A dual-AIV-dispatched AIV kernel is a mixed-kernel lane
     // reached via Group, handled by the Group branch — not a standalone launch.)
-    if (kernel->func_type_ == FunctionType::AIV && !kernel->HasAttr(kAttrDualAivDispatch)) {
+    //
+    // Read the VALUE, not just the key: ``kAttrDualAivDispatch`` is declared bool
+    // and ``HasAttr`` ignores the value, so an explicit ``dual_aiv_dispatch=False``
+    // would suppress this check on a kernel that is NOT dual-dispatched. Every
+    // other reader of the key (both codegens, SplitVectorKernel) already reads the
+    // value; this arm was the one that did not.
+    if (kernel->func_type_ == FunctionType::AIV && !kernel->GetAttr<bool>(kAttrDualAivDispatch, false)) {
       for (const auto& hs : HardSyncallsCached(kernel, syncalls)) {
         if (hs.core_type != "aiv_only") {
           diagnostics.emplace_back(DiagnosticSeverity::Error, "HardSyncallOccupancy", 0,

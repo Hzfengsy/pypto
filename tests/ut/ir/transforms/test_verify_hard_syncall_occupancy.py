@@ -247,6 +247,47 @@ def _bare_kernel_program():
     return Prog
 
 
+def _aiv_default_mix_program_dual_dispatch_false(n: int):
+    """As ``_aiv_default_mix_program``, but the kernel states ``dual_aiv_dispatch=False``.
+
+    ``False`` means "NOT dual-dispatched", so this is a standalone AIV launch and the
+    mix barrier is just as unsatisfiable as in the plain case. The verifier used to key
+    on ``HasAttr``, which is true for a present-but-false attr, and so skipped the check
+    on exactly the kernels the attr says are *not* dual-dispatched.
+    """
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.InCore)
+        def add(
+            self,
+            a: pl.Tensor[[n * TR, TC], pl.FP32],
+            b: pl.Tensor[[n * TR, TC], pl.FP32],
+            out: pl.Out[pl.Tensor[[n * TR, TC], pl.FP32]],
+        ) -> pl.Tensor[[n * TR, TC], pl.FP32]:
+            pl.func_attr({"dual_aiv_dispatch": False})
+            i = pl.tile.get_block_idx()
+            o = i * TR
+            ta = pl.load(a, [o, 0], [TR, TC])
+            tb = pl.load(b, [o, 0], [TR, TC])
+            pl.system.syncall()  # default core_type="mix" — no AIC participants in an AIV launch
+            out = pl.store(pl.add(ta, tb), [o, 0], out)
+            return out
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def orchestrator(
+            self,
+            a: pl.Tensor[[n * TR, TC], pl.FP32],
+            b: pl.Tensor[[n * TR, TC], pl.FP32],
+            out: pl.Out[pl.Tensor[[n * TR, TC], pl.FP32]],
+        ) -> pl.Tensor[[n * TR, TC], pl.FP32]:
+            with pl.spmd(n):
+                out = self.add(a, b, out)
+            return out
+
+    return Prog
+
+
 def _aiv_default_mix_program(n: int):
     """Pure-AIV kernel with the DEFAULT (mix) hard barrier — unsatisfiable in an AIV launch."""
 
@@ -701,6 +742,15 @@ class TestHardSyncallOccupancy:
         """A pure-AIV kernel with the default (mix) hard barrier can never complete (no AIC)."""
         with pytest.raises(pypto.Error, match="can never complete"):
             _run(_aiv_default_mix_program(48))
+
+    def test_standalone_default_mix_barrier_rejected_with_dual_dispatch_false(self):
+        """``dual_aiv_dispatch=False`` states the kernel is NOT dual-dispatched — still checked.
+
+        Regression: the guard read ``HasAttr``, which is true for a present-but-false
+        attr, so an explicit ``False`` suppressed the very check it should have left on.
+        """
+        with pytest.raises(pypto.Error, match="can never complete"):
+            _run(_aiv_default_mix_program_dual_dispatch_false(48))
 
     def test_spmd_submit_partial_occupancy_rejected(self):
         """pl.spmd_submit(core_num=24) carries the block count on the Submit — still checked."""
