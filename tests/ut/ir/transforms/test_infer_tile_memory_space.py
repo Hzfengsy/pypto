@@ -1680,6 +1680,67 @@ class TestAutoMoveInsertion:
         After = passes.infer_tile_memory_space()(Before)
         ir.assert_structural_equal(After, Expected)
 
+    def test_divergent_branch_spaces_leave_the_phi_unrecorded(self):
+        """When the two branches yield different memory spaces, the IfStmt phi has
+        no single well-defined space and the analyzer must record none.
+
+        Reconciling such a phi needs a ``tile.move`` in one branch — Phase 2/3's
+        job, not something the analyzer can express. Recording either side would
+        make Phase 3 retype the phi to it and strand the other branch's yield, so
+        the slot is skipped and the pass leaves this shape exactly as it found it
+        (the state before the IfStmt override existed). Guards the branch-
+        disagreement check, not the divergence itself, which is pre-existing and
+        reported by the type checker.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                z: pl.Tensor[[16, 128], pl.FP32],
+                flag: pl.Scalar[pl.INDEX],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                xt: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+                )
+                yt: pl.Tile[[128, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    y, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat
+                )
+                zt: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Vec] = pl.load(z, [0, 0], [16, 128])
+                if flag < 1:
+                    a: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Acc] = pl.matmul(xt, yt)
+                    phi = pl.yield_(a)
+                else:
+                    b: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Vec] = pl.add(zt, zt)
+                    phi = pl.yield_(b)
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.store(phi, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                z: pl.Tensor[[16, 128], pl.FP32],
+                flag: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.create_tensor([16, 128], dtype=pl.FP32)
+                return self.main_incore_0(x, y, z, flag, out_0)
+
+        After = passes.infer_tile_memory_space()(Before)
+        printed = ir.python_print(After)
+        # Each branch keeps the space its own producer resolved to; the phi is not
+        # retyped onto either one.
+        assert "a: pl.Tile[[16, 128], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(" in printed, printed
+        assert "b: pl.Tile[[16, 128], pl.FP32, pl.Mem.Vec] = pl.tile.add(" in printed, printed
+        # No move is invented to reconcile the divergence.
+        assert "pl.tile.move(a," not in printed, printed
+        assert "pl.tile.move(b," not in printed, printed
+
 
 class TestInferTileMemorySpaceSSAAlias:
     """SSA-alias propagation added by the backward-demand-inference refactor.

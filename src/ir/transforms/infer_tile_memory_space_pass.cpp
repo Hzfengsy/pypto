@@ -307,10 +307,18 @@ class TileMemorySpaceAnalyzer : public IRVisitor {
       auto rv_tile = As<TileType>(rv->GetType());
       if (!rv_tile) continue;
 
-      // Then-branch is canonical (it is the branch YieldFixup also treats as
-      // canonical); the else branch covers a then-only-stripped yield.
-      std::optional<MemorySpace> memory = YieldMemoryAt(then_yield, i);
-      if (!memory.has_value()) memory = YieldMemoryAt(else_yield, i);
+      // Record only a space the two branches agree on. When both yield a space
+      // and they differ, this phi has no single well-defined space: reconciling
+      // it needs a tile.move in one branch, which is Phase 2/3's job and not
+      // something the analyzer can express. Recording either side would make
+      // Phase 3 retype the phi to it and leave the other branch's yield behind,
+      // so leave the slot unrecorded — exactly the state before this override
+      // existed — and let the type checker report the divergence.
+      std::optional<MemorySpace> then_memory = YieldMemoryAt(then_yield, i);
+      std::optional<MemorySpace> else_memory = YieldMemoryAt(else_yield, i);
+      if (then_memory.has_value() && else_memory.has_value() && *then_memory != *else_memory) continue;
+
+      std::optional<MemorySpace> memory = then_memory.has_value() ? then_memory : else_memory;
       if (!memory.has_value()) memory = rv_tile->memory_space_;
       if (memory.has_value()) var_memory_[rv] = *memory;
     }
