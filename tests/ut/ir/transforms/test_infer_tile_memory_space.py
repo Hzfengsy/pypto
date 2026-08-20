@@ -1566,6 +1566,120 @@ class TestAutoMoveInsertion:
         After = passes.infer_tile_memory_space()(Before)
         ir.assert_structural_equal(After, Expected)
 
+    def test_cast_of_if_phi_acc_operand_gets_move(self):
+        """An op's input constraint must be enforced when the operand is an
+        IfStmt phi, not only when it is an AssignStmt or ForStmt result.
+
+        ``tile.cast`` declares ``set_input_memory(0, Vec)``. Here its operand is
+        the phi of an ``if``/``else`` whose branches both produce ``Acc`` (the
+        canonical peeled-accumulator shape: a fresh ``matmul`` seed on one side,
+        an in-place ``matmul_acc`` on the other). The analyzer records memory
+        spaces only from AssignStmts and ForStmt carries, so before the IfStmt
+        override the phi was absent from ``var_memory_``, ``CheckInputConstraints``
+        skipped the operand, and no ``Acc -> Vec`` move was queued. The cast then
+        kept an ``Acc`` operand in violation of its own contract, leaving no
+        cube/vector boundary ``tile.move`` for ExpandMixedKernel to lower into a
+        ``tpush_to_aiv`` / ``tpop_from_aic`` pair — it split the kernel with the
+        cast referencing a var defined only on the cube side.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                flag: pl.Scalar[pl.INDEX],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.BF16]],
+            ) -> pl.Tensor[[16, 128], pl.BF16]:
+                x_tile: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+                )
+                y_tile: pl.Tile[[128, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    y, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat
+                )
+                seed: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Acc] = pl.matmul(x_tile, y_tile)
+                if flag < 1:
+                    acc = pl.yield_(seed)
+                else:
+                    acc_more: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Acc] = pl.matmul_acc(
+                        seed, x_tile, y_tile
+                    )
+                    acc = pl.yield_(acc_more)
+                narrowed: pl.Tile[[16, 128], pl.BF16] = pl.cast(acc, pl.BF16, mode="rint")
+                out_0: pl.Tensor[[16, 128], pl.BF16] = pl.store(narrowed, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                flag: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[16, 128], pl.BF16]:
+                out_0: pl.Tensor[[16, 128], pl.BF16] = pl.create_tensor([16, 128], dtype=pl.BF16)
+                z: pl.Tensor[[16, 128], pl.BF16] = self.main_incore_0(x, y, flag, out_0)
+                return z
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                flag: pl.Scalar[pl.INDEX],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.BF16]],
+            ) -> pl.Tensor[[16, 128], pl.BF16]:
+                x_tile: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+                )
+                y_tile: pl.Tile[[128, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    y, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat
+                )
+                x_tile_Left: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Left] = pl.move(
+                    x_tile, target_memory=pl.MemorySpace.Left
+                )
+                y_tile_Right: pl.Tile[[128, 128], pl.BF16, pl.MemorySpace.Right] = pl.move(
+                    y_tile, target_memory=pl.MemorySpace.Right
+                )
+                seed: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Acc] = pl.matmul(x_tile_Left, y_tile_Right)
+                if flag < 1:
+                    acc: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Acc] = pl.yield_(seed)
+                else:
+                    acc_more: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Acc] = pl.matmul_acc(
+                        seed, x_tile_Left, y_tile_Right
+                    )
+                    acc: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Acc] = pl.yield_(acc_more)
+                # The move this test guards: the phi operand is narrowed to Vec
+                # before the cast, giving ExpandMixedKernel a real CV boundary.
+                acc_Vec: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Vec] = pl.move(
+                    acc,
+                    target_memory=pl.MemorySpace.Vec,
+                    blayout=pl.TileLayout.row_major,
+                    slayout=pl.TileLayout.none_box,
+                )
+                narrowed: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Vec] = pl.cast(
+                    acc_Vec, pl.BF16, mode="rint"
+                )
+                out_0: pl.Tensor[[16, 128], pl.BF16] = pl.store(narrowed, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                flag: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[16, 128], pl.BF16]:
+                out_0: pl.Tensor[[16, 128], pl.BF16] = pl.create_tensor([16, 128], dtype=pl.BF16)
+                z: pl.Tensor[[16, 128], pl.BF16] = self.main_incore_0(x, y, flag, out_0)
+                return z
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+
 
 class TestInferTileMemorySpaceSSAAlias:
     """SSA-alias propagation added by the backward-demand-inference refactor.

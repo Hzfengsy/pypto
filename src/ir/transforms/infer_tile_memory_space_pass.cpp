@@ -276,9 +276,62 @@ class TileMemorySpaceAnalyzer : public IRVisitor {
     }
   }
 
+  // Record each TileType phi (IfStmt return_var) in var_memory_ from its branch
+  // yields, the sibling of the ForStmt carry propagation above.
+  //
+  // Without this the analyzer only ever populates var_memory_ from AssignStmts
+  // and ForStmt carries, so a phi is absent from the map and *every* consumer
+  // that looks it up degrades silently on the miss: InheritFromInput falls
+  // through to a co-argument, CheckInputConstraints skips the operand entirely
+  // (queueing no tile.move, so an op's declared input space is left violated —
+  // e.g. `tile.cast`, which requires Vec, keeps an Acc phi operand and the
+  // cube→vector cut then has no boundary tile.move for ExpandMixedKernel to
+  // turn into tpush/tpop), and the Phase-3 mutator skips the retype.
+  //
+  // Derive from the yields rather than reading the return_var's own annotation:
+  // a branch may have been re-inferred during this same run (the accumulator
+  // pattern the ForStmt override documents — a conservatively-Vec tile.create
+  // that the body writes as Acc), which leaves the annotation stale. The
+  // annotation is still the fallback, mirroring the yield_memory lookup above.
+  void VisitStmt_(const IfStmtPtr& op) override {
+    IRVisitor::VisitStmt_(op);
+
+    if (op->return_vars_.empty()) return;
+
+    auto then_yield = GetLastYieldStmt(op->then_body_);
+    auto else_yield = op->else_body_.has_value() ? GetLastYieldStmt(op->else_body_.value()) : nullptr;
+    if (!then_yield && !else_yield) return;
+
+    for (size_t i = 0; i < op->return_vars_.size(); ++i) {
+      const auto& rv = op->return_vars_[i];
+      auto rv_tile = As<TileType>(rv->GetType());
+      if (!rv_tile) continue;
+
+      // Then-branch is canonical (it is the branch YieldFixup also treats as
+      // canonical); the else branch covers a then-only-stripped yield.
+      std::optional<MemorySpace> memory = YieldMemoryAt(then_yield, i);
+      if (!memory.has_value()) memory = YieldMemoryAt(else_yield, i);
+      if (!memory.has_value()) memory = rv_tile->memory_space_;
+      if (memory.has_value()) var_memory_[rv] = *memory;
+    }
+  }
+
  private:
   const std::map<VarPtr, MemorySpace>& demands_;
   std::map<VarPtr, MemorySpace> var_memory_;
+
+  /// Memory space of `yield`'s value at position `i`: the analyzed space when the
+  /// value was visited, else its TileType annotation.
+  std::optional<MemorySpace> YieldMemoryAt(const YieldStmtPtr& yield, size_t i) {
+    if (!yield || i >= yield->value_.size()) return std::nullopt;
+    auto var = AsVarLike(yield->value_[i]);
+    if (!var) return std::nullopt;
+    auto it = var_memory_.find(var);
+    if (it != var_memory_.end()) return it->second;
+    auto tile = As<TileType>(var->GetType());
+    if (tile) return tile->memory_space_;
+    return std::nullopt;
+  }
 
   MemorySpace InferFromOp(const std::string& op_name, const CallPtr& call, const VarPtr& out_var) {
     auto& registry = OpRegistry::GetInstance();

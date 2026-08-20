@@ -233,7 +233,8 @@ enum class VerificationLevel {
  * Returns {SSAForm, TypeChecked, MixedKernelExpanded, AllocatedMemoryAddr,
  * BreakContinueValid, NoRedundantBlocks, InOutUseValid,
  * CallDirectionsResolved, ManualDepsOnSubmitOnly, ReturnParamsExplicit,
- * AivSplitValid} — lightweight checks that catch the most common IR errors.
+ * AivSplitValid, TileMemoryInferred} — lightweight checks that catch the most
+ * common IR errors.
  */
 const IRPropertySet& GetVerifiedProperties();
 
