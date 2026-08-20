@@ -980,8 +980,70 @@ inline constexpr const char* kAttrPredicate = "predicate";
  */
 class Submit : public Expr {
  public:
-  OpPtr op_;                   // Callee (typically a GlobalVar)
-  std::vector<ExprPtr> args_;  // Positional arguments
+  OpPtr op_;  // Callee (typically a GlobalVar)
+  // Positional arguments. **Canonical statement of the args-coverage
+  // invariant** — every pass and codegen consumer reads this comment; do not
+  // restate it locally, cross-reference it.
+  //
+  // Mapping is positional identity against the callee's ``params_``:
+  // ``args_[i]`` binds ``callee->params_[i]``. The kinds differ only in
+  // *coverage*:
+  //
+  //   * ``Call``  — full coverage: ``args_.size() == params_.size()``.
+  //   * ``Submit`` — **bounded** coverage: ``args_.size() <= params_.size()``.
+  //
+  // A Submit's args therefore split into up to three regions, in callee param
+  // order:
+  //
+  //   1. ``[0, args_.size() - ctx)`` — **caller-supplied**. Any direction:
+  //      ``In``, ``InOut``, *and* ``Out``. A caller-allocated ``Out`` param is
+  //      an ordinary positional arg and is NOT excluded from ``args_``;
+  //      orchestration codegen has a live branch for exactly this case
+  //      (``GenerateSubmitReturnAliases`` aliases the return-tuple element to
+  //      ``args_[param_idx]``, because the runtime's ``TaskOutputTensors``
+  //      holds only runtime-created outputs).
+  //   2. ``[args_.size() - ctx, params_.size() - ctx)`` — **runtime-allocated
+  //      outputs**, present only when the gap is non-empty. These must be
+  //      declared ``Out``; no arg is passed, so orchestration codegen synths
+  //      one ``add_output(TensorCreateInfo)`` per param, in callee param order
+  //      (``EmitSubmitSynthOutputEntry``), and the matching return-tuple
+  //      element aliases to ``task_<n>_outs.get_ref(param_idx - (args_.size()
+  //      - ctx))``.
+  //   3. ``[params_.size() - ctx, params_.size())`` — the **CommCtx suffix**
+  //      appended by ``MaterializeDistTensorCtx``. Both signature and call site
+  //      grow together, so ``args_`` carries this suffix in full and it is
+  //      *not* part of the prefix. ``ctx`` is the count of trailing
+  //      ``CommCtxType`` params. Consequently ``args_`` is a plain prefix of
+  //      ``params_`` only while ``ctx == 0``; after that pass it is a prefix
+  //      plus a suffix, with region 2 as the gap between them. Consumers that
+  //      index ``args_`` against ``params_`` must subtract ``ctx`` first.
+  //
+  // Region 2 comes from *user source*, not from a pass: writing
+  // ``pl.submit(self.kernel, x)`` against a kernel that declares a trailing
+  // ``pl.Out`` param is accepted by the parser and carries the gap through the
+  // whole pipeline. (Neither pass that appends a tail ``Out`` param to a callee
+  // signature opens it — ``ConvertTensorToTileOps`` and ``InjectGMPipeBuffer``
+  // both forward the matching arg at the Submit call site.) So a pass that
+  // bails on ``args_.size() != params_.size()`` mishandles ordinary DSL input,
+  // not just a hypothetical future rewrite: relax the guard to ``<=`` for
+  // Submit (see ``.claude/rules/pass-submit-awareness.md`` §5). Regression
+  // coverage: ``TestDeriveSubmit`` in
+  // tests/ut/ir/transforms/test_derive_call_directions.py (pass side) and
+  // ``test_submit_runtime_allocated_out_synths_add_output_and_get_ref_alias``
+  // in tests/ut/codegen/test_orchestration_manual_scope.py (codegen side,
+  // covering all three regions in one program).
+  //
+  // Note the args-side asymmetry does NOT change the return shape: the result
+  // stays ``Tuple[<callee return>..., Scalar[TASK_ID]]``. Appending an ``Out``
+  // param mirrors an existing declared return rather than adding one, so
+  // regions 1 and 2 both surface through the *same* return-tuple elements —
+  // only the aliasing target differs (arg vs synth output).
+  //
+  // This cannot be constructor-checked: ``op_`` is an ``OpPtr``, so the node
+  // has the callee's *name* but not its ``Function``, and ``params_`` is
+  // unreachable from here. The bound is enforced where the callee resolves —
+  // ``DeriveCallDirections`` and orchestration codegen's ``BuildTaskParams``.
+  std::vector<ExprPtr> args_;
   std::vector<ExprPtr> deps_;  // TaskId dependencies (Scalar[TASK_ID] / Array[N, TASK_ID])
   // SPMD launch spec — populated only by ``pl.spmd_submit(...)``.
   // ``core_num_`` is the block count (an INDEX/INT-typed Expr — typically a

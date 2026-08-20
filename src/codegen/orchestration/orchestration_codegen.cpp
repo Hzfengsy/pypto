@@ -1957,12 +1957,18 @@ class OrchestrationStmtCodegen : public CodegenBase {
     // Args use positional identity mapping against the callee param list
     // (args_[i] ↔ params_[i]) in both kinds. The difference is *coverage*:
     //   - Call: args_.size() == params_.size() (full coverage).
-    //   - Submit: args_.size() <= params_.size() (prefix). The trailing
-    //     callee params (indices [args_.size() .. params_.size())) are
-    //     runtime-allocated outputs that must be Out — the IR builder
-    //     appends them at the tail of the callee signature, so we synth an
-    //     add_output(TensorCreateInfo) entry for each. See
-    //     `.claude/rules/pass-submit-awareness.md` §5.
+    //   - Submit: args_.size() <= params_.size(). NOT a plain prefix once
+    //     MaterializeDistTensorCtx has run: args_ is the caller-supplied
+    //     prefix *plus* the trailing CommCtx suffix, whose params grew
+    //     alongside the call site. The gap between them — callee params
+    //     [original_arg_count .. original_param_count) below — is the
+    //     runtime-allocated outputs, which must be Out; no arg is passed, so
+    //     we synth an add_output(TensorCreateInfo) entry for each, in callee
+    //     param order, before emitting the CommCtx args. That ordering is
+    //     what makes GenerateSubmitReturnAliases' get_ref(param_idx -
+    //     original_arg_count) correct.
+    // Canonical statement: Submit::args_ in include/pypto/ir/expr.h; see also
+    // `.claude/rules/pass-submit-awareness.md` §5.
     // Selective dump (``pl.dump_tag`` / ``dumps=``):
     // ``kAttrDumpVars`` lists the arg Vars to mark via ``Arg::dump``. Match by
     // VarPtr identity against each arg — never by name.
@@ -3779,9 +3785,11 @@ class OrchestrationStmtCodegen : public CodegenBase {
   /// ``task_<idx>_outs.task_id()`` and registered in ``manual_task_id_map_``
   /// so a downstream ``deps=[tid]`` resolves to it.
   ///
-  /// For the Out/InOut tuple elements, the aliasing target depends on whether
-  /// the callee param is *caller-allocated* (in Submit's original, non-ctx args)
-  /// or *runtime-allocated* (callee param index >= original arg count):
+  /// For the Out/InOut tuple elements, the aliasing target depends on which
+  /// coverage region the callee param falls in (see Submit::args_ in
+  /// include/pypto/ir/expr.h) — *caller-allocated* (in Submit's original,
+  /// non-ctx args) or *runtime-allocated* (callee param index >= original
+  /// arg count):
   ///   - Caller-allocated (param_idx < original arg count): alias to
   ///     ``call->args_[param_idx]`` — the original tensor variable the user
   ///     passed in. The runtime's ``TaskOutputTensors`` stores only

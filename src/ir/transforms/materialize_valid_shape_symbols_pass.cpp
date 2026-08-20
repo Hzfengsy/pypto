@@ -280,21 +280,27 @@ class MaterializeValidShapeSymbolsMutator : public IRMutator {
     for (const auto& symbol : plan.symbols) {
       ExprPtr value = nullptr;
       for (const auto& [param_idx, dim_idx] : symbol.slots) {
-        // Submit passes a positional prefix of the callee params, so a slot past
-        // the supplied args has no actual to read.
-        CHECK_SPAN(param_idx < old_args.size(), span)
-            << "MaterializeValidShapeSymbols: call does not supply argument " << param_idx
+        // The three checks below are pass invariants, not user input: `plan` is
+        // built from the *callee's* own params, and by this pass (the last in
+        // the pipeline) the actuals have been type- and rank-checked against
+        // that signature. A failure means a compiler bug — most plausibly a
+        // Submit whose args_ do not cover a valid_shape-declaring param (see
+        // Submit::args_ in include/pypto/ir/expr.h; a runtime-allocated Out
+        // param has no actual to read a valid_shape from). The disagreement
+        // check further down is the one genuine user error here.
+        INTERNAL_CHECK_SPAN(param_idx < old_args.size(), span)
+            << "Internal error: MaterializeValidShapeSymbols: call does not supply argument " << param_idx
             << ", which declares valid_shape symbol '" << symbol.symbol->name_hint_ << "'";
         auto tensor_type = AsTensorTypeLike(old_args[param_idx]->GetType());
-        CHECK_SPAN(tensor_type, span)
-            << "MaterializeValidShapeSymbols: argument " << param_idx << " for valid_shape symbol '"
-            << symbol.symbol->name_hint_ << "' must be a tensor, got "
+        INTERNAL_CHECK_SPAN(tensor_type, span)
+            << "Internal error: MaterializeValidShapeSymbols: argument " << param_idx
+            << " for valid_shape symbol '" << symbol.symbol->name_hint_ << "' must be a tensor, got "
             << old_args[param_idx]->GetType()->TypeName();
         const auto& actual_valid = GetEffectiveTensorValidShape(*tensor_type);
-        CHECK_SPAN(dim_idx < actual_valid.size(), span)
-            << "MaterializeValidShapeSymbols: argument " << param_idx << " has valid_shape rank "
-            << actual_valid.size() << ", too short to supply '" << symbol.symbol->name_hint_
-            << "' at position " << dim_idx;
+        INTERNAL_CHECK_SPAN(dim_idx < actual_valid.size(), span)
+            << "Internal error: MaterializeValidShapeSymbols: argument " << param_idx
+            << " has valid_shape rank " << actual_valid.size() << ", too short to supply '"
+            << symbol.symbol->name_hint_ << "' at position " << dim_idx;
         const ExprPtr& candidate = actual_valid[dim_idx];
         // The same symbol declared in two slots must be given one value; binding
         // it from the first slot alone would silently drop the disagreement.

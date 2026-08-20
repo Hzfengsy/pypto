@@ -2101,8 +2101,10 @@ class OutWindowExternalizer {
         AddBudgetArg(direction, type, &budget);
       }
 
-      // Submit args are a prefix of callee params. Tail Out params are
-      // runtime-allocated outputs materialized by codegen as add_output.
+      // A Submit need not cover every callee param (see Submit::args_ in
+      // include/pypto/ir/expr.h). Uncovered params are runtime-allocated Out
+      // outputs that codegen materializes as add_output, so they still consume
+      // a runtime arg slot and must be counted against the budget here.
       for (size_t i = args.size(); i < callee->params_.size() && i < callee->param_directions_.size(); ++i) {
         if (callee->param_directions_[i] != ParamDirection::Out) continue;
         AddBudgetArg(ArgDirection::Output, callee->params_[i]->GetType(), &budget);

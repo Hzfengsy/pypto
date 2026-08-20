@@ -2475,11 +2475,19 @@ class CallSiteUpdateMutator : public TypePropagatingMutator {
     return SeqStmts::Flatten(std::move(stmts), op->span_);
   }
 
-  // Submit variant of the call-site update. The appended runtime-allocated
-  // outputs are Out *params* (inputs the callee writes), not additional
-  // returns, so the Submit's own result tuple — Tuple[<callee returns>...,
-  // TASK_ID] — is unchanged; only args_ grows and Submit-ness / deps_ / kwargs_
-  // / attrs_ are preserved. The result var keeps its type, so no var remap.
+  // Submit variant of the call-site update. The appended outputs are Out
+  // *params* (inputs the callee writes) mirroring existing declared returns,
+  // not additional returns, so the Submit's own result tuple —
+  // Tuple[<callee returns>..., TASK_ID] — is unchanged; only args_ grows and
+  // Submit-ness / deps_ / kwargs_ / attrs_ are preserved. The result var keeps
+  // its type, so no var remap.
+  //
+  // Because this forwards an arg for every param it appends, the Submit leaves
+  // here with coverage still *exact* — this pass does not open the
+  // args_.size() < params_.size() gap that Submit::args_ (include/pypto/ir/expr.h)
+  // permits. Forwarding is deliberate: a caller-allocated Out arg lets
+  // orchestration codegen alias the return-tuple element straight to the arg
+  // instead of synthesising a runtime add_output.
   StmtPtr HandleSubmitCallSite(const AssignStmtPtr& op, const SubmitPtr& submit) {
     auto global_var = std::dynamic_pointer_cast<const GlobalVar>(submit->op_);
     if (!global_var) return HandlePassThroughAssign(op, submit);

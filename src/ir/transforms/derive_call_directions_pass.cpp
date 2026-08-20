@@ -97,17 +97,11 @@ ProgramPtr MaterializeWrapperDirections(const ProgramPtr& program) {
 }
 
 /// Uniform view of a call-like expression's positional args for direction
-/// analysis. Both Call and Submit use identity positional mapping:
-/// args_[i] ↔ callee->params_[i].
-///
-/// The kinds differ only in *coverage*:
-///   - Call: args_.size() == callee->params_.size() (full coverage).
-///   - Submit: args_.size() <= callee->params_.size() (prefix). The trailing
-///     callee params (indices [args_.size() .. params_.size())) are
-///     runtime-allocated outputs materialised via TaskOutputTensors / the
-///     Submit's return-tuple elements, not passed positionally. The IR
-///     builder (e.g. ConvertTensorToTileOps) appends those Out params at the
-///     tail of the callee signature.
+/// analysis. Both Call and Submit use identity positional mapping
+/// (args_[i] ↔ callee->params_[i]) and differ only in *coverage*: Call is
+/// exact, Submit is bounded by ``args_.size() <= params_.size()``. See the
+/// canonical statement on Submit::args_ in include/pypto/ir/expr.h for the
+/// region breakdown; this pass only needs the bound.
 struct CallLikeArgs {
   std::vector<ExprPtr> args;
   OpPtr op;
@@ -209,10 +203,11 @@ class PriorWriterCollector {
   }
 
   /// If `expr` is a non-builtin Call or Submit, add every Out/InOut root it
-  /// writes (local or enclosing-param-rooted) into `out`. Submit's args_ is
-  /// a positional *prefix* of callee->params_ — runtime-allocated outputs
-  /// occupy the trailing positions and aren't reached here. Within the
-  /// prefix, args_[i] ↔ params_[i] is identity, same as Call.
+  /// writes (local or enclosing-param-rooted) into `out`. args_[i] ↔
+  /// params_[i] is identity for both kinds; the loop is bounded by the args
+  /// actually carried, so a Submit's uncovered callee params (if any) are not
+  /// reached. Those are runtime-allocated outputs with no caller-side root to
+  /// record — skipping them is correct, not a gap.
   void CollectCallWrittenRoots(const ExprPtr& expr, std::unordered_set<const Var*>& out) {
     auto cl = BuildCallLikeArgs(expr);
     if (!cl) return;
@@ -276,8 +271,9 @@ class PriorWriterCollector {
 
   /// For a single Call or Submit expression, mark "first writer" roots and
   /// update `seen`. Both kinds use positional identity mapping over the args
-  /// they actually carry (Submit may carry a prefix; the trailing runtime-
-  /// allocated outputs aren't reached here). First-writer is registered
+  /// they actually carry (a Submit may cover fewer callee params; the
+  /// uncovered ones are runtime-allocated and have no caller-side root).
+  /// First-writer is registered
   /// under the original expression's stable pointer (`expr.get()`) so the
   /// CallDirectionMutator can look it up regardless of kind.
   void AnalyzeCall(const ExprPtr& expr, std::unordered_set<const Var*>& seen) {
@@ -366,9 +362,9 @@ class CallDirectionMutator : public IRMutator {
     auto base = IRMutator::VisitExpr_(op);
     auto call = As<Call>(base);
     if (!call) return base;
-    // Call path: args_[i] ↔ params_[i] (identity mapping). Submit takes a
-    // separate visitor below, since its args_ excludes declared-Out callee
-    // params (those materialise as return-tuple elements).
+    // Call path: args_[i] ↔ params_[i] with full coverage. Submit takes a
+    // separate visitor below purely because its coverage is bounded rather
+    // than exact — its args_ still include caller-allocated Out params.
     auto dirs = DeriveDirectionsForCallLike(call, op.get(), /*is_submit=*/false);
     if (!dirs) return call;
     auto new_attrs = WithArgDirectionsAttr(call->attrs_, std::move(*dirs));
@@ -388,9 +384,12 @@ class CallDirectionMutator : public IRMutator {
     // — which round-trips — and post-DeriveCallDirections consumers funnel
     // through SubmitToCallView wherever they need the Call-shaped view.
     //
-    // Submit's args_ doesn't positionally line up with the callee's full param
-    // list (declared-Out callee params are excluded), so derivation threads the
-    // prefix coverage rule through DeriveDirectionsForCallLike via is_submit.
+    // Submit's args_ may cover fewer than the callee's full param list, so
+    // derivation threads the bounded-coverage rule through
+    // DeriveDirectionsForCallLike via is_submit. Note the args it *does* carry
+    // include caller-allocated Out params — coverage is bounded, not
+    // direction-filtered. See the canonical statement on Submit::args_ in
+    // include/pypto/ir/expr.h.
     auto base = IRMutator::VisitExpr_(op);
     auto submit = std::static_pointer_cast<const Submit>(base);
     // SubmitToCallView yields the Call-shaped view used *only* to inspect args
@@ -411,11 +410,12 @@ class CallDirectionMutator : public IRMutator {
 
   /// Shared core that derives the ArgDirection vector for a Call-shaped node.
   /// Args use identity positional mapping in both kinds (args_[i] ↔
-  /// callee->params_[i]); the kinds differ only in coverage. The size check
-  /// is relaxed for Submit because Submit's args_ may be a *prefix* of the
-  /// callee param list (the trailing callee params are runtime-allocated
-  /// outputs materialised via the Submit's return tuple, not passed
-  /// positionally). For Call we require full positional 1:1.
+  /// callee->params_[i]); the kinds differ only in coverage. The size check is
+  /// relaxed to `<=` for Submit, whose args_ need not cover every callee param
+  /// (see Submit::args_ in include/pypto/ir/expr.h). For Call we require full
+  /// positional 1:1. Directions are derived only for the args carried — which
+  /// is every arg the node has, so the result always satisfies the
+  /// ValidateArgDirectionsAttr size contract.
   ///
   /// `identity_key` is the address of the original IR node (Call::get() or
   /// Submit::get()) used to look up first_writer_roots_; we don't key off the
@@ -442,7 +442,7 @@ class CallDirectionMutator : public IRMutator {
     // (MaterializeWrapperDirections) wrote them into the signature before this
     // mutator ran, so a plain field read is correct for every callee kind.
     const auto& effective = callee->param_directions_;
-    // Submit: prefix coverage allowed (args.size() <= effective.size()).
+    // Submit: bounded coverage allowed (args.size() <= effective.size()).
     // Call: full coverage required (args.size() == effective.size()).
     const bool size_ok =
         is_submit ? (call->args_.size() <= effective.size()) : (call->args_.size() == effective.size());

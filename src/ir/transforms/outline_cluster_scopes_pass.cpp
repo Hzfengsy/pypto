@@ -167,8 +167,9 @@ class LaunchSpecStamper : public IRMutator {
   }
 
   /// Rewrite the callee-scoped ``core_num`` into the caller's Var space via the
-  /// dispatch's positional args. ``Submit::args_`` may be a prefix of
-  /// ``params_`` (pass-submit-awareness rule 5), so bound by the arg count.
+  /// dispatch's positional args. ``Submit::args_`` need not cover every entry
+  /// of ``params_`` (see Submit::args_ in include/pypto/ir/expr.h), so bound
+  /// the zip by the arg count.
   [[nodiscard]] static ExprPtr ToCallerScope(const SpmdLaunchSpec& spec, const std::vector<ExprPtr>& args) {
     // Every entry in specs_ is built with its Group attached. Falling back to
     // the un-translated expression here would silently re-introduce the very
