@@ -109,8 +109,6 @@ CoreType InferFunctionCoreType(const FunctionPtr& func) {
 
 namespace {
 
-constexpr const char* kDualAivDispatchAttr = "dual_aiv_dispatch";
-
 const char* ParamDirectionToRuntimeName(ParamDirection dir) {
   switch (dir) {
     case ParamDirection::In:
@@ -176,7 +174,7 @@ std::string GenerateConfigFunction(int expected_arg_count) {
 // because their hand-written source owns sub-lane partitioning.
 bool RequiresDualAivDispatch(const FunctionPtr& aiv_func) {
   if (aiv_func == nullptr) return false;
-  return aiv_func->HasAttr(kDualAivDispatchAttr) && aiv_func->GetAttr<bool>(kDualAivDispatchAttr, false);
+  return aiv_func->HasAttr(kAttrDualAivDispatch) && aiv_func->GetAttr<bool>(kAttrDualAivDispatch, false);
 }
 
 // Returns the opening of a rt_submit_{aic,aiv}_task call.

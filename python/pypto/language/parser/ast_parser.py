@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, TypeGuard, cast
 
+from pypto._function_attrs import AUTO_SCOPE_ATTR, EXTERNAL_SOURCE_ATTR
 from pypto.ir import IRBuilder
 from pypto.ir import op as ir_op
 from pypto.ir.printer import python_print
@@ -90,7 +91,7 @@ _OMIT_ATTR: Any = object()
 #   - ``external_source`` selects the no-DSL-body path entirely (the body must
 #                         be a bare ``...``, so there is nowhere to put a
 #                         prologue in the first place)
-_DECORATOR_ONLY_FUNC_ATTRS: frozenset[str] = frozenset({"auto_scope", "external_source"})
+_DECORATOR_ONLY_FUNC_ATTRS: frozenset[str] = frozenset({AUTO_SCOPE_ATTR, EXTERNAL_SOURCE_ATTR})
 
 # Enum values that op wrappers and printed ``attrs={...}`` dicts take verbatim.
 # ``parse_expression`` cannot represent these: it either rejects the standalone
@@ -981,8 +982,8 @@ class ASTParser:
         func_name = func_def.name
         self._func_name = func_name
         self._func_level = func_level
-        # auto_scope rides in func_attrs (key "auto_scope"); absent ⇒ default True.
-        self._func_auto_scope = bool((func_attrs or {}).get("auto_scope", True))
+        # auto_scope rides in func_attrs; absent ⇒ default True.
+        self._func_auto_scope = bool((func_attrs or {}).get(AUTO_SCOPE_ATTR, True))
         self._func_type = func_type
         self._param_dim_symbols = set()
         func_span = self.span_tracker.get_span(func_def)
@@ -1075,7 +1076,7 @@ class ASTParser:
 
             # Parse function body. HOST SubWorkers carry pure-Python source
             # via ``inline_body`` and are not parsed as DSL.
-            external_source = (func_attrs or {}).get("external_source")
+            external_source = (func_attrs or {}).get(EXTERNAL_SOURCE_ATTR)
             if external_source is not None:
                 # Header-only external C++ kernel: no DSL body to parse. The
                 # signature (params + directions + return types) is the contract

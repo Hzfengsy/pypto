@@ -2267,7 +2267,7 @@ Pass AutoDeriveTaskDependencies(bool analyze_auto_scopes) {
 
       const bool analyze_whole_body_as_auto_scope = analyze_auto_scopes &&
                                                     func->func_type_ == FunctionType::Orchestration &&
-                                                    func->GetAttr<bool>("auto_scope", true);
+                                                    func->GetAttr<bool>(kAttrAutoScope, true);
       AutoDepMutator mutator(program, &storage, &task_ids.task_id_by_expr(), &task_ids.task_id_by_var_id(),
                              &task_ids.task_ids_by_var_id(), &task_ids.task_id_dynamic_slots_by_var_id(),
                              &task_ids.task_id_array_extent_by_var_id(), &task_ids.task_ids_by_array_var_id(),

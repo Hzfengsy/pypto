@@ -20,6 +20,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypeAlias, TypeVar, cast, overload
 
+from pypto._function_attrs import AUTO_SCOPE_ATTR, EXTERNAL_SOURCE_ATTR
 from pypto.compile_profiling import CompileProfiler, get_active_profiler
 from pypto.pypto_core import ir
 
@@ -532,14 +533,6 @@ def _expr_references_ssa(expr: ir.Expr) -> bool:
     return finder.found
 
 
-# Function-attr key carrying the path to a hand-written external C++ kernel
-# source. When present on an AIC/AIV function, the DSL body is empty (``...``):
-# the compiler assigns the function a kernel func_id and emits the orchestration
-# submit as usual, but skips PyPTO codegen and instead compiles the referenced
-# ``.cpp`` as the InCore kernel (see pto_backend). Stored as an absolute path str.
-EXTERNAL_SOURCE_ATTR = "external_source"
-
-
 def _resolve_external_source(external_source: str | Path, caller_frame: Any) -> str:
     """Resolve an ``external_source`` argument to an absolute file path string.
 
@@ -1021,7 +1014,7 @@ def function(
             func_attrs = _normalize_attrs(attrs) if attrs is not None else None
             # Fold auto_scope=False into attrs (absent ⇒ default True).
             if auto_scope is False:
-                func_attrs = {**(func_attrs or {}), "auto_scope": False}
+                func_attrs = {**(func_attrs or {}), AUTO_SCOPE_ATTR: False}
             # Fold external_source into attrs — marks this as a header-only
             # external kernel (empty ``...`` body, backed by hand-written C++).
             if resolved_external_source is not None:
@@ -1266,7 +1259,7 @@ def program(cls: type | None = None, *, strict_ssa: bool = False) -> ir.Program 
                 # MaterializeRuntimeScopes and the parser both read attrs["auto_scope"].
                 func_auto_scope = _extract_function_auto_scope_from_decorator(func_def)
                 if func_auto_scope is False:
-                    func_attrs["auto_scope"] = False
+                    func_attrs[AUTO_SCOPE_ATTR] = False
 
                 # External C++ kernel: @pl.function(external_source=...) stashed the
                 # resolved path on the method object (the value is a runtime Path

@@ -38,6 +38,7 @@ except ImportError:  # pragma: no cover - fallback for older interpreters
 from typing import Any
 
 from pypto._external_source import EXTERNAL_INCLUDE_DIRS_ATTR, decode_external_include_dirs
+from pypto._function_attrs import DUAL_AIV_DISPATCH_ATTR, EXTERNAL_SOURCE_ATTR
 from pypto.backend._ptoas_locate import PTOAS_RELATIVE_PATHS as _PTOAS_RELATIVE_PATHS
 from pypto.backend._ptoas_locate import find_ptoas_binary as _find_ptoas_binary
 from pypto.backend._ptoas_preprocess import preprocess_ptoas_output as _preprocess_ptoas_output
@@ -723,7 +724,7 @@ def _requires_dual_aiv_dispatch(func: _ir_core.Function) -> bool:
     split_mode = getattr(func, "split", None)
     if split_mode is not None and split_mode != _ir_core.SplitMode.NONE:
         return True
-    return bool(getattr(func, "attrs", {}).get("dual_aiv_dispatch", False))
+    return bool(getattr(func, "attrs", {}).get(DUAL_AIV_DISPATCH_ATTR, False))
 
 
 def _uses_spmd_block_ops(func: _ir_core.Function) -> bool:
@@ -1187,7 +1188,7 @@ def _external_source_of(func: _ir_core.Function) -> str | None:
     this original path in the manifest (so its sibling files stay reachable),
     instead of generating a kernel.
     """
-    return dict(func.attrs).get("external_source")
+    return dict(func.attrs).get(EXTERNAL_SOURCE_ATTR)
 
 
 def _external_include_dirs_of(func: _ir_core.Function) -> tuple[str, ...]:

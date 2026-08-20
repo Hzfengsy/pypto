@@ -518,6 +518,29 @@ func_orch = ir.Function("orchestrator", params, return_types, body, span, ir.Fun
 | `role_` | optional[Role] | Hierarchy role (auto-derived from `func_type_` for InCore/AIC/AIV/Group/Orchestration; see below) |
 | `attrs_` | list[(str, Any)] | Ordered free-form metadata, exposed as `UsualField` (participates in structural traversal) |
 
+### Reserved `attrs_` keys
+
+A key that one pass writes and another reads is a contract, and spelling it as a
+bare string literal at each site leaves that contract with no single point of
+rename. Reserved `Function` attr keys are therefore declared once per layer:
+
+| Layer | Declaration site |
+| ----- | ---------------- |
+| C++ | `include/pypto/ir/function.h` — `inline constexpr const char* kAttr...`, each with a lifecycle comment naming the writer pass, the readers, and whether the key is ever stripped |
+| Python | `python/pypto/_function_attrs.py` — `..._ATTR = "..."` for the subset the DSL, backend and JIT layers touch |
+
+`tests/lint/check_function_attr_key_parity.py` (a pre-commit hook) enforces
+three things: the two declaration sites agree on every key Python declares, the
+identifiers correspond (`kAttrDualAivDispatch` ↔ `DUAL_AIV_DISPATCH_ATTR`), and
+no other source spells one of the keys as a bare literal at a site that reads or
+writes `attrs`.
+
+Keys on other node kinds have their own owners and are not covered by this
+check: `Call` / `Submit` attrs are declared in `include/pypto/ir/expr.h`
+(`kAttrCoreNum`, `kAttrDevice`, `kAttrPredicate`, `kAttrManualDepEdges`, …), and
+`ForStmt` / pass-internal attrs in
+`include/pypto/ir/transforms/utils/attrs.h`.
+
 ### Auto-derivation of `level_` / `role_`
 
 For `func_type_` in {`InCore`, `AIC`, `AIV`, `Group`, `Orchestration`}, the

@@ -385,6 +385,91 @@ inline ParamDirection StringToParamDirection(const std::string& str) {
 inline constexpr const char* kAttrSpmdUnwrapped = "spmd_unwrapped";
 
 /**
+ * @brief Reserved Function attr key marking an AIV kernel that runs on BOTH
+ * vector sub-lanes of a mixed kernel.
+ *
+ * Value type: ``bool``. Written by ``LowerAutoVectorSplit`` (pass 20) and
+ * ``SplitVectorKernel`` (pass 23) onto the AIV lane, and by
+ * ``ExpandMixedKernel`` (pass 21) for the backend-inferred no-split case
+ * (``BackendHandler::RequiresNoSplitDualAivDispatch``). Read by PTO codegen
+ * (``PTOCodegen::IsDualAivDispatchFunction`` — subblock-aware emission),
+ * orchestration codegen (both-lanes MixedKernel dispatch) and
+ * ``VerifyHardSyncallOccupancy`` (a dual-dispatched AIV kernel is a mixed-kernel
+ * lane, not a standalone AIV launch). Never stripped — it survives to codegen.
+ *
+ * Mode-agnostic on purpose: it states only "both AIV sub-lanes execute this
+ * body". The per-op split geometry rides the ``split`` attr / per-op ints, so a
+ * multi-mode ``pl.split_aiv`` function carries this marker with no
+ * function-level ``split`` mode at all.
+ */
+inline constexpr const char* kAttrDualAivDispatch = "dual_aiv_dispatch";
+
+/**
+ * @brief Reserved Function attr key marking an InCore function outlined from a
+ * scope that held ``pl.split_aiv`` region(s).
+ *
+ * Value type: ``bool``. Written by ``ScopeOutliner`` (pass 8) when it outlines a
+ * CORE_GROUP scope containing ``SplitAivScopeStmt`` regions, and re-stamped by
+ * ``LowerAutoVectorSplit`` (pass 20) on the functions it lowers. Read by
+ * ``SplitVectorKernel`` (pass 23, to stamp ``dual_aiv_dispatch`` without
+ * re-halving an already-lowered body), ``MemoryReuse`` (pass 33 — it gates the
+ * Ascend910B ``tile.load`` + ``tpop_from_aic`` in-place hazard guard) and
+ * ``VerifyAivSplit`` (provenance for the boundary-op checks). Never stripped.
+ *
+ * ``MemoryReuse`` keys on this marker rather than on ``Function::GetSplitMode``
+ * precisely because a multi-mode region function has no single function-level
+ * mode once pass 20 has lowered and erased the per-region ones — dropping the
+ * marker there silently disables a hardware-correctness guard.
+ */
+inline constexpr const char* kAttrSplitAiv = "split_aiv";
+
+/**
+ * @brief Reserved Function attr key recording that ``pl.split_aiv`` regions were
+ * already transpose-hazard-checked per region.
+ *
+ * Value type: ``bool``. Written by ``LowerAutoVectorSplit`` (pass 20), which
+ * validates each region against its own unambiguous mode. Read by
+ * ``ExpandMixedKernel`` (pass 21) to skip its single-function-mode transpose
+ * check, which would otherwise mis-check a multi-mode function against whichever
+ * mode happened to be stamped function-level. Never stripped.
+ */
+inline constexpr const char* kAttrSplitAivRegionValidated = "split_aiv_region_validated";
+
+/**
+ * @brief Reserved Function attr key naming a hand-written external C++ kernel
+ * source.
+ *
+ * Value type: ``std::string`` (an absolute path). Written by the
+ * ``@pl.function(external_source=...)`` decorator; the function's DSL body is
+ * then an empty ``...``. Read by ``ExpandMixedKernel`` (external members cannot
+ * be ABI-normalised or inferred into dual dispatch),
+ * ``VerifyReturnParamsExplicit`` (a declaration-only body legitimately has no
+ * ``ReturnStmt``), the Python printer, and the backend, which compiles the named
+ * ``.cpp`` in place of PyPTO codegen. Never stripped.
+ *
+ * Decorator-only: the printer emits it as an ``@pl.function(external_source=...)``
+ * keyword rather than a ``pl.func_attr({...})`` body prologue, because the parser
+ * must read it before it walks the body. Kept in sync with the parser's
+ * ``_DECORATOR_ONLY_FUNC_ATTRS``.
+ */
+inline constexpr const char* kAttrExternalSource = "external_source";
+
+/**
+ * @brief Reserved Function attr key opting a function out of automatic
+ * ``RuntimeScopeStmt`` materialization.
+ *
+ * Value type: ``bool``; **absent means true**, so only the opt-out (``false``)
+ * is ever stored. Written by the ``@pl.function(auto_scope=False)`` decorator and
+ * by ``MaterializeRuntimeScopes`` (pass 44), which stamps ``false`` on the
+ * functions it has already processed. Read by that same pass (idempotence),
+ * ``AutoDeriveTaskDependencies`` (pass 38), ``VerifyRuntimeScopesMaterialized``
+ * and the Python printer.
+ *
+ * Decorator-only, for the same reason as ``kAttrExternalSource`` — see there.
+ */
+inline constexpr const char* kAttrAutoScope = "auto_scope";
+
+/**
  * @brief Function definition
  *
  * Represents a complete function definition with name, parameters, return types, and body.

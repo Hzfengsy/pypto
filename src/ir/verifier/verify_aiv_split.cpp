@@ -37,13 +37,6 @@ namespace ir {
 
 namespace {
 
-/// Function attr recording that ``OutlineIncoreScopes`` minted this InCore
-/// function by outlining a CORE_GROUP scope that held ``pl.split_aiv`` regions.
-/// Written in ``scope_outline_utils.cpp`` and re-stamped by ``LowerAutoVectorSplit``;
-/// read here as the provenance signal for check (h). Kept as a literal for the
-/// same reason both producers do — it is a plain attr key, not an operator name.
-constexpr const char* kSplitAivAttr = "split_aiv";
-
 /// Everything that differs between the two split-axis boundary ops: the memory
 /// space each side must carry, plus the direction-specific diagnostic wording.
 /// Keeping it in one table row per op means a reader (and an editor) sees the
@@ -589,9 +582,12 @@ class AivSplitValidPropertyVerifierImpl : public PropertyVerifier {
       // the body can still establish.
       FunctionSplitFactScanner scanner;
       scanner.VisitStmt(func->body_);
+      // ``kAttrSplitAiv`` (function.h) is the provenance signal for check (h):
+      // ScopeOutliner stamps it when it outlines a scope holding pl.split_aiv
+      // regions, and LowerAutoVectorSplit re-stamps it on the lowered result.
       SplitAivStructuralVerifier verifier(
           diagnostics, scanner.facts(), func->func_type_ == FunctionType::InCore,
-          func->HasAttr(kSplitAivAttr) && func->GetAttr<bool>(kSplitAivAttr, false));
+          func->HasAttr(kAttrSplitAiv) && func->GetAttr<bool>(kAttrSplitAiv, false));
       verifier.VisitStmt(func->body_);
     }
   }

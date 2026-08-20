@@ -1227,7 +1227,7 @@ inline CallPtr SubmitToCallView(const SubmitPtr& submit) {
     // re-emitted below from core_num_ / sync_start_. Drop any stray attr of
     // the same key so the field stays the single source of truth (Call::GetAttr
     // returns the first match, so a stale attr would otherwise shadow it).
-    if (k != kAttrManualDepEdges && k != "core_num" && k != "sync_start" && k != "allow_early_resolve" &&
+    if (k != kAttrManualDepEdges && k != kAttrCoreNum && k != kAttrSyncStart && k != "allow_early_resolve" &&
         k != kAttrPredicate) {
       attrs.emplace_back(k, v);
     }
@@ -1264,8 +1264,8 @@ inline CallPtr SubmitToCallView(const SubmitPtr& submit) {
   // Spmd-wrapper function's attrs). core_num_/sync_start_ are first-class
   // Submit fields and never appear in submit->attrs_, so no duplication.
   if (submit->core_num_.has_value()) {
-    attrs.emplace_back("core_num", std::any(*submit->core_num_));
-    attrs.emplace_back("sync_start", std::any(submit->sync_start_));
+    attrs.emplace_back(kAttrCoreNum, std::any(*submit->core_num_));
+    attrs.emplace_back(kAttrSyncStart, std::any(submit->sync_start_));
   }
   // Speculative early-dispatch opt-in — surface as a Call-view attr so
   // orchestration codegen emits ``Arg::set_allow_early_resolve(true)``. Only

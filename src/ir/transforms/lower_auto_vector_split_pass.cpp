@@ -94,12 +94,6 @@ using split_axis::ProcessStmts;
 using split_axis::SplitDimension;
 using split_axis::TileInfo;
 
-constexpr const char* kDualAivDispatchAttr = "dual_aiv_dispatch";
-constexpr const char* kSplitAivAttr = "split_aiv";
-// Stamped by the explicit-region path so ExpandMixedKernel (pass 21) skips its
-// single-func-mode transpose-hazard check (validated per-region here instead).
-constexpr const char* kSplitAivRegionValidatedAttr = "split_aiv_region_validated";
-
 CallPtr AsCall(const ExprPtr& expr) { return std::dynamic_pointer_cast<const Call>(expr); }
 
 // Defined below LowerStmts; forward-declared so the LowerStmts SplitAivScopeStmt
@@ -1074,11 +1068,11 @@ FunctionPtr LowerExplicitRegionFunction(const FunctionPtr& func) {
   auto attrs = func->attrs_;
   attrs.erase(std::remove_if(attrs.begin(), attrs.end(),
                              [](const auto& kv) {
-                               return kv.first == kSplitAivAttr || kv.first == kSplitAivRegionValidatedAttr;
+                               return kv.first == kAttrSplitAiv || kv.first == kAttrSplitAivRegionValidated;
                              }),
               attrs.end());
-  attrs.emplace_back(kSplitAivAttr, true);
-  attrs.emplace_back(kSplitAivRegionValidatedAttr, true);
+  attrs.emplace_back(kAttrSplitAiv, true);
+  attrs.emplace_back(kAttrSplitAivRegionValidated, true);
 
   auto new_func = MutableCopy(func);
   new_func->body_ = cloned_body;
@@ -1090,12 +1084,12 @@ std::vector<std::pair<std::string, std::any>> WithSplitAivAttrs(const FunctionPt
   auto attrs = func->attrs_;
   attrs.erase(std::remove_if(attrs.begin(), attrs.end(),
                              [](const auto& kv) {
-                               return kv.first == "split" || kv.first == kSplitAivAttr ||
-                                      kv.first == kDualAivDispatchAttr;
+                               return kv.first == "split" || kv.first == kAttrSplitAiv ||
+                                      kv.first == kAttrDualAivDispatch;
                              }),
               attrs.end());
   attrs.emplace_back("split", static_cast<int>(mode));
-  attrs.emplace_back(kSplitAivAttr, true);
+  attrs.emplace_back(kAttrSplitAiv, true);
   return attrs;
 }
 
@@ -1141,7 +1135,7 @@ FunctionPtr LowerFunction(const FunctionPtr& func, SplitMode mode) {
 }
 
 bool IsAlreadyExplicitSplitAiv(const FunctionPtr& func) {
-  return func->HasAttr(kSplitAivAttr) && func->GetAttr<bool>(kSplitAivAttr, false);
+  return func->HasAttr(kAttrSplitAiv) && func->GetAttr<bool>(kAttrSplitAiv, false);
 }
 
 // Roll up the cross-core affinity of a statement list, mirroring

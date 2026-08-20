@@ -44,6 +44,7 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 
 from pypto._external_source import EXTERNAL_INCLUDE_DIRS_ATTR, encode_external_include_dirs
+from pypto._function_attrs import DUAL_AIV_DISPATCH_ATTR
 from pypto.language.typing.array import Array as _LangArray
 from pypto.pypto_core import DataType
 from pypto.pypto_core.ir import TensorLayout
@@ -1864,7 +1865,7 @@ class Specializer:
                 encoded_include_dirs = encode_external_include_dirs(ctx.external_include_dirs)
                 function_attrs.append(f'"{EXTERNAL_INCLUDE_DIRS_ATTR}": {encoded_include_dirs!r}')
             if dual_aiv_dispatch:
-                function_attrs.append('"dual_aiv_dispatch": True')
+                function_attrs.append(f'"{DUAL_AIV_DISPATCH_ATTR}": True')
             attrs = f", attrs={{{', '.join(function_attrs)}}}" if function_attrs else ""
             return [
                 f"@pl.function(type=pl.FunctionType.{core_upper}, external_source={source!r}{attrs})",

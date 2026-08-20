@@ -31,7 +31,7 @@ class RuntimeScopesMaterializedPropertyVerifierImpl : public PropertyVerifier {
     if (!program) return;
     for (const auto& [gv, func] : program->functions_) {
       if (!func || func->func_type_ != FunctionType::Orchestration) continue;
-      if (!func->GetAttr<bool>("auto_scope", true)) continue;
+      if (!func->GetAttr<bool>(kAttrAutoScope, true)) continue;
 
       diagnostics.emplace_back(DiagnosticSeverity::Error, "RuntimeScopesMaterialized", 0,
                                "Orchestration function '" + func->name_ +

@@ -65,8 +65,6 @@ namespace ir {
 
 namespace {
 
-constexpr const char* kDualAivDispatchAttr = "dual_aiv_dispatch";
-
 using core_affinity::ClassifyCallAffinity;
 using core_affinity::ClassifyMoveDirection;
 using core_affinity::CombineAffinity;
@@ -1147,7 +1145,7 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
   // the single-func-mode check for them. A multi-mode function carries no single
   // ``func->GetSplitMode()`` and this whole-function check would mis-check the
   // other region's axis (critique #2).
-  if (!func->HasAttr("split_aiv_region_validated")) {
+  if (!func->HasAttr(kAttrSplitAivRegionValidated)) {
     if (auto mode = func->GetSplitMode(); mode.has_value() && *mode != SplitMode::None) {
       int split_dim = (*mode == SplitMode::UpDown) ? 0 : 1;
       auto hazard = split_axis::FindTransposeSplitHazard(func->body_, split_dim);
@@ -1364,9 +1362,9 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
   auto aiv_attrs = func->attrs_;
   if (needs_dual_aiv_dispatch) {
     aiv_attrs.erase(std::remove_if(aiv_attrs.begin(), aiv_attrs.end(),
-                                   [](const auto& kv) { return kv.first == kDualAivDispatchAttr; }),
+                                   [](const auto& kv) { return kv.first == kAttrDualAivDispatch; }),
                     aiv_attrs.end());
-    aiv_attrs.emplace_back(kDualAivDispatchAttr, true);
+    aiv_attrs.emplace_back(kAttrDualAivDispatch, true);
   }
   auto aiv_func = std::make_shared<Function>(aiv_name, aiv_params, func->param_directions_,
                                              func->return_types_, aiv_cloned_body, func->span_,
@@ -1587,7 +1585,7 @@ bool NeedsInferredNoSplitDualAivDispatch(const FunctionPtr& func) {
   const auto* backend_handler = pass_context ? pass_context->GetBackendHandler()
                                              : pypto::backend::BackendConfig::GetBackend()->GetHandler();
   if (!backend_handler->RequiresNoSplitDualAivDispatch() ||
-      func->GetAttr<bool>(kDualAivDispatchAttr, false) || func->HasAttr("external_source") ||
+      func->GetAttr<bool>(kAttrDualAivDispatch, false) || func->HasAttr(kAttrExternalSource) ||
       func->requires_runtime_binding_) {
     return false;
   }
@@ -1604,9 +1602,9 @@ FunctionPtr WithDualAivDispatch(const FunctionPtr& func) {
   auto result = MutableCopy(func);
   auto attrs = result->attrs_;
   attrs.erase(std::remove_if(attrs.begin(), attrs.end(),
-                             [](const auto& kv) { return kv.first == kDualAivDispatchAttr; }),
+                             [](const auto& kv) { return kv.first == kAttrDualAivDispatch; }),
               attrs.end());
-  attrs.emplace_back(kDualAivDispatchAttr, true);
+  attrs.emplace_back(kAttrDualAivDispatch, true);
   result->attrs_ = std::move(attrs);
   return result;
 }
@@ -1821,10 +1819,11 @@ NormalizedGroups NormalizeHandWrittenGroupAbis(const ProgramPtr& program,
     if (!needs_abi_normalization && !needs_dual_aiv_dispatch) continue;
 
     if (needs_abi_normalization) {
-      CHECK_SPAN(
-          !aic.inner_callee->HasAttr("external_source") && !aiv.inner_callee->HasAttr("external_source") &&
-              !aic.inner_callee->requires_runtime_binding_ && !aiv.inner_callee->requires_runtime_binding_,
-          group->span_)
+      CHECK_SPAN(!aic.inner_callee->HasAttr(kAttrExternalSource) &&
+                     !aiv.inner_callee->HasAttr(kAttrExternalSource) &&
+                     !aic.inner_callee->requires_runtime_binding_ &&
+                     !aiv.inner_callee->requires_runtime_binding_,
+                 group->span_)
           << "Mixed Group '" << group->name_
           << "' has AIC/AIV members with different argument layouts. External or runtime-bound members "
              "cannot be adapted; declare both members with the same signature and forward the Group's full "

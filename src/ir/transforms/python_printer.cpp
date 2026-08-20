@@ -2518,7 +2518,7 @@ void IRPythonPrinter::VisitFunction(const FunctionPtr& func) {
   // deprecated ``attrs=`` keyword and the compiler never warns on its own
   // output. Kept in sync with the parser's ``_DECORATOR_ONLY_FUNC_ATTRS``.
   auto is_filtered_attr = [](const std::string& k, const std::any& v) {
-    if (k == "auto_scope" || k == "external_source") return true;
+    if (k == kAttrAutoScope || k == kAttrExternalSource) return true;
     if (k != "split") return false;
     const int* split_value = std::any_cast<int>(&v);
     return split_value != nullptr && *split_value == static_cast<int>(SplitMode::None);
@@ -2540,8 +2540,8 @@ void IRPythonPrinter::VisitFunction(const FunctionPtr& func) {
     bool has_level = func->level_.has_value();
     bool has_role = func->role_.has_value();
     // Absent ⇒ default True ⇒ not printed.
-    bool auto_scope_off = !func->GetAttr<bool>("auto_scope", true);
-    std::string external_source = func->GetAttr<std::string>("external_source", "");
+    bool auto_scope_off = !func->GetAttr<bool>(kAttrAutoScope, true);
+    std::string external_source = func->GetAttr<std::string>(kAttrExternalSource, "");
     if (has_type || has_level || has_role || auto_scope_off || !external_source.empty()) {
       stream_ << "(";
       bool first = true;

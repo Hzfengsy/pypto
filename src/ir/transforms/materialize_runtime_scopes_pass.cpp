@@ -245,7 +245,7 @@ Pass MaterializeRuntimeScopes() {
     // ``pl.manual_scope()``), which the parser already materialised into the
     // IR. The simpler runtime's implicit top-level scope covers correctness, so
     // emitting zero compiler scopes is valid. Leave such functions untouched.
-    if (!func->GetAttr<bool>("auto_scope", true)) return func;
+    if (!func->GetAttr<bool>(kAttrAutoScope, true)) return func;
 
     const bool whole_layer_manual = func->GetAttr<bool>(kAttrCompilerAutoManualLayerCandidate, false);
     StmtPtr inner = func->body_;
@@ -268,11 +268,11 @@ Pass MaterializeRuntimeScopes() {
     std::vector<std::pair<std::string, std::any>> new_attrs;
     new_attrs.reserve(func->attrs_.size() + 1);
     for (const auto& kv : func->attrs_) {
-      if (kv.first != "auto_scope" && kv.first != kAttrCompilerAutoManualLayerCandidate) {
+      if (kv.first != kAttrAutoScope && kv.first != kAttrCompilerAutoManualLayerCandidate) {
         new_attrs.push_back(kv);
       }
     }
-    new_attrs.emplace_back("auto_scope", std::any(false));
+    new_attrs.emplace_back(kAttrAutoScope, std::any(false));
 
     return std::make_shared<Function>(func->name_, func->params_, func->param_directions_,
                                       func->return_types_, new_body, func->span_, func->func_type_,

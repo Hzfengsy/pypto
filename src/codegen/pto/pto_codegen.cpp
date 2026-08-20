@@ -2021,8 +2021,8 @@ bool PTOCodegen::IsAIVFunction() const {
 }
 
 bool PTOCodegen::IsDualAivDispatchFunction() const {
-  return fs_.current_function && fs_.current_function->HasAttr("dual_aiv_dispatch") &&
-         fs_.current_function->GetAttr<bool>("dual_aiv_dispatch", false);
+  return fs_.current_function && fs_.current_function->HasAttr(ir::kAttrDualAivDispatch) &&
+         fs_.current_function->GetAttr<bool>(ir::kAttrDualAivDispatch, false);
 }
 
 void PTOCodegen::EmitExtraAllocTiles() {

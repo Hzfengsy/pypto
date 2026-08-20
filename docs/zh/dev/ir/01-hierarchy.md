@@ -472,6 +472,26 @@ func_orch = ir.Function("orchestrator", params, return_types, body, span, ir.Fun
 | `role_` | optional[Role] | 层次角色（对 InCore/AIC/AIV/Group/Orchestration 自动派生，详见下文） |
 | `attrs_` | list[(str, Any)] | 有序的自由形式元数据，以 `UsualField` 暴露（参与结构遍历） |
 
+### 保留的 `attrs_` 键
+
+一个 pass 写入、另一个 pass 读取的键是一份契约；若在每个站点都写成裸字符串字面量，
+这份契约就没有唯一的重命名入口。因此保留的 `Function` attr 键在每一层只声明一次：
+
+| 层 | 声明位置 |
+| -- | -------- |
+| C++ | `include/pypto/ir/function.h` — `inline constexpr const char* kAttr...`，每个键都带生命周期注释，说明写入 pass、读取方，以及该键是否会被剥离 |
+| Python | `python/pypto/_function_attrs.py` — `..._ATTR = "..."`，仅覆盖 DSL、后端与 JIT 层实际使用的子集 |
+
+`tests/lint/check_function_attr_key_parity.py`（pre-commit 钩子）强制三件事：
+两个声明位置对 Python 声明的每个键取值一致；标识符互相对应
+（`kAttrDualAivDispatch` ↔ `DUAL_AIV_DISPATCH_ATTR`）；其他源文件不得在读写
+`attrs` 的站点上把这些键写成裸字面量。
+
+其他节点类型的键各有归属，不在本检查范围内：`Call` / `Submit` 的 attr 声明在
+`include/pypto/ir/expr.h`（`kAttrCoreNum`、`kAttrDevice`、`kAttrPredicate`、
+`kAttrManualDepEdges` 等），`ForStmt` / pass 内部 attr 声明在
+`include/pypto/ir/transforms/utils/attrs.h`。
+
 ### `level_` / `role_` 自动派生
 
 当 `func_type_` 属于 {`InCore`, `AIC`, `AIV`, `Group`, `Orchestration`} 时，

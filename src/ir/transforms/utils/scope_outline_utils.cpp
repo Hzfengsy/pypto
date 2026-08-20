@@ -1264,7 +1264,7 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
            "split would otherwise be silently dropped (the per-region split governs the lanes). "
            "To pin a custom cross-core slot count, use "
            "optimizations=[pl.cross_core_slot(slot_num=N)], which is orthogonal to splitting.";
-    outlined_attrs.emplace_back("split_aiv", true);
+    outlined_attrs.emplace_back(kAttrSplitAiv, true);
     // Stamp a function-level representative ``split`` mode ONLY when all regions
     // share one mode (``uniform_mode``) AND that mode is a real split. Differing
     // sibling modes have no single representative: leave the function-level mode

@@ -1661,7 +1661,7 @@ bool NeedsLoadTpopHazardGuard(const FunctionPtr& func) {
   // pl.split_aiv regions have their per-region modes lowered + erased by
   // LowerAutoVectorSplit, so no single function-level mode survives. Key on the
   // marker too so the guard still fires for them.
-  if (func->HasAttr("split_aiv") && func->GetAttr<bool>("split_aiv", false)) return true;
+  if (func->HasAttr(kAttrSplitAiv) && func->GetAttr<bool>(kAttrSplitAiv, false)) return true;
   const auto split_mode = func->GetSplitMode();
   return split_mode.has_value() && *split_mode != SplitMode::None;
 }

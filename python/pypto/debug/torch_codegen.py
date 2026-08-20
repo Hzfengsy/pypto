@@ -20,6 +20,7 @@ import torch
 import pypto.language as pl
 from pypto import DataType
 from pypto import ir as _ir
+from pypto._function_attrs import DUAL_AIV_DISPATCH_ATTR
 
 # ---------------------------------------------------------------------------
 # DataType -> torch dtype string
@@ -854,7 +855,7 @@ def _build_group_meta(program: _ir.Program) -> dict[str, dict[str, Any]]:
             split = _split_mode_to_int(func.split)
             if split == 0:
                 split = _split_mode_to_int(aiv_func.split)
-        dual_aiv_dispatch = bool(getattr(aiv_func, "attrs", {}).get("dual_aiv_dispatch", False))
+        dual_aiv_dispatch = bool(getattr(aiv_func, "attrs", {}).get(DUAL_AIV_DISPATCH_ATTR, False))
         group_meta[func.name] = {
             "aic": aic_name,
             "aiv": aiv_name,
