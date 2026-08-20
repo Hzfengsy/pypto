@@ -11,6 +11,7 @@
 
 from collections.abc import Callable
 
+import pypto.language as pl
 import pytest
 from pypto import DataType, ir
 from pypto.pypto_core import ir as _core_ir
@@ -328,6 +329,18 @@ def _dims(*extents: int) -> list[ir.ConstInt]:
     return [ir.ConstInt(e, DataType.INT64, _span()) for e in extents]
 
 
+def _start_offset_of(tile_type: ir.Type) -> ir.Expr | None:
+    """Read ``tile_view.start_offset`` off a ``TileType``, asserting the view survived.
+
+    ``TileType``'s ctor canonicalizes an implicit view away to ``None``, so a
+    bare attribute chain would silently read through a dropped view.
+    """
+    assert isinstance(tile_type, ir.TileType)
+    tile_view = tile_type.tile_view
+    assert tile_view is not None, "TileType canonicalized the view away"
+    return tile_view.start_offset
+
+
 # One shared WindowBuffer so the two instances a factory builds stay
 # structurally equal: window_buffer_ is compared by Var identity, not by value.
 _SHARED_WINDOW_BUFFER = ir.WindowBuffer(
@@ -352,6 +365,22 @@ _TYPE_FACTORIES: dict[str, Callable[[], ir.Type]] = {
         _dims(64, 128), DataType.FP32, _SHARED_WINDOW_BUFFER
     ),
     "TileType": lambda: ir.TileType([64, 128], DataType.FP16),
+    # A partial view: start_offset stays None, which is the state
+    # pl.TileView(...) and TileView's default ctor both produce.
+    "TileType_view_null_start_offset": lambda: ir.TileType(
+        [64, 128],
+        DataType.FP16,
+        tile_view=ir.TileView(valid_shape=[32, 128], pad=ir.PadValue.zero),
+    ),
+    "TileType_view_explicit_start_offset": lambda: ir.TileType(
+        [64, 128],
+        DataType.FP16,
+        tile_view=ir.TileView(
+            valid_shape=[32, 128],
+            pad=ir.PadValue.zero,
+            start_offset=ir.ConstInt(0, DataType.INDEX, _span()),
+        ),
+    ),
     "ArrayType": lambda: ir.ArrayType(DataType.INT32, 16),
     "TupleType": lambda: ir.TupleType([ir.ScalarType(DataType.INT64), ir.ArrayType(DataType.INT32, 8)]),
     "PtrType": lambda: ir.PtrType(),
@@ -534,6 +563,64 @@ class TestHashTypeLadderParity:
         null_pad, zero_pad = make(ir.PadValue.null), make(ir.PadValue.zero)
         assert not ir.structural_equal(null_pad, zero_pad)
         assert hash(null_pad) != hash(zero_pad)
+
+    def test_null_tile_view_start_offset_hashes_apart_from_an_explicit_zero(self):
+        """A null ``TileView::start_offset`` must hash, not abort.
+
+        ``start_offset`` carries no non-null invariant: the C++ default ctor
+        leaves it unset, ``pl.TileView(...)`` defaults it to ``None``, and
+        ``IsImplicitPrintedTileView`` reads non-null as "explicit offset".
+        ``EqualType`` compares it through the null-tolerant ``Equal(...)``, so
+        ``HashType``'s ``INTERNAL_CHECK`` used to abort on a ``TileType`` that
+        ``structural_equal`` reported equal to itself.
+        """
+
+        def make(start_offset: ir.Expr | None) -> ir.TileType:
+            return ir.TileType(
+                [64, 128],
+                DataType.FP16,
+                tile_view=ir.TileView(valid_shape=[32, 128], pad=ir.PadValue.zero, start_offset=start_offset),
+            )
+
+        null_off = make(None)
+        assert _start_offset_of(null_off) is None
+        # Null is a distinct state, not a stand-in for offset 0.
+        zero_off = make(ir.ConstInt(0, DataType.INDEX, _span()))
+        assert not ir.structural_equal(null_off, zero_off)
+        assert hash(null_off) != hash(zero_off)
+
+    def test_a_kernel_signature_with_a_partial_tile_view_is_hashable(self):
+        """The null ``start_offset`` above is reachable from plain DSL syntax.
+
+        A ``pl.Tile[...]`` annotation carrying a partial ``pl.TileView(...)``
+        leaves ``start_offset`` unset, so the abort propagated all the way out
+        of ``structural_hash(program)``.
+        """
+
+        @pl.program
+        class Mod:
+            @pl.function
+            def main(
+                self,
+                x: pl.Tile[
+                    [64, 32],
+                    pl.FP32,
+                    pl.Mem.Vec,
+                    pl.TileView(valid_shape=[32, 32], pad=pl.PadValue.zero),
+                ],
+            ) -> pl.Tile[
+                [64, 32], pl.FP32, pl.Mem.Vec, pl.TileView(valid_shape=[32, 32], pad=pl.PadValue.zero)
+            ]:
+                return x
+
+        main = Mod["main"]
+        assert main is not None
+        param_type = main.params[0].type
+        assert _start_offset_of(param_type) is None
+        assert ir.structural_equal(param_type, param_type)
+        assert isinstance(ir.structural_hash(param_type), int)
+        assert isinstance(hash(param_type), int)
+        assert isinstance(ir.structural_hash(Mod), int)
 
 
 if __name__ == "__main__":
