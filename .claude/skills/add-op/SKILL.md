@@ -90,7 +90,10 @@ third argument. Template: [reference.md §2](reference.md).
 **File**: `python/pypto/language/op/tile_ops.py`
 
 Unwrap the `Tile` args → call the IR function → wrap the result in `Tile`. Also add
-`"<op_name>"` to `__all__` if the file has one. Template: [reference.md §3](reference.md).
+`"<op_name>"` to `__all__` if the file has one. **This docstring is the published manual** —
+`docs/en/user/api/tile.md` renders it — so carry A2's explanation across rather than trimming to
+a one-line summary; `tests/lint/check_op_docstring_parity.py` fails otherwise. Template:
+[reference.md §3](reference.md).
 
 ### A4: Unit Tests
 
@@ -186,7 +189,7 @@ Also check whether the 910B backend needs special handling in
 - [ ] Exact backend pipe inference exists when the source/destination route is not uniquely inferable
 - [ ] New `.cpp` added to `CMakeLists.txt` if created
 - [ ] Python IR wrapper in `ir/op/{tile,tensor}_ops.py`
-- [ ] Python DSL wrapper in `language/op/{tile,tensor}_ops.py`
+- [ ] Python DSL wrapper in `language/op/{tile,tensor}_ops.py`, docstring carries A2's explanation
 - [ ] Conversion registered in `op_conversion_registry.cpp` (if Phase B)
 - [ ] Codegen registered in backend (if Phase C)
 - [ ] Unit tests pass: `python3 -m pytest tests/ut/ir/operators/ -v -k <op_name>`

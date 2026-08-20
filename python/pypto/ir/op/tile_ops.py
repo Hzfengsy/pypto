@@ -3223,7 +3223,7 @@ def gather_compare(
     :class:`Call` whose result type is a ``TupleType{dst, cdst}``::
 
         dst  : TileType, [rows, out_cols], INT32  — gathered indices
-        cdst : TileType, [rows],           count_dtype — per-row match count
+        cdst : TileType, [1, rows],        count_dtype — per-row match count
 
     The DSL form ``d, c = pl.tile.gather_compare(src, kvalue, tmp, ...)`` is
     desugared by the parser into ``_tuple = call; d = _tuple[0]; c = _tuple[1]``.
