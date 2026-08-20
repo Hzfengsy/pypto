@@ -163,7 +163,7 @@ pass 之后是否存在。
 | 语义 | 同步函数调用 | 异步任务启动 |
 | 出现位置 | 任意位置 | `manual_scope` 体内（由 parser 产生），以及作为 `pl.at(..., deps=[...])` 作用域外提后的派发点（缺失 `as tid` 绑定时会得到一个合成的未使用 TaskId Var）；在整个流水线中保持不变 |
 | 返回类型 | 被调方声明的返回 | `Tuple[<callee return>..., Scalar[TASK_ID]]` |
-| `args_` 与被调方 `params_` 的对应 | 恒等映射，完全覆盖：`args_.size() == params_.size()` | 恒等映射，**有界（bounded）**覆盖：`args_.size() <= params_.size()`。调用方提供的实参排在最前（方向不限——In、InOut，**以及**调用方分配的 Out）；中间未被覆盖的被调方形参必须声明为 `Out`，由运行时分配（orchestration codegen 会为每个这样的形参合成一个 `add_output`）；由 `MaterializeDistTensorCtx` 追加在尾部的 `CommCtxType` 形参会被完整地带入 `args_`，因此只有在该 pass 运行之前，`args_` 才是 `params_` 的纯前缀（prefix）。权威表述见 `include/pypto/ir/expr.h` 中的 `Submit::args_` |
+| `args_` 与被调方 `params_` 的对应 | 恒等映射，完全覆盖：`args_.size() == params_.size()` | **有界（bounded）**覆盖：`args_.size() <= params_.size()`。恒等映射只在开头这段调用方提供的实参上成立（方向不限——In、InOut，**以及**调用方分配的 Out）；中间未被覆盖的被调方形参必须声明为 `Out`，由运行时分配（orchestration codegen 会为每个这样的形参合成一个 `add_output`）；由 `MaterializeDistTensorCtx` 追加在尾部的 `CommCtxType` 形参虽然也带在 `args_` 中，但位置是 `args_[i - gap]`（其中 `gap = params_.size() - args_.size()`）——因此当“空缺”与 CommCtx 后缀同时存在时，`args_[i] ↔ params_[i]` **不成立**。权威表述见 `include/pypto/ir/expr.h` 中的 `Submit::args_` |
 | 是否有 `deps` | 无 —— 普通 `Call` 从不携带依赖边（`attrs["manual_dep_edges"]` 仅出现在由 `pl.at` 产生的 `ScopeStmt` 上，在作用域外提时被消费；由 ManualDepsOnSubmitOnly 校验） | 一等的 `deps_` 字段 —— `Scalar[TASK_ID]` Var / `Array[N, TASK_ID]` Var |
 | SPMD 启动规格 | 无 | `core_num_`（`optional<ExprPtr>` 块数）+ `sync_start_`（bool），仅由 `pl.spmd_submit` 设置；`sync_start_` 仅在 `core_num_` 存在时才有意义（构造函数强制 `sync_start ⇒ core_num`）；`nullopt` ⇒ 普通单块 submit |
 | Use-def 链 | 仅 `args_` | `args_`、`deps_`，**以及** `core_num_` |

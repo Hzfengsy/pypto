@@ -205,5 +205,54 @@ def test_scalar_param_after_the_annotation_that_uses_it_is_rejected():
     assert "earlier parameter" in str(exc_info.value)
 
 
+def test_submit_omitting_out_param_that_declares_symbol_is_a_user_error():
+    """Omitting a trailing ``pl.Out`` whose valid_shape names an unbound symbol
+    must raise an actionable ``ValueError``, not an ``InternalError``.
+
+    ``Submit::args_`` need not cover every callee param (see the canonical
+    statement on ``Submit::args_`` in ``include/pypto/ir/expr.h``), so this is
+    legal DSL that reaches the pass directly from user source. But a
+    runtime-allocated output does not exist at the call site, so it carries no
+    valid_shape for the pass to read ``VALID`` from — a real limitation of this
+    lowering rather than a compiler bug. Pins the classification: an
+    ``INTERNAL_CHECK`` here would surface a C++ traceback for ordinary source.
+    """
+    VALID = pl.dynamic("VALID")
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            x: pl.Tensor[[64], pl.FP32],
+            ret0__out: pl.Out[
+                pl.Tensor[
+                    [64],
+                    pl.FP32,
+                    pl.TensorView(valid_shape=[VALID], layout=pl.TensorLayout.ND),
+                ]
+            ],
+        ) -> pl.Tensor[[64], pl.FP32]:
+            xt = pl.load(x, [0], [64], [64], target_memory=pl.Mem.Vec)
+            return pl.store(pl.tile.add(xt, xt), [0], ret0__out)
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+            with pl.manual_scope():
+                # ``ret0__out`` deliberately not supplied.
+                a, _a_tid = pl.submit(self.kernel, x)
+            return a
+
+    with pytest.raises(ValueError, match="VALID") as exc_info:
+        passes.materialize_valid_shape_symbols()(Prog)
+
+    message = str(exc_info.value)
+    assert "does not supply that argument" in message, message
+    # Actionable: names the kernel, the parameter, and what to do about it.
+    assert "kernel" in message, message
+    assert "parameter 1" in message, message
+    assert "Pass the argument explicitly" in message, message
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

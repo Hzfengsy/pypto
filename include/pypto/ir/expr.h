@@ -985,15 +985,23 @@ class Submit : public Expr {
   // invariant** — every pass and codegen consumer reads this comment; do not
   // restate it locally, cross-reference it.
   //
-  // Mapping is positional identity against the callee's ``params_``:
-  // ``args_[i]`` binds ``callee->params_[i]``. The kinds differ only in
-  // *coverage*:
+  // ``Call`` maps positionally by identity — ``args_[i]`` binds
+  // ``callee->params_[i]`` — with full coverage:
+  // ``args_.size() == params_.size()``.
   //
-  //   * ``Call``  — full coverage: ``args_.size() == params_.size()``.
-  //   * ``Submit`` — **bounded** coverage: ``args_.size() <= params_.size()``.
+  // ``Submit`` has **bounded** coverage, ``args_.size() <= params_.size()``,
+  // and identity holds only over the leading caller-supplied args. Writing
+  // ``gap = params_.size() - args_.size()`` and ``ctx`` for the number of
+  // trailing ``CommCtxType`` params, the mapping is:
   //
-  // A Submit's args therefore split into up to three regions, in callee param
-  // order:
+  //   * ``i`` in ``[0, args_.size() - ctx)``    → ``params_[i]``
+  //   * ``i`` in ``[args_.size() - ctx, args_.size())`` → ``params_[i + gap]``
+  //
+  // so with params ``[x, omitted_out, ctx]`` the args are ``[x, ctx]`` and
+  // ``args_[1]`` binds ``params_[2]``, not ``params_[1]``. Identity is
+  // recovered exactly when ``gap == 0`` (which includes every ``Call``).
+  //
+  // The regions behind that mapping, in callee param order:
   //
   //   1. ``[0, args_.size() - ctx)`` — **caller-supplied**. Any direction:
   //      ``In``, ``InOut``, *and* ``Out``. A caller-allocated ``Out`` param is
