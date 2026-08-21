@@ -4244,7 +4244,7 @@ class TestManualPipeVtoCFractalAdapt:
             ):
                 v2c_peer = pl.import_peer_buffer(name="v2c_slot_buffer", peer_func="manual_aic")
                 pl.aiv_initialize_pipe(pl.const(0, pl.INT32), v2c_peer, dir_mask=2, slot_size=1024, id=1)
-                a_tile = pl.load(a, [0, 0], [16, 16])
+                a_tile = pl.load(a, [0, 0], [16, 16], target_memory=pl.Mem.Vec)
                 doubled = pl.add(a_tile, a_tile)
                 doubled_nz = pl.move(
                     doubled,
@@ -4342,7 +4342,7 @@ class TestManualPipeVtoCFractalAdapt:
             ):
                 v2c_peer = pl.import_peer_buffer(name="v2c_slot_buffer", peer_func="manual_aic")
                 pl.aiv_initialize_pipe(pl.const(0, pl.INT32), v2c_peer, dir_mask=2, slot_size=1024, id=1)
-                a_tile = pl.load(a, [0, 0], [16, 16])
+                a_tile = pl.load(a, [0, 0], [16, 16], target_memory=pl.Mem.Vec)
                 doubled = pl.add(a_tile, a_tile)
                 doubled_nz = pl.move(
                     doubled,
