@@ -1740,6 +1740,13 @@ std::optional<CalleeRewriteAnalysis> AnalyzeAggregateWindowLoop(
       continue;
     }
 
+    // Only the dense path was ever gated on this: both static-piece fallbacks
+    // above `continue` before reaching here, so a full-parent piece from the
+    // fallback stayed a real rewrite. Record which case this is instead of
+    // re-deriving it from the shapes, which cannot tell the two apart.
+    const bool covers_full_parent =
+        AreExprVectorsEqual(window_shape, out_tensor_type->shape_) && IsAllZeroOffsets(base_offsets);
+
     auto output_window_shape = std::move(window_shape);
     auto output_base_offsets = std::move(base_offsets);
     auto output_local_offsets = std::move(local_zero_offsets);
@@ -1752,7 +1759,8 @@ std::optional<CalleeRewriteAnalysis> AnalyzeAggregateWindowLoop(
                                                  std::move(output_local_offsets),
                                                  MakeDenseRegion({std::move(output_piece)}),
                                                  {},
-                                                 match.iter_arg_index});
+                                                 match.iter_arg_index,
+                                                 covers_full_parent});
   }
 
   if (analysis.outputs.empty()) return std::nullopt;
@@ -1851,7 +1859,11 @@ AnalysisMap Analyze(const ProgramPtr& program) {
     const bool outputs_are_wholesale = AllAggregateOutputsCoverFullParent(aggregate_analysis, out_indices);
     if (aggregate_analysis.has_value()) {
       auto& outputs = aggregate_analysis->outputs;
-      outputs.erase(std::remove_if(outputs.begin(), outputs.end(), CoversFullParent), outputs.end());
+      outputs.erase(std::remove_if(outputs.begin(), outputs.end(),
+                                   [](const OutputRewriteInfo& output) {
+                                     return output.dense_window_covers_full_parent;
+                                   }),
+                    outputs.end());
       if (!outputs.empty()) {
         analyses.emplace(func->name_, std::move(*aggregate_analysis));
         continue;

@@ -74,6 +74,13 @@ struct OutputRewriteInfo {
   AccessRegion region;
   std::vector<size_t> piece_return_indices;
   size_t iter_arg_index = SIZE_MAX;
+  /// True when the dense aggregate path proved a window covering the whole
+  /// parent at offset zero. Windowing that narrows nothing, so `Analyze` drops
+  /// it from the rewrite plan -- while the pure-input-window verdict still
+  /// counts it. The static-piece fallback deliberately never sets this: a
+  /// full-parent *piece* there is one of several, and the multi-piece rewrite
+  /// is real.
+  bool dense_window_covers_full_parent = false;
 };
 
 struct InputRewriteInfo {
