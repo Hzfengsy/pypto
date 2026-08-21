@@ -100,6 +100,16 @@ class GeneratedScalarLocalFlattener : public IRMutator {
   Span span_;
 };
 
+/// `ceil(distance / step_abs)` for a non-negative `distance` and a positive
+/// `step_abs`, or nullopt when the round-up would overflow int64.
+std::optional<int64_t> CheckedCeilDiv(int64_t distance, int64_t step_abs) {
+  auto sum = CheckedAdd(distance, step_abs);
+  if (!sum.has_value()) return std::nullopt;
+  auto rounded = CheckedSub(*sum, 1);
+  if (!rounded.has_value()) return std::nullopt;
+  return *rounded / step_abs;
+}
+
 }  // namespace
 
 std::string GetCallFuncName(const CallPtr& call) {
@@ -369,6 +379,11 @@ std::optional<int64_t> CheckedMul(int64_t lhs, int64_t rhs) {
   return lhs * rhs;
 }
 
+std::optional<int64_t> CheckedAbs(int64_t value) {
+  if (value == std::numeric_limits<int64_t>::min()) return std::nullopt;
+  return value < 0 ? -value : value;
+}
+
 bool AddLinearCoeff(LinearIndexExpr* expr, const Var* var, int64_t coeff) {
   if (!expr || !var || coeff == 0) return true;
   auto& slot = expr->coeffs[var];
@@ -474,13 +489,17 @@ std::optional<AffineForm> ParseAffineInLoop(const ExprPtr& expr, const Var* loop
     auto lhs = ParseAffineInLoop(add->left_, loop_var);
     auto rhs = ParseAffineInLoop(add->right_, loop_var);
     if (!lhs.has_value() || !rhs.has_value()) return std::nullopt;
-    return AffineForm{lhs->coeff + rhs->coeff, MakeAdd(lhs->base, rhs->base, expr->span_)};
+    auto coeff = CheckedAdd(lhs->coeff, rhs->coeff);
+    if (!coeff.has_value()) return std::nullopt;
+    return AffineForm{*coeff, MakeAdd(lhs->base, rhs->base, expr->span_)};
   }
   if (auto sub = As<Sub>(expr)) {
     auto lhs = ParseAffineInLoop(sub->left_, loop_var);
     auto rhs = ParseAffineInLoop(sub->right_, loop_var);
     if (!lhs.has_value() || !rhs.has_value()) return std::nullopt;
-    return AffineForm{lhs->coeff - rhs->coeff, MakeSub(lhs->base, rhs->base, expr->span_)};
+    auto coeff = CheckedSub(lhs->coeff, rhs->coeff);
+    if (!coeff.has_value()) return std::nullopt;
+    return AffineForm{*coeff, MakeSub(lhs->base, rhs->base, expr->span_)};
   }
   if (auto mul = As<Mul>(expr)) {
     auto lhs_ci = As<ConstInt>(mul->left_);
@@ -488,15 +507,19 @@ std::optional<AffineForm> ParseAffineInLoop(const ExprPtr& expr, const Var* loop
     if (lhs_ci) {
       auto rhs = ParseAffineInLoop(mul->right_, loop_var);
       if (!rhs.has_value()) return std::nullopt;
-      return AffineForm{lhs_ci->value_ * rhs->coeff,
+      auto coeff = CheckedMul(lhs_ci->value_, rhs->coeff);
+      if (!coeff.has_value()) return std::nullopt;
+      return AffineForm{*coeff,
                         MakeMul(std::make_shared<ConstInt>(lhs_ci->value_, lhs_ci->dtype(), lhs_ci->span_),
                                 rhs->base, expr->span_)};
     }
     if (rhs_ci) {
       auto lhs = ParseAffineInLoop(mul->left_, loop_var);
       if (!lhs.has_value()) return std::nullopt;
+      auto coeff = CheckedMul(rhs_ci->value_, lhs->coeff);
+      if (!coeff.has_value()) return std::nullopt;
       return AffineForm{
-          rhs_ci->value_ * lhs->coeff,
+          *coeff,
           MakeMul(lhs->base, std::make_shared<ConstInt>(rhs_ci->value_, rhs_ci->dtype(), rhs_ci->span_),
                   expr->span_)};
     }
@@ -517,10 +540,12 @@ std::optional<int64_t> GetStaticTripCount(const ForStmtPtr& loop) {
   auto step = GetConstIntValue(loop->step_);
   if (!start.has_value() || !stop.has_value() || !step.has_value() || *step == 0) return std::nullopt;
   if ((*step > 0 && *stop <= *start) || (*step < 0 && *stop >= *start)) return int64_t{0};
-  int64_t distance = *stop - *start;
-  int64_t step_abs = *step > 0 ? *step : -*step;
-  int64_t distance_abs = distance > 0 ? distance : -distance;
-  return (distance_abs + step_abs - 1) / step_abs;
+  auto distance = CheckedSub(*stop, *start);
+  if (!distance.has_value()) return std::nullopt;
+  auto step_abs = CheckedAbs(*step);
+  auto distance_abs = CheckedAbs(*distance);
+  if (!step_abs.has_value() || !distance_abs.has_value()) return std::nullopt;
+  return CheckedCeilDiv(*distance_abs, *step_abs);
 }
 
 std::optional<int64_t> GetKnownPositiveTripCount(const ForStmtPtr& loop) {
@@ -544,8 +569,9 @@ std::optional<int64_t> GetKnownPositiveTripCount(const ForStmtPtr& loop) {
     distance_value = *linear_distance;
   }
   if (distance_value <= 0) return int64_t{0};
-  int64_t step_abs = *step > 0 ? *step : -*step;
-  return (distance_value + step_abs - 1) / step_abs;
+  auto step_abs = CheckedAbs(*step);
+  if (!step_abs.has_value()) return std::nullopt;
+  return CheckedCeilDiv(distance_value, *step_abs);
 }
 
 std::optional<ExprPtr> SimplifyWithLoopBound(const ExprPtr& expr, const VarPtr& loop_var, int64_t value) {
@@ -567,9 +593,10 @@ std::optional<ExprPtr> GetLoopValueAtTrip(const ForStmtPtr& loop, int64_t trip_i
   if (!loop || trip_index < 0) return std::nullopt;
   auto step = GetConstIntValue(loop->step_);
   if (!step.has_value()) return std::nullopt;
-  int64_t delta = trip_index * *step;
-  if (delta == 0) return loop->start_;
-  auto delta_expr = std::make_shared<ConstInt>(delta, DataType::INDEX, loop->span_);
+  auto delta = CheckedMul(trip_index, *step);
+  if (!delta.has_value()) return std::nullopt;
+  if (*delta == 0) return loop->start_;
+  auto delta_expr = std::make_shared<ConstInt>(*delta, DataType::INDEX, loop->span_);
   return arith::Analyzer().Simplify(MakeAdd(loop->start_, delta_expr, loop->span_));
 }
 }  // namespace window_externalization

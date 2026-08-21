@@ -13,7 +13,6 @@
 #include <any>
 #include <array>
 #include <cstddef>
-#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <string>
@@ -1251,7 +1250,11 @@ class OrchRewriter : public IRMutator {
       if (!extent_ci || !loop_step.has_value()) return LoopRegionRole::Unknown;
       if (varying_dim.has_value()) return LoopRegionRole::Unknown;
       if (varying_dims_used && varying_dims_used->count(i)) return LoopRegionRole::Unknown;
-      if (std::abs(affine->coeff * *loop_step) < extent_ci->value_) return LoopRegionRole::Unknown;
+      auto stride = CheckedMul(affine->coeff, *loop_step);
+      if (!stride.has_value()) return LoopRegionRole::Unknown;
+      auto stride_abs = CheckedAbs(*stride);
+      if (!stride_abs.has_value()) return LoopRegionRole::Unknown;
+      if (*stride_abs < extent_ci->value_) return LoopRegionRole::Unknown;
       varying_dim = i;
     }
     if (!varying_dim.has_value()) {
