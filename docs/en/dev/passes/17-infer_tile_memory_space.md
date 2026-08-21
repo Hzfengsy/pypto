@@ -32,7 +32,7 @@ infer_pass = passes.infer_tile_memory_space()
 program_inferred = infer_pass(program)
 ```
 
-The pass only rewrites functions whose `func_type_ == FunctionType::InCore`. Orchestration and Opaque functions pass through unchanged.
+The pass rewrites every InCore-variant function -- `IsInCoreType`, i.e. `InCore`, `AIC` and `AIV`. Orchestration and Opaque functions pass through unchanged; a tile reaching `InitMemRef` from one of those is reported as an authoring error, since a non-device function has no on-chip buffer to place it in.
 
 ## Algorithm
 
@@ -47,7 +47,7 @@ Walks the function body once and records two pieces of information:
 
 Demands are then propagated *backward* through those edges by a single reverse-order sweep. Because inherit-input ops in SSA always have `dst` defined after `src`, one reverse pass reaches the fixed point in O(N). When two demands collide on the same var, a non-`Vec` demand wins (`ShouldOverrideDemand`) — `Vec` is the permissive default and a specialized demand from a compute op should override it.
 
-This phase is what lets `slice(tensor) → fillpad → matmul` push the matmul's `Left`/`Right` demand all the way back to the `tile.slice` output, so Phase 1 can resolve that producer directly to `Left`/`Right` instead of routing through `Vec`.
+This phase is what lets `slice(tensor) → fillpad → matmul` push the matmul's `Left`/`Right` demand all the way back to the `tile.slice` output. Phase 1 then resolves that producer to `Mat` — the staging space a cube demand maps to, per the table below — and Phase 2 inserts the `Mat -> Left` / `Mat -> Right` move. The demand is what selects `Mat` over `Vec`; without it the operand would take the longer GM -> UB -> L1 -> L0 route.
 
 ### Phase 1 — Forward analysis (`TileMemorySpaceAnalyzer`)
 
@@ -249,4 +249,11 @@ The `TileMemoryInferred` property is the contract this pass establishes. Downstr
 | `Orchestration` | Unchanged |
 | `Opaque` | Unchanged |
 
-The pass also asserts that no InCore function parameter has `TileType` — InCore params must be `TensorType`. This is checked at the start of Phase 1 and raises a `CHECK` failure if violated.
+Tile *parameters* are handled by function type, at the start of Phase 1:
+
+| Function type | Tile parameter | Why |
+| ------------- | -------------- | --- |
+| `InCore` | Rejected (`INTERNAL_CHECK`) | An InCore kernel is entered from orchestration, which speaks tensors; a tile parameter means an earlier pass produced a malformed signature |
+| `AIC` / `AIV` | Accepted, and **seeds** the analysis | These are sub-workers entered from a mixed kernel, so a tile parameter is the ordinary cross-core handoff |
+
+A parameter's space is part of the signature — the caller decides where the tile lives — so this pass never infers it. An `AIC`/`AIV` tile parameter that omits its space is a user error, reported with the annotation to add.

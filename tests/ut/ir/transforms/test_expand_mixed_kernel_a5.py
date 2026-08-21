@@ -3987,7 +3987,7 @@ class TestDCERegression:
         """Regression for issue #977: an init-value defined inside an outer loop must
         reach the split AIC body ahead of the inner loop that carries it.
 
-        This is the Qwen3Scope1 shape: an outer loop allocates a zero accumulator,
+        This is the Qwen3Scope1 shape: an outer loop allocates an accumulator,
         an inner loop takes it through ``init_values`` and accumulates with
         ``matmul_acc``. If the allocation does not land in the AIC body before the
         inner loop, the split function references an undefined init value.
@@ -4003,6 +4003,12 @@ class TestDCERegression:
         the definition in place instead of dropping it; the nested-loop init-value
         structure is still verified end to end, but the pull path itself is no longer
         reachable from the DSL.
+
+        Note this fixture is structural only. ``tile.create`` allocates without
+        initializing, so the accumulator is not zeroed the way the old ``tile.full``
+        one was; a kernel that needs a defined starting value passes
+        ``init_cond=(kb == 0)`` to overwrite on the first step. Nothing here executes
+        the arithmetic -- the assertion compares IR structure.
         """
 
         @pl.program

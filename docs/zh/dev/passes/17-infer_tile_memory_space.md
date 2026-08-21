@@ -6,7 +6,7 @@
 
 `FlattenTileNdTo2D` 之后，每个 InCore tile 都拥有静态的 2D shape，但其 `TileType::memory_space_` 仍未设置（或仅在通过 `target_memory` kwarg 显式标注的部分生产者上设置）。PTO-ISA 硬件暴露了多种不同的片上缓冲区——`Vec`（统一缓冲区 / 向量）、`Mat`（L1）、`Left` / `Right`（L0A / L0B 矩阵乘操作数缓冲区）、`Acc`（L0C 累加器）、`Bias`——大多数算子都对其输入和输出可使用的 memory space 施加约束。本 pass 就是这个约束求解器：它沿数据流前向传播 memory space，遵循显式的 `target_memory` kwarg，沿视图链反向传播需求，并在生产者与消费者无法在同一 space 上达成一致时插入 `tile.move`。
 
-本 pass 运行后，InCore 函数中每个 `TileType` 都带有具体的 `memory_space_`，满足 `ExpandMixedKernel`、`InitMemRef` 以及下游 codegen 所要求的 `TileMemoryInferred` IR 属性。
+本 pass 运行后，每个 InCore 变体函数 —— `InCore`、`AIC`、`AIV`，三者皆可由用户编写 —— 中的每个 `TileType` 都带有具体的 `memory_space_`，满足 `ExpandMixedKernel`、`InitMemRef` 以及下游 codegen 所要求的 `TileMemoryInferred` IR 属性。
 
 **前置条件**：
 
@@ -32,7 +32,7 @@ infer_pass = passes.infer_tile_memory_space()
 program_inferred = infer_pass(program)
 ```
 
-本 pass 仅重写 `func_type_ == FunctionType::InCore` 的函数。Orchestration 与 Opaque 函数原样返回。
+本 pass 重写所有 InCore 变体函数 —— 即 `IsInCoreType`：`InCore`、`AIC`、`AIV`。Orchestration 与 Opaque 函数原样返回；若有 tile 从这类函数到达 `InitMemRef`，会作为编写错误报出 —— 非设备函数没有片上缓冲可供放置。
 
 ## 算法
 
@@ -47,7 +47,7 @@ program_inferred = infer_pass(program)
 
 随后在这些边上**反向**传播需求：单次反向序遍历即可达到不动点。这是因为 SSA 中 inherit-input 算子的 `dst` 总在 `src` 之后定义，一次反向扫描即可完成 O(N) 的不动点。当同一变量上两个需求冲突时，非 `Vec` 的需求获胜（`ShouldOverrideDemand`）——`Vec` 是宽松的默认值，应被来自 compute 算子的特化需求覆盖。
 
-正是这一阶段使 `slice(tensor) → fillpad → matmul` 链能把 matmul 的 `Left` / `Right` 需求一直传回 `tile.slice` 的输出，从而让阶段 1 把该生产者直接解析为 `Left` / `Right`，而无需绕道 `Vec`。
+正是这一阶段使 `slice(tensor) → fillpad → matmul` 链能把 matmul 的 `Left` / `Right` 需求一直传回 `tile.slice` 的输出。随后阶段 1 把该生产者解析为 `Mat` —— 即下表中 cube 需求所映射的中转 space —— 再由阶段 2 插入 `Mat -> Left` / `Mat -> Right` 搬运。正是该需求让结果选择 `Mat` 而非 `Vec`；否则操作数会走更长的 GM -> UB -> L1 -> L0 路径。
 
 ### 阶段 1 — 前向分析（`TileMemorySpaceAnalyzer`）
 
@@ -248,4 +248,11 @@ class After:
 | `Orchestration` | 不变 |
 | `Opaque` | 不变 |
 
-本 pass 还断言任何 InCore 函数的参数都不能是 `TileType` —— InCore 参数必须是 `TensorType`。该断言在阶段 1 起始处检查，违反时触发 `CHECK` 失败。
+tile *参数* 在阶段 1 起始处按函数类型分别处理：
+
+| 函数类型 | tile 参数 | 原因 |
+| -------- | --------- | ---- |
+| `InCore` | 拒绝（`INTERNAL_CHECK`） | InCore kernel 由 orchestration 调用，后者只使用 tensor；出现 tile 参数说明前序 pass 生成了非法签名 |
+| `AIC` / `AIV` | 接受，并作为分析的**种子** | 二者是由混合 kernel 调用的 sub-worker，tile 参数正是常规的跨核交接 |
+
+参数的 space 属于签名的一部分 —— 由调用方决定该 tile 位于何处 —— 因此本 pass 从不推断它。`AIC` / `AIV` 的 tile 参数若省略 space，属于用户错误，报错会给出应补充的标注。

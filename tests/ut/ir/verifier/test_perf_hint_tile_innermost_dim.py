@@ -357,7 +357,7 @@ def test_message_includes_dtype_shape_memory_tuple_a5():
     perf_hints = [d for d in diags if d.severity == passes.DiagnosticSeverity.PerfHint]
     assert len(perf_hints) >= 1
     msg = perf_hints[0].message
-    # innermost = 16 elements of fp32, default target_memory = Vec.
+    # innermost = 16 elements of fp32; the fixture requests target_memory=Vec explicitly.
     assert "fp32[16]" in msg
     assert "target_memory=Vec" in msg
 

@@ -163,12 +163,32 @@ class DemandCollector : public IRVisitor {
 
 class TileMemorySpaceAnalyzer : public IRVisitor {
  public:
-  TileMemorySpaceAnalyzer(const std::vector<VarPtr>& params, const std::map<VarPtr, MemorySpace>& demands)
+  TileMemorySpaceAnalyzer(const std::vector<VarPtr>& params, const std::map<VarPtr, MemorySpace>& demands,
+                          FunctionType func_type)
       : demands_(demands) {
     for (const auto& var : params) {
-      INTERNAL_CHECK(!As<TileType>(var->GetType()))
+      auto tile_type = As<TileType>(var->GetType());
+      if (!tile_type) continue;
+
+      // An InCore kernel is entered from orchestration, which speaks tensors:
+      // a tile parameter there means an earlier pass produced a malformed
+      // signature.
+      INTERNAL_CHECK(func_type != FunctionType::InCore)
           << "InCore function parameter '" << var->name_hint_
           << "' has TileType, but InCore parameters must be TensorType";
+
+      // AIC and AIV are different: they are sub-workers entered from a mixed
+      // kernel, so a tile parameter is the ordinary cross-core handoff (the
+      // c2v operand ExpandMixedKernel threads through, or a hand-authored
+      // equivalent). Its space is fixed by the caller, not by this pass -- so
+      // seed from it rather than infer it, and every downstream inherit-input
+      // op resolves against the real space.
+      CHECK_SPAN(tile_type->memory_space_.has_value(), var->span_)
+          << "The tile parameter '" << var->name_hint_ << "' of this " << FunctionTypeToString(func_type)
+          << " function has no memory space. A parameter's space is part of the signature -- the "
+             "caller decides where the tile lives, so the compiler cannot infer it here. Name it "
+             "in the annotation, e.g. pl.Tile[[...], dtype, pl.Mem.Vec].";
+      var_memory_[var] = *tile_type->memory_space_;
     }
   }
 
@@ -469,8 +489,8 @@ class MoveCollector : public IRVisitor {
 class TileMemorySpaceMutator : public IRMutator {
  public:
   TileMemorySpaceMutator(const std::map<VarPtr, MemorySpace>& var_memory,
-                         const std::set<MoveKey, MoveKeyLess>& needed_moves)
-      : var_memory_(var_memory), needed_moves_(needed_moves) {}
+                         const std::set<MoveKey, MoveKeyLess>& needed_moves, std::set<VarPtr> params)
+      : var_memory_(var_memory), needed_moves_(needed_moves), params_(std::move(params)) {}
 
  protected:
   // When promoting to a new memory_space, refresh the layout pieces (blayout/
@@ -500,6 +520,16 @@ class TileMemorySpaceMutator : public IRMutator {
     auto it = var_cache_.find(op);
     if (it != var_cache_.end()) {
       return it->second;
+    }
+
+    // A parameter's type is fixed by the signature -- an AIC/AIV tile param
+    // arrives already placed and Phase 1 only seeds from it. Re-minting it here
+    // would hand the body a fresh Var while `params_` kept the original, so the
+    // body would reference a var nothing defines. Locals are all reachable
+    // through the body, so only params need this.
+    if (params_.count(op) > 0) {
+      var_cache_[op] = op;
+      return op;
     }
 
     if (auto new_type = ComputeRewrittenType(op)) {
@@ -785,6 +815,7 @@ class TileMemorySpaceMutator : public IRMutator {
  private:
   const std::map<VarPtr, MemorySpace>& var_memory_;
   const std::set<MoveKey, MoveKeyLess>& needed_moves_;
+  std::set<VarPtr> params_;
   std::map<VarPtr, ExprPtr> var_cache_;
   std::map<MoveKey, ExprPtr, MoveKeyLess> created_moves_;
   // One entry per active SeqStmts scope holding the keys inserted into
@@ -928,7 +959,7 @@ FunctionPtr TransformInferTileMemorySpace(const FunctionPtr& func) {
 
   // Phase 1: Analyze — infer memory space for each tile variable, using Phase-0
   // demand as fallback for retargetable producers whose target_memory is absent.
-  TileMemorySpaceAnalyzer analyzer(func->params_, demand_collector.GetDemands());
+  TileMemorySpaceAnalyzer analyzer(func->params_, demand_collector.GetDemands(), func->func_type_);
   analyzer.VisitStmt(func->body_);
 
   const auto& var_memory = analyzer.GetVarMemory();
@@ -945,7 +976,8 @@ FunctionPtr TransformInferTileMemorySpace(const FunctionPtr& func) {
   // rewrite target_memory kwargs on retargetable producers to stay consistent.
   // MX scale-address binding (tile.tget_scale_addr) is inserted afterwards by
   // InsertMxScaleAddr, once every operand memory space is concrete.
-  TileMemorySpaceMutator mutator(var_memory, collector.GetNeededMoves());
+  TileMemorySpaceMutator mutator(var_memory, collector.GetNeededMoves(),
+                                 std::set<VarPtr>(func->params_.begin(), func->params_.end()));
   auto new_body = mutator.VisitStmt(func->body_);
 
   auto inferred_func = MutableCopy(func);

@@ -2239,6 +2239,62 @@ class TestInferTileMemorySpaceUnreachableDemand:
         assert "pl.tile.create" in message
 
 
+class TestInferTileMemorySpaceTileParams:
+    """Tile *parameters*, which this pass seeds from rather than infers.
+
+    A parameter's space is part of the signature -- the caller decides where the
+    tile lives -- so it is never inferred here. Which function types may carry
+    one differs: an `InCore` kernel is entered from orchestration and takes
+    tensors, while `AIC`/`AIV` sub-workers are entered from a mixed kernel and
+    take the cross-core handoff tile directly.
+    """
+
+    def test_aiv_tile_param_seeds_instead_of_aborting(self):
+        """A hand-authored AIV kernel with a tile parameter must compile.
+
+        This pass covers every `IsInCoreType` function, so AIC/AIV reach the
+        Phase 1 analyzer. Its parameter loop previously rejected *any* TileType
+        parameter with the InCore-only rule, turning a supported, tested form
+        (`test_expand_mixed_kernel_split_aiv.py` authors exactly this) into an
+        internal error.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.AIV)
+            def worker(
+                self,
+                qk: pl.Tile[[128, 128], pl.FP32, pl.Mem.Vec],
+                out_0: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                r = pl.exp(qk)
+                return pl.store(r, [0, 0], out_0)
+
+        printed = ir.python_print(passes.infer_tile_memory_space()(Before))
+        # The declared space survives, and the body op resolves against it.
+        assert "pl.Mem.Vec" in printed
+        assert "tile.exp" in printed
+
+    def test_aiv_tile_param_without_space_is_a_user_error(self):
+        """The caller owns a parameter's space, so an omitted one cannot be inferred."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.AIV)
+            def worker(
+                self,
+                qk: pl.Tile[[128, 128], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                r = pl.exp(qk)
+                return pl.store(r, [0, 0], out_0)
+
+        with pytest.raises(ValueError) as excinfo:
+            passes.infer_tile_memory_space()(Before)
+        assert "qk" in str(excinfo.value)
+        assert "signature" in str(excinfo.value)
+
+
 class TestInferTileMemorySpaceIterArgInherit:
     """An inherit-input op whose argument is a loop iter-arg must inherit that
     iter-arg's space — IterArg is matched via ``AsVarLike``, not ``As<Var>`` (kind

@@ -2710,7 +2710,7 @@ class TestFlattenTileNdTo2DBatchMatmulAcc:
             "copy, which the ISA also lacks), and the Acc->Vec move cannot be dropped because "
             "ExpandMixedKernel relies on it to see the AIC->AIV boundary. The fix is to fuse "
             "per batch so matmul_b -> matmul_acc_b both stay in Acc -- the batch_count == 1 "
-            "fast path generalized. See KNOWN_ISSUES.md."
+            "fast path generalized."
         ),
     )
     def test_batch_two_acc_unrolls_without_acc_roundtrip_moves(self):
@@ -2771,7 +2771,7 @@ class TestFlattenTileNdTo2DBatchMatmulAcc:
             "copy, which the ISA also lacks), and the Acc->Vec move cannot be dropped because "
             "ExpandMixedKernel relies on it to see the AIC->AIV boundary. The fix is to fuse "
             "per batch so matmul_b -> matmul_acc_b both stay in Acc -- the batch_count == 1 "
-            "fast path generalized. See KNOWN_ISSUES.md."
+            "fast path generalized."
         ),
     )
     def test_batch_two_acc_end_to_end_with_infer_memory_inserts_required_moves(self):

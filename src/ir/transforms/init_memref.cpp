@@ -263,8 +263,9 @@ class DeclaredAllocCollector : public IRVisitor {
 // Mutator to initialize MemRef for variables
 class InitMemRefMutator : public IRMutator {
  public:
-  InitMemRefMutator(const DeclaredAllocMap& declared_allocs, const backend::BackendHandler* handler)
-      : declared_allocs_(declared_allocs), handler_(handler) {}
+  InitMemRefMutator(const DeclaredAllocMap& declared_allocs, const backend::BackendHandler* handler,
+                    FunctionType func_type)
+      : declared_allocs_(declared_allocs), handler_(handler), func_type_(func_type) {}
 
   /// Whether `type` is bound to one of this function's declared allocations.
   [[nodiscard]] bool HasUserBinding(const TypePtr& type) const {
@@ -426,10 +427,26 @@ class InitMemRefMutator : public IRMutator {
       // than let that travel. Non-tile ShapedTypes (tensors) keep the DDR
       // default, which is their correct home.
       if (auto tile_type = std::dynamic_pointer_cast<const TileType>(var_expr->GetType())) {
-        INTERNAL_CHECK_SPAN(tile_type->memory_space_.has_value(), var->span_)
-            << "Internal error: tile '" << var->name_hint_
-            << "' reached InitMemRef with no memory space; InferTileMemorySpace must place every "
-               "tile in a device function before this pass runs";
+        if (IsInCoreType(func_type_)) {
+          // A device tile with no space after pass 17 is a compiler bug:
+          // InferTileMemorySpace covers every IsInCoreType function and is
+          // declared to produce TileMemoryInferred.
+          INTERNAL_CHECK_SPAN(tile_type->memory_space_.has_value(), var->span_)
+              << "Internal error: tile '" << var->name_hint_
+              << "' reached InitMemRef with no memory space; InferTileMemorySpace must place every "
+                 "tile in a device function before this pass runs";
+        } else {
+          // Outside a device function there is no on-chip buffer for a tile to
+          // live in, so no space can be inferred and none should be defaulted
+          // -- the old DDR fallback produced a "tile" in global memory that
+          // later read as a real placement. This is an authoring error, not a
+          // compiler bug: tile ops belong in a device function.
+          CHECK_SPAN(tile_type->memory_space_.has_value(), var->span_)
+              << "The tile '" << var->name_hint_ << "' lives in a " << FunctionTypeToString(func_type_)
+              << " function, which has no on-chip memory to place it in. Tiles are on-chip "
+                 "hardware state, so tile ops belong in a device function -- move this code into "
+                 "an InCore function, or into a pl.scope() the outliner turns into one.";
+        }
       }
       // Resolve memory space once, pass to both CreateMemRef and CloneType
       auto memory_space = ResolveTileMemorySpace(var_expr->GetType(), /*default_to_ddr=*/true);
@@ -782,6 +799,7 @@ class InitMemRefMutator : public IRMutator {
   std::map<VarPtr, VarPtr> var_map_;
   const DeclaredAllocMap& declared_allocs_;
   const backend::BackendHandler* handler_ = nullptr;
+  FunctionType func_type_ = FunctionType::InCore;
   uint64_t next_id_ = 0;
 };
 
@@ -856,7 +874,7 @@ FunctionPtr TransformInitMemRef(const FunctionPtr& func) {
     }
   }
 
-  InitMemRefMutator mutator(declared_allocs, handler);
+  InitMemRefMutator mutator(declared_allocs, handler, normalized_func->func_type_);
 
   std::vector<VarPtr> new_params;
   new_params.reserve(normalized_func->params_.size());
