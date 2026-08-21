@@ -440,7 +440,13 @@ std::optional<OrderedLoopOffsets> GetOrderedLoopOffsets(const ExprPtr& expr, con
   auto affine = ParseAffineInLoop(expr, loop->loop_var_.get());
   auto loop_step = GetConstIntValue(loop->step_);
   if (!affine.has_value() || !loop_step.has_value()) return std::nullopt;
-  if (affine->coeff * *loop_step >= 0) {
+  // Only the *sign* of `coeff * step` decides the order, and the operand signs
+  // decide the sign on their own -- so read it off them instead of evaluating a
+  // product that can overflow int64 (`ParseAffineInLoop` can return INT64_MAX,
+  // and a one-trip loop with step 2 still reaches here). Exactly equivalent to
+  // `coeff * step >= 0` for every representable pair, so no path changes.
+  const bool ascending = affine->coeff == 0 || *loop_step == 0 || (affine->coeff > 0) == (*loop_step > 0);
+  if (ascending) {
     return OrderedLoopOffsets{*first_offset, *last_offset};
   }
   return OrderedLoopOffsets{*last_offset, *first_offset};
