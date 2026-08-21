@@ -28,6 +28,26 @@
 namespace pypto {
 namespace ir {
 
+bool IsTileMoveEverSupported(MemorySpace src, MemorySpace dst) {
+  switch (src) {
+    case MemorySpace::Mat:
+      // MTE1 feeds the cube operand and scale buffers. Mat -> Mat is absent:
+      // there is no L1 -> L1 tmov.
+      return dst == MemorySpace::Left || dst == MemorySpace::Right || dst == MemorySpace::Bias ||
+             dst == MemorySpace::LeftScale || dst == MemorySpace::RightScale;
+    case MemorySpace::Vec:
+      // Vec -> Mat is A5-only; included here because this is the union over
+      // targets. BackendHandler::CanMoveTile narrows it per target.
+      return dst == MemorySpace::Vec || dst == MemorySpace::Mat;
+    case MemorySpace::Acc:
+      // FIXPIPE drains L0C outward only.
+      return dst == MemorySpace::Mat || dst == MemorySpace::Vec;
+    default:
+      return false;
+  }
+  // Note the absent row: nothing has `dst == MemorySpace::Acc`.
+}
+
 std::string MemorySpaceToString(MemorySpace space) {
   switch (space) {
     case MemorySpace::DDR:

@@ -296,7 +296,7 @@ def _scalar_operand_to_expr(value: int | Scalar | Expr) -> Expr:
 def create(
     shape: Sequence[IntLike],
     dtype: DataType,
-    target_memory: MemorySpace = MemorySpace.Vec,
+    target_memory: MemorySpace | None = None,
     transpose: bool | None = None,
     *,
     flat_layout: bool | None = None,
@@ -306,7 +306,8 @@ def create(
     Args:
         shape: Shape of the tile
         dtype: Data type of the tile
-        target_memory: Target memory space (MemorySpace.Vec, .Mat, .Left, .Right)
+        target_memory: Target memory space (MemorySpace.Vec, .Mat, .Left, .Right).
+            ``None`` (the default) leaves the space unset for the compiler to place.
         transpose: When True, allocate the transposed Mat (ZN) fractal layout for a
             matmul ``b_trans`` B-operand (the layout a DN-source ``gather_row`` fills).
             Default ``None`` keeps the canonical layout and is omitted from the op.
@@ -375,7 +376,7 @@ def load(
     offsets: Sequence[IntLike],
     shapes: Sequence[IntLike],
     valid_shape: Sequence[IntLike] | None = None,
-    target_memory: MemorySpace = MemorySpace.Vec,
+    target_memory: MemorySpace | None = None,
     clamp: bool = False,
 ) -> Tile:
     """Copy data from tensor to unified buffer (tile).
@@ -395,7 +396,8 @@ def load(
             TileView.valid_shape in the output TileType. When omitted, shapes is used
             as valid_shape. Uses the same coordinate convention as shapes. Narrows
             the tile; cannot widen it past what the source has.
-        target_memory: Target memory space (MemorySpace.Vec default, or MemorySpace.Mat).
+        target_memory: Target memory space (MemorySpace.Vec or MemorySpace.Mat).
+            ``None`` (the default) leaves the space unset for the compiler to place.
             MX-layout tensors require an explicit MemorySpace.Mat.
         clamp: Sanction a read that runs off the end of the source. By default a
             load asserts ``offsets + valid_shape`` stays inside the source and is
@@ -2867,7 +2869,7 @@ def mgather(
     coalesce: str | int = ...,
     *,
     gather_oob: str | int = ...,
-    target_memory: Literal[MemorySpace.Vec] = ...,
+    target_memory: Literal[MemorySpace.Vec] | None = ...,
     scratch: None = ...,
     valid_shape: None = ...,
 ) -> Tile: ...
@@ -2905,7 +2907,7 @@ def mgather(
     coalesce: str | int = "row",
     *,
     gather_oob: str | int = "undefined",
-    target_memory: MemorySpace = MemorySpace.Vec,
+    target_memory: MemorySpace | None = None,
     scratch: Tensor | None = None,
     valid_shape: Sequence[int] | None = None,
 ) -> Tile:
@@ -2919,7 +2921,8 @@ def mgather(
             element gather. Integer values support printed-IR round trips.
         gather_oob: Out-of-bounds handling: ``"undefined"``, ``"clamp"``,
             ``"wrap"``, ``"zero"``, or the corresponding integer ``0..3``.
-        target_memory: ``MemorySpace.Vec`` (default) or ``MemorySpace.Mat``.
+        target_memory: ``MemorySpace.Vec`` or ``MemorySpace.Mat``; ``None`` (the
+            default) leaves the space unset for the compiler to place.
         scratch: Same-dtype GM workspace required by Mat element gather and
             forbidden by the other forms.
         valid_shape: Optional two-dimensional written region for Mat output.

@@ -61,6 +61,29 @@ std::string MemorySpaceToString(MemorySpace space);
  */
 MemorySpace StringToMemorySpace(const std::string& str);
 
+/**
+ * @brief Whether *some* target implements a single-instruction tile move from
+ *        @p src to @p dst.
+ *
+ * The union over every backend of PTOAS's `TMovOp::verify` address-space table.
+ * A pair outside this union is unimplementable everywhere, so IR-level code can
+ * reject it without knowing the target — which matters because type deduction
+ * runs while parsing, before any backend is selected.
+ *
+ * Use this only for that "impossible anywhere" question. Once a backend is
+ * configured, `BackendHandler::CanMoveTile` gives the exact per-target subset
+ * (A5 implements Vec -> Mat, A2/A3 does not); passes and codegen want that one.
+ *
+ * The row worth knowing: **no target moves anything into `Acc`.** Only the MAD
+ * unit writes L0C, so an accumulator has to be created in `Acc` — no copy can
+ * put it there afterwards.
+ *
+ * @param src Source memory space
+ * @param dst Destination memory space
+ * @return True when at least one target implements the move
+ */
+[[nodiscard]] bool IsTileMoveEverSupported(MemorySpace src, MemorySpace dst);
+
 }  // namespace ir
 }  // namespace pypto
 

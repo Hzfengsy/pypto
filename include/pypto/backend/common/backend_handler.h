@@ -180,6 +180,47 @@ class BackendHandler {
     return dtype.GetBit() != 4;
   }
 
+  /**
+   * @brief Whether the ISA can move a tile from @p src to @p dst in one
+   *        `pto.tmov`.
+   *
+   * This mirrors PTOAS's `TMovOp::verify` address-space table, which is the
+   * authoritative source. Keeping a copy here lets PyPTO reject an
+   * unimplementable move at the IR level, against the user's own source span,
+   * instead of shipping MLIR that only PTOAS rejects — with an error that names
+   * neither the tile nor the line that created it.
+   *
+   * The base implementation is the pair set common to every current target:
+   *
+   * | src -> dst                        | legal |
+   * | --------------------------------- | ----- |
+   * | Mat -> Left / Right / Bias        | yes   |
+   * | Vec -> Vec                        | yes   |
+   * | Acc -> Mat, Acc -> Vec            | yes   |
+   * | Vec -> Mat                        | A5 only (see Ascend950 override) |
+   * | * -> Acc                          | never |
+   *
+   * The last row is the load-bearing one: nothing writes L0C except the MAD
+   * unit, so a tile that must reach `Acc` has to be *created* there — no copy
+   * can put it there afterwards. Passes therefore cannot repair an `Acc`
+   * operand constraint with a `tile.move`, the way they legitimately repair a
+   * Left/Right/Bias one.
+   *
+   * @param src Source memory space
+   * @param dst Destination memory space
+   * @return True when a single `pto.tmov` implements the transfer
+   */
+  [[nodiscard]] virtual bool CanMoveTile(ir::MemorySpace src, ir::MemorySpace dst) const {
+    using ir::MemorySpace;
+    if (src == MemorySpace::Mat) {
+      return dst == MemorySpace::Left || dst == MemorySpace::Right || dst == MemorySpace::Bias ||
+             dst == MemorySpace::LeftScale || dst == MemorySpace::RightScale;
+    }
+    if (src == MemorySpace::Vec) return dst == MemorySpace::Vec;
+    if (src == MemorySpace::Acc) return dst == MemorySpace::Mat || dst == MemorySpace::Vec;
+    return false;
+  }
+
   // ---------------------------------------------------------------------------
   // Pass behavioural hooks
   // ---------------------------------------------------------------------------

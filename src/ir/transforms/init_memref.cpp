@@ -417,6 +417,20 @@ class InitMemRefMutator : public IRMutator {
     }
 
     if (auto shaped_type = std::dynamic_pointer_cast<const ShapedType>(var_expr->GetType())) {
+      // A tile must already have its space: InitMemRef declares
+      // IRProperty::TileMemoryInferred as required, so an unset one here means
+      // InferTileMemorySpace did not cover this function. Defaulting it to DDR
+      // instead produced a "tile" in global memory that later reads as a real
+      // placement -- a vector op with a DDR operand, and a memory planner
+      // packing every such tile at offset 0. Fail with the tile's name rather
+      // than let that travel. Non-tile ShapedTypes (tensors) keep the DDR
+      // default, which is their correct home.
+      if (auto tile_type = std::dynamic_pointer_cast<const TileType>(var_expr->GetType())) {
+        INTERNAL_CHECK_SPAN(tile_type->memory_space_.has_value(), var->span_)
+            << "Internal error: tile '" << var->name_hint_
+            << "' reached InitMemRef with no memory space; InferTileMemorySpace must place every "
+               "tile in a device function before this pass runs";
+      }
       // Resolve memory space once, pass to both CreateMemRef and CloneType
       auto memory_space = ResolveTileMemorySpace(var_expr->GetType(), /*default_to_ddr=*/true);
       // A declared allocation wins over a fresh one: the whole point is

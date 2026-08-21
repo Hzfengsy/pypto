@@ -61,7 +61,7 @@ program_inferred = infer_pass(program)
 
 对每个带 `return_vars_` 的 `ForStmt`，访问完函数体后，分析器把每个 yield 变量的 memory space 拷贝到对应的 `return_var_`。同样的 space 还会被强制写到：
 
-- 对应的 `iter_arg_` —— 用于覆盖累加器模式：`tile.create` 保守地默认 `Vec`，但循环体写入了不同 space（如来自 `matmul_acc` 的 `Acc`）。如果不做这一步反向传播，最终的 `tile.store` 读到的是 Vec 类型 tile，会导致 `ExpandMixedKernel` 误判为混合 kernel，进而生成错误的 AIC/AIV IR。
+- 对应的 `iter_arg_` —— 用于覆盖累加器模式：循环体写入了 init 载体尚不具备的 space（如来自 `matmul_acc` 的 `Acc`）。过去这一步是必需的，因为 `tile.create` 默认打上 `Vec`、必须由反向传播覆盖；如今未指定 space 的 `tile.create` 会直接依据需求解析为 `Acc`，反向传播只需覆盖 `AssignStmt` 遍历访问不到的载体。如果不做这一步反向传播，最终的 `tile.store` 读到的是 Vec 类型 tile，会导致 `ExpandMixedKernel` 误判为混合 kernel，进而生成错误的 AIC/AIV IR。
 - `iter_arg_` 下面的 TileType `init_var_` 载体 —— 处理 `IfStmt` 的 `return_var`（永远不会作为 `AssignStmt` 被访问）作为循环 init 的情形。
 
 #### 阶段 1 的逐算子解析表
@@ -73,10 +73,14 @@ program_inferred = infer_pass(program)
 | 已注册但无 `MemorySpec` 的算子 | 若 `Call` 返回类型已设置且非 `DDR`，则使用之；否则 `Vec` |
 | `deduce_output_memory` 返回 `Some(s)` 的已注册算子（如 `tile.matmul → Acc`） | `s` |
 | `output_inherits_input` 算子（如 `tile.slice`、`tile.fillpad`、`tile.reshape`），且解析器返回 `None` | 第一个 tile 输入的 space；否则 `Vec` |
-| `HasRetargetableMemoryKwarg()` 算子（如 `tile.load`、`tile.create`），且解析器返回 `None`（kwarg 缺失） | 阶段 0 的需求若为 `Vec` 或 `Mat` 则使用之；否则继承输入；否则 `Vec` |
+| `HasRetargetableMemoryKwarg()` 算子（如 `tile.load`、`tile.create`），且解析器返回 `None`（kwarg 缺失） | 阶段 0 的需求若为 `Vec` 或 `Mat` 则使用之；cube 操作数需求（`Left`、`Right`、`LeftScale`、`RightScale`、`Bias`）解析为 `Mat`；否则继承输入；否则 `Vec` |
 | `tile.*` 算子，`deduce_output_memory` 返回 `None`，且既非 retargetable 也非 inherit | 继承输入；否则 `Vec` |
 
 对 retargetable 生产者执行 "夹逼到 `{Vec, Mat}`" 是有意为之：面向 DDR 的 `tile.load` 不能直接产出 `Left` / `Right` / `Acc` / `Bias`；即便下游需求是这些 space 之一，生产者也必须停在 `Mat`（或 `Vec`），由阶段 2 插入 `tile.move` 抵达特化 space。
+
+究竟停在两者中的哪一个，由需求决定，而非由某个默认值决定。cube 操作数需求会把生产者解析为 **`Mat`**：L1 是 `tload` 能填充、且 MTE1 随后能搬入 L0A/L0B 的唯一缓冲区 —— `Mat -> Left` / `Mat -> Right` 是 PTOAS（`TMovOp::verify`）唯一实现的搬运对。若改为路由到 `Vec`，不仅要多走 GM -> UB -> L1 -> L0 一条链，更糟的是会把仅供 cube 使用的操作数放到 vector 核上，`ExpandMixedKernel` 随后会将其识别为混合 kernel 并拆分到 AIC/AIV。
+
+`Acc` 被刻意排除在该映射之外：**任何 target、任何路径都无法把数据搬入 `Acc`**，只有矩阵单元才写 L0C。因此必须作为累加器的 tile 只能在 `Acc` 中创建 —— `OpRegistry::Create` 会拒绝显式 space 无法抵达 `Acc` 约束的操作数，这类需求根本不会到达本 pass。
 
 阶段 1 **从不**覆盖已有的 `target_memory` kwarg。如果用户写了 `pl.load(..., target_memory=Mat)`，而下游 `matmul` 需要 `Left`，则 load 仍保持 `Mat`，并由后续插入 `tile.move`。
 

@@ -327,6 +327,21 @@ class TileMemorySpaceAnalyzer : public IRVisitor {
         // tile.move inserted by Phase 2 MoveCollector. Clamping here keeps
         // the producer's output hardware-valid and preserves the move chain.
         if (demand == MemorySpace::Vec || demand == MemorySpace::Mat) return demand;
+        // A cube-operand demand still tells us which of {Vec, Mat} to stage
+        // through: L1 is the only buffer a tload can fill that MTE1 can then
+        // move into L0A/L0B, so Mat is the correct staging space and Phase 2
+        // adds the Mat -> L0 move. Falling through to Vec instead would route
+        // the operand GM -> UB -> L1 -> L0 and, worse, put a cube-only operand
+        // on the vector core, which ExpandMixedKernel then reads as a mixed
+        // kernel and splits across AIC/AIV.
+        if (demand == MemorySpace::Left || demand == MemorySpace::Right || demand == MemorySpace::LeftScale ||
+            demand == MemorySpace::RightScale || demand == MemorySpace::Bias) {
+          return MemorySpace::Mat;
+        }
+        // Acc is deliberately excluded: nothing writes L0C except the MAD, so
+        // there is no staging space that reaches it and no legal move into it.
+        // Such a demand belongs to an in-place accumulator, which OpRegistry
+        // already requires to be created in Acc directly.
       }
     }
     return InheritFromInput(call).value_or(MemorySpace::Vec);
@@ -639,7 +654,38 @@ class TileMemorySpaceMutator : public IRMutator {
             if (!saw_target_memory) {
               new_kwargs.emplace_back("target_memory", std::any(promoted));
             }
-            auto promoted_view = tile_view_semantics::GetImplicitTileView(old_call_type->shape_, promoted);
+            // Refresh the layout for the new space, keeping every field that
+            // describes the *data* (valid_shape, stride, start_offset, pad,
+            // compact). Rebuilding the view from scratch would drop a dynamic
+            // valid extent silently and leave the tile looking fully valid.
+            TileView promoted_view = tile_view_semantics::GetEffectiveTileView(*old_call_type);
+
+            // Where the layout comes from matters. The space->layout table is not
+            // the whole story: a single-row 2-D Mat operand is the ND row-vector
+            // form (row_major / none_box), not canonical NZ, and which shape entry
+            // is the row dim depends on the source layout. Only the op's own
+            // deducer knows that, so ask it -- and then take just the layout.
+            //
+            // It can only be asked when the deduction still describes this call.
+            // After FlattenTileNdTo2D a `tile.load` keeps its ND region arguments
+            // while its result has been rewritten to 2D, so re-deducing would
+            // report the pre-flattening ND shape. Detect that by comparing shapes
+            // and fall back to the table, which at least sees the real 2-D shape.
+            auto probe = registry.Create(call_op_name, call->args_, new_kwargs, call->span_);
+            auto probe_type = As<TileType>(probe->GetType());
+            const bool probe_describes_this_call =
+                probe_type &&
+                tile_view_semantics::ShapeExprListsEquivalent(probe_type->shape_, old_call_type->shape_);
+            if (probe_describes_this_call) {
+              TileView probe_view = tile_view_semantics::GetEffectiveTileView(*probe_type);
+              promoted_view.blayout = probe_view.blayout;
+              promoted_view.slayout = probe_view.slayout;
+              promoted_view.fractal = probe_view.fractal;
+            } else {
+              tile_view_semantics::SetTileLayout(
+                  promoted_view, tile_view_semantics::GetImplicitTileLayout(old_call_type->shape_, promoted));
+            }
+
             auto promoted_type = std::make_shared<TileType>(old_call_type->shape_, old_call_type->dtype_,
                                                             old_call_type->memref_, promoted_view, promoted);
             new_value = std::make_shared<Call>(call->op_, call->args_, std::move(new_kwargs), call->attrs_,
@@ -880,7 +926,13 @@ Pass InferTileMemorySpace() {
   auto pass_func = [](const ProgramPtr& program) -> ProgramPtr {
     std::map<GlobalVarPtr, FunctionPtr, GlobalVarPtrLess> new_functions;
     for (const auto& [gvar, func] : program->functions_) {
-      if (func->func_type_ == FunctionType::InCore) {
+      // Every InCore *variant*, not just InCore. AIC and AIV are user-writable
+      // function types, not only pass-generated ones (ExpandMixedKernel creates
+      // them at pass 21, well after this pass), so a hand-authored AIV kernel
+      // must have its tiles placed here too. Gating on InCore alone left those
+      // tiles unset, and InitMemRef then defaulted them to DDR -- yielding a
+      // vector op reading a DDR operand, which no hardware does.
+      if (IsInCoreType(func->func_type_)) {
         new_functions[gvar] = TransformInferTileMemorySpace(func);
       } else {
         new_functions[gvar] = func;
@@ -910,7 +962,7 @@ class TileMemoryInferredVerifier : public IRVisitor {
       auto tile_type = As<TileType>(op->var_->GetType());
       if (tile_type && !tile_type->memory_space_.has_value()) {
         diagnostics_.emplace_back(DiagnosticSeverity::Error, "TileMemoryInferred", 0,
-                                  "InCore function '" + func_name_ + "': TileType variable '" +
+                                  "Device function '" + func_name_ + "': TileType variable '" +
                                       op->var_->name_hint_ + "' has no memory_space set",
                                   op->var_->span_);
       }
@@ -957,7 +1009,7 @@ class TileMemoryInferredVerifier : public IRVisitor {
           allowed_str += MemorySpaceToString(allowed_spaces[j]);
         }
         diagnostics_.emplace_back(DiagnosticSeverity::Error, "TileMemoryInferred", 0,
-                                  "InCore function '" + func_name_ + "': Op '" + call->op_->name_ +
+                                  "Device function '" + func_name_ + "': Op '" + call->op_->name_ +
                                       "' input " + std::to_string(i) + " ('" + var->name_hint_ +
                                       "') requires " + allowed_str + " but is in " +
                                       MemorySpaceToString(actual),
@@ -977,7 +1029,9 @@ class TileMemoryInferredPropertyVerifierImpl : public PropertyVerifier {
     if (!program) return;
     for (const auto& [gv, func] : program->functions_) {
       if (!func || !func->body_) continue;
-      if (func->func_type_ != FunctionType::InCore) continue;
+      // Must mirror the pass's own gate above: verifying a narrower set than
+      // the pass transforms is how the AIC/AIV miss stayed invisible.
+      if (!IsInCoreType(func->func_type_)) continue;
       TileMemoryInferredVerifier verifier(diagnostics, func->name_);
       verifier.VisitStmt(func->body_);
     }

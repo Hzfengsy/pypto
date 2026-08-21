@@ -4,9 +4,9 @@ Infers the on-chip `MemorySpace` for every `TileType` variable inside InCore fun
 
 ## Overview
 
-After `FlattenTileNdTo2D`, every InCore tile has a static 2D shape but its `TileType::memory_space_` is still unset (or only set on a subset of producers via the `target_memory` kwarg). The PTO-ISA hardware exposes several distinct on-chip buffers — `Vec` (unified buffer / vector), `Mat` (L1), `Left` / `Right` (L0A / L0B matmul operand buffers), `Acc` (L0C accumulator), `Bias` — and most ops constrain which spaces their inputs and outputs may live in. This pass runs that constraint solver: it forwards memory spaces along data flow, honors explicit `target_memory` kwargs, propagates demand backward through view chains, and inserts `tile.move` where producer and consumer cannot agree on a single space.
+After `FlattenTileNdTo2D`, every device-function tile has a static 2D shape but its `TileType::memory_space_` is still unset (or only set on a subset of producers via the `target_memory` kwarg). The PTO-ISA hardware exposes several distinct on-chip buffers — `Vec` (unified buffer / vector), `Mat` (L1), `Left` / `Right` (L0A / L0B matmul operand buffers), `Acc` (L0C accumulator), `Bias` — and most ops constrain which spaces their inputs and outputs may live in. This pass runs that constraint solver: it forwards memory spaces along data flow, honors explicit `target_memory` kwargs, propagates demand backward through view chains, and inserts `tile.move` where producer and consumer cannot agree on a single space.
 
-After this pass every `TileType` in InCore functions carries a concrete `memory_space_`, satisfying the `TileMemoryInferred` IR property required by `ExpandMixedKernel`, `InitMemRef`, and downstream codegen.
+After this pass every `TileType` in every InCore-variant function -- `InCore`, `AIC` and `AIV`, all three of which are user-writable -- carries a concrete `memory_space_`, satisfying the `TileMemoryInferred` IR property required by `ExpandMixedKernel`, `InitMemRef`, and downstream codegen.
 
 **Requirements**:
 
@@ -61,7 +61,7 @@ For each `AssignStmt` whose LHS has `TileType`, the analyzer dispatches by RHS s
 
 For each `ForStmt` with `return_vars_`, after visiting the body the analyzer copies the memory space of each yielded var to the corresponding `return_var_`. Critically, the same space is also forced onto:
 
-- The matching `iter_arg_` — covers the accumulator pattern where `tile.create` conservatively defaults to `Vec` but the loop body writes a different space (e.g. `Acc` from `matmul_acc`). Without this back-propagation the final `tile.store` reads a `Vec` tile and `ExpandMixedKernel` misclassifies the kernel as mixed, producing broken AIC/AIV IR.
+- The matching `iter_arg_` — covers the accumulator pattern where the loop body writes a space the init carrier does not yet have (e.g. `Acc` from `matmul_acc`). This used to be load-bearing because `tile.create` stamped `Vec` by default and the back-propagation had to overwrite it; now an unset `tile.create` simply resolves to `Acc` from demand, and the back-propagation only has to reach carriers no `AssignStmt` traversal visits. Without this back-propagation the final `tile.store` reads a `Vec` tile and `ExpandMixedKernel` misclassifies the kernel as mixed, producing broken AIC/AIV IR.
 - The TileType `init_var_` carrier underneath the `iter_arg_` — handles cases where an `IfStmt` `return_var` (never visited as an `AssignStmt`) is used as a loop init.
 
 #### Per-op resolution table (Phase 1)
@@ -73,14 +73,18 @@ For each `ForStmt` with `return_vars_`, after visiting the body the analyzer cop
 | Registered op with no `MemorySpec` | Read from `Call` return type if set & not `DDR`; else `Vec` |
 | Registered op with `deduce_output_memory` returning `Some(s)` (e.g. `tile.matmul → Acc`) | `s` |
 | `output_inherits_input` op (e.g. `tile.slice`, `tile.fillpad`, `tile.reshape`) and resolver returned `None` | First tile input's space; else `Vec` |
-| `HasRetargetableMemoryKwarg()` op (e.g. `tile.load`, `tile.create`) and resolver returned `None` (kwarg absent) | Phase-0 demand if it is `Vec` or `Mat`; otherwise input-inherit; else `Vec` |
+| `HasRetargetableMemoryKwarg()` op (e.g. `tile.load`, `tile.create`) and resolver returned `None` (kwarg absent) | Phase-0 demand if it is `Vec` or `Mat`; a cube-operand demand (`Left`, `Right`, `LeftScale`, `RightScale`, `Bias`) resolves to `Mat`; otherwise input-inherit; else `Vec` |
 | `tile.*` op with `deduce_output_memory` returning `None` and not retargetable / not inherit | Input-inherit; else `Vec` |
 
 `tile.load` of a `TensorLayout.MX_A_ZZ` / `MX_B_NN` source must carry an
 explicit `target_memory=Mat`; type deduction rejects an omitted or different
 target before this pass runs.
 
-The "clamp to `{Vec, Mat}`" step on retargetable producers is deliberate: a DDR-facing `tile.load` cannot directly produce `Left`/`Right`/`Acc`/`Bias`, so even when downstream demand is one of those, the producer must stop at `Mat` (or `Vec`) and Phase 2 inserts a `tile.move` to reach the specialized space.
+The clamp to `{Vec, Mat}` on retargetable producers is deliberate: a DDR-facing `tile.load` cannot directly produce `Left`/`Right`/`Acc`/`Bias`, so even when downstream demand is one of those, the producer must stop at `Mat` (or `Vec`) and Phase 2 inserts a `tile.move` to reach the specialized space.
+
+Which of the two it stops at is decided by the demand, not by a default. A cube-operand demand resolves the producer to **`Mat`**, because L1 is the only buffer a `tload` can fill that MTE1 can then move into L0A/L0B — the `Mat -> Left` / `Mat -> Right` pairs are the only ones PTOAS implements (`TMovOp::verify`). Routing such an operand to `Vec` instead would cost a GM -> UB -> L1 -> L0 chain and, worse, put a cube-only operand on the vector core, which `ExpandMixedKernel` then reads as a mixed kernel and splits across AIC/AIV.
+
+`Acc` is deliberately excluded from that mapping: **no target moves anything into `Acc`**, on any path. Only the matrix unit writes L0C. A tile that must be an accumulator therefore has to be created there — `OpRegistry::Create` rejects an operand whose explicit space cannot reach an `Acc` constraint, so such a demand never reaches this pass.
 
 The pass *never* overrides a present `target_memory` kwarg in Phase 1. If a user wrote `pl.load(..., target_memory=Mat)` and a downstream `matmul` demands `Left`, the load stays at `Mat` and a `tile.move` is inserted.
 

@@ -66,7 +66,12 @@ def _make_load_program(innermost: int, dtype) -> ir.Program:
             x: pl.Tensor[[rows, innermost], dtype],
             out: pl.Out[pl.Tensor[[rows, innermost], dtype]],
         ) -> pl.Tensor[[rows, innermost], dtype]:
-            t: pl.Tile[[rows, innermost], dtype] = pl.load(x, [0, 0], [rows, innermost])
+            t: pl.Tile[[rows, innermost], dtype] = pl.load(
+                x,
+                [0, 0],
+                [rows, innermost],
+                target_memory=pl.Mem.Vec,
+            )
             out_1: pl.Tensor[[rows, innermost], dtype] = pl.store(t, [0, 0], out)
             return out_1
 
@@ -313,7 +318,7 @@ def test_volume_follows_valid_shape_not_physical_shape_a5():
             out: pl.Out[pl.Tensor[[rows, inner], pl.FP32]],
         ) -> pl.Tensor[[rows, inner], pl.FP32]:
             t: pl.Tile[[rows, inner], pl.FP32] = pl.load(
-                x, [0, 0], [rows, inner], valid_shape=[valid_rows, inner]
+                x, [0, 0], [rows, inner], valid_shape=[valid_rows, inner], target_memory=pl.Mem.Vec
             )
             return pl.store(t, [0, 0], out)
 
@@ -417,9 +422,14 @@ def test_dedup_collapses_repeated_site_a3():
             x: pl.Tensor[[rows, inner], pl.FP32],
             out: pl.Out[pl.Tensor[[16, inner], pl.FP32]],
         ) -> pl.Tensor[[16, inner], pl.FP32]:
-            acc: pl.Tile[[16, inner], pl.FP32] = pl.load(x, [0, 0], [16, inner])
+            acc: pl.Tile[[16, inner], pl.FP32] = pl.load(x, [0, 0], [16, inner], target_memory=pl.Mem.Vec)
             for i in pl.range(4):
-                t: pl.Tile[[16, inner], pl.FP32] = pl.load(x, [i * 16, 0], [16, inner])
+                t: pl.Tile[[16, inner], pl.FP32] = pl.load(
+                    x,
+                    [i * 16, 0],
+                    [16, inner],
+                    target_memory=pl.Mem.Vec,
+                )
                 acc = pl.add(acc, t)
             return pl.store(acc, [0, 0], out)
 
