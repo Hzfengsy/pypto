@@ -80,7 +80,16 @@ program_inferred = infer_pass(program)
 
 究竟停在两者中的哪一个，由需求决定，而非由某个默认值决定。cube 操作数需求会把生产者解析为 **`Mat`**：L1 是 `tload` 能填充、且 MTE1 随后能搬入 L0A/L0B 的唯一缓冲区 —— `Mat -> Left` / `Mat -> Right` 是 PTOAS（`TMovOp::verify`）唯一实现的搬运对。若改为路由到 `Vec`，不仅要多走 GM -> UB -> L1 -> L0 一条链，更糟的是会把仅供 cube 使用的操作数放到 vector 核上，`ExpandMixedKernel` 随后会将其识别为混合 kernel 并拆分到 AIC/AIV。
 
-`Acc` 被刻意排除在该映射之外：**任何 target、任何路径都无法把数据搬入 `Acc`**，只有矩阵单元才写 L0C。因此必须作为累加器的 tile 只能在 `Acc` 中创建 —— `OpRegistry::Create` 会拒绝显式 space 无法抵达 `Acc` 约束的操作数，这类需求根本不会到达本 pass。
+`Acc` 单独处理：**任何 target、任何路径都无法把数据搬入 `Acc`**，只有矩阵单元才写 L0C。因此必须作为累加器的 tile 只能在 `Acc` 中*创建*，阶段 2 无法为其架桥。`OpRegistry::Create` 会拒绝*显式* space 无法抵达 `Acc` 约束的操作数，但*未设置* space 的生产者仍会携带该需求到达本 pass，上述夹逼不能把它吞掉。
+
+因此，当需求指向一个没有入边的 space（`IsTileMoveEverPossibleInto`）时，依据生产者已注册的 execution-memory-access 证据分流：
+
+| 生产者 | 证据 | 结果 |
+| ------ | ---- | ---- |
+| `tile.create` | `no_execution_memory_access()` | 直接满足需求 —— 该分配直接诞生在 `Acc` |
+| `tile.load` | `functional_execution_memory_access()` | 面向用户的报错 —— MTE2 只填充 {`Vec`, `Mat`}，从不写 L0C，任何放置都无法满足 |
+
+以注册表的证据而非算子名清单作为判据，意味着后续新增的生产者会按其实际行为自动归类。若改为落到 `Vec` 兜底，阶段 2 会用一条任何 target 都未实现的 `tile.move`（搬入 `Acc`）去 "修复" 该不匹配 —— 这条非法 IR 会一直存活到后端才中止，且报错既不指明 tile 也不指明创建它的源码行。阶段 2 对该情况设有断言（`INTERNAL_CHECK_SPAN`），确保它不会再被静默生成。
 
 阶段 1 **从不**覆盖已有的 `target_memory` kwarg。如果用户写了 `pl.load(..., target_memory=Mat)`，而下游 `matmul` 需要 `Left`，则 load 仍保持 `Mat`，并由后续插入 `tile.move`。
 

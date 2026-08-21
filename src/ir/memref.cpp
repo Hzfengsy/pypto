@@ -48,6 +48,18 @@ bool IsTileMoveEverSupported(MemorySpace src, MemorySpace dst) {
   // Note the absent row: nothing has `dst == MemorySpace::Acc`.
 }
 
+bool IsTileMoveEverPossibleInto(MemorySpace dst) {
+  // Every space that can hold a tile is a candidate source; if none of them
+  // reaches `dst`, no pass can ever bridge into it with a `tile.move` and the
+  // value has to be created there instead.
+  for (MemorySpace src :
+       {MemorySpace::Vec, MemorySpace::Mat, MemorySpace::Acc, MemorySpace::Left, MemorySpace::Right,
+        MemorySpace::Bias, MemorySpace::LeftScale, MemorySpace::RightScale}) {
+    if (IsTileMoveEverSupported(src, dst)) return true;
+  }
+  return false;
+}
+
 std::string MemorySpaceToString(MemorySpace space) {
   switch (space) {
     case MemorySpace::DDR:

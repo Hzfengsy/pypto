@@ -84,6 +84,20 @@ MemorySpace StringToMemorySpace(const std::string& str);
  */
 [[nodiscard]] bool IsTileMoveEverSupported(MemorySpace src, MemorySpace dst);
 
+/**
+ * @brief Whether @p dst has any inbound edge at all in the move graph.
+ *
+ * The `std::any_of` over every possible source of
+ * @ref IsTileMoveEverSupported. False means the space is unreachable by copy on
+ * every target, so a value that must live there has to be *created* there --
+ * no pass can insert a bridge. Today `Acc` is the only such space: nothing
+ * writes L0C except the MAD unit.
+ *
+ * @param dst Destination memory space
+ * @return True when some target implements some move into @p dst
+ */
+[[nodiscard]] bool IsTileMoveEverPossibleInto(MemorySpace dst);
+
 }  // namespace ir
 }  // namespace pypto
 

@@ -84,7 +84,16 @@ The clamp to `{Vec, Mat}` on retargetable producers is deliberate: a DDR-facing 
 
 Which of the two it stops at is decided by the demand, not by a default. A cube-operand demand resolves the producer to **`Mat`**, because L1 is the only buffer a `tload` can fill that MTE1 can then move into L0A/L0B — the `Mat -> Left` / `Mat -> Right` pairs are the only ones PTOAS implements (`TMovOp::verify`). Routing such an operand to `Vec` instead would cost a GM -> UB -> L1 -> L0 chain and, worse, put a cube-only operand on the vector core, which `ExpandMixedKernel` then reads as a mixed kernel and splits across AIC/AIV.
 
-`Acc` is deliberately excluded from that mapping: **no target moves anything into `Acc`**, on any path. Only the matrix unit writes L0C. A tile that must be an accumulator therefore has to be created there — `OpRegistry::Create` rejects an operand whose explicit space cannot reach an `Acc` constraint, so such a demand never reaches this pass.
+`Acc` is handled separately, because **no target moves anything into `Acc`** on any path — only the matrix unit writes L0C. A tile that must be an accumulator therefore has to be *created* there; Phase 2 cannot bridge to it. `OpRegistry::Create` rejects an operand whose *explicit* space cannot reach an `Acc` constraint, but an *unset* producer still arrives here carrying that demand, and the clamp above must not swallow it.
+
+So a demand for a space with no inbound move edge (`IsTileMoveEverPossibleInto`) splits on the producer's registered execution-memory-access evidence:
+
+| Producer | Evidence | Outcome |
+| -------- | -------- | ------- |
+| `tile.create` | `no_execution_memory_access()` | Honour the demand directly — the allocation is born in `Acc` |
+| `tile.load` | `functional_execution_memory_access()` | User-facing error — MTE2 fills {`Vec`, `Mat`} and never L0C, so no placement satisfies it |
+
+Keying this on the registry's evidence rather than an op-name list means a producer added later is classified by what it actually does. Falling through to the `Vec` fallback instead would let Phase 2 "repair" the mismatch with a `tile.move` into `Acc` that no target implements — invalid IR that survives to the backend and aborts there, naming neither the tile nor the line that created it. Phase 2 asserts on that case (`INTERNAL_CHECK_SPAN`) so it can never be emitted silently again.
 
 The pass *never* overrides a present `target_memory` kwarg in Phase 1. If a user wrote `pl.load(..., target_memory=Mat)` and a downstream `matmul` demands `Left`, the load stays at `Mat` and a `tile.move` is inserted.
 

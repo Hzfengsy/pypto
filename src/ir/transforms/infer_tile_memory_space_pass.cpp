@@ -338,10 +338,37 @@ class TileMemorySpaceAnalyzer : public IRVisitor {
             demand == MemorySpace::RightScale || demand == MemorySpace::Bias) {
           return MemorySpace::Mat;
         }
-        // Acc is deliberately excluded: nothing writes L0C except the MAD, so
-        // there is no staging space that reaches it and no legal move into it.
-        // Such a demand belongs to an in-place accumulator, which OpRegistry
-        // already requires to be created in Acc directly.
+        // A demand for a space with no inbound move edge -- today only Acc,
+        // since nothing writes L0C except the MAD unit -- cannot be staged
+        // through anywhere. The value has to be *created* where it is needed.
+        //
+        // An allocation producer can do exactly that: `tile.create` declares
+        // `no_execution_memory_access()`, so it moves no data and is free to
+        // name any buffer the hardware can hold a tile in. Honour the demand
+        // directly and the accumulator is born in L0C, which is what
+        // `tile.matmul_acc` requires.
+        //
+        // A DDR-facing producer cannot: `tile.load` drives MTE2, which fills
+        // {Vec, Mat} and never L0C. Falling through to the Vec fallback here
+        // would leave Phase 2 to "repair" the mismatch with a move into Acc
+        // that no target implements -- an invalid `tile.move` that survives to
+        // the backend and aborts there, naming neither the tile nor the line
+        // that created it. Report it here instead, where the span is exact.
+        if (!IsTileMoveEverPossibleInto(demand)) {
+          if (entry.GetExecutionMemoryAccessEvidence() == ExecutionMemoryAccessEvidence::NoAccess) {
+            return demand;
+          }
+          CHECK_SPAN(false, call->span_)
+              << "The operator " << op_name << " produces a value that " << MemorySpaceToString(demand)
+              << " memory is required for, but it cannot write that memory: no target has any data "
+                 "path into "
+              << MemorySpaceToString(demand)
+              << " memory -- only the matrix unit writes it -- so the compiler can neither produce "
+                 "the value there nor copy it there afterwards. An accumulator has to come from a "
+                 "matmul, or from an allocation (pl.tile.create) that the compiler is free to place "
+                 "in "
+              << MemorySpaceToString(demand) << " memory.";
+        }
       }
     }
     return InheritFromInput(call).value_or(MemorySpace::Vec);
@@ -417,6 +444,18 @@ class MoveCollector : public IRVisitor {
       bool allowed =
           std::find(allowed_spaces.begin(), allowed_spaces.end(), it->second) != allowed_spaces.end();
       if (!allowed) {
+        // Phase 1 is responsible for placing a value that needs an
+        // unreachable space (Acc) directly there; if it did its job, no move
+        // into such a space is ever requested here. Emitting one anyway
+        // produces a `tile.move` no target implements, which survives to the
+        // backend and aborts with a message naming neither the tile nor the
+        // line that created it -- so fail loudly at the point of the mistake.
+        INTERNAL_CHECK_SPAN(IsTileMoveEverPossibleInto(allowed_spaces[0]), call->span_)
+            << "Internal error: InferTileMemorySpace wants a tile.move into "
+            << MemorySpaceToString(allowed_spaces[0]) << " memory for argument " << i << " of "
+            << call->op_->name_
+            << ", but no target implements any move into it. Phase 1 should "
+               "have placed the producer there directly.";
         needed_moves_.insert({var, allowed_spaces[0]});
       }
     }

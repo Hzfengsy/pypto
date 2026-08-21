@@ -2149,6 +2149,96 @@ class TestInferTileMemorySpaceDemandBackprop:
         ir.assert_structural_equal(After, Expected)
 
 
+class TestInferTileMemorySpaceUnreachableDemand:
+    """A demand for a space with no inbound edge in the move graph.
+
+    `Acc` is the only such space today: nothing writes L0C except the MAD unit,
+    so `BackendHandler::CanMoveTile` reports no move into it from anywhere. A
+    tile that must be an accumulator therefore has to be *created* in `Acc` --
+    Phase 2 cannot repair the mismatch with a `tile.move` the way it does for a
+    Left/Right operand reached from Mat.
+
+    Which producers can honour such a demand is decided by the registry's own
+    execution-memory-access evidence, not by an op-name list:
+
+    * `tile.create` declares `no_execution_memory_access()` -- it moves no data,
+      so it is free to name any buffer, `Acc` included.
+    * `tile.load` declares `functional_execution_memory_access()` -- it drives
+      MTE2, which fills {Vec, Mat} and never L0C, so the demand is genuinely
+      unsatisfiable and must be reported.
+    """
+
+    def test_unset_create_feeding_matmul_acc_is_placed_in_acc(self):
+        """The remedy the operand-constraint diagnostic advertises must work.
+
+        Leaving the allocation unset is one of the three fixes `OpRegistry`
+        suggests for a wrongly-placed accumulator. Before the unreachable-demand
+        branch existed, this fell through to the `Vec` fallback and Phase 2 then
+        emitted a `tile.move(..., target_memory=Acc)` that no target implements;
+        it survived to `ExpandMixedKernel` and aborted there with an internal
+        error naming neither the tile nor the line that created it.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[16, 16], pl.FP32],
+                rhs: pl.Tensor[[16, 16], pl.FP32],
+                output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                lhs_tile = pl.load(lhs, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
+                rhs_tile = pl.load(rhs, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
+                acc_tile = pl.tile.create([16, 16], pl.FP32)
+                out_tile = pl.tile.matmul_acc(acc_tile, lhs_tile, rhs_tile)
+                return pl.store(out_tile, [0, 0], output)
+
+        printed = ir.python_print(passes.infer_tile_memory_space()(Before))
+
+        # The allocation is born in Acc ...
+        create_line = next(ln for ln in printed.splitlines() if "tile.create" in ln)
+        assert "pl.Mem.Acc" in create_line, create_line
+        # ... so no move into Acc is needed. Only the Left/Right cube operands move.
+        assert "target_memory=pl.MemorySpace.Acc" not in printed
+        for line in printed.splitlines():
+            if "tile.move" in line:
+                assert "pl.Mem.Left" in line or "pl.Mem.Right" in line, line
+
+    def test_unset_load_feeding_matmul_acc_is_a_user_error(self):
+        """A DDR-facing producer cannot reach Acc, and says so.
+
+        MTE2 fills {Vec, Mat} and never L0C, so no placement satisfies the
+        demand. This must be a `ValueError` against the user's source, not an
+        internal error from a backend that received an impossible `tile.move`.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                acc: pl.Tensor[[16, 16], pl.FP32],
+                lhs: pl.Tensor[[16, 16], pl.FP32],
+                rhs: pl.Tensor[[16, 16], pl.FP32],
+                output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                lhs_tile = pl.load(lhs, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
+                rhs_tile = pl.load(rhs, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
+                acc_tile = pl.load(acc, [0, 0], [16, 16])
+                out_tile = pl.tile.matmul_acc(acc_tile, lhs_tile, rhs_tile)
+                return pl.store(out_tile, [0, 0], output)
+
+        with pytest.raises(ValueError) as excinfo:
+            passes.infer_tile_memory_space()(Before)
+
+        message = str(excinfo.value)
+        assert "tile.load" in message
+        assert "Acc memory" in message
+        # The diagnostic must name the way out, not just the refusal.
+        assert "pl.tile.create" in message
+
+
 class TestInferTileMemorySpaceIterArgInherit:
     """An inherit-input op whose argument is a loop iter-arg must inherit that
     iter-arg's space — IterArg is matched via ``AsVarLike``, not ``As<Var>`` (kind
