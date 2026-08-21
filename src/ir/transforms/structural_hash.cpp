@@ -546,9 +546,21 @@ StructuralHasher::result_type StructuralHasher::HashType(const TypePtr& type) {
         INTERNAL_CHECK(dim) << "structural_hash encountered null stride dimension in TileView";
         h = hash_combine(h, HashNode(dim));
       }
-      // Hash start_offset
-      INTERNAL_CHECK(tv.start_offset) << "structural_hash encountered null start_offset in TileView";
-      h = hash_combine(h, HashNode(tv.start_offset));
+      // Hash start_offset. Unlike valid_shape / stride elements, a null
+      // start_offset is a legal TileView state, not a construction bug: the
+      // default ctor leaves it unset (type.h), pl.TileView(...) defaults it to
+      // None, and IsImplicitPrintedTileView reads non-null as "explicit
+      // offset". EqualType compares it through the null-tolerant Equal(...)
+      // (structural_equal.cpp), so asserting here broke equal => equal-hash by
+      // aborting on a type structural_equal happily accepts. Hash the
+      // presence tag the way the optional fields around this branch do, and
+      // mirror ir::Hash(const TileView&)'s null tolerance (type.cpp).
+      if (tv.start_offset) {
+        h = hash_combine(h, static_cast<result_type>(1));  // indicate presence
+        h = hash_combine(h, HashNode(tv.start_offset));
+      } else {
+        h = hash_combine(h, static_cast<result_type>(0));  // indicate absence
+      }
       // Hash blayout
       h = hash_combine(h, static_cast<result_type>(tv.blayout));
       // Hash slayout

@@ -64,6 +64,9 @@ enum class IRProperty : uint64_t {
   CommDomainScopesMaterialized,     ///< Host_orch bodies are wrapped in CommDomainScopeStmts (one per
                                     ///< inferred comm domain) and pld.tensor.window result types carry
                                     ///< DistributedTensorType.window_buffer_ back-references
+  DistTensorCtxMaterialized,        ///< No pld.system.get_comm_ctx survives outside host orchestration;
+                                    ///< every chip-orchestration / device communication context is an
+                                    ///< explicit CommCtxType SSA value traceable to a parameter
   RuntimeScopesMaterialized,        ///< Orchestration functions carry explicit RuntimeScopeStmt nodes for the
                                     ///< function body and for/if bodies; codegen no longer emits implicit
                                     ///< PTO2_SCOPE() wrappers
@@ -233,7 +236,10 @@ enum class VerificationLevel {
  * Returns {SSAForm, TypeChecked, MixedKernelExpanded, AllocatedMemoryAddr,
  * BreakContinueValid, NoRedundantBlocks, InOutUseValid,
  * CallDirectionsResolved, ManualDepsOnSubmitOnly, ReturnParamsExplicit,
- * AivSplitValid} — lightweight checks that catch the most common IR errors.
+ * AivSplitValid, TileMemoryInferred, HardSyncallOccupancyValid,
+ * IterArgCarryClassified, RuntimeScopesMaterialized, AccToGmStoreValid,
+ * AtomicAddDtypeValid} — lightweight checks that catch the most common IR
+ * errors.
  */
 const IRPropertySet& GetVerifiedProperties();
 

@@ -292,7 +292,7 @@ bool EqualWithFields(const NodePtr& lhs_op, const NodePtr& rhs_op) {
 "相等的节点哈希值也相等"的保证：`structural_equal` 接受的输入，
 `structural_hash` 却拒绝。
 
-有两类分发陷阱需要在各条分支链之间保持一致：
+有三类分发陷阱需要在各条分支链之间保持一致：
 
 - **子类 kind。** `As<T>()` 是精确的 `ObjectKind` 匹配，因此
   `As<TensorType>(dt)` 对 `DistributedTensorType` 按设计返回 `nullptr`
@@ -300,6 +300,14 @@ bool EqualWithFields(const NodePtr& lhs_op, const NodePtr& rhs_op) {
   并使用 `static_pointer_cast` —— 参见 `.claude/rules/ir-kind-traits.md`。
 - **仅子类持有的字段。** `DistributedTensorType::window_buffer_` 在
   `TensorType` 上没有对应字段；共用分支必须在 kind 判断的保护下对它做哈希与比较。
+- **可为空的字段。** 没有非空不变式的裸 `ExprPtr` 字段 —— 例如
+  `TileView::start_offset`，默认构造函数与 `pl.TileView(...)` 都会将其留空 ——
+  是一种*合法且可区分*的状态，而不是构造错误。`EqualType` 通过容忍空值的
+  `Equal(...)` 天然支持这一点，因此 `HashType` 必须对它哈希一个存在性标记，
+  而不是用 `INTERNAL_CHECK` 断言。只在一条分支链上加断言，会以与"漏掉某个
+  Type"相同的方式破坏上述保证：`structural_equal` 判定与自身相等的值，
+  `structural_hash` 却会中止。`HashType` 中的 `INTERNAL_CHECK` 应当只用于
+  确实不可能为空的字段，例如 `shape_` 的元素。
 
 `tests/ut/ir/transforms/test_hash.py::TestHashTypeLadderParity` 会遍历每一个
 可由 Python 构造的 Type，当某个 Type 在 `HashType` 中缺失时测试失败。每新增一个

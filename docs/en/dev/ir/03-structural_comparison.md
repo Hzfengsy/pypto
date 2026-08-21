@@ -294,7 +294,7 @@ compiles, passes serialization round-trips, and compares correctly — then hits
 guarantee above, since `structural_equal` accepts what `structural_hash`
 rejects.
 
-Two dispatch hazards to mirror across the ladders:
+Three dispatch hazards to mirror across the ladders:
 
 - **Subclass kinds.** `As<T>()` is a precise `ObjectKind` match, so
   `As<TensorType>(dt)` returns `nullptr` for a `DistributedTensorType` by
@@ -303,6 +303,16 @@ Two dispatch hazards to mirror across the ladders:
 - **Subclass-only fields.** `DistributedTensorType::window_buffer_` has no
   `TensorType` counterpart; a shared branch has to hash and compare it under a
   kind guard.
+- **Nullable fields.** A bare `ExprPtr` field with no non-null invariant —
+  `TileView::start_offset`, which the default ctor and `pl.TileView(...)` both
+  leave unset — is a *legal, distinct* state, not a construction bug.
+  `EqualType` gets that for free by routing it through the null-tolerant
+  `Equal(...)`, so `HashType` must hash a presence tag rather than
+  `INTERNAL_CHECK` on it. Guarding one ladder and not the other breaks the
+  guarantee in the same direction as a missing Type: `structural_equal` reports
+  a value equal to itself that `structural_hash` aborts on. Reserve
+  `INTERNAL_CHECK` in `HashType` for fields that genuinely cannot be null, such
+  as `shape_` elements.
 
 `tests/ut/ir/transforms/test_hash.py::TestHashTypeLadderParity` walks every
 Python-constructible Type and fails when one is missing from `HashType`. Add a

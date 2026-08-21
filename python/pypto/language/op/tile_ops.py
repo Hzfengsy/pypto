@@ -546,6 +546,9 @@ def extract(
 ) -> Tile:
     """Extract a sub-tile from ``src`` at ``(index_row, index_col)`` — ISA TEXTRACT.
 
+    Maps to ISA TEXTRACT Variant 1 (Standard Extract). The result tile has the
+    given static ``shape`` and lives in ``target_memory``.
+
     Args:
         src: Source tile (typically in Mat or Acc memory)
         index_row: Starting row offset
@@ -570,6 +573,11 @@ def extract(
 
 def scatter_update(input: Tile, *args: Any, **kwargs: Any) -> Tile:
     """Update tile rows at positions specified by 2D index tile with values from src.
+
+    Supports two rank variants:
+
+    - 2D: ``input [rows, d]``, ``src [b*s, d]``, ``index [b, s]``
+    - 4D: ``input [blockNum, blockSize, 1, d]``, ``src [b, s, 1, d]``, ``index [b, s]``
 
     Accepts the same flexible call shapes as the IR builder
     ``pypto.ir.op.tile.scatter_update``:
@@ -729,6 +737,13 @@ def ci(
     """Generate a contiguous integer sequence into a tile.
 
     Equivalent to ``numpy.arange``-style index generation. Maps to ``pto.tci``.
+    For a column index ``k`` in the first row of the destination, ascending gives
+    ``dst[0, k] = start + k`` and descending gives ``dst[0, k] = start - k``.
+
+    Note:
+        ``pto.tci`` uses the destination's valid-column count as the sequence
+        length and does NOT populate additional rows. Leading dimensions must
+        be 1 — prefer shapes of the form ``[1, N]``.
 
     Args:
         start: Starting integer (plain int or a Scalar). Must match ``dtype``.
@@ -942,6 +957,9 @@ def get_block_num() -> Scalar:
 def add(lhs: Tile, rhs: Tile | int | float | Scalar | Expr) -> Tile:
     """Element-wise addition of tile and tile or scalar.
 
+    Supports broadcasting when both operands are tiles. A scalar ``rhs``
+    canonicalizes to ``tile.adds``.
+
     Args:
         lhs: Left-hand side tile
         rhs: Right-hand side tile or scalar
@@ -956,6 +974,9 @@ def add(lhs: Tile, rhs: Tile | int | float | Scalar | Expr) -> Tile:
 def sub(lhs: Tile, rhs: Tile | int | float | Scalar | Expr) -> Tile:
     """Element-wise subtraction of tile and tile or scalar.
 
+    Supports broadcasting when both operands are tiles. A scalar ``rhs``
+    canonicalizes to ``tile.subs``.
+
     Args:
         lhs: Left-hand side tile
         rhs: Right-hand side tile or scalar
@@ -969,6 +990,9 @@ def sub(lhs: Tile, rhs: Tile | int | float | Scalar | Expr) -> Tile:
 
 def mul(lhs: Tile, rhs: Tile | int | float | Scalar | Expr) -> Tile:
     """Element-wise multiplication of tile and tile or scalar.
+
+    Supports broadcasting when both operands are tiles. A scalar ``rhs``
+    canonicalizes to ``tile.muls``.
 
     Args:
         lhs: Left-hand side tile
@@ -987,6 +1011,10 @@ def div(
     high_precision: bool = False,
 ) -> Tile:
     """Element-wise division of tile and tile or scalar.
+
+    Tile-tile division requires identical physical and valid shapes. A scalar
+    ``rhs`` canonicalizes to ``tile.divs``, which does not expose the ``tdiv``
+    precision mode — hence ``high_precision`` applies only to the tile-tile form.
 
     Args:
         lhs: Left-hand side tile
@@ -1086,6 +1114,9 @@ def exp(tile: Tile) -> Tile:
 def sin(tile: Tile) -> Tile:
     """Element-wise sine of a tile (radians). FP32 only.
 
+    Non-FP32 inputs are rejected rather than promoted — cast explicitly with
+    ``pl.cast(tile, pl.FP32)`` first.
+
     Args:
         tile: Input tile (FP32)
 
@@ -1098,6 +1129,9 @@ def sin(tile: Tile) -> Tile:
 
 def cos(tile: Tile) -> Tile:
     """Element-wise cosine of a tile (radians). FP32 only.
+
+    Non-FP32 inputs are rejected rather than promoted — cast explicitly with
+    ``pl.cast(tile, pl.FP32)`` first.
 
     Args:
         tile: Input tile (FP32)
@@ -1207,6 +1241,9 @@ def cast(
 
     Returns:
         Tile wrapping the cast operation
+
+    Example:
+        >>> tile_fp32 = pl.tile.cast(tile_bf16, pl.FP32)
     """
     call_expr = _ir_ops.cast(tile.unwrap(), target_type, mode)
     return Tile(expr=call_expr)
@@ -1228,6 +1265,9 @@ def matmul(lhs: Tile, rhs: Tile) -> Tile:
 
 def batch_matmul(lhs: Tile, rhs: Tile) -> Tile:
     """Batch matrix multiplication of two tiles.
+
+    Broadcasts the batch dims: for inputs shaped ``[...batch_dims, M, K]`` and
+    ``[...batch_dims, K, N]``, the output is ``[...broadcast_batch_dims, M, N]``.
 
     Args:
         lhs: Left-hand side tile
@@ -1431,6 +1471,9 @@ def gemv_bias(lhs: Tile, rhs: Tile, bias: Tile, acc_phase: str = "unspecified") 
 def row_max(tile: Tile, tmp_tile: Tile) -> Tile:
     """Row-wise max reduction.
 
+    Reduces the last axis with keepdim, producing output shape
+    ``input_shape[:-1] + [1]`` (e.g. ``[rows, 1]`` for a 2D ``[rows, cols]`` input).
+
     Args:
         tile: Input tile
         tmp_tile: Scratch tile with the same dtype and rank as ``tile`` and
@@ -1445,6 +1488,9 @@ def row_max(tile: Tile, tmp_tile: Tile) -> Tile:
 
 def row_sum(tile: Tile, tmp_tile: Tile) -> Tile:
     """Row-wise sum reduction.
+
+    Reduces the last axis with keepdim, producing output shape
+    ``input_shape[:-1] + [1]`` (e.g. ``[rows, 1]`` for a 2D ``[rows, cols]`` input).
 
     Args:
         tile: Input tile
@@ -1461,6 +1507,9 @@ def row_sum(tile: Tile, tmp_tile: Tile) -> Tile:
 def row_min(tile: Tile, tmp_tile: Tile) -> Tile:
     """Row-wise min reduction.
 
+    Reduces the last axis with keepdim, producing output shape
+    ``input_shape[:-1] + [1]`` (e.g. ``[rows, 1]`` for a 2D ``[rows, cols]`` input).
+
     Args:
         tile: Input tile
         tmp_tile: Scratch tile with the same dtype and rank as ``tile`` and
@@ -1475,6 +1524,9 @@ def row_min(tile: Tile, tmp_tile: Tile) -> Tile:
 
 def row_prod(tile: Tile, tmp_tile: Tile) -> Tile:
     """Row-wise product reduction.
+
+    Reduces the last axis with keepdim, producing output shape
+    ``input_shape[:-1] + [1]`` (e.g. ``[rows, 1]`` for a 2D ``[rows, cols]`` input).
 
     Args:
         tile: Input tile
@@ -1491,8 +1543,10 @@ def row_prod(tile: Tile, tmp_tile: Tile) -> Tile:
 def col_sum(tile: Tile, tmp_tile: Tile | None = None) -> Tile:
     """Column-wise sum reduction.
 
-    Passing ``tmp_tile`` activates the binary-tree reduction path; omitting it
-    uses the sequential path.
+    Output shape is ``[1, N]`` for an ``[M, N]`` input.
+
+    Passing ``tmp_tile`` activates the binary-tree reduction path (O(log M) depth,
+    better precision); omitting it uses the sequential path.
 
     Args:
         tile: Input tile
@@ -1510,6 +1564,8 @@ def col_sum(tile: Tile, tmp_tile: Tile | None = None) -> Tile:
 def col_max(tile: Tile) -> Tile:
     """Column-wise max reduction.
 
+    Output shape is ``[1, N]`` for an ``[M, N]`` input.
+
     Args:
         tile: Input tile
 
@@ -1522,6 +1578,8 @@ def col_max(tile: Tile) -> Tile:
 
 def col_min(tile: Tile) -> Tile:
     """Column-wise min reduction.
+
+    Output shape is ``[1, N]`` for an ``[M, N]`` input.
 
     Args:
         tile: Input tile
@@ -1536,6 +1594,8 @@ def col_min(tile: Tile) -> Tile:
 def col_prod(tile: Tile) -> Tile:
     """Column-wise product reduction.
 
+    Output shape is ``[1, N]`` for an ``[M, N]`` input.
+
     Args:
         tile: Input tile
 
@@ -1548,6 +1608,8 @@ def col_prod(tile: Tile) -> Tile:
 
 def row_argmax(tile: Tile, tmp_tile: Tile) -> Tile:
     """Row-wise argmax (column index of the per-row maximum, int32 output).
+
+    Output shape is ``[rows, 1]`` with INT32 index dtype.
 
     Args:
         tile: Input tile
@@ -1563,6 +1625,8 @@ def row_argmax(tile: Tile, tmp_tile: Tile) -> Tile:
 def row_argmin(tile: Tile, tmp_tile: Tile) -> Tile:
     """Row-wise argmin (column index of the per-row minimum, int32 output).
 
+    Output shape is ``[rows, 1]`` with INT32 index dtype.
+
     Args:
         tile: Input tile
         tmp_tile: Scratch tile with exactly the same shape and dtype as ``tile``
@@ -1576,6 +1640,9 @@ def row_argmin(tile: Tile, tmp_tile: Tile) -> Tile:
 
 def col_argmax(tile: Tile, tmp_tile: Tile) -> Tile:
     """Column-wise argmax (row index of the per-column maximum, int32 output).
+
+    Output shape is ``[1, N]`` with INT32 index dtype. Unlike [`col_max`][pypto.language.tile.col_max], the
+    column argmax requires a ``tmp_tile`` scratch buffer.
 
     Args:
         tile: Input tile
@@ -1591,6 +1658,9 @@ def col_argmax(tile: Tile, tmp_tile: Tile) -> Tile:
 def col_argmin(tile: Tile, tmp_tile: Tile) -> Tile:
     """Column-wise argmin (row index of the per-column minimum, int32 output).
 
+    Output shape is ``[1, N]`` with INT32 index dtype. Unlike [`col_min`][pypto.language.tile.col_min], the
+    column argmin requires a ``tmp_tile`` scratch buffer.
+
     Args:
         tile: Input tile
         tmp_tile: Temporary tile
@@ -1604,6 +1674,8 @@ def col_argmin(tile: Tile, tmp_tile: Tile) -> Tile:
 
 def maximum(lhs: Tile, rhs: Tile) -> Tile:
     """Element-wise maximum of two tiles.
+
+    Supports broadcasting between the two tiles.
 
     Args:
         lhs: Left-hand side tile
@@ -1633,6 +1705,9 @@ def row_expand(target: Tile, row_vec: Tile) -> Tile:
 def row_expand_sub(tile: Tile, row_vec: Tile) -> Tile:
     """Row-wise broadcast subtraction.
 
+    Subtracts a row vector from each row of the tile:
+    ``tile[i, :] - row_vec[i, 0]`` for all ``i``.
+
     Args:
         tile: Input tile [M, N]
         row_vec: Row vector [M, 1]
@@ -1646,6 +1721,9 @@ def row_expand_sub(tile: Tile, row_vec: Tile) -> Tile:
 
 def row_expand_div(tile: Tile, row_vec: Tile) -> Tile:
     """Row-wise broadcast division.
+
+    Divides each row of the tile by the corresponding row vector value:
+    ``tile[i, :] / row_vec[i, 0]`` for all ``i``.
 
     Args:
         tile: Input tile [M, N]
@@ -1661,6 +1739,9 @@ def row_expand_div(tile: Tile, row_vec: Tile) -> Tile:
 def row_expand_mul(tile: Tile, row_vec: Tile) -> Tile:
     """Row-wise broadcast multiplication.
 
+    Multiplies each row of the tile by the corresponding row vector value:
+    ``tile[i, :] * row_vec[i, 0]`` for all ``i``.
+
     Args:
         tile: Input tile [M, N]
         row_vec: Row vector [M, 1]
@@ -1674,6 +1755,11 @@ def row_expand_mul(tile: Tile, row_vec: Tile) -> Tile:
 
 def row_expand_add(tile: Tile, row_vec: Tile, tmp: Tile | None = None) -> Tile:
     """Row-wise scalar or packed-block expansion addition.
+
+    A non-row-major ``[M, 1]`` carrier broadcasts one scalar per row:
+    ``tile[i, :] + row_vec[i, 0]`` for all ``i``. A row-major carrier instead holds
+    one 32-byte lane block per row and repeats that block across the destination
+    columns.
 
     Args:
         tile: Input tile [M, N]
@@ -1705,6 +1791,9 @@ def col_expand(target: Tile, col_vec: Tile) -> Tile:
 def col_expand_mul(tile: Tile, col_vec: Tile) -> Tile:
     """Expand column vector and multiply with tile.
 
+    Multiplies each column of the tile by the corresponding column vector value:
+    ``tile[:, j] * col_vec[0, j]`` for all ``j``.
+
     Args:
         tile: Input tile [M, N]
         col_vec: Column vector [1, N]
@@ -1718,6 +1807,9 @@ def col_expand_mul(tile: Tile, col_vec: Tile) -> Tile:
 
 def col_expand_div(tile: Tile, col_vec: Tile) -> Tile:
     """Expand column vector and divide tile by it.
+
+    Divides each column of the tile by the corresponding column vector value:
+    ``tile[:, j] / col_vec[0, j]`` for all ``j``.
 
     Args:
         tile: Input tile [M, N]
@@ -1733,6 +1825,9 @@ def col_expand_div(tile: Tile, col_vec: Tile) -> Tile:
 def col_expand_sub(tile: Tile, col_vec: Tile) -> Tile:
     """Expand column vector and subtract from tile.
 
+    Subtracts a column vector from each column of the tile:
+    ``tile[:, j] - col_vec[0, j]`` for all ``j``.
+
     Args:
         tile: Input tile [M, N]
         col_vec: Column vector [1, N]
@@ -1746,6 +1841,9 @@ def col_expand_sub(tile: Tile, col_vec: Tile) -> Tile:
 
 def col_expand_add(tile: Tile, col_vec: Tile) -> Tile:
     """Expand column vector and add to tile.
+
+    Adds a column vector to each column of the tile:
+    ``tile[:, j] + col_vec[0, j]`` for all ``j``.
 
     Args:
         tile: Input tile [M, N]
@@ -1761,6 +1859,9 @@ def col_expand_add(tile: Tile, col_vec: Tile) -> Tile:
 def row_expand_max(tile: Tile, row_vec: Tile) -> Tile:
     """Row-wise broadcast maximum: max(tile, row_vec broadcasted).
 
+    Takes the element-wise maximum of each row and the row vector value:
+    ``max(tile[i, :], row_vec[i, 0])`` for all ``i``.
+
     Args:
         tile: Input tile [M, N]
         row_vec: Row vector [M, 1]
@@ -1774,6 +1875,9 @@ def row_expand_max(tile: Tile, row_vec: Tile) -> Tile:
 
 def row_expand_min(tile: Tile, row_vec: Tile) -> Tile:
     """Row-wise broadcast minimum: min(tile, row_vec broadcasted).
+
+    Takes the element-wise minimum of each row and the row vector value:
+    ``min(tile[i, :], row_vec[i, 0])`` for all ``i``.
 
     Args:
         tile: Input tile [M, N]
@@ -1789,6 +1893,8 @@ def row_expand_min(tile: Tile, row_vec: Tile) -> Tile:
 def row_expand_expdif(tile: Tile, row_vec: Tile) -> Tile:
     """Row-wise exp-diff: exp(tile - row_vec) with per-row scalar.
 
+    Computes ``exp(tile[i, :] - row_vec[i, 0])`` for all ``i``.
+
     Args:
         tile: Input tile [M, N]
         row_vec: Row vector providing per-row scalar [M, 1]
@@ -1802,6 +1908,8 @@ def row_expand_expdif(tile: Tile, row_vec: Tile) -> Tile:
 
 def col_expand_max(tile: Tile, col_vec: Tile) -> Tile:
     """Expand column vector and take element-wise maximum with tile.
+
+    Computes ``max(tile[:, j], col_vec[0, j])`` for all ``j``.
 
     Args:
         tile: Input tile [M, N]
@@ -1817,6 +1925,8 @@ def col_expand_max(tile: Tile, col_vec: Tile) -> Tile:
 def col_expand_min(tile: Tile, col_vec: Tile) -> Tile:
     """Expand column vector and take element-wise minimum with tile.
 
+    Computes ``min(tile[:, j], col_vec[0, j])`` for all ``j``.
+
     Args:
         tile: Input tile [M, N]
         col_vec: Column vector [1, N]
@@ -1830,6 +1940,8 @@ def col_expand_min(tile: Tile, col_vec: Tile) -> Tile:
 
 def col_expand_expdif(tile: Tile, col_vec: Tile) -> Tile:
     """Expand column vector and compute exp-diff with per-column scalar.
+
+    Computes ``exp(tile[:, j] - col_vec[0, j])`` for all ``j``.
 
     Args:
         tile: Input tile [M, N]
@@ -1845,6 +1957,8 @@ def col_expand_expdif(tile: Tile, col_vec: Tile) -> Tile:
 def expands(target: Tile, scalar: int | float | Expr | Scalar) -> Tile:
     """Expand scalar to target tile shape.
 
+    Broadcasts a scalar value to match the shape of the target tile.
+
     Args:
         target: Target tile defining output shape
         scalar: Scalar value to expand
@@ -1859,6 +1973,8 @@ def expands(target: Tile, scalar: int | float | Expr | Scalar) -> Tile:
 
 def minimum(lhs: Tile, rhs: Tile) -> Tile:
     """Element-wise minimum of two tiles.
+
+    Supports broadcasting between the two tiles.
 
     Args:
         lhs: Left-hand side tile
@@ -2912,6 +3028,10 @@ def mgather(
     valid_shape: Sequence[int] | None = None,
 ) -> Tile:
     """Gather-load rows or elements from a GM tensor into a fresh Vec or Mat tile.
+
+    Vec output uses a 2D INT32 index tile. Mat output uses a GM INT32 index tensor
+    and produces canonical NZ layout; its element mode additionally requires a
+    same-dtype GM scratch tensor.
 
     Args:
         mem: Source tensor in GM.

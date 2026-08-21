@@ -12,6 +12,8 @@
 #ifndef PYPTO_IR_TRANSFORMS_UTILS_OP_PREDICATES_H_
 #define PYPTO_IR_TRANSFORMS_UTILS_OP_PREDICATES_H_
 
+#include <cstddef>
+#include <optional>
 #include <string>
 
 #include "pypto/ir/expr.h"
@@ -19,6 +21,26 @@
 namespace pypto {
 namespace ir {
 namespace op_predicates {
+
+/// Index of the argument a builtin *output-side* op binds its result to.
+///
+/// These ops do not allocate: they bind a fresh SSA var to a buffer an existing
+/// value already names, so the result inherits that argument's identity — and
+/// with it anything derived from identity, such as which function parameter a
+/// value traces back to or which communication context a DistributedTensor
+/// belongs to (`tile.store(value, indices, target)` -> `args[2]`,
+/// `tensor.assemble(target, source, offset)` -> `args[0]`).
+///
+/// The op declares this itself via `set_output_reuses_input(idx)`; this is a
+/// registry read, not an op list, so a newly added in-place op is picked up
+/// without touching every lineage analysis. Note the sibling declaration
+/// `set_output_memory_inherit_input()` is a *different* statement — it fixes the
+/// output's memory SPACE, not its buffer, and carries no argument index (see
+/// `IsBufferAliasingViewOp`).
+///
+/// @return the aliased argument index, or nullopt when @p op declares no reuse
+///         or @p arg_count is too small for the declared index
+[[nodiscard]] std::optional<size_t> BuiltinWritebackArgIndex(const OpPtr& op, size_t arg_count);
 
 /// True if the Call targets a tpop op (tile.tpop_from_aic / tile.tpop_from_aiv).
 /// Decided by the registry's CrossCoreRole, not by op-name string matching.
@@ -61,8 +83,9 @@ bool IsBufferAliasingViewOp(const std::string& op_name);
 bool OutputInheritsSourceBuffer(const std::string& op_name);
 
 /// True for builtin ops whose name is namespaced `tile.` / `tensor.` /
-/// `system.` / `array.`. Builtin ops are never user Functions, so they carry
-/// no callee body and no Out/InOut params to trace.
+/// `system.` / `array.`, or for the distributed context query
+/// `pld.system.get_comm_ctx`. Builtin ops are never user Functions, so they
+/// carry no callee body and no Out/InOut params to trace.
 ///
 /// This is a deliberate string-prefix *family* check, not a registry lookup:
 /// it must classify op names that may not be registered (e.g. during `.pto`

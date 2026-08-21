@@ -49,9 +49,13 @@ inline const PassProperties kLowerHostTensorCollectivesProperties{
     .required = {IRProperty::CommDomainScopesMaterialized},
     .produced = {IRProperty::CommDomainScopesMaterialized}};
 
+// Resolves a returned DistributedTensor to the parameter it writes back via
+// return_lineage::ExplicitReturnedParamIndices, which is a pointer-identity read
+// of the ReturnStmt and only meaningful once NormalizeReturnOrder has
+// canonicalized it — hence the ReturnParamsExplicit requirement.
 inline const PassProperties kMaterializeDistTensorCtxProperties{
-    .required = {IRProperty::CommDomainScopesMaterialized},
-    .produced = {IRProperty::CommDomainScopesMaterialized}};
+    .required = {IRProperty::CommDomainScopesMaterialized, IRProperty::ReturnParamsExplicit},
+    .produced = {IRProperty::CommDomainScopesMaterialized, IRProperty::DistTensorCtxMaterialized}};
 
 // -- MaterializeValidShapeSymbols pass (runs last) ---------------------------
 //    Prepends a Scalar[INDEX] parameter per device-kernel valid_shape symbol that

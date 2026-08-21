@@ -148,9 +148,33 @@ Pattern: unwrap `Tile` → call IR function → wrap result:
 
 ```python
 def <op_name>(lhs: Tile, rhs: Tile) -> Tile:
+    """<One-line summary.>
+
+    <The explanation from the §2 IR wrapper, adapted to the DSL surface.>
+
+    Args:
+        lhs: Left-hand side tile
+        rhs: Right-hand side tile
+
+    Returns:
+        Tile wrapping the <op_name> operation
+    """
     call_expr = _ir_ops.<op_name>(lhs.unwrap(), rhs.unwrap())
     return Tile(expr=call_expr)
 ```
+
+**The docstring is not optional and not a shortened copy.** `pypto.language.tile` and
+`pypto.language.tensor` are rendered into `docs/en/user/api/`, so this docstring is the
+published manual while the §2 IR wrapper is internal. Whatever the IR copy says about shape
+rules, broadcasting, dtype restrictions or operand aliasing has to be said here too.
+
+Adapt rather than paste: drop the `span` argument and codegen internals, write `pl.tile.foo`
+where the IR copy writes `foo`, and say `Tile` where it says `TileType`. Being *longer* than the
+IR copy is fine and common. Write it as a **source literal** — do not assign `__doc__` from
+`_ir_ops.<op_name>` at import time, since mkdocstrings reads the source statically through griffe
+(see `docs/requirements.txt`) and a runtime-assigned `__doc__` renders empty on the API page.
+`tests/lint/check_op_docstring_parity.py` fails when the IR docstring explains something past its
+summary and the DSL twin does not.
 
 ### File: `python/pypto/language/op/tensor_ops.py`
 

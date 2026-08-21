@@ -26,6 +26,7 @@
 #include "pypto/backend/common/backend_config.h"
 #include "pypto/backend/common/backend_handler.h"
 #include "pypto/core/any_cast.h"
+#include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/core_affinity_kind.h"
 #include "pypto/ir/expr.h"
@@ -366,7 +367,8 @@ void CollectCVBoundaryMoves(const std::vector<StmtPtr>& stmts,
                                                     call->args_[0],
                                                     call->GetType(),
                                                     /*op_driven=*/true,
-                                                    call->GetKwarg<int>("split", 0)};
+                                                    call->GetKwarg<int>("split", 0),
+                                                    call->GetKwarg<int>("lane_stride", 0)};
       } else if (call) {
         auto dir = ClassifyMoveDirection(call);
         if (dir != CVDirection::NONE) {
@@ -403,12 +405,44 @@ void CollectCVBoundaryMoves(const std::vector<StmtPtr>& stmts,
 // TPUSH / TPOP creation helpers
 // ============================================================================
 
-std::vector<std::pair<std::string, std::any>> MakeSplitKwargs(int split = 0) {
-  return {{"split", std::any(split)}};
+std::vector<std::pair<std::string, std::any>> MakeSplitKwargs(int split = 0, int lane_stride = 0) {
+  std::vector<std::pair<std::string, std::any>> kwargs{{"split", std::any(split)}};
+  // The partition stride only rides along when a ragged boundary was rebalanced
+  // (see split_axis::ResolveLaneStride). PTO codegen ignores it — it prints only
+  // id and split — but the torch reference runtime needs it to cut the two lanes
+  // where the compiler did.
+  if (lane_stride > 0) {
+    kwargs.emplace_back("lane_stride", std::any(lane_stride));
+  }
+  return kwargs;
 }
 
-CallPtr CreateTpush(const std::string& op_name, const ExprPtr& tile, const Span& span, int split = 0) {
-  return OpRegistry::GetInstance().Create(op_name, {tile}, MakeSplitKwargs(split), span);
+/// The pto-isa split code for an op-driven boundary's tpush / tpop pair.
+///
+/// ``CVBoundaryMove::split`` is the authored MODE (see cross_core.cpp); the code
+/// additionally encodes how the two lanes' runtime extents relate, which only
+/// the FULL-width tile can tell us: the shard's operand (Cube -> Vector) or the
+/// gather's result (Vector -> Cube). Both sides of the pipe run this on the same
+/// inputs, so the AIC and AIV bodies always agree on the code.
+int BoundaryTransportSplitCode(const CVBoundaryMove& bm, const Span& span) {
+  const SplitMode mode = SplitModeFromSplitCode(bm.split);
+  if (mode == SplitMode::None) return kSplitNone;
+  const int split_dim = split_axis::SplitDimension(mode);
+  if (bm.direction == CVDirection::CUBE_TO_VECTOR) {
+    // `lane_stride` is what LowerAutoVectorSplit actually partitioned by: absent
+    // (0) for the default box partition, the balanced stride when it rebalanced
+    // a ragged boundary across the lanes.
+    ExprPtr lane_stride =
+        bm.lane_stride > 0 ? std::make_shared<ConstInt>(bm.lane_stride, DataType::INDEX, span) : nullptr;
+    return split_axis::ShardSplitCode(mode, bm.source_tile->GetType(), split_dim, lane_stride,
+                                      "tile.aiv_shard", span);
+  }
+  return split_axis::GatherSplitCode(mode, bm.result_type, split_dim, "tile.aic_gather", span);
+}
+
+CallPtr CreateTpush(const std::string& op_name, const ExprPtr& tile, const Span& span, int split = 0,
+                    int lane_stride = 0) {
+  return OpRegistry::GetInstance().Create(op_name, {tile}, MakeSplitKwargs(split, lane_stride), span);
 }
 
 CallPtr CreateTpop(const std::string& op_name, const TypePtr& result_type, const Span& span,
@@ -431,13 +465,88 @@ CallPtr CreateMove(const ExprPtr& tile, MemorySpace target_memory, const TypePtr
   return std::make_shared<Call>(op, std::vector<ExprPtr>{tile}, std::move(kwargs), result_type, span);
 }
 
-// ============================================================================
-// Parameterized Core Body Builder (shared by AIC and AIV)
-// ============================================================================
-
 MemorySpace GetBoundaryTpopMemory(CoreSide side) {
   return (side == CoreSide::AIC) ? MemorySpace::Mat : MemorySpace::Vec;
 }
+
+// ============================================================================
+// Hand-written cross-core pipe: V->C push layout adaptation
+// ============================================================================
+
+/// Give a hand-written `pl.tpush_to_aic` the same fractal adapter the compiler
+/// inserts for the pipes it builds itself.
+///
+/// The boundary-move path below adapts every V->C push on a backend whose
+/// cross-core boundary carries fractal layout (BackendHandler::
+/// RequiresVtoCFractalAdapt). A hand-written pipe -- pl.reserve_buffer +
+/// pl.{aic,aiv}_initialize_pipe + pl.tpush_to_aic, authored directly in an AIV
+/// function -- never reaches it, because this pass expands InCore functions and
+/// passes every other function through untouched. On Ascend950 that shipped a
+/// bare ND tile into a FIFO the cube reads as fractal, so every element of the
+/// popped tile landed somewhere else: tests/st/runtime/cross_core
+/// test_multiple_pipes_nosplit returns 256/256 wrong values on board while
+/// passing on a5sim (which does not model the on-chip FIFO layout) and on
+/// Ascend910B (which needs no adapter: push/pop goes ub -> gm -> mat and takes
+/// ND directly).
+///
+/// The target view does not depend on where the consumer pops to -- the handler
+/// maps Mat, Left and Right alike onto one fractal view -- so keying off Mat,
+/// the cube-side transfer memory the op-driven branch below already uses, is
+/// exact rather than a guess, and needs no cross-function analysis to find the
+/// matching tpop.
+class AdaptManualVtoCPush : public IRMutator {
+ protected:
+  StmtPtr VisitStmt_(const EvalStmtPtr& op) override {
+    auto call = As<Call>(op->expr_);
+    if (!call || !IsOp(call, "tile.tpush_to_aic") || call->args_.size() != 1) {
+      return IRMutator::VisitStmt_(op);
+    }
+    const ExprPtr& source = call->args_[0];
+    auto src_type = As<TileType>(source->GetType());
+    INTERNAL_CHECK_SPAN(src_type, op->span_) << "Internal error: tile.tpush_to_aic source must be a TileType";
+
+    // Backend gate lives here, not around the caller's loop: a program with no
+    // hand-written push must not require a configured backend to walk this phase.
+    const auto* handler = PassContext::Current()->GetBackendHandler();
+    if (!handler->RequiresVtoCFractalAdapt()) {
+      return IRMutator::VisitStmt_(op);
+    }
+    const TileView src_view = tile_view_semantics::GetEffectiveTileView(*src_type);
+    const TileView fractal_view =
+        handler->BuildCrossCoreTransferView(GetBoundaryTpopMemory(CoreSide::AIC), src_view);
+    // Already in the boundary layout: either a second run of this pass, or an
+    // author who staged the move by hand. Either way there is nothing to add.
+    if (fractal_view.blayout == src_view.blayout && fractal_view.slayout == src_view.slayout) {
+      return IRMutator::VisitStmt_(op);
+    }
+
+    auto adapted_type = std::make_shared<TileType>(src_type->shape_, src_type->dtype_, std::nullopt,
+                                                   fractal_view, MemorySpace::Vec);
+    std::string src_name = "tile";
+    if (auto sv = AsVarLike(source)) {
+      src_name = sv->name_hint_;
+    }
+    const bool is_nz = (fractal_view.blayout == TileLayout::col_major);
+    auto adapted_var = std::make_shared<Var>(src_name + (is_nz ? "_nz" : "_zn"), adapted_type, op->span_);
+    auto adapt_call = CreateMove(source, MemorySpace::Vec, adapted_type, op->span_);
+
+    // Rebuild rather than CreateTpush: a hand-written push carries its own
+    // kwargs (`split`, and `id` selecting one of several pipes), and dropping
+    // `id` would silently collapse a multi-pipe program onto one FIFO. attrs_
+    // rides along for the same reason -- this rewrite replaces the pushed tile
+    // and nothing else, so it must not quietly drop compiler metadata a caller
+    // or an earlier pass attached to the op.
+    auto adapted_push = std::make_shared<Call>(call->op_, std::vector<ExprPtr>{adapted_var}, call->kwargs_,
+                                               call->attrs_, call->GetType(), call->span_);
+    std::vector<StmtPtr> out{std::make_shared<AssignStmt>(adapted_var, adapt_call, op->span_),
+                             std::make_shared<EvalStmt>(adapted_push, op->span_)};
+    return SeqStmts::Flatten(std::move(out), op->span_);
+  }
+};
+
+// ============================================================================
+// Parameterized Core Body Builder (shared by AIC and AIV)
+// ============================================================================
 
 TypePtr BuildBoundaryTpopType(CoreSide side, const TypePtr& original_type) {
   auto tt = std::dynamic_pointer_cast<const TileType>(original_type);
@@ -762,12 +871,25 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
         // off this transfer memory rather than the op's result memory — which
         // names the other lane whenever this side is the producer.
         const MemorySpace xfer_ms = GetBoundaryTpopMemory(side);
-        const int op_split = bm.op_driven ? bm.split : 0;
+        // The transport carries the pto-isa split CODE, not the authored mode:
+        // when the two AIV lanes' extents differ by one — an odd physical box,
+        // or an odd valid extent inside an even one — the pair takes the ODD
+        // code, whose lane 1 band sits one cell past its own extent. Derived
+        // from the FULL (cube-side) tile: the shard's operand, the gather's
+        // result.
+        const int op_split = bm.op_driven ? BoundaryTransportSplitCode(bm, stmt->span_) : kSplitNone;
+        // Only the Cube -> Vector direction is ever rebalanced, so only its
+        // transport carries the stride.
+        const int op_lane_stride =
+            (bm.op_driven && bm.direction == CVDirection::CUBE_TO_VECTOR) ? bm.lane_stride : 0;
         if (bm.direction == push_direction) {
           ExprPtr push_source = bm.source_tile;
           // AIV V->C push: insert tile.move (tmov) to adapt the source into
           // the required fractal layout before tpush.
-          // On Ascend950: Left -> NZ, Right -> ZN.
+          // On Ascend950 both cross as NZ: Left -> NZ, and Right -> NZ too, because
+          // V2C inserts the Vec tile into the Mat FIFO via TINSERT_IMPL<TInsertMode::NZ>.
+          // A Right operand does end up ZN, but only after the cube side's own
+          // Mat -> Right tile.move, one step past this boundary.
           // On Ascend910B: don't need to adapt layout! push/pop will be ub -> gm -> mat, ub -> gm can
           // directly use nd
           if (side == CoreSide::AIV && handler->RequiresVtoCFractalAdapt()) {
@@ -805,7 +927,7 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
             push_source = tmov_var;
           }
           result.push_back(std::make_shared<EvalStmt>(
-              CreateTpush(push_op, push_source, stmt->span_, op_split), stmt->span_));
+              CreateTpush(push_op, push_source, stmt->span_, op_split, op_lane_stride), stmt->span_));
         } else {
           // Op-driven pop: the half/full shape comes from the op result type and
           // the memory from this side's transfer memory; the explicit follow-on
@@ -863,8 +985,8 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
           tpop_var_remap[tpop_var.get()] = tpop_var;
           // tile.move boundary tpops carry no split kwarg here (assigned later by
           // SplitVectorKernel); op-driven tpops stamp the op's split now.
-          auto pop_kwargs =
-              bm.op_driven ? MakeSplitKwargs(op_split) : std::vector<std::pair<std::string, std::any>>{};
+          auto pop_kwargs = bm.op_driven ? MakeSplitKwargs(op_split, op_lane_stride)
+                                         : std::vector<std::pair<std::string, std::any>>{};
           result.push_back(std::make_shared<AssignStmt>(
               tpop_var, CreateTpop(pop_op, tpop_result_type, stmt->span_, pop_kwargs), stmt->span_));
           if (needs_post_move) {
@@ -2072,6 +2194,33 @@ Pass ExpandMixedKernel() {
     // to AIV, or left alone because it was not InCore) carries the same stamp
     // and must not keep it either.
     for (auto& func : new_functions) func = StripCorePlacement(func);
+
+    // Phase 6: give every hand-written V->C push the boundary's fractal layout.
+    //
+    // The sweep covers EVERY emitted AIV function rather than only the ones
+    // that were already typed AIV on entry. `tile.tpush_to_aic` declares
+    // CoreAffinity::VECTOR, so it is legal to author one inside an InCore body:
+    // a pure-vector body reaches AIV through the conversion above, and a mixed
+    // body carries the statement into its expanded AIV half. Both produce their
+    // AIV function after the per-function loop, so a hook there would leave
+    // exactly the bare ND push this adapter exists to prevent.
+    //
+    // Running last also makes the boundary-move path's own adapters harmless:
+    // AdaptManualVtoCPush leaves a push whose source already carries the
+    // boundary view alone, so the pushes that path staged are not touched twice.
+    // The backend is consulted inside the mutator, on the first V->C push it
+    // meets, rather than as a guard around this loop: a program with no
+    // hand-written push must not require a configured backend just to walk past
+    // this phase.
+    for (auto& func : new_functions) {
+      if (func->func_type_ != FunctionType::AIV) continue;
+      AdaptManualVtoCPush adapter;
+      auto adapted_body = adapter.VisitStmt(func->body_);
+      if (adapted_body == func->body_) continue;
+      auto adapted = std::make_shared<Function>(*func);
+      adapted->body_ = adapted_body;
+      func = adapted;
+    }
 
     return std::make_shared<Program>(new_functions, program->name_, program->span_);
   };

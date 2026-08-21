@@ -11,7 +11,9 @@
 
 #include "pypto/ir/transforms/utils/op_predicates.h"
 
+#include <cstddef>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "pypto/ir/core_affinity_kind.h"
@@ -69,9 +71,19 @@ bool OutputInheritsSourceBuffer(const std::string& op_name) {
   return IsBufferAliasingViewOp(op_name) || entry.GetOutputReusesInputArg().has_value();
 }
 
+std::optional<size_t> BuiltinWritebackArgIndex(const OpPtr& op, size_t arg_count) {
+  if (!op) return std::nullopt;
+  auto& registry = OpRegistry::GetInstance();
+  if (!registry.IsRegistered(op->name_)) return std::nullopt;
+  auto aliased_idx = registry.GetEntry(op->name_).GetOutputReusesInputArg();
+  if (!aliased_idx || *aliased_idx >= arg_count) return std::nullopt;
+  return aliased_idx;
+}
+
 bool IsBuiltinOp(const std::string& op_name) {
   return op_name.rfind("tile.", 0) == 0 || op_name.rfind("tensor.", 0) == 0 ||
-         op_name.rfind("system.", 0) == 0 || op_name.rfind("array.", 0) == 0;
+         op_name.rfind("system.", 0) == 0 || op_name.rfind("array.", 0) == 0 ||
+         op_name == "pld.system.get_comm_ctx";
 }
 
 bool IsPublishingWrite(const CallPtr& call) {
