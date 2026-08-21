@@ -72,7 +72,7 @@ for i in pl.range(N, init_values=[init_buf]):
 
 **Solution**: Analyze `tensor.slice(parent, size, offset)` patterns in orchestration. When a slice result is passed as an `In` argument to an InCore call, attach the parent tensor's shape-derived strides via `TensorView` on the InCore function's `In` param type, so `tile.load` uses the correct memory layout.
 
-### Pattern 5: Static Window Externalization (OutWindowExternalizer)
+### Pattern 5: Static Window Externalization
 
 Pattern 5 runs **only** on InCore-type functions (`InCore`, `AIC`, or `AIV`) explicitly annotated with `windowize=True`. Unannotated kernels are never windowed regardless of access pattern.
 
@@ -250,9 +250,18 @@ The `tensor.create` is eliminated; the iter-arg buffer is reused across iteratio
 
 **Main pass implementation**: `src/ir/transforms/optimize_orch_tensors_pass.cpp`
 
-**Pattern 5 utility module**:
-`include/pypto/ir/transforms/utils/window_externalization.h`,
-`src/ir/transforms/utils/window_externalization.cpp`
+**Pattern 5 module**: `include/pypto/ir/transforms/utils/window_externalization.h`
+(public entry points) over `src/ir/transforms/window_externalization/`:
+
+| File | Stage |
+| ---- | ----- |
+| `internal.h` | Shared vocabulary — rewrite-info structs, the window-type and affine helpers |
+| `common.cpp` | Implementation of those shared helpers, plus the two public mapping utilities |
+| `analysis.cpp` | Decides which callees are windowable, then applies the type/ABI safety policy |
+| `callee_rewrite.cpp` | Clones one callee into its windowed form |
+| `localizers.cpp` | Rewrites window writes / reads inside a cloned callee body |
+| `orch_rewriter.cpp` | Retargets Orchestration call sites to the windowed clones |
+| `pass.cpp` | Drives the stages; hosts the public entry points |
 
 **Python binding**: `python/bindings/modules/passes.cpp`
 
@@ -274,7 +283,7 @@ The `tensor.create` is eliminated; the iter-arg buffer is reused across iteratio
 | `AssembleParentStridesOptimizer` | Pattern 2 — attaches parent strides via TensorView |
 | `SliceInputStridesOptimizer` | Pattern 4 — attaches parent strides to In params via TensorView for slice patterns |
 | `AssembleLoopRewriter` | Pattern 3 — rewrites tile.assemble loops to tile.store loops |
-| `OutWindowExternalizer` | Pattern 5 utility module — rewrites eligible local Out writes and eligible In-window consumers to explicit call-site slices |
+| `window_externalization::ApplyWindowExternalization` | Pattern 5 module — rewrites eligible local Out writes and eligible In-window consumers to explicit call-site slices |
 | `BuildOutParamReturnMappings` | Shared helper — maps Out params to return indices via tile.store |
 | `ComputeRowMajorStrides` | Shared helper — computes row-major strides from a shape |
 

@@ -197,6 +197,12 @@ set(PYPTO_SOURCES
     src/ir/transforms/lower_auto_vector_split_pass.cpp
     src/ir/transforms/split_vector_kernel_pass.cpp
     src/ir/transforms/auto_tile_matmul_l0_pass.cpp
+    src/ir/transforms/window_externalization/analysis.cpp
+    src/ir/transforms/window_externalization/callee_rewrite.cpp
+    src/ir/transforms/window_externalization/common.cpp
+    src/ir/transforms/window_externalization/localizers.cpp
+    src/ir/transforms/window_externalization/orch_rewriter.cpp
+    src/ir/transforms/window_externalization/pass.cpp
     src/ir/transforms/flatten_tile_nd_to_2d/analysis.cpp
     src/ir/transforms/flatten_tile_nd_to_2d/batch_matmul.cpp
     src/ir/transforms/flatten_tile_nd_to_2d/pass.cpp
@@ -237,7 +243,6 @@ set(PYPTO_SOURCES
     src/ir/transforms/utils/transform_utils.cpp
     src/ir/transforms/utils/wrapper_call_utils.cpp
     src/ir/transforms/utils/window_alias_utils.cpp
-    src/ir/transforms/utils/window_externalization.cpp
     src/ir/transforms/visitor.cpp
 
     # IR - Verifier

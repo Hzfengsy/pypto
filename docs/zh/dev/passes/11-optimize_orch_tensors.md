@@ -72,7 +72,7 @@ for i in pl.range(N, init_values=[init_buf]):
 
 **方案**：分析编排函数中的 `tensor.slice(parent, size, offset)` 模式。当切片结果作为 `In` 参数传递给 InCore 调用时，将父张量形状推导出的步长通过 `TensorView` 附加到 InCore 函数的 `In` 参数类型上，使 `tile.load` 能使用正确的内存布局。
 
-### 模式 5：静态窗口外提（OutWindowExternalizer）
+### 模式 5：静态窗口外提
 
 模式 5 **仅**对显式标注了 `windowize=True` 的 InCore-type function（`InCore`、`AIC` 或 `AIV`）生效。未标注的 kernel 无论访问模式如何都不会被 windowize。
 
@@ -244,9 +244,18 @@ class After:
 
 **主 pass 实现**：`src/ir/transforms/optimize_orch_tensors_pass.cpp`
 
-**模式 5 工具模块**：
-`include/pypto/ir/transforms/utils/window_externalization.h`，
-`src/ir/transforms/utils/window_externalization.cpp`
+**模式 5 模块**：`include/pypto/ir/transforms/utils/window_externalization.h`
+（对外入口）之上的 `src/ir/transforms/window_externalization/`：
+
+| 文件 | 阶段 |
+| ---- | ---- |
+| `internal.h` | 共享词汇表 — 改写信息结构体、窗口类型与仿射辅助函数 |
+| `common.cpp` | 上述共享辅助函数的实现，以及两个对外的映射工具 |
+| `analysis.cpp` | 判定哪些 callee 可窗口化，随后施加类型/ABI 安全策略 |
+| `callee_rewrite.cpp` | 将单个 callee 克隆为窗口化形式 |
+| `localizers.cpp` | 在克隆后的 callee 体内改写窗口写/读 |
+| `orch_rewriter.cpp` | 将 Orchestration callsite 重定向到窗口化克隆 |
+| `pass.cpp` | 驱动各阶段；承载对外入口 |
 
 **Python 绑定**：`python/bindings/modules/passes.cpp`
 
@@ -268,7 +277,7 @@ class After:
 | `AssembleParentStridesOptimizer` | 模式 2 — 通过 TensorView 附加父张量步长 |
 | `SliceInputStridesOptimizer` | 模式 4 — 通过 TensorView 为切片输入的 In 参数附加父张量步长 |
 | `AssembleLoopRewriter` | 模式 3 — 将 tile.assemble 循环重写为 tile.store 循环 |
-| `OutWindowExternalizer` | 模式 5 工具模块 — 将 eligible 的局部 Out 写和 eligible In-window consumer 改写为显式 callsite slice |
+| `window_externalization::ApplyWindowExternalization` | 模式 5 模块 — 将 eligible 的局部 Out 写和 eligible In-window consumer 改写为显式 callsite slice |
 | `BuildOutParamReturnMappings` | 共享辅助函数 — 通过 tile.store 映射 Out 参数到返回索引 |
 | `ComputeRowMajorStrides` | 共享辅助函数 — 从形状计算行主序步长 |
 
