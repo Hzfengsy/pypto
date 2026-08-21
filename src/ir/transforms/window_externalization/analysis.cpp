@@ -1117,9 +1117,22 @@ std::vector<InputRewriteInfo> AnalyzeAggregateInputWindows(
   return inputs;
 }
 
+/// True when an aggregate output covers its whole parent at offset zero, so
+/// windowing it would not narrow the dependency at all.
+bool CoversFullParent(const OutputRewriteInfo& info) {
+  return AreExprVectorsEqual(info.window_shape, info.parent_shape) && IsAllZeroOffsets(info.callsite_offsets);
+}
+
+/// Analyze the aggregate output-window loop of `func`.
+///
+/// The result carries *every* provable aggregate output, full-parent ones
+/// included. Those are not windowable on their own, so `Analyze` drops them
+/// before using the analysis as a rewrite plan -- but the pure-input-window
+/// verdict needs to see them, and running this traversal a second time to
+/// recover them costs as much as the first.
 std::optional<CalleeRewriteAnalysis> AnalyzeAggregateWindowLoop(
     const FunctionPtr& func, const std::vector<size_t>& out_indices,
-    const std::vector<InputRewriteInfo>& existing_inputs, bool include_full_shape_zero_outputs = false) {
+    const std::vector<InputRewriteInfo>& existing_inputs) {
   if (!func || out_indices.empty()) return std::nullopt;
 
   auto body_stmts = FlattenToStmts(func->body_);
@@ -1726,11 +1739,6 @@ std::optional<CalleeRewriteAnalysis> AnalyzeAggregateWindowLoop(
       continue;
     }
 
-    if (AreExprVectorsEqual(window_shape, out_tensor_type->shape_) && IsAllZeroOffsets(base_offsets) &&
-        !include_full_shape_zero_outputs) {
-      continue;
-    }
-
     auto output_window_shape = std::move(window_shape);
     auto output_base_offsets = std::move(base_offsets);
     auto output_local_offsets = std::move(local_zero_offsets);
@@ -1755,24 +1763,18 @@ std::optional<CalleeRewriteAnalysis> AnalyzeAggregateWindowLoop(
   return analysis;
 }
 
-bool HasAggregateFullShapeZeroOffsetReturnOutputs(const FunctionPtr& func,
-                                                  const std::vector<size_t>& out_indices,
-                                                  const std::vector<InputRewriteInfo>& existing_inputs) {
-  auto analysis = AnalyzeAggregateWindowLoop(func, out_indices, existing_inputs,
-                                             /*include_full_shape_zero_outputs=*/true);
+/// True when every `out_indices` entry has an aggregate output covering its
+/// whole parent -- the callee writes its outputs wholesale, so only its inputs
+/// are worth windowing.
+bool AllAggregateOutputsCoverFullParent(const std::optional<CalleeRewriteAnalysis>& analysis,
+                                        const std::vector<size_t>& out_indices) {
   if (!analysis.has_value() || analysis->outputs.size() != out_indices.size()) return false;
 
   for (const auto& out_index : out_indices) {
-    auto out_tensor_type = As<TensorType>(func->params_[out_index]->GetType());
-    if (!out_tensor_type) return false;
     auto it = std::find_if(
         analysis->outputs.begin(), analysis->outputs.end(),
         [out_index](const OutputRewriteInfo& info) { return info.out_param_index == out_index; });
-    if (it == analysis->outputs.end()) return false;
-    if (!AreExprVectorsEqual(it->window_shape, out_tensor_type->shape_) ||
-        !IsAllZeroOffsets(it->callsite_offsets)) {
-      return false;
-    }
+    if (it == analysis->outputs.end() || !CoversFullParent(*it)) return false;
   }
   return true;
 }
@@ -1843,14 +1845,20 @@ AnalysisMap Analyze(const ProgramPtr& program) {
     }
 
     auto aggregate_analysis = AnalyzeAggregateWindowLoop(func, out_indices, input_windows);
-    if (aggregate_analysis.has_value() && !aggregate_analysis->outputs.empty()) {
-      analyses.emplace(func->name_, std::move(*aggregate_analysis));
-      continue;
+    // Read the pure-input-window verdict off the superset before narrowing it to
+    // the windowable outputs -- both answers come from this one traversal.
+    const bool outputs_are_wholesale = AllAggregateOutputsCoverFullParent(aggregate_analysis, out_indices);
+    if (aggregate_analysis.has_value()) {
+      auto& outputs = aggregate_analysis->outputs;
+      outputs.erase(std::remove_if(outputs.begin(), outputs.end(), CoversFullParent), outputs.end());
+      if (!outputs.empty()) {
+        analyses.emplace(func->name_, std::move(*aggregate_analysis));
+        continue;
+      }
     }
 
     if (!input_windows.empty() &&
-        (HasOnlyFullShapeZeroOffsetReturnOutputs(func, out_indices) ||
-         HasAggregateFullShapeZeroOffsetReturnOutputs(func, out_indices, input_windows))) {
+        (HasOnlyFullShapeZeroOffsetReturnOutputs(func, out_indices) || outputs_are_wholesale)) {
       CalleeRewriteAnalysis input_only_analysis;
       input_only_analysis.kind = RewriteKind::FinalStore;
       input_only_analysis.inputs = std::move(input_windows);
