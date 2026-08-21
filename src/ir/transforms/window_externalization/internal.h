@@ -61,7 +61,6 @@ struct WindowRewriteContext {
   }
 
   size_t next_scalar_temp_id = 0;
-  std::unordered_map<std::string, std::unordered_map<size_t, VarPtr>> output_dynamic_extent_dims_by_func;
 };
 
 struct OutputRewriteInfo {

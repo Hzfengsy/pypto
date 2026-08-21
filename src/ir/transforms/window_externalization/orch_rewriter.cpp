@@ -433,8 +433,6 @@ class OrchRewriter : public IRMutator {
       return std::nullopt;
     }
     std::unordered_map<size_t, std::vector<VarPtr>> slices_by_in_index_multi;
-    std::unordered_map<size_t, std::vector<ExprPtr>> extra_args_by_out_index;
-    std::unordered_map<size_t, ExprPtr> output_extent_arg_by_out_index;
     std::unordered_map<size_t, std::vector<SliceBundle>> slices_by_out_index;
     std::vector<StmtPtr> stmts;
     stmts.reserve((analysis.inputs.size() + analysis.outputs.size()) * 2 + 2);
@@ -498,7 +496,6 @@ class OrchRewriter : public IRMutator {
       ExprPtr parent_expr = MaterializeWindowParentExpr(call->args_[output.out_param_index]);
       for (size_t piece_index = 0; piece_index < pieces.size(); ++piece_index) {
         const auto& piece = pieces[piece_index];
-        std::vector<ExprPtr> output_extra_args;
         std::vector<ExprPtr> shape_exprs;
         shape_exprs.reserve(piece.window_shape.size());
         for (const auto& dim : piece.window_shape) {
@@ -530,9 +527,6 @@ class OrchRewriter : public IRMutator {
             std::make_shared<Var>(out_arg->name_hint_ + suffix, slice_call->GetType(), out_arg->span_);
         stmts.push_back(std::make_shared<AssignStmt>(slice_var, slice_call, call_assign->span_));
         output_slices.push_back(SliceBundle{slice_var, parent_expr, shape_tuple, offset_tuple});
-        if (!output_extra_args.empty()) {
-          extra_args_by_out_index.emplace(output.out_param_index, std::move(output_extra_args));
-        }
       }
       slices_by_out_index.emplace(output.out_param_index, std::move(output_slices));
     }
@@ -547,10 +541,6 @@ class OrchRewriter : public IRMutator {
       }
       auto slice_it = slices_by_out_index.find(i);
       if (slice_it != slices_by_out_index.end()) {
-        auto extra_it = extra_args_by_out_index.find(i);
-        if (extra_it != extra_args_by_out_index.end()) {
-          for (const auto& arg : extra_it->second) new_args.push_back(arg);
-        }
         for (const auto& slice : slice_it->second) new_args.push_back(slice.slice_var);
       } else {
         new_args.push_back(VisitExpr(call->args_[i]));
@@ -567,15 +557,6 @@ class OrchRewriter : public IRMutator {
     std::unordered_map<const Var*, ExprPtr> cloned_param_callsite_subst;
     for (size_t i = 0; i < cloned_func->params_.size() && i < new_args.size(); ++i) {
       cloned_param_callsite_subst[cloned_func->params_[i].get()] = new_args[i];
-    }
-    auto dynamic_dim_it = rewrite_context_.output_dynamic_extent_dims_by_func.find(callee_name);
-    if (dynamic_dim_it != rewrite_context_.output_dynamic_extent_dims_by_func.end()) {
-      for (const auto& [out_param_index, extent_dim] : dynamic_dim_it->second) {
-        auto extent_arg_it = output_extent_arg_by_out_index.find(out_param_index);
-        if (extent_dim && extent_arg_it != output_extent_arg_by_out_index.end()) {
-          cloned_param_callsite_subst[extent_dim.get()] = extent_arg_it->second;
-        }
-      }
     }
     for (auto& result_type : result_types) {
       result_type = SubstituteTypeExprs(result_type, cloned_param_callsite_subst);
@@ -1291,7 +1272,7 @@ class OrchRewriter : public IRMutator {
       }
       return loop_local_allocs->count(root);
     }
-    return parent_var && loop_local_allocs->count(parent_var.get());
+    return false;
   }
 
   ExprPtr ResolveLoopInitExpr(const ExprPtr& expr) const {

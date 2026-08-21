@@ -304,9 +304,6 @@ FunctionPtr RewriteCallee(const ProgramPtr& program, const FunctionPtr& func,
   std::vector<VarPtr> primary_new_param_by_old_index(func->params_.size());
   std::unordered_map<size_t, std::vector<VarPtr>> output_piece_params_by_old_index;
   std::unordered_map<size_t, std::vector<size_t>> output_piece_return_indices_by_old_index;
-  std::unordered_map<size_t, VarPtr> output_dynamic_base_params_by_old_index;
-  std::unordered_map<size_t, VarPtr> output_dynamic_extent_params_by_old_index;
-  std::unordered_map<size_t, VarPtr> output_dynamic_extent_dims_by_old_index;
 
   std::unordered_map<const Var*, ExprPtr> seed;
   for (size_t i = 0; i < func->params_.size(); ++i) {
@@ -371,11 +368,6 @@ FunctionPtr RewriteCallee(const ProgramPtr& program, const FunctionPtr& func,
     primary_new_param_by_old_index[i] = new_param;
     seed[func->params_[i].get()] = new_param;
   }
-  if (!output_dynamic_extent_dims_by_old_index.empty()) {
-    rewrite_context.output_dynamic_extent_dims_by_func[func->name_] = output_dynamic_extent_dims_by_old_index;
-  } else {
-    rewrite_context.output_dynamic_extent_dims_by_func.erase(func->name_);
-  }
 
   auto cloned_name = MakeUniqueFunctionName(program, func->name_ + clone_suffix);
   auto cloned = DeepClone(func->body_, seed);
@@ -401,33 +393,11 @@ FunctionPtr RewriteCallee(const ProgramPtr& program, const FunctionPtr& func,
       remap_rebuilt_param(&param);
     }
   }
-  for (auto& [_, param] : output_dynamic_base_params_by_old_index) {
-    remap_rebuilt_param(&param);
-  }
-  for (auto& [_, param] : output_dynamic_extent_params_by_old_index) {
-    remap_rebuilt_param(&param);
-  }
   std::vector<OutputRewriteInfo> localized_outputs = analysis.outputs;
   for (auto& output : localized_outputs) {
     auto return_it = output_piece_return_indices_by_old_index.find(output.out_param_index);
     if (return_it != output_piece_return_indices_by_old_index.end()) {
       output.piece_return_indices = return_it->second;
-    }
-    auto output_base_it = output_dynamic_base_params_by_old_index.find(output.out_param_index);
-    auto output_extent_it = output_dynamic_extent_params_by_old_index.find(output.out_param_index);
-    if (output_base_it != output_dynamic_base_params_by_old_index.end() ||
-        output_extent_it != output_dynamic_extent_params_by_old_index.end()) {
-      if (output_base_it == output_dynamic_base_params_by_old_index.end() ||
-          output_extent_it == output_dynamic_extent_params_by_old_index.end() ||
-          output.window_shape.empty() || output.callsite_offsets.empty() ||
-          output.region.dense_pieces.empty() || output.region.dense_pieces.front().window_shape.empty() ||
-          output.region.dense_pieces.front().callsite_offsets.empty()) {
-        return nullptr;
-      }
-      output.window_shape[0] = output_extent_it->second;
-      output.callsite_offsets[0] = output_base_it->second;
-      output.region.dense_pieces.front().window_shape[0] = output_extent_it->second;
-      output.region.dense_pieces.front().callsite_offsets[0] = output_base_it->second;
     }
     for (auto& offset : output.callsite_offsets) {
       offset = transform_utils::Substitute(offset, body_subst);
