@@ -743,7 +743,8 @@ def main(argv: list[str] | None = None) -> int:
     Steps:
         1. Verify clang-tidy is installed and check its version.
         2. Collect C/C++ source and header files.
-        3. Resolve build directory (explicit ``-B`` > existing ``./build`` > temp dir).
+        3. Resolve build directory: the explicit ``-B``, or a temp dir when it is
+           omitted -- or when configuring into it would clobber its CMake cache.
         4. Lint header files first (fixes may affect source files).
         5. Lint source files (all enabled checks via compile database).
         6. Re-print version warning at the end (if any).
