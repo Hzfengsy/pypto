@@ -6,8 +6,6 @@
 
 此 Pass 静态展开通过 `pl.unroll()` 创建的 for 循环，将其替换为循环体的多份副本，其中循环变量被替换为每次迭代的常量值。
 
-**前置条件**: TypeChecked 属性。
-
 **使用场景**: 在默认流水线（pipeline）中自动运行，位于 `ConvertToSSA` 之前。当循环次数为编译时常量并且您希望为每次迭代复制循环体时，使用 `pl.unroll()`。
 
 ## API
@@ -86,6 +84,6 @@ UnrollLoops 将 `pl.unroll()` 循环展开为完全平铺的直线代码形式�
 
 | 属性 | 值 |
 | ---- | -- |
-| 前置要求（Required） | `TypeChecked` |
-| 产生（Produced） | `TypeChecked` |
-| 失效（Invalidated） | （无） |
+| 前置要求（Required） | — |
+| 产生（Produced） | `UnrollResolved` |
+| 失效（Invalidated） | — |

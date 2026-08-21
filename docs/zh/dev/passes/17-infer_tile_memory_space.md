@@ -224,10 +224,12 @@ class After:
 | 属性 | 取值 |
 | ---- | ---- |
 | Required | `SSAForm`、`IncoreTileOps`、`SplitIncoreOrch`、`NormalizedStmtStructure` |
-| Produced | `SSAForm`、`TileMemoryInferred`、`NormalizedStmtStructure` |
-| Invalidated | — |
+| Produced | `SSAForm`、`TileMemoryInferred`、`NormalizedStmtStructure`、`AivSplitValid`、`AccToGmStoreValid` |
+| Invalidated | `AivSplitValid` |
 
 `TileMemoryInferred` 属性是本 pass 建立的契约。下游 pass（尤其 `ExpandMixedKernel` 与 `InitMemRef`）依赖该契约，配套的属性 verifier 守护回归。
+
+`AccToGmStoreValid` 只有在这里才可判定：`tile.store` 是否从 Acc 收窄写入 GM，取决于本 pass 解析出的 memory space。`AivSplitValid` 被失效并重新产生也是同一原因——这是最后一个能观察到 AIV split 边界内存的验证点（此前在 `ConvertTensorToTileOps` 处该操作数的 space 可能仍未解析），再往后 `LowerAutoVectorSplit` 就会擦除区域节点。
 
 ## 作用范围
 

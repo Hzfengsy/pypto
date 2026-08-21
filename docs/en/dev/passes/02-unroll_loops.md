@@ -84,6 +84,6 @@ UnrollLoops expands `pl.unroll()` loops into their fully unrolled, straight-line
 
 | Property | Value |
 | -------- | ----- |
-| Required | `TypeChecked` |
-| Produced | `TypeChecked` |
-| Invalidated | (none) |
+| Required | — |
+| Produced | `UnrollResolved` |
+| Invalidated | — |

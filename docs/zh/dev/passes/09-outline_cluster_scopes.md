@@ -165,7 +165,7 @@ Orchestration 代码生成通过 `EffectiveLaunchSpec` 读取该规格：优先�
 
 | 属性 | 值 |
 | ---- | -- |
-| 所需 | TypeChecked, SSAForm |
+| 所需 | SSAForm |
 | 产生 | SSAForm, ClusterOutlined |
 | 失效 | — |
 

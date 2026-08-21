@@ -500,9 +500,11 @@ class After:
 
 | Property | Value |
 | -------- | ----- |
-| Required | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred |
-| Produced | SSAForm, MixedKernelExpanded |
+| Required | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure |
+| Produced | SSAForm, MixedKernelExpanded, NormalizedStmtStructure, HardSyncallOccupancyValid |
 | Invalidated | — |
+
+`HardSyncallOccupancyValid` is produced here not by anything this pass rewrites, but because resolving each kernel's `FunctionType` to AIV/AIC/Group is the precondition the hard-syncall occupancy verifier depends on. That verifier fires once, right after this pass.
 
 ## Property Verifier
 

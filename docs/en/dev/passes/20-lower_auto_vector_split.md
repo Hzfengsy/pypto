@@ -48,9 +48,11 @@ result = passes.lower_auto_vector_split()(program)
 
 | Property | Value |
 | -------- | ----- |
-| Required | `SSAForm` |
-| Produced | `SSAForm` |
-| Invalidated | — |
+| Required | `SSAForm`, `IncoreTileOps`, `SplitIncoreOrch`, `TileOps2D`, `TileMemoryInferred`, `NormalizedStmtStructure`, `AivSplitValid` |
+| Produced | `SSAForm`, `IncoreTileOps`, `SplitIncoreOrch`, `TileOps2D`, `TileMemoryInferred`, `NormalizedStmtStructure` |
+| Invalidated | `AivSplitValid` |
+
+This pass closes the `AivSplitValid` verification window that `OutlineIncoreScopes` opened: it consumes and erases the first-class `SplitAivScopeStmt` regions, so the structural region verifier cannot run after it. Hence `AivSplitValid` is required on entry and invalidated on exit. The rest of the set is unchanged across the pass — the still-mixed InCore body is rewritten in place.
 
 Source: `include/pypto/ir/transforms/pass_properties.h`
 (`kLowerAutoVectorSplitProperties`).

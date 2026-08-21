@@ -202,8 +202,8 @@ The phase entry points and rewrite component interface are private to the transf
 
 | Property | Value |
 | -------- | ----- |
-| Required | SSAForm, IncoreTileOps |
-| Produced | SSAForm, TileOps2D |
+| Required | SSAForm, IncoreTileOps, NormalizedStmtStructure |
+| Produced | SSAForm, TileOps2D, NormalizedStmtStructure |
 | Invalidated | — |
 
 ## Scope

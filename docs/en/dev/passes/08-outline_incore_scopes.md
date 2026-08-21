@@ -350,3 +350,17 @@ The authoritative per-region mode always rides `SplitAivScopeStmt::split_`, whic
 applies the same rule as a backstop: it omits a `split` attr of `SplitMode.NONE`
 so IR that bypassed this pass (a pre-existing `.pto` blob, a programmatically
 built `Function`) still prints in the canonical, re-parsable form.
+
+## Pass Properties
+
+| Property | Value |
+| -------- | ----- |
+| Required | SSAForm |
+| Produced | SSAForm, SplitIncoreOrch, AivSplitValid |
+| Invalidated | — |
+
+`AivSplitValid` opens here. The pass preserves the first-class `SplitAivScopeStmt` regions inside
+each outlined InCore function, so the structural region verifier can run from this point until
+[`LowerAutoVectorSplit`](20-lower_auto_vector_split.md) erases the node and invalidates the
+property. `ConvertTensorToTileOps` and `InferTileMemorySpace` re-verify it in between, once the
+boundary's memory side becomes observable.

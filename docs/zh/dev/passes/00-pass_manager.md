@@ -34,13 +34,41 @@
 | `NormalizedStmtStructure` | 语句 (Statement) 结构已规范化 |
 | `NoRedundantBlocks` | 无单子节点或嵌套的 SeqStmts |
 | `SplitIncoreOrch` | InCore 作用域已提取为独立函数 |
-| `ClusterOutlined` | Cluster 作用域已提取为 Group 函数 |
 | `HasMemRefs` | 变量上已初始化内存引用 (MemRef) 对象 |
-| `IncoreTileOps` | InCore 函数使用 tile 操作 |
-| `MixedKernelExpanded` | 混合 InCore 函数已拆分为 AIC + AIV + Group |
+| `IncoreTileOps` | InCore 函数使用 tile 操作（tile 类型、load/store） |
 | `AllocatedMemoryAddr` | 所有 MemRef 在缓冲区限制内具有有效地址 |
+| `MixedKernelExpanded` | 混合 InCore 函数已拆分为 AIC + AIV + Group |
+| `ClusterOutlined` | Cluster 作用域已提取为 Group 函数 |
+| `TileOps2D` | InCore 函数中所有 tile 操作的 tile 维度 ≤2D |
+| `TileMemoryInferred` | InCore 函数中 `TileType::memory_space_` 已填充 |
+| `BreakContinueValid` | break/continue 仅出现在 sequential/while 循环中 |
+| `UseAfterDef` | 所有变量使用都被其定义支配 (dominate) |
+| `HierarchyOutlined` | Hierarchy 作用域已提取为 level/role 函数 |
+| `StructuredCtrlFlow` | 不存在 BreakStmt/ContinueStmt——只有结构化控制流 |
+| `VectorKernelSplit` | 带 split 模式的 AIV 函数已调整 tpop 形状与 store 偏移 |
+| `OutParamNotShadowed` | Out/InOut 参数未被创建 tensor 的算子重新赋值 |
+| `NoNestedInCore` | 无嵌套 InCore 作用域（ScopeStmt 内再嵌 ScopeStmt） |
+| `InOutUseValid` | 调用之后不再读取以 InOut/Out 传入的变量（RFC #1026） |
+| `PipelineLoopValid` | 双向不变量：`ForStmt.kind_ == Pipeline` ⇔ 带有 `pipeline_stages` 属性 |
+| `PipelineResolved` | 不再残留 `ForKind::Pipeline`；由 CanonicalizeIOOrder 产生 |
+| `CallDirectionsResolved` | 每个非 builtin Call 都带有显式的 `attrs['arg_directions']` |
 | `TileTypeCoherence` | 每个 TileType 都具有规范的 tile_view（隐式视图存储为 nullopt） |
+| `InlineFunctionsEliminated` | 不再残留 `FunctionType::Inline` 函数及对其的 Call |
 | `OrchestrationReferencesResolved` | `FunctionType::Orchestration` 函数体内每一个非 builtin Call 必须对应到 Program 中存在的 Function |
+| `TensorViewCanonical` | TensorView 规范性已验证（弱模式：允许空 stride；严格模式：要求已材料化，RFC #1300 §2.2） |
+| `ArrayNotEscaped` | ArrayType 不会出现在函数参数或返回类型中 |
+| `CommDomainScopesMaterialized` | host_orch 函数体已被 CommDomainScopeStmt 包裹，且 `pld.tensor.window` 结果类型带有 `DistributedTensorType::window_buffer_` 反向引用 |
+| `DistTensorCtxMaterialized` | host orchestration 之外不再残留 `pld.system.get_comm_ctx`；每个 chip-orchestration / device 通信上下文都是可追溯到参数的显式 CommCtxType SSA 值 |
+| `RuntimeScopesMaterialized` | Orchestration 函数带有显式的 RuntimeScopeStmt 节点，codegen 不再隐式生成 `PTO2_SCOPE()` 包裹 |
+| `AssignTypeSymmetry` | 每个 AssignStmt 满足 `structural_equal(var->GetType(), value->GetType())`（memref 作为分配细节被排除） |
+| `ManualDepsOnSubmitOnly` | 普通跨函数 Call 不携带 `attrs["manual_dep_edges"]`——手写依赖边只存在于 `Submit::deps_` |
+| `ReturnParamsExplicit` | InCore/Group/Spmd 的 tensor 返回值按指针恒等引用函数参数（#1702） |
+| `UnrollResolved` | 不再残留 `ForKind::Unroll`；由 UnrollLoops 产生 |
+| `AivSplitValid` | SplitAivScopeStmt 区域结构合法：区域内无 cube 计算与 split 轴 reduce，边界算子只出现在区域内 |
+| `HardSyncallOccupancyValid` | 每个硬 (FFTS) `system.syncall` 都在满占用下启动——部分或超额启动会导致设备侧死锁 (507018) |
+| `IterArgCarryClassified` | Orchestration 中每个带 iter_args 的 ForStmt 都带有 `iter_arg_rebind_<i>` 携带方案，codegen 直接读取而不再重新推导 |
+| `AccToGmStoreValid` | 每个源 tile 位于 Acc 的 `tile.store` 所写 GM dtype 都能被后端 fix-pipe 收窄 |
+| `AtomicAddDtypeValid` | 每个写入 GM 的 atomic-add 的目标 dtype 都能被后端 store pipe 合并 |
 
 ### IRPropertySet
 
@@ -61,42 +89,64 @@ struct PassProperties {
 | Pass | 所需 | 产生 | 失效 |
 | ---- | ---- | ---- | ---- |
 | InlineFunctions | — | InlineFunctionsEliminated | — |
-| UnrollLoops | TypeChecked | TypeChecked | — |
-| CtrlFlowTransform | TypeChecked | TypeChecked, StructuredCtrlFlow | — |
-| ConvertToSSA | TypeChecked | TypeChecked, SSAForm | NormalizedStmtStructure |
-| FlattenCallExpr | SSAForm | SSAForm, NoNestedCalls | NormalizedStmtStructure |
-| NormalizeStmtStructure | TypeChecked | TypeChecked, NormalizedStmtStructure | — |
-| OutlineIncoreScopes | TypeChecked, SSAForm | SplitIncoreOrch | — |
-| OutlineClusterScopes | TypeChecked, SSAForm | ClusterOutlined | — |
-| ConvertTensorToTileOps | SplitIncoreOrch | IncoreTileOps | — |
+| UnrollLoops | — | UnrollResolved | — |
+| CtrlFlowTransform | — | StructuredCtrlFlow | — |
+| ConvertToSSA | — | SSAForm | NormalizedStmtStructure |
+| Simplify | — | — | — |
+| NormalizeStmtStructure | — | NormalizedStmtStructure | — |
+| FlattenCallExpr | SSAForm, NormalizedStmtStructure | SSAForm, NoNestedCalls, NormalizedStmtStructure | — |
+| OutlineHierarchyScopes | SSAForm | SSAForm, HierarchyOutlined, OrchestrationReferencesResolved | — |
+| OutlineIncoreScopes | SSAForm | SSAForm, SplitIncoreOrch, AivSplitValid | — |
+| OutlineClusterScopes | SSAForm | SSAForm, ClusterOutlined | — |
+| ConvertTensorToTileOps | SSAForm, SplitIncoreOrch, NormalizedStmtStructure | SSAForm, IncoreTileOps, NormalizedStmtStructure, AivSplitValid | AivSplitValid |
+| OptimizeOrchTensors | SplitIncoreOrch, IncoreTileOps | SplitIncoreOrch, IncoreTileOps | — |
 | LowerCompositeOps | — | — | — |
-| FlattenTileNdTo2D | SSAForm, IncoreTileOps | SSAForm, TileOps2D | — |
+| FlattenTileNdTo2D | SSAForm, IncoreTileOps, NormalizedStmtStructure | SSAForm, TileOps2D, NormalizedStmtStructure | — |
 | LegalizeTileCast | — | — | — |
-| AutoTileMatmulL0 | SSAForm, IncoreTileOps, TileOps2D | SSAForm, IncoreTileOps, TileOps2D | — |
+| AutoTileMatmulL0 | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, NormalizedStmtStructure | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, NormalizedStmtStructure | — |
 | CanonicalizeTileSlice | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, NormalizedStmtStructure | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, NormalizedStmtStructure | — |
-| InsertMxScaleAddr | SSAForm, IncoreTileOps, SplitIncoreOrch, TileMemoryInferred, NormalizedStmtStructure | SSAForm, IncoreTileOps, SplitIncoreOrch, TileMemoryInferred, NormalizedStmtStructure | — |
+| InferTileMemorySpace | SSAForm, IncoreTileOps, SplitIncoreOrch, NormalizedStmtStructure | SSAForm, TileMemoryInferred, NormalizedStmtStructure, AivSplitValid, AccToGmStoreValid | AivSplitValid |
+| InsertMxScaleAddr | SSAForm, IncoreTileOps, SplitIncoreOrch, NormalizedStmtStructure, TileMemoryInferred | SSAForm, IncoreTileOps, SplitIncoreOrch, NormalizedStmtStructure, TileMemoryInferred | — |
 | ResolveBackendOpLayouts | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, NormalizedStmtStructure | — |
-| LowerAutoVectorSplit | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | — |
-| ExpandMixedKernel | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D | SSAForm, MixedKernelExpanded | — |
-| NormalizeReturnOrder | SplitIncoreOrch, IncoreTileOps | — | — |
-| InitMemRef | TypeChecked, SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D | HasMemRefs | SSAForm |
-| MaterializeSemanticAliases | SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D | — | — |
-| MemoryReuse | TypeChecked, SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D | — | — |
-| AllocateMemoryAddr | TypeChecked, SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D | AllocatedMemoryAddr | — |
+| LowerAutoVectorSplit | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure, AivSplitValid | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | AivSplitValid |
+| ExpandMixedKernel | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | SSAForm, MixedKernelExpanded, NormalizedStmtStructure, HardSyncallOccupancyValid | — |
+| InjectGMPipeBuffer | SSAForm, MixedKernelExpanded, NormalizedStmtStructure | SSAForm, MixedKernelExpanded, NormalizedStmtStructure | — |
+| SplitVectorKernel | SSAForm, MixedKernelExpanded | SSAForm, VectorKernelSplit, NormalizedStmtStructure | — |
+| StampTfreeSplit | SplitIncoreOrch | — | — |
+| NormalizeReturnOrder | SplitIncoreOrch, IncoreTileOps | ReturnParamsExplicit | — |
+| SkewCrossCorePipeline | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | — |
+| LowerPipelineToSlots | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | — |
+| LowerPipelineLoops | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | — |
+| CanonicalizeIOOrder | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure, PipelineResolved | — |
+| MaterializeTensorStrides | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure, TensorViewCanonical | — |
+| InitMemRef | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred | HasMemRefs, NormalizedStmtStructure | SSAForm |
+| MaterializeSemanticAliases | SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D, NormalizedStmtStructure | NormalizedStmtStructure | — |
+| MemoryReuse | SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D, NormalizedStmtStructure | NormalizedStmtStructure | — |
+| AllocateMemoryAddr | SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D | AllocatedMemoryAddr | — |
 | FoldNoOpReshape | SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D | — | — |
-| FuseCreateAssembleToSlice | — | — | — |
+| FuseCreateAssembleToSlice | SplitIncoreOrch | — | — |
 | DeriveCallDirections | SplitIncoreOrch | CallDirectionsResolved | — |
 | AutoDeriveTaskDependencies | SplitIncoreOrch, CallDirectionsResolved | CallDirectionsResolved | — |
 | ExpandManualPhaseFence | NoNestedCalls, NormalizedStmtStructure, CallDirectionsResolved | NoNestedCalls, NormalizedStmtStructure, CallDirectionsResolved | — |
 | SynthesizeAllReduceSignals | — | — | — |
 | MaterializeCommDomainScopes | — | CommDomainScopesMaterialized | — |
 | LowerHostTensorCollectives | CommDomainScopesMaterialized | CommDomainScopesMaterialized | — |
-| MaterializeDistTensorCtx | CommDomainScopesMaterialized | CommDomainScopesMaterialized | — |
-| Simplify | — | — | — |
+| MaterializeDistTensorCtx | CommDomainScopesMaterialized, ReturnParamsExplicit | CommDomainScopesMaterialized, DistTensorCtxMaterialized | — |
 | MaterializeRuntimeScopes | SplitIncoreOrch, CallDirectionsResolved | RuntimeScopesMaterialized | — |
 | ClassifyIterArgCarry | CallDirectionsResolved, RuntimeScopesMaterialized | IterArgCarryClassified, RuntimeScopesMaterialized | — |
+| InsertCommFence | SplitIncoreOrch | — | — |
+| MaterializeValidShapeSymbols | — | — | — |
 
-> **注意**：VerifySSA 和 TypeCheck 是**属性验证器 (PropertyVerifier)**（验证规则），不是 Pass。它们通过 `VerificationInstrument` 或 `run_verifier()` 工具函数运行——参见[验证器](99-verifier.md)。
+本表按 `Default` 策略的执行顺序列出全部已注册 Pass。新增 Pass 或修改属性声明时，请同步更新
+此处对应的行。
+
+多数 `PassProperties` 常量位于 `include/pypto/ir/transforms/pass_properties.h`，但该头文件并非
+完整清单：`kFuseCreateAssembleToSliceProperties` 就声明在
+`src/ir/transforms/fuse_create_assemble_to_slice_pass.cpp` 内部。真正把 Pass *名字* 与其属性绑定
+起来的是 `CreateFunctionPass` / `CreateProgramPass` 调用点——`Pass::GetName()` 与该常量正是在那里
+汇合。因此请从调用点而非仅从头文件重新生成表格行，否则会静默漏掉 pass 内部的局部声明。
+
+> **注意**：VerifySSA 和 TypeCheck 是**属性验证器 (PropertyVerifier)**（验证规则），不是 Pass。它们通过 `VerificationInstrument` 或 `run_verifier()` 工具函数运行——参见[验证器](99-verifier.md)。这也是没有任何 Pass 声明 `TypeChecked` 的原因：它是**结构性**属性（`GetStructuralProperties()`），在流水线入口的 IR 上验证一次，而不是由某个 Pass 建立。
 
 ## C++ Pass 基础设施
 
@@ -325,26 +375,33 @@ class PassPipeline {
 
 ### 自动验证
 
-当 `VerificationLevel` 为 `Basic`（默认值）时，流水线会自动对一组**轻量级属性**各验证一次。这可以在无需手动设置 `PassContext` 的情况下捕获常见的 IR 错误。
-
-**验证的属性**：`{SSAForm, TypeChecked, AllocatedMemoryAddr}`
+当 `VerificationLevel` 为 `Basic`（默认值）时，流水线会自动验证 `GetVerifiedProperties()`（`src/ir/transforms/ir_property.cpp`）列出的**轻量级属性**，每次产生时各验证一次。这可以在无需手动设置 `PassContext` 的情况下捕获常见的 IR 错误。
 
 **工作原理**：
 
-1. 每个 Pass 执行后，检查是否产生了尚未检查的已验证属性
-2. 使用 `PropertyVerifierRegistry` 验证这些属性
-3. 出错时抛出 `VerificationError`
-4. 跟踪已验证属性以避免重复检查
+1. 在流水线入口验证 `GetStructuralProperties() ∩ GetVerifiedProperties()`——这些不变量在任何 Pass 运行前就应在用户自己的 IR 上成立
+2. 每个 Pass 执行后，验证它所*产生*且位于 `GetVerifiedProperties()` 中、尚未验证过的属性
+3. 当某个 Pass *失效*了这样一个属性时，将其从已验证集合中移除，以便后续的产生者重新验证
+4. 出错时抛出 `VerificationError`
 
-**使用 `Default` 策略时**：
+**使用 `Default` 策略时**（共 20 次检查；两个集合都声明在 `ir_property.cpp` 中，因此该时序完全由它们与上面的逐 Pass 属性表推导得出）：
 
-| Pass 执行后 | 验证的属性 | 累计 |
-| ----------- | ---------- | ---- |
-| ConvertToSSA | SSAForm, TypeChecked | 2 |
-| FlattenCallExpr | *(TypeChecked 已验证——跳过)* | 2 |
-| AllocateMemoryAddr | AllocatedMemoryAddr | 3 |
+| 验证时机 | 验证的属性 |
+| -------- | ---------- |
+| 流水线入口 | TypeChecked, BreakContinueValid, NoRedundantBlocks, InOutUseValid, ManualDepsOnSubmitOnly, AtomicAddDtypeValid |
+| ConvertToSSA | SSAForm |
+| OutlineIncoreScopes | AivSplitValid |
+| ConvertTensorToTileOps | AivSplitValid *（重新验证——本 Pass 会先失效它，参见 [10](10-convert_tensor_to_tile_ops.md)）* |
+| InferTileMemorySpace | AivSplitValid *（重新验证）*、TileMemoryInferred、AccToGmStoreValid |
+| ExpandMixedKernel | MixedKernelExpanded, HardSyncallOccupancyValid |
+| NormalizeReturnOrder | ReturnParamsExplicit |
+| AllocateMemoryAddr | AllocatedMemoryAddr |
+| DeriveCallDirections | CallDirectionsResolved |
+| MaterializeDistTensorCtx | DistTensorCtxMaterialized |
+| MaterializeRuntimeScopes | RuntimeScopesMaterialized |
+| ClassifyIterArgCarry | IterArgCarryClassified |
 
-**总计：3 次属性检查**（每个属性恰好验证一次）。
+因此，一个 Pass 少声明 `produced` 不只是文档写错——它会悄悄地从该时序中抹掉一次验证。
 
 **通过 `PassContext` 控制**：
 

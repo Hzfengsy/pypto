@@ -46,9 +46,11 @@ result = passes.lower_auto_vector_split()(program)
 
 | 属性 | 值 |
 | ---- | -- |
-| Required | `SSAForm` |
-| Produced | `SSAForm` |
-| Invalidated | — |
+| Required | `SSAForm`、`IncoreTileOps`、`SplitIncoreOrch`、`TileOps2D`、`TileMemoryInferred`、`NormalizedStmtStructure`、`AivSplitValid` |
+| Produced | `SSAForm`、`IncoreTileOps`、`SplitIncoreOrch`、`TileOps2D`、`TileMemoryInferred`、`NormalizedStmtStructure` |
+| Invalidated | `AivSplitValid` |
+
+本 pass 关闭了由 `OutlineIncoreScopes` 打开的 `AivSplitValid` 验证窗口：它消费并擦除第一类 `SplitAivScopeStmt` 区域，此后结构化区域 verifier 无法再运行。因此该属性在入口被要求、在出口被失效。其余属性在 pass 前后保持不变——仍是混合形态的 InCore 函数体被就地改写。
 
 来源：`include/pypto/ir/transforms/pass_properties.h`
 （`kLowerAutoVectorSplitProperties`）。

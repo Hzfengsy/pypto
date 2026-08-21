@@ -471,9 +471,11 @@ class After:
 
 | 属性 | 值 |
 | ---- | -- |
-| 所需 | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred |
-| 产生 | SSAForm, MixedKernelExpanded |
+| 所需 | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure |
+| 产生 | SSAForm, MixedKernelExpanded, NormalizedStmtStructure, HardSyncallOccupancyValid |
 | 失效 | — |
+
+`HardSyncallOccupancyValid` 在此产生，并非因为本 pass 做了什么改写，而是因为它把每个 kernel 的 `FunctionType` 解析为 AIV/AIC/Group——这正是硬 syncall 占用率 verifier 所依赖的前置条件。该 verifier 只在本 pass 之后触发一次。
 
 ## 属性验证器
 

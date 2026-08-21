@@ -320,8 +320,10 @@ class After:
 | 属性 | 值 |
 | ---- | -- |
 | Required | SSAForm, SplitIncoreOrch, NormalizedStmtStructure |
-| Produced | SSAForm, IncoreTileOps, NormalizedStmtStructure |
-| Invalidated | — |
+| Produced | SSAForm, IncoreTileOps, NormalizedStmtStructure, AivSplitValid |
+| Invalidated | AivSplitValid |
+
+`AivSplitValid` 同时被失效并重新产生，从而在此处强制对 split 区域再验证一次。`OutlineIncoreScopes` 建立该属性时，AIV split 边界还是 `tensor.aiv_shard` / `tensor.aic_gather`；TensorType 不携带 memory space，因此验证器的边界内存契约检查在那里必然被跳过。本 Pass 把这些算子改写为 tile 形式并附上声明的边界内存，而这正是该项检查所要检视的内容。
 
 ## 关键组件
 

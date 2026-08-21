@@ -322,3 +322,16 @@ print → parse 有损（`Kwargs size mismatch`）。权威的逐区域模式始
 `SplitAivScopeStmt::split_`，由 [`LowerAutoVectorSplit`](20-lower_auto_vector_split.md)
 消费。printer 以同一规则兜底：省略取值为 `SplitMode.NONE` 的 `split` 属性，使绕过本 Pass
 的 IR（此前写出的 `.pto`、以编程方式构造的 `Function`）依然以规范、可重新解析的形式打印。
+
+## Pass 属性
+
+| 属性 | 值 |
+| ---- | -- |
+| 所需 | SSAForm |
+| 产生 | SSAForm, SplitIncoreOrch, AivSplitValid |
+| 失效 | — |
+
+`AivSplitValid` 的验证窗口从这里打开。本 Pass 在每个被外提的 InCore 函数内保留第一类
+`SplitAivScopeStmt` 区域，因此结构化区域 verifier 可以从此处一直运行到
+[`LowerAutoVectorSplit`](20-lower_auto_vector_split.md) 擦除该节点并使属性失效为止。
+其间 `ConvertTensorToTileOps` 与 `InferTileMemorySpace` 会在边界内存变得可观察后各重新验证一次。

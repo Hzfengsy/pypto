@@ -174,7 +174,7 @@ deserialized IR that still spells a constant `core_num` on the function.
 
 | Property | Value |
 | -------- | ----- |
-| Required | TypeChecked, SSAForm |
+| Required | SSAForm |
 | Produced | SSAForm, ClusterOutlined |
 | Invalidated | — |
 

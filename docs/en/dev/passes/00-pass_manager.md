@@ -34,13 +34,41 @@ Framework for organizing and executing IR transformation passes on Programs with
 | `NormalizedStmtStructure` | Statement structure normalized |
 | `NoRedundantBlocks` | No single-child or nested SeqStmts |
 | `SplitIncoreOrch` | InCore scopes outlined into separate functions |
-| `ClusterOutlined` | Cluster scopes outlined into Group functions |
 | `HasMemRefs` | MemRef objects initialized on variables |
-| `IncoreTileOps` | InCore functions use tile ops |
-| `MixedKernelExpanded` | Mixed InCore functions split into AIC + AIV + Group |
+| `IncoreTileOps` | InCore functions use tile ops (tile types, load/store) |
 | `AllocatedMemoryAddr` | All MemRefs have valid addresses within buffer limits |
+| `MixedKernelExpanded` | Mixed InCore functions split into AIC + AIV + Group |
+| `ClusterOutlined` | Cluster scopes outlined into Group functions |
+| `TileOps2D` | All tile ops in InCore functions use ≤2D tiles |
+| `TileMemoryInferred` | `TileType::memory_space_` populated in InCore functions |
+| `BreakContinueValid` | Break/continue only in sequential/while loops |
+| `UseAfterDef` | All variable uses are dominated by a definition |
+| `HierarchyOutlined` | Hierarchy scopes outlined into level/role functions |
+| `StructuredCtrlFlow` | No BreakStmt/ContinueStmt — only structured control flow |
+| `VectorKernelSplit` | AIV functions with a split mode have tpop shapes and store offsets adjusted |
+| `OutParamNotShadowed` | Out/InOut params are not reassigned with tensor-creating ops |
+| `NoNestedInCore` | No nested InCore scopes (ScopeStmt inside ScopeStmt) |
+| `InOutUseValid` | No reads of InOut/Out-passed variables after the call (RFC #1026) |
+| `PipelineLoopValid` | Bidirectional invariant: `ForStmt.kind_ == Pipeline` ⇔ has a `pipeline_stages` attr |
+| `PipelineResolved` | No `ForKind::Pipeline` survives; produced by CanonicalizeIOOrder |
+| `CallDirectionsResolved` | Every non-builtin Call has explicit `attrs['arg_directions']` |
 | `TileTypeCoherence` | Every TileType has canonical tile_view (implicit views stored as nullopt) |
+| `InlineFunctionsEliminated` | No `FunctionType::Inline` functions or Calls to them remain |
 | `OrchestrationReferencesResolved` | Every non-builtin Call inside a `FunctionType::Orchestration` function targets a Function in the surrounding Program |
+| `TensorViewCanonical` | TensorView canonicality verified (weak: empty stride ok; strict: requires materialization, RFC #1300 §2.2) |
+| `ArrayNotEscaped` | ArrayType never appears as a function parameter or return type |
+| `CommDomainScopesMaterialized` | Host_orch bodies wrapped in CommDomainScopeStmts, and `pld.tensor.window` result types carry `DistributedTensorType::window_buffer_` back-references |
+| `DistTensorCtxMaterialized` | No `pld.system.get_comm_ctx` survives outside host orchestration; every chip-orchestration / device communication context is an explicit CommCtxType SSA value traceable to a parameter |
+| `RuntimeScopesMaterialized` | Orchestration functions carry explicit RuntimeScopeStmt nodes, so codegen emits no implicit `PTO2_SCOPE()` wrappers |
+| `AssignTypeSymmetry` | Every AssignStmt has `structural_equal(var->GetType(), value->GetType())` (memref excluded as an allocation detail) |
+| `ManualDepsOnSubmitOnly` | No plain cross-function Call carries `attrs["manual_dep_edges"]` — manual edges live in `Submit::deps_` |
+| `ReturnParamsExplicit` | InCore/Group/Spmd tensor returns reference function params by pointer identity (#1702) |
+| `UnrollResolved` | No `ForKind::Unroll` survives; produced by UnrollLoops |
+| `AivSplitValid` | SplitAivScopeStmt regions are structurally valid: no cube compute or split-axis reduce inside a region, boundary ops only inside one |
+| `HardSyncallOccupancyValid` | Every hard (FFTS) `system.syncall` is launched at full occupancy — a partial or over launch deadlocks on device (507018) |
+| `IterArgCarryClassified` | Every Orchestration ForStmt with iter_args carries its `iter_arg_rebind_<i>` carry plan, so codegen reads it instead of re-deriving it |
+| `AccToGmStoreValid` | Every `tile.store` from an Acc-resident tile targets a GM dtype the backend's fix-pipe can narrow into |
+| `AtomicAddDtypeValid` | Every atomic-add write into GM targets a destination dtype the backend's store pipe can combine |
 
 ### IRPropertySet
 
@@ -61,42 +89,65 @@ struct PassProperties {
 | Pass | Required | Produced | Invalidated |
 | ---- | -------- | -------- | ----------- |
 | InlineFunctions | — | InlineFunctionsEliminated | — |
-| UnrollLoops | TypeChecked | TypeChecked | — |
-| CtrlFlowTransform | TypeChecked | TypeChecked, StructuredCtrlFlow | — |
-| ConvertToSSA | TypeChecked | TypeChecked, SSAForm | NormalizedStmtStructure |
-| FlattenCallExpr | SSAForm | SSAForm, NoNestedCalls | NormalizedStmtStructure |
-| NormalizeStmtStructure | TypeChecked | TypeChecked, NormalizedStmtStructure | — |
-| OutlineIncoreScopes | TypeChecked, SSAForm | SplitIncoreOrch | — |
-| OutlineClusterScopes | TypeChecked, SSAForm | ClusterOutlined | — |
-| ConvertTensorToTileOps | SplitIncoreOrch | IncoreTileOps | — |
+| UnrollLoops | — | UnrollResolved | — |
+| CtrlFlowTransform | — | StructuredCtrlFlow | — |
+| ConvertToSSA | — | SSAForm | NormalizedStmtStructure |
+| Simplify | — | — | — |
+| NormalizeStmtStructure | — | NormalizedStmtStructure | — |
+| FlattenCallExpr | SSAForm, NormalizedStmtStructure | SSAForm, NoNestedCalls, NormalizedStmtStructure | — |
+| OutlineHierarchyScopes | SSAForm | SSAForm, HierarchyOutlined, OrchestrationReferencesResolved | — |
+| OutlineIncoreScopes | SSAForm | SSAForm, SplitIncoreOrch, AivSplitValid | — |
+| OutlineClusterScopes | SSAForm | SSAForm, ClusterOutlined | — |
+| ConvertTensorToTileOps | SSAForm, SplitIncoreOrch, NormalizedStmtStructure | SSAForm, IncoreTileOps, NormalizedStmtStructure, AivSplitValid | AivSplitValid |
+| OptimizeOrchTensors | SplitIncoreOrch, IncoreTileOps | SplitIncoreOrch, IncoreTileOps | — |
 | LowerCompositeOps | — | — | — |
-| FlattenTileNdTo2D | SSAForm, IncoreTileOps | SSAForm, TileOps2D | — |
+| FlattenTileNdTo2D | SSAForm, IncoreTileOps, NormalizedStmtStructure | SSAForm, TileOps2D, NormalizedStmtStructure | — |
 | LegalizeTileCast | — | — | — |
-| AutoTileMatmulL0 | SSAForm, IncoreTileOps, TileOps2D | SSAForm, IncoreTileOps, TileOps2D | — |
+| AutoTileMatmulL0 | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, NormalizedStmtStructure | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, NormalizedStmtStructure | — |
 | CanonicalizeTileSlice | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, NormalizedStmtStructure | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, NormalizedStmtStructure | — |
-| InsertMxScaleAddr | SSAForm, IncoreTileOps, SplitIncoreOrch, TileMemoryInferred, NormalizedStmtStructure | SSAForm, IncoreTileOps, SplitIncoreOrch, TileMemoryInferred, NormalizedStmtStructure | — |
+| InferTileMemorySpace | SSAForm, IncoreTileOps, SplitIncoreOrch, NormalizedStmtStructure | SSAForm, TileMemoryInferred, NormalizedStmtStructure, AivSplitValid, AccToGmStoreValid | AivSplitValid |
+| InsertMxScaleAddr | SSAForm, IncoreTileOps, SplitIncoreOrch, NormalizedStmtStructure, TileMemoryInferred | SSAForm, IncoreTileOps, SplitIncoreOrch, NormalizedStmtStructure, TileMemoryInferred | — |
 | ResolveBackendOpLayouts | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, NormalizedStmtStructure | — |
-| LowerAutoVectorSplit | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | — |
-| ExpandMixedKernel | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D | SSAForm, MixedKernelExpanded | — |
-| NormalizeReturnOrder | SplitIncoreOrch, IncoreTileOps | — | — |
-| InitMemRef | TypeChecked, SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D | HasMemRefs | SSAForm |
-| MaterializeSemanticAliases | SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D | — | — |
-| MemoryReuse | TypeChecked, SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D | — | — |
-| AllocateMemoryAddr | TypeChecked, SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D | AllocatedMemoryAddr | — |
+| LowerAutoVectorSplit | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure, AivSplitValid | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | AivSplitValid |
+| ExpandMixedKernel | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | SSAForm, MixedKernelExpanded, NormalizedStmtStructure, HardSyncallOccupancyValid | — |
+| InjectGMPipeBuffer | SSAForm, MixedKernelExpanded, NormalizedStmtStructure | SSAForm, MixedKernelExpanded, NormalizedStmtStructure | — |
+| SplitVectorKernel | SSAForm, MixedKernelExpanded | SSAForm, VectorKernelSplit, NormalizedStmtStructure | — |
+| StampTfreeSplit | SplitIncoreOrch | — | — |
+| NormalizeReturnOrder | SplitIncoreOrch, IncoreTileOps | ReturnParamsExplicit | — |
+| SkewCrossCorePipeline | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | — |
+| LowerPipelineToSlots | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | — |
+| LowerPipelineLoops | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | — |
+| CanonicalizeIOOrder | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure, PipelineResolved | — |
+| MaterializeTensorStrides | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure, TensorViewCanonical | — |
+| InitMemRef | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred | HasMemRefs, NormalizedStmtStructure | SSAForm |
+| MaterializeSemanticAliases | SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D, NormalizedStmtStructure | NormalizedStmtStructure | — |
+| MemoryReuse | SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D, NormalizedStmtStructure | NormalizedStmtStructure | — |
+| AllocateMemoryAddr | SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D | AllocatedMemoryAddr | — |
 | FoldNoOpReshape | SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D | — | — |
-| FuseCreateAssembleToSlice | — | — | — |
+| FuseCreateAssembleToSlice | SplitIncoreOrch | — | — |
 | DeriveCallDirections | SplitIncoreOrch | CallDirectionsResolved | — |
 | AutoDeriveTaskDependencies | SplitIncoreOrch, CallDirectionsResolved | CallDirectionsResolved | — |
 | ExpandManualPhaseFence | NoNestedCalls, NormalizedStmtStructure, CallDirectionsResolved | NoNestedCalls, NormalizedStmtStructure, CallDirectionsResolved | — |
 | SynthesizeAllReduceSignals | — | — | — |
 | MaterializeCommDomainScopes | — | CommDomainScopesMaterialized | — |
 | LowerHostTensorCollectives | CommDomainScopesMaterialized | CommDomainScopesMaterialized | — |
-| MaterializeDistTensorCtx | CommDomainScopesMaterialized | CommDomainScopesMaterialized | — |
-| Simplify | — | — | — |
+| MaterializeDistTensorCtx | CommDomainScopesMaterialized, ReturnParamsExplicit | CommDomainScopesMaterialized, DistTensorCtxMaterialized | — |
 | MaterializeRuntimeScopes | SplitIncoreOrch, CallDirectionsResolved | RuntimeScopesMaterialized | — |
 | ClassifyIterArgCarry | CallDirectionsResolved, RuntimeScopesMaterialized | IterArgCarryClassified, RuntimeScopesMaterialized | — |
+| InsertCommFence | SplitIncoreOrch | — | — |
+| MaterializeValidShapeSymbols | — | — | — |
 
-> **Note**: VerifySSA and TypeCheck are **PropertyVerifiers** (verification rules), not Passes. They run via `VerificationInstrument` or the `run_verifier()` utility — see [Verifier](99-verifier.md).
+The table lists every registered pass, in `Default`-strategy execution order. Update the row
+here whenever you add a pass or change its declaration.
+
+Most `PassProperties` constants live in `include/pypto/ir/transforms/pass_properties.h`, but that
+header is not the whole list: `kFuseCreateAssembleToSliceProperties` is declared locally in
+`src/ir/transforms/fuse_create_assemble_to_slice_pass.cpp`. What authoritatively binds a pass
+*name* to its properties is the `CreateFunctionPass` / `CreateProgramPass` call site, since that
+is where `Pass::GetName()` and the constant meet. Regenerate a row from the call sites rather
+than from the header alone, or a pass-local declaration is silently missed.
+
+> **Note**: VerifySSA and TypeCheck are **PropertyVerifiers** (verification rules), not Passes. They run via `VerificationInstrument` or the `run_verifier()` utility — see [Verifier](99-verifier.md). That is why no pass declares `TypeChecked`: it is a *structural* property (`GetStructuralProperties()`), verified once on the pipeline's input IR rather than established by any pass.
 
 ## C++ Pass Infrastructure
 
@@ -325,26 +376,33 @@ class PassPipeline {
 
 ### Automatic Verification
 
-When `VerificationLevel` is `Basic` (the default), the pipeline automatically verifies a small set of **lightweight properties** exactly once each. This catches common IR errors without requiring manual `PassContext` setup.
-
-**Verified properties**: `{SSAForm, TypeChecked, AllocatedMemoryAddr}`
+When `VerificationLevel` is `Basic` (the default), the pipeline automatically verifies the **lightweight properties** listed by `GetVerifiedProperties()` (`src/ir/transforms/ir_property.cpp`), each one exactly once per time it is produced. This catches common IR errors without requiring manual `PassContext` setup.
 
 **How it works**:
 
-1. After each pass, check if it produced any verified properties not yet checked
-2. Verify those properties using `PropertyVerifierRegistry`
-3. Throw `VerificationError` on errors
-4. Track verified properties to avoid re-checking
+1. At pipeline input, verify `GetStructuralProperties() ∩ GetVerifiedProperties()` — the invariants that hold on the user's own IR before any pass runs
+2. After each pass, verify the properties it *produces* that are in `GetVerifiedProperties()` and not already verified
+3. When a pass *invalidates* such a property, drop it from the verified set so a later producer re-verifies it
+4. Throw `VerificationError` on errors
 
-**With the `Default` strategy**:
+**With the `Default` strategy** (20 checks; the two sets are declared in `ir_property.cpp`, so this schedule follows from them and from the per-pass table above):
 
-| After Pass | Properties Verified | Cumulative |
-| ---------- | ------------------- | ---------- |
-| ConvertToSSA | SSAForm, TypeChecked | 2 |
-| FlattenCallExpr | *(TypeChecked already verified — skipped)* | 2 |
-| AllocateMemoryAddr | AllocatedMemoryAddr | 3 |
+| Verification point | Properties verified |
+| ------------------ | ------------------- |
+| pipeline input | TypeChecked, BreakContinueValid, NoRedundantBlocks, InOutUseValid, ManualDepsOnSubmitOnly, AtomicAddDtypeValid |
+| ConvertToSSA | SSAForm |
+| OutlineIncoreScopes | AivSplitValid |
+| ConvertTensorToTileOps | AivSplitValid *(re-verified — the pass invalidates it, see [10](10-convert_tensor_to_tile_ops.md))* |
+| InferTileMemorySpace | AivSplitValid *(re-verified)*, TileMemoryInferred, AccToGmStoreValid |
+| ExpandMixedKernel | MixedKernelExpanded, HardSyncallOccupancyValid |
+| NormalizeReturnOrder | ReturnParamsExplicit |
+| AllocateMemoryAddr | AllocatedMemoryAddr |
+| DeriveCallDirections | CallDirectionsResolved |
+| MaterializeDistTensorCtx | DistTensorCtxMaterialized |
+| MaterializeRuntimeScopes | RuntimeScopesMaterialized |
+| ClassifyIterArgCarry | IterArgCarryClassified |
 
-**Total: 3 property checks** (each property verified exactly once).
+A pass that under-declares `produced` therefore does not just mis-document itself — it silently removes a verification from this schedule.
 
 **Control via `PassContext`**:
 

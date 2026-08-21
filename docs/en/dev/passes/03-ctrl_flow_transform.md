@@ -8,9 +8,9 @@ PTO codegen emits MLIR-style SCF (structured control flow), which does not direc
 
 **Applies to**: InCore-type functions only (InCore, AIC, AIV). Orchestration/Host functions are skipped because they can use `break`/`continue` natively.
 
-**Requires**: `TypeChecked`
+**Requires**: nothing.
 
-**Produces**: `TypeChecked`, `StructuredCtrlFlow`
+**Produces**: `StructuredCtrlFlow`
 
 **When to use**: Runs automatically in the default pipeline after `UnrollLoops` and before `ConvertToSSA`.
 
@@ -170,6 +170,6 @@ UnrollLoops -> CtrlFlowTransform -> ConvertToSSA -> FlattenCallExpr -> ...
 
 | Property | Value |
 | -------- | ----- |
-| Required | `TypeChecked` |
-| Produced | `TypeChecked`, `StructuredCtrlFlow` |
-| Invalidated | (none) |
+| Required | — |
+| Produced | `StructuredCtrlFlow` |
+| Invalidated | — |

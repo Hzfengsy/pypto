@@ -8,9 +8,9 @@ PTO codegen 生成 MLIR 格式的 SCF（结构化控制流），不直接支持 
 
 **适用范围**: 仅对 InCore 类函数生效（InCore、AIC、AIV）。Orchestration/Host 函数会被跳过，因为它们可以原生支持 `break`/`continue`。
 
-**所需属性**: `TypeChecked`
+**所需属性**: 无。
 
-**产生属性**: `TypeChecked`, `StructuredCtrlFlow`
+**产生属性**: `StructuredCtrlFlow`
 
 **使用时机**: 在默认流水线中自动运行，位于 `UnrollLoops` 之后、`ConvertToSSA` 之前。
 
@@ -170,6 +170,6 @@ UnrollLoops -> CtrlFlowTransform -> ConvertToSSA -> FlattenCallExpr -> ...
 
 | 属性 | 值 |
 | ---- | -- |
-| 所需 (Required) | `TypeChecked` |
-| 产生 (Produced) | `TypeChecked`, `StructuredCtrlFlow` |
-| 失效 (Invalidated) | (none) |
+| 所需 (Required) | — |
+| 产生 (Produced) | `StructuredCtrlFlow` |
+| 失效 (Invalidated) | — |

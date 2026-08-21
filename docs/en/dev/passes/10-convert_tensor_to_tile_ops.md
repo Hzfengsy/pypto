@@ -335,8 +335,10 @@ Key changes:
 | Property | Value |
 | -------- | ----- |
 | Required | SSAForm, SplitIncoreOrch, NormalizedStmtStructure |
-| Produced | SSAForm, IncoreTileOps, NormalizedStmtStructure |
-| Invalidated | — |
+| Produced | SSAForm, IncoreTileOps, NormalizedStmtStructure, AivSplitValid |
+| Invalidated | AivSplitValid |
+
+`AivSplitValid` is both invalidated and re-produced, which forces a second verification of the split regions here. `OutlineIncoreScopes` establishes the property while the AIV-split boundary is still `tensor.aiv_shard` / `tensor.aic_gather`; a TensorType carries no memory space, so the verifier's boundary memory-contract check is necessarily skipped there. This pass rewrites those ops to their tile form and attaches the declared boundary memory, which is exactly what that check inspects.
 
 ## Key Components
 

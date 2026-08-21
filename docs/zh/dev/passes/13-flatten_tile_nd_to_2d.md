@@ -180,8 +180,8 @@ for c, (o,) in pl.range(0, s_dim, CHUNK, init_values=(out,)):
 
 | 属性 | 值 |
 | ---- | -- |
-| 所需 | SSAForm, IncoreTileOps |
-| 产生 | SSAForm, TileOps2D |
+| 所需 | SSAForm, IncoreTileOps, NormalizedStmtStructure |
+| 产生 | SSAForm, TileOps2D, NormalizedStmtStructure |
 | 失效 | — |
 
 ## 作用范围
