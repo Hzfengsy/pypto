@@ -67,7 +67,7 @@ std::string FormatAllowedSpaces(const std::vector<MemorySpace>& allowed) {
 ///
 /// Only the last case is rejected, and the axis is *reachability in the ISA's
 /// move graph*, not aliasing. In practice it fires on `Acc`: nothing writes L0C
-/// except the MAD unit, so `BackendHandler::CanMoveTile` reports no inbound
+/// except the MAD unit, so no target's SoC memory graph has an inbound
 /// edge to `Acc` on any target. A tile that must be an accumulator therefore has
 /// to be *created* in `Acc` — no copy can put it there afterwards. Without this
 /// check the pass emits a `pto.tmov` into L0C that PTOAS rejects much later,
@@ -91,7 +91,7 @@ std::string FormatAllowedSpaces(const std::vector<MemorySpace>& allowed) {
 /// left alone here even when it is also unimplementable, because at construction
 /// time we cannot tell a settled operand from a transient one. Those belong to
 /// `InferTileMemorySpace`'s MoveCollector, which runs on settled IR and knows the
-/// configured target's exact table via `BackendHandler::CanMoveTile`.
+/// configured target's exact adjacency via `SoC::GetMemoryGraph()`.
 void CheckOperandMemorySpaceReachable(const OpMemorySpaceSpec& spec, const std::string& op_name,
                                       const std::vector<ExprPtr>& args, const Span& span) {
   if (spec.input_constraints.empty()) return;

@@ -71,8 +71,9 @@ MemorySpace StringToMemorySpace(const std::string& str);
  * runs while parsing, before any backend is selected.
  *
  * Use this only for that "impossible anywhere" question. Once a backend is
- * configured, `BackendHandler::CanMoveTile` gives the exact per-target subset
- * (A5 implements Vec -> Mat, A2/A3 does not); passes and codegen want that one.
+ * configured, `Backend::GetSoC().GetMemoryGraph()` gives the exact per-target
+ * adjacency (A5 implements Vec -> Mat, A2/A3 does not) -- the same data
+ * `Backend::FindMemPath` walks; passes and codegen want that one.
  *
  * The row worth knowing: **no target moves anything into `Acc`.** Only the MAD
  * unit writes L0C, so an accumulator has to be created in `Acc` — no copy can

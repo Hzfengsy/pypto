@@ -502,7 +502,7 @@ def mgather(
     span: Span | None = None,
     *,
     gather_oob: str | int = "undefined",
-    target_memory: MemorySpace | None = None,
+    target_memory: MemorySpace = MemorySpace.Vec,
     scratch: Expr | None = None,
     valid_shape: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
 ) -> Call:
@@ -513,13 +513,13 @@ def mgather(
     requires a same-dtype GM scratch tensor.
     ``gather_oob`` selects undefined, clamp, wrap, or zero handling.
     """
-    if target_memory is not None and target_memory not in (MemorySpace.Vec, MemorySpace.Mat):
+    if target_memory not in (MemorySpace.Vec, MemorySpace.Mat):
         raise ValueError(
             f"mgather target_memory must be MemorySpace.Vec or MemorySpace.Mat, got {target_memory}"
         )
     actual_span = _get_span_or_capture(span)
     kwargs: dict[str, Any] = {"coalesce": _resolve_mgather_coalesce(coalesce)}
-    if target_memory is not None:
+    if target_memory != MemorySpace.Vec:
         kwargs["target_memory"] = target_memory
     resolved_gather_oob = _resolve_mgather_gather_oob(gather_oob)
     if resolved_gather_oob != 0:

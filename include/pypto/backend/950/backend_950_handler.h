@@ -44,15 +44,6 @@ class Ascend950Handler : public BackendHandler {
     return dtype.GetBit() != 4 || dtype == DataType::FP4;
   }
 
-  // A5 additionally implements Vec -> Mat (UB -> L1) as a single tmov; A2/A3
-  // does not. Everything else, including the universal "nothing moves into
-  // Acc", comes from the base table. Mirrors PTOAS `TMovOp::verify`'s
-  // `okPair = okPair || isVecToMat` under `isA5`.
-  [[nodiscard]] bool CanMoveTile(ir::MemorySpace src, ir::MemorySpace dst) const override {
-    if (src == ir::MemorySpace::Vec && dst == ir::MemorySpace::Mat) return true;
-    return BackendHandler::CanMoveTile(src, dst);
-  }
-
   [[nodiscard]] bool RequiresGMPipeBuffer() const override { return false; }
   [[nodiscard]] bool RequiresSplitLoadTpopWorkaround() const override { return false; }
   [[nodiscard]] bool RequiresVtoCFractalAdapt() const override { return true; }

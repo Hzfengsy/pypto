@@ -525,12 +525,14 @@ class MoveCollector : public IRVisitor {
       bool allowed =
           std::find(allowed_spaces.begin(), allowed_spaces.end(), it->second) != allowed_spaces.end();
       if (!allowed) {
-        // Phase 1 is responsible for placing a value that needs an
-        // unreachable space (Acc) directly there; if it did its job, no move
-        // into such a space is ever requested here. Emitting one anyway
-        // produces a `tile.move` no target implements, which survives to the
-        // backend and aborts with a message naming neither the tile nor the
-        // line that created it -- so fail loudly at the point of the mistake.
+        // Guard only the destination, not the specific src -> dst pair. A space
+        // with no inbound edge anywhere (Acc) can never be reached by a move,
+        // so requesting one is a Phase 1 placement bug. Which *pairs* a given
+        // target implements is PTOAS's `TMovOp::verify`, and PyPTO has no
+        // faithful copy of it: `SoC::GetMemoryGraph()` models the memory
+        // hierarchy for `FindMemPath`, not tmov legality, and omits edges this
+        // pipeline emits and PTOAS accepts (`Acc -> Vec` on Ascend910B). A
+        // per-pair check here would reject working kernels.
         INTERNAL_CHECK_SPAN(IsTileMoveEverPossibleInto(allowed_spaces[0]), call->span_)
             << "Internal error: InferTileMemorySpace wants a tile.move into "
             << MemorySpaceToString(allowed_spaces[0]) << " memory for argument " << i << " of "

@@ -2985,7 +2985,7 @@ def mgather(
     coalesce: str | int = ...,
     *,
     gather_oob: str | int = ...,
-    target_memory: Literal[MemorySpace.Vec] | None = ...,
+    target_memory: Literal[MemorySpace.Vec] = ...,
     scratch: None = ...,
     valid_shape: None = ...,
 ) -> Tile: ...
@@ -3023,7 +3023,7 @@ def mgather(
     coalesce: str | int = "row",
     *,
     gather_oob: str | int = "undefined",
-    target_memory: MemorySpace | None = None,
+    target_memory: MemorySpace = MemorySpace.Vec,
     scratch: Tensor | None = None,
     valid_shape: Sequence[int] | None = None,
 ) -> Tile:
@@ -3041,8 +3041,10 @@ def mgather(
             element gather. Integer values support printed-IR round trips.
         gather_oob: Out-of-bounds handling: ``"undefined"``, ``"clamp"``,
             ``"wrap"``, ``"zero"``, or the corresponding integer ``0..3``.
-        target_memory: ``MemorySpace.Vec`` or ``MemorySpace.Mat``; ``None`` (the
-            default) leaves the space unset for the compiler to place.
+        target_memory: ``MemorySpace.Vec`` (default) or ``MemorySpace.Mat``.
+            This selects the operator *variant*, not merely a placement: the two
+            take a different ``idx`` type and produce a different output shape
+            and view, so it cannot be left for the compiler to infer.
         scratch: Same-dtype GM workspace required by Mat element gather and
             forbidden by the other forms.
         valid_shape: Optional two-dimensional written region for Mat output.
