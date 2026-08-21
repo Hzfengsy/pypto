@@ -762,11 +762,20 @@ ExtractedInputAccessSet ExtractInputAccessSet(const StmtPtr& root, const Var* pa
         return;
       }
 
+      // A body that never mentions `param` records nothing however many trips
+      // it is unrolled for, so enumerating it is pure cost -- and nested loops
+      // multiply that cost by their trip counts. Skip it, exactly as the
+      // unknown-trip-count branch below already does. Any scalar defs the body
+      // would have contributed are loop-local and get restored after the trip
+      // loop anyway, so this cannot change the extracted access set.
+      const bool body_reads_param = CountVarRefsInStmt(loop->body_, param) != 0;
+
       auto trip_count = GetKnownPositiveTripCount(loop);
       if (!trip_count.has_value() || *trip_count < 0 || *trip_count > kMaxEnumeratedLoopTripCount) {
-        if (CountVarRefsInStmt(loop->body_, param) != 0) result.unsupported_ref = true;
+        if (body_reads_param) result.unsupported_ref = true;
         return;
       }
+      if (!body_reads_param) return;
 
       auto saved_subst = subst;
       for (int64_t trip = 0; trip < *trip_count; ++trip) {

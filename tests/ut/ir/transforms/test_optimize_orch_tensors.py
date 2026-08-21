@@ -17,6 +17,8 @@ test. Never build a golden by running OptimizeOrchTensors itself: a regression
 in the baseline would then change both sides and the test would stay green.
 """
 
+import time
+
 import pypto.language as pl
 import pytest
 from pypto import ir, passes
@@ -1404,6 +1406,54 @@ class Program:
 
         After = _run_to_optimize_orch_tensors(Before)
 
+        _assert_unchanged_by_pass(Before, After)
+        assert After.get_function("consume__windowed") is None
+
+    def test_nested_static_loops_without_param_reads_skip_trip_enumeration(self):
+        """Statically bounded loops that never read the In param are not unrolled.
+
+        ``ExtractInputAccessSet`` enumerates every trip of a statically bounded
+        loop and recurses into the body once per trip, and nested loops
+        multiply. ``kMaxEnumeratedInputUses`` does not bound that: it counts
+        *recorded uses*, and a nest that never touches the param records
+        nothing while still expanding fully. The three 128-trip loops below
+        cost ~2M visits (~18s) without the early exit and ~0 with it, so the
+        budget has a wide margin in the passing direction.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(
+                self,
+                src: pl.Tensor[[64, 128], pl.FP32],
+                acc: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+            ) -> pl.Tensor[[64, 128], pl.FP32]:
+                seed: pl.Tile[[64, 128], pl.FP32] = pl.load(src, [0, 0], [64, 128])
+                out0: pl.Tensor[[64, 128], pl.FP32] = pl.store(seed, [0, 0], acc)
+                total0: pl.Scalar[pl.INDEX] = 0
+                for _i1, (t1,) in pl.range(128, init_values=(total0,)):
+                    for _i2, (t2,) in pl.range(128, init_values=(t1,)):
+                        for _i3, (t3,) in pl.range(128, init_values=(t2,)):
+                            bumped: pl.Scalar[pl.INDEX] = t3 + 1
+                            r3 = pl.yield_(bumped)
+                        r2 = pl.yield_(r3)
+                    r1 = pl.yield_(r2)
+                return out0
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                src: pl.Tensor[[64, 128], pl.FP32],
+            ) -> pl.Tensor[[64, 128], pl.FP32]:
+                acc: pl.Tensor[[64, 128], pl.FP32] = pl.create_tensor([64, 128], dtype=pl.FP32)
+                return self.consume(src, acc)
+
+        start = time.perf_counter()
+        After = _run_to_optimize_orch_tensors(Before)
+        elapsed = time.perf_counter() - start
+
+        assert elapsed < 10.0, f"loop trips were enumerated without a param read: pass took {elapsed:.1f}s"
         _assert_unchanged_by_pass(Before, After)
         assert After.get_function("consume__windowed") is None
 
