@@ -484,7 +484,10 @@ class OrchRewriter : public IRMutator {
 
     arith::Analyzer output_offset_analyzer;
     for (const auto& output : analysis.outputs) {
-      if (output.out_param_index >= call->args_.size()) return std::nullopt;
+      if (output.out_param_index >= call->args_.size() ||
+          output.out_param_index >= original_func->params_.size()) {
+        return std::nullopt;
+      }
       auto out_arg = AsVarLike(call->args_[output.out_param_index]);
       if (!out_arg) return std::nullopt;
       const auto& pieces = DensePieces(output);
@@ -683,6 +686,7 @@ class OrchRewriter : public IRMutator {
       const auto& assemble_pieces = DensePieces(output);
       if (piece_return_indices.size() != slice_bundles.size()) return std::nullopt;
       if (piece_return_indices.size() != assemble_pieces.size()) return std::nullopt;
+      if (output.return_index >= assembled_result_exprs.size()) return std::nullopt;
 
       ExprPtr current_parent_expr = slice_bundles.front().parent_expr;
       for (size_t piece_index = 0; piece_index < assemble_pieces.size(); ++piece_index) {
@@ -1235,6 +1239,9 @@ class OrchRewriter : public IRMutator {
       return LoopRegionRole::Reduction;
     }
 
+    if (output.window_shape.size() != output.callsite_offsets.size()) {
+      return LoopRegionRole::Unknown;
+    }
     std::optional<size_t> varying_dim;
     for (size_t i = 0; i < output.callsite_offsets.size(); ++i) {
       auto rewritten = transform_utils::Substitute(output.callsite_offsets[i], callsite_subst);

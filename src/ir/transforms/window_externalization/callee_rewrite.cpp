@@ -318,6 +318,7 @@ FunctionPtr RewriteCallee(const ProgramPtr& program, const FunctionPtr& func,
       if (!out_tensor_type) return nullptr;
       const auto& pieces = DensePieces(*rewrite_it);
       if (pieces.empty()) return nullptr;
+      if (rewrite_it->return_index >= new_return_types.size()) return nullptr;
 
       std::vector<VarPtr> piece_params;
       std::vector<size_t> piece_return_indices;

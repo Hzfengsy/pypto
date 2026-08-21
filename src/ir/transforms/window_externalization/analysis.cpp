@@ -1403,6 +1403,9 @@ std::optional<CalleeRewriteAnalysis> AnalyzeAggregateWindowLoop(
   }
 
   if (!yield_stmt) return std::nullopt;
+  // Mirror the nested-loop guard above: indexing the yield by iter-arg index is
+  // only safe once the outer yield is known to carry one value per carry.
+  if (yield_stmt->value_.size() != loop->return_vars_.size()) return std::nullopt;
 
   const auto function_use_index = BuildVarUseIndex(func->body_);
   const auto loop_use_index = BuildVarUseIndex(loop);
