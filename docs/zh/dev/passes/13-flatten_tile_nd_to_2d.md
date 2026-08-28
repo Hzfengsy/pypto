@@ -107,11 +107,11 @@ batch 重发。
 以裸指针紧凑写出 `[m, n]` 目标，没有目标跨步（hw-native-sys/pto-isa#253），所以按行
 打包的 `[B*M, N]` 形状根本没有正确的降级路径：每页只有前 16 列会落在正确位置。
 这正是 `CanonicalizeTileSlice`（pass 16）拒绝的形状，参见
-[16-canonicalize_tile_slice.md](16-canonicalize_tile_slice.md)。
+[17-canonicalize_tile_slice.md](17-canonicalize_tile_slice.md)。
 
 **列**窗口覆盖父 tile 的整个行范围，因此窗口自身的紧凑几何与父 tile 的几何一致，
 被丢弃的跨步也就无关紧要。`GetSliceAccumulatorGeometry` 正是给这种形状计算
-NZ 精确字节偏移（参见 [31-init_memref.md](31-init_memref.md)）。
+NZ 精确字节偏移（参见 [32-init_memref.md](32-init_memref.md)）。
 
 ### 生产者侧的变化
 
