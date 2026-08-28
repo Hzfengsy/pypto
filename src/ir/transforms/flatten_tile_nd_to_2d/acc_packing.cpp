@@ -752,14 +752,11 @@ ChainVerdict JudgeChain(ChainCollector& graph, const std::vector<const Var*>& me
     }
   }
 
-  AccPackingPlan plan;
-  plan.batch_count = batch_count;
-  plan.rows = rows;
-  plan.cols = cols;
-  plan.dtype = head.dtype;
-  plan.batch_dims = head.batch_dims;
-  plan.nd_shape = head.nd_shape;
-  verdict.plan = std::move(plan);
+  // Aggregate-initialize every field in one expression. Default-constructing and
+  // then assigning field by field makes clang's analyzer report `batch_count` as
+  // uninitialized when the plan is later moved into the optional, even though the
+  // in-class initializers cover it.
+  verdict.plan = AccPackingPlan{batch_count, rows, cols, head.dtype, head.batch_dims, head.nd_shape};
   return verdict;
 }
 
