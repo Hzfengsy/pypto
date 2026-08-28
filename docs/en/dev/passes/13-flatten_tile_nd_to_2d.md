@@ -203,8 +203,9 @@ L0C block column that `CanonicalizeTileSlice` whitelists. Note `M % 16 == 0` is
 *stricter* than what row packing needs (`B*M % 16 == 0`), so e.g. `M = 8, B = 2,
 N = 16` deliberately falls back.
 
-Three further conditions defeat the row-packed fallback as well, so a chain that
-hits one is rejected at **any** page width, 16 included:
+Three further conditions defeat the row-packed fallback. The first two reject a
+chain at **any** page width, 16 included; the third only applies above 16
+columns, where the fallback is unavailable anyway:
 
 | Condition | Why row packing cannot rescue it |
 | --------- | -------------------------------- |

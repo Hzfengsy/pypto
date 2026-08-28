@@ -1327,9 +1327,10 @@ def matmul_acc(acc: Tile, lhs: Tile, rhs: Tile, init_cond: BoolLike | None = Non
     accumulated into. This is the split-K idiom, and it removes the need to zero
     the accumulator or to peel the first K step::
 
-        for k0 in pl.pipeline(0, K, K_TILE, stage=2):
-            acc_n = pl.tile.slice(acc, [M, N_TILE], [0, n0 * N_TILE])
-            pl.tile.matmul_acc(acc_n, a, b, init_cond=(k0 == 0))
+        for n0 in pl.range(N // N_TILE):
+            for k0 in pl.pipeline(0, K, K_TILE, stage=2):
+                acc_n = pl.tile.slice(acc, [M, N_TILE], [0, n0 * N_TILE])
+                pl.tile.matmul_acc(acc_n, a, b, init_cond=(k0 == 0))
 
     A literal ``True`` / ``False`` selects one form at compile time; a runtime
     predicate lowers to a branch over the two, with no phi on the accumulator.
