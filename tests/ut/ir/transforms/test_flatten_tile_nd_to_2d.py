@@ -2702,90 +2702,102 @@ class TestFlattenTileNdTo2DBatchMatmulAcc:
         walk(node)
         return out
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "LowerBatchMatmul stages its multi-batch accumulator through Vec, then "
-            "LowerBatchMatmulAcc slices that Vec buffer into tile.matmul_acc, whose arg 0 "
-            "must be Acc. The old pipeline papered over this with a tile.move into L0C -- a "
-            "tmov PTOAS implements on no target, since only the matrix unit writes L0C. The "
-            "operand check now rejects it at construction. There is no local repair: an Acc "
-            "staging buffer is equally impossible (assembling page b would be an L0C->L0C "
-            "copy, which the ISA also lacks), and the Acc->Vec move cannot be dropped because "
-            "ExpandMixedKernel relies on it to see the AIC->AIV boundary. The fix is to fuse "
-            "per batch so matmul_b -> matmul_acc_b both stay in Acc -- the batch_count == 1 "
-            "fast path generalized."
-        ),
-    )
-    def test_batch_two_acc_unrolls_without_acc_roundtrip_moves(self):
-        """batch=2 ``tile.batch_matmul_acc`` unrolls into 2 tile.matmul_acc +
-        slice/assemble — no Vec→Acc / Acc→Vec round-trip on the accumulator.
+    @staticmethod
+    def _acc_windows(calls: list[ir.Call], packed_shape: list[int]) -> list[ir.Call]:
+        """Every ``tile.slice`` that takes a window of the packed accumulator."""
+        return [
+            c
+            for c in calls
+            if c.op.name == _OP_TILE_SLICE
+            and isinstance(c.args[0].type, ir.TileType)
+            and _const_int_values(cast(ir.TileType, c.args[0].type).shape) == packed_shape
+        ]
 
-        ``LowerBatchMatmulAcc`` no longer emits any memory-space moves on the
-        loop-carried accumulator — that responsibility belongs to
-        ``InferTileMemorySpace`` (pass 17). The remaining ``tile.move`` calls in
-        this single-pass output come from ``LowerBatchMatmul`` (the
-        non-accumulating variant) staging per-batch matmul results into a Vec
-        assembly buffer, which is an orthogonal concern.
+    @staticmethod
+    def _tuple_ints(expr: ir.Expr) -> list[int]:
+        return _const_int_values(cast(ir.MakeTuple, expr).elements)
+
+    def test_batch_two_acc_packs_pages_along_columns(self):
+        """batch=2 accumulator: ONE ``[M, B*N]`` Acc tile, page ``b`` at column ``b*N``.
+
+        L0C is NZ-boxed, so box ``(r_b, c_b)`` of an ``[M, N]`` tile starts at
+        ``(c_b * M/16 + r_b) * 1024`` bytes: a ROW window of a multi-block-column
+        accumulator is strided, and the hardware MAD writes its destination
+        compactly with no destination stride. Stacking the pages along rows
+        therefore has no correct lowering at all. Packing them along COLUMNS gives
+        every page the parent's full row extent, so the window's compact geometry
+        and the parent's coincide.
+
+        The producer changes shape too: it can no longer emit ``tile.matmul`` into
+        a fresh Acc tile and evacuate it to Vec, because the accumulator must stay
+        in the one space ``tile.matmul_acc`` accepts. It writes page ``b`` straight
+        into its column window with ``tile.matmul_acc(..., init_cond=True)``, which
+        folds to a plain non-accumulating ``pto.tmatmul`` at codegen.
         """
         before = self._build_batch_two_acc_program()
         after = passes.flatten_tile_nd_to_2d()(passes.convert_tensor_to_tile_ops()(before))
         fn = after.get_function("main_incore_0")
         assert fn is not None
-        body = cast(ir.SeqStmts, fn.body)
-        calls = [
-            stmt.value
-            for stmt in body.stmts
-            if isinstance(stmt, ir.AssignStmt) and isinstance(stmt.value, ir.Call)
-        ]
+        calls = self._collect_calls_recursive(fn.body)
         names = [c.op.name for c in calls]
 
         # Both batch ops are fully unrolled.
         assert _OP_TILE_BATCH_MATMUL not in names
         assert _OP_TILE_BATCH_MATMUL_ACC not in names
 
-        # Two batches × {matmul, matmul_acc} = 2 + 2.
-        assert names.count(_OP_TILE_MATMUL) == 2
-        assert names.count(_OP_TILE_MATMUL_ACC) == 2
+        # 2 producer pages + 2 consumer pages, every one of them an in-place write
+        # into a window of the packed accumulator. No plain tile.matmul survives:
+        # a destination-less matmul cannot write a sub-region.
+        assert names.count(_OP_TILE_MATMUL) == 0, f"got call sequence {names}"
+        assert names.count(_OP_TILE_MATMUL_ACC) == 4, f"got call sequence {names}"
 
-        # General path still uses slice/assemble around per-batch matmul_acc.
-        assert _OP_TILE_SLICE in names
-        assert _OP_TILE_ASSEMBLE in names
+        # Exactly one accumulator allocation, [M, B*N] = [16, 128], stated as Acc
+        # here rather than left to InferTileMemorySpace so the page windows are an
+        # Acc parent's windows from this pass onward.
+        creates = [c for c in calls if c.op.name == _OP_TILE_CREATE]
+        assert len(creates) == 1, f"expected one accumulator tile.create, got {len(creates)}"
+        assert self._tuple_ints(creates[0].args[0]) == [16, 128]
+        assert creates[0].kwargs.get("target_memory") == pl.MemorySpace.Acc
 
-        # Core invariant (issue #1235): LowerBatchMatmulAcc no longer emits any
-        # tile.move targeting Acc. The remaining moves (target=Vec) come from
-        # LowerBatchMatmul staging per-batch matmul results, not from the
-        # accumulator round-trip path.
-        move_targets = [c.kwargs.get("target_memory") for c in calls if c.op.name == _OP_TILE_MOVE]
-        assert pl.MemorySpace.Acc not in move_targets, (
-            f"FlattenTileNdTo2D must not emit tile.move(target_memory=Acc) on "
-            f"the batch_matmul_acc accumulator — that belongs to "
-            f"InferTileMemorySpace. Got move_targets={move_targets}"
-        )
+        # Every page window: full row extent, row origin 0, box-aligned column
+        # origin -- the exact predicate GetSliceAccumulatorGeometry admits and
+        # CanonicalizeTileSlice accepts as a MAD destination.
+        windows = self._acc_windows(calls, [16, 128])
+        assert len(windows) == 6, f"expected 2 producer + 2 consumer + 2 drain windows, got {len(windows)}"
+        column_origins = set()
+        for window in windows:
+            assert self._tuple_ints(window.args[1]) == [16, 64]
+            offset = self._tuple_ints(window.args[2])
+            assert offset[0] == 0, (
+                f"an accumulator window must start at row 0 and span the parent's full row "
+                f"extent; got offset {offset}"
+            )
+            assert offset[1] % 16 == 0, f"page column origin must be box-aligned, got {offset}"
+            column_origins.add(offset[1])
+        assert sorted(column_origins) == [0, 64]
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "LowerBatchMatmul stages its multi-batch accumulator through Vec, then "
-            "LowerBatchMatmulAcc slices that Vec buffer into tile.matmul_acc, whose arg 0 "
-            "must be Acc. The old pipeline papered over this with a tile.move into L0C -- a "
-            "tmov PTOAS implements on no target, since only the matrix unit writes L0C. The "
-            "operand check now rejects it at construction. There is no local repair: an Acc "
-            "staging buffer is equally impossible (assembling page b would be an L0C->L0C "
-            "copy, which the ISA also lacks), and the Acc->Vec move cannot be dropped because "
-            "ExpandMixedKernel relies on it to see the AIC->AIV boundary. The fix is to fuse "
-            "per batch so matmul_b -> matmul_acc_b both stay in Acc -- the batch_count == 1 "
-            "fast path generalized."
-        ),
-    )
-    def test_batch_two_acc_end_to_end_with_infer_memory_inserts_required_moves(self):
-        """End-to-end ``flatten + infer_tile_memory_space``: ``MoveCollector``
-        inserts the needed Vec→Acc move(s) on the per-batch acc slices.
+        # The drain is one store per page, straight out of L0C: the packed tile is
+        # not the row-major collapse of the [2, 16, 64] output window, so a single
+        # whole-tile store would write garbage.
+        stores = [c for c in calls if c.op.name == _OP_TILE_STORE]
+        assert len(stores) == 2
+        assert [self._tuple_ints(s.args[1]) for s in stores] == [[0, 0, 0], [1, 0, 0]]
+        assert [self._tuple_ints(s.args[3]) for s in stores] == [[1, 16, 64], [1, 16, 64]]
 
-        After flatten alone the acc slices are in the same memory space as the
-        upstream batch_matmul output (Vec). ``InferTileMemorySpace`` Phase 2
-        sees that ``tile.matmul_acc`` demands ``Acc`` for its acc operand and
-        inserts the matching ``tile.move(target_memory=Acc)``.
+        # Core invariant: the accumulator never leaves Acc. The old lowering staged
+        # it in Vec, which forced tile.matmul_acc's acc operand into a space only
+        # the matrix unit can write.
+        assert _OP_TILE_MOVE not in names, f"got call sequence {names}"
+
+    def test_batch_two_acc_stays_in_acc_after_infer_memory(self):
+        """End-to-end ``flatten + infer_tile_memory_space``: no move touches the
+        accumulator.
+
+        The previous lowering needed an *illegal* Vec->Acc repair here, because the
+        producer had already evacuated the accumulator to Vec. With the pages
+        packed along columns the chain is Acc from its ``tile.create`` to its
+        per-page store, so the only moves left are the Mat->Left / Mat->Right
+        operand moves ``tile.matmul_acc`` demands.
         """
         before = self._build_batch_two_acc_program()
         after = passes.infer_tile_memory_space()(
@@ -2796,19 +2808,323 @@ class TestFlattenTileNdTo2DBatchMatmulAcc:
         calls = self._collect_calls_recursive(fn.body)
         names = [c.op.name for c in calls]
 
-        # Sanity: batch ops still gone, slice/assemble preserved.
         assert _OP_TILE_BATCH_MATMUL not in names
         assert _OP_TILE_BATCH_MATMUL_ACC not in names
-        assert _OP_TILE_SLICE in names
-        assert _OP_TILE_ASSEMBLE in names
 
-        # InferTileMemorySpace must have inserted at least one tile.move to Acc
-        # to satisfy tile.matmul_acc's input_constraints[0] = {Acc}.
-        move_targets = [c.kwargs.get("target_memory") for c in calls if c.op.name == _OP_TILE_MOVE]
-        assert pl.MemorySpace.Acc in move_targets, (
-            f"InferTileMemorySpace should insert a Vec→Acc move on matmul_acc's "
-            f"acc input. Got move_targets={move_targets}"
+        creates = [c for c in calls if c.op.name == _OP_TILE_CREATE]
+        assert len(creates) == 1
+        assert self._tuple_ints(creates[0].args[0]) == [16, 128]
+        assert creates[0].kwargs.get("target_memory") == pl.MemorySpace.Acc
+
+        move_targets = {c.kwargs.get("target_memory") for c in calls if c.op.name == _OP_TILE_MOVE}
+        assert move_targets <= {pl.MemorySpace.Left, pl.MemorySpace.Right}, (
+            f"the accumulator chain must stay in Acc end to end; only the matmul operands "
+            f"may be moved. Got move_targets={move_targets}"
         )
+
+    def test_batch_two_acc_survives_canonicalize_tile_slice(self):
+        """The emitted windows pass ``CanonicalizeTileSlice``'s L0C contiguity guard.
+
+        That guard rejects a strided accumulator window with a ``ValueError``, and
+        it is what turned the old row-packed lowering into a hard compile error for
+        any batched accumulator wider than 16 columns. Running it here is the
+        acceptance test for the packing: reaching the end without raising is the
+        assertion.
+        """
+        before = self._build_batch_two_acc_program()
+        after = passes.canonicalize_tile_slice()(
+            passes.infer_tile_memory_space()(
+                passes.flatten_tile_nd_to_2d()(passes.convert_tensor_to_tile_ops()(before))
+            )
+        )
+        fn = after.get_function("main_incore_0")
+        assert fn is not None
+        names = [c.op.name for c in self._collect_calls_recursive(fn.body)]
+        assert names.count(_OP_TILE_MATMUL_ACC) == 4, f"got call sequence {names}"
+
+    def test_batch_two_acc_carried_through_loop_packs_columns(self):
+        """A split-K accumulator carried by ``pl.range`` packs columns too, as ONE
+        iter_arg.
+
+        This is the canonical accumulator shape, and the reason the packing
+        decision cannot be block-local: the ``tile.create`` is flattened in the
+        outer block, long before the ``tile.batch_matmul_acc`` inside the loop is
+        seen. It is also why the pages stay in a single tile rather than becoming
+        one carry each -- B separate iter_args would change the loop's arity.
+        """
+        T, K, N = 16, 128, 64
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                h: pl.Tensor[[2, T, K], pl.BF16],
+                w: pl.Tensor[[2, N, K], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[2, T, N], pl.FP32]],
+            ) -> pl.Tensor[[2, T, N], pl.FP32]:
+                acc_init = pl.tile.create([2, T, N], dtype=pl.FP32)
+                for k, (acc,) in pl.range(2, init_values=(acc_init,)):
+                    lhs = pl.tile.load(h, [0, 0, 0], [2, T, K], target_memory=pl.Mem.Mat)
+                    rhs_load = pl.tile.load(w, [0, 0, 0], [2, N, K], target_memory=pl.Mem.Mat)
+                    rhs = pl.tile.transpose_view(rhs_load)
+                    acc_next = pl.tile.batch_matmul_acc(acc, lhs, rhs, k == 0)
+                    acc_final = pl.yield_(acc_next)
+                out_0 = pl.tile.store(acc_final, [0, 0, 0], out_0)
+                return out_0
+
+        after = passes.flatten_tile_nd_to_2d()(Before)
+        fn = after.get_function("main_incore_0")
+        assert fn is not None
+        calls = self._collect_calls_recursive(fn.body)
+        names = [c.op.name for c in calls]
+
+        assert _OP_TILE_BATCH_MATMUL_ACC not in names
+        assert names.count(_OP_TILE_MATMUL_ACC) == 2
+
+        creates = [c for c in calls if c.op.name == _OP_TILE_CREATE]
+        assert len(creates) == 1
+        assert self._tuple_ints(creates[0].args[0]) == [16, 128]
+        assert creates[0].kwargs.get("target_memory") == pl.MemorySpace.Acc
+
+        # The whole packed accumulator is ONE loop carry, retyped to the 2D shape.
+        body = cast(ir.SeqStmts, fn.body)
+        loops = [stmt for stmt in body.stmts if isinstance(stmt, ir.ForStmt)]
+        assert len(loops) == 1
+        assert len(loops[0].iter_args) == 1
+        carry_type = cast(ir.TileType, loops[0].iter_args[0].type)
+        assert _const_int_values(carry_type.shape) == [16, 128]
+
+        windows = self._acc_windows(calls, [16, 128])
+        offsets = [self._tuple_ints(w.args[2]) for w in windows]
+        assert offsets == [[0, 0], [0, 64], [0, 0], [0, 64]], (
+            f"expected 2 accumulate windows + 2 drain windows at columns 0 and 64, got {offsets}"
+        )
+
+        # The init_cond predicate reaches every page: each window is the sole
+        # writer of its own columns, so "overwrite instead of accumulate" applies
+        # page by page. Dropping it would accumulate into an uninitialized tile on
+        # the k == 0 step.
+        acc_calls = [c for c in calls if c.op.name == _OP_TILE_MATMUL_ACC]
+        assert all(len(c.args) == 4 for c in acc_calls), (
+            f"every unrolled page must carry the init_cond predicate, got {[len(c.args) for c in acc_calls]}"
+        )
+
+        stores = [c for c in calls if c.op.name == _OP_TILE_STORE]
+        assert [self._tuple_ints(s.args[1]) for s in stores] == [[0, 0, 0], [1, 0, 0]]
+
+    def test_batch_acc_rejects_pages_that_cannot_be_column_packed(self):
+        """A page width that is not a whole number of 16-column L0C blocks is
+        refused, with the DSL workaround named.
+
+        ``GetSliceAccumulatorGeometry`` silently declines such a window and
+        ``InitMemRef`` falls back to row-major arithmetic, which is the wrong
+        address for an NZ-boxed tile. Emitting it would be a silent miscompute, so
+        the pass reports it instead.
+        """
+        T, K, N = 16, 64, 24
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                h: pl.Tensor[[2, T, K], pl.BF16],
+                w: pl.Tensor[[2, K, N], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[2, T, N], pl.FP32]],
+            ) -> pl.Tensor[[2, T, N], pl.FP32]:
+                acc_init = pl.tile.create([2, T, N], dtype=pl.FP32)
+                lhs = pl.tile.load(h, [0, 0, 0], [2, T, K], target_memory=pl.Mem.Mat)
+                rhs = pl.tile.load(w, [0, 0, 0], [2, K, N], target_memory=pl.Mem.Mat)
+                acc = pl.tile.batch_matmul_acc(acc_init, lhs, rhs)
+                out_0 = pl.tile.store(acc, [0, 0, 0], out_0)
+                return out_0
+
+        with pytest.raises(ValueError) as excinfo:
+            passes.flatten_tile_nd_to_2d()(Before)
+        message = str(excinfo.value)
+        assert "N=24 is not a multiple of 16" in message, message
+        assert "packed along COLUMNS" in message, message
+        assert "write the batch loop out in the kernel" in message, message
+
+    def test_batch_acc_two_allocations_merged_by_control_flow_is_rejected(self):
+        """Two allocating definitions joined by an ``IfStmt`` are refused here.
+
+        One chain is one buffer: the whole packing rests on every member naming
+        the same allocation. When a ``tile.create`` and a ``tile.batch_matmul``
+        both root the same chain, reconciling them at the merge would need an
+        L0C-to-L0C copy the ISA does not have, and row packing cannot express it
+        either. Without this check the program survives to ``MemoryReuse``'s
+        YieldFixup twenty passes later and dies there with an *internal* error,
+        which ``.claude/rules/error-checking.md`` reserves for compiler bugs.
+
+        The reject is unconditional on page width, and its message must offer
+        the single-allocation remedy rather than the column-packing one --
+        neither "keep the pages 16 wide" nor "write the batch loop out" fixes a
+        second allocation.
+        """
+        T, K, N = 16, 128, 64
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                h: pl.Tensor[[2, T, K], pl.BF16],
+                w: pl.Tensor[[2, K, N], pl.BF16],
+                flag: pl.Scalar[pl.INT32],
+                out_0: pl.Out[pl.Tensor[[2, T, N], pl.FP32]],
+            ) -> pl.Tensor[[2, T, N], pl.FP32]:
+                lhs = pl.tile.load(h, [0, 0, 0], [2, T, K], target_memory=pl.Mem.Mat)
+                rhs = pl.tile.load(w, [0, 0, 0], [2, K, N], target_memory=pl.Mem.Mat)
+                acc_init = pl.tile.create([2, T, N], dtype=pl.FP32, target_memory=pl.Mem.Acc)
+                if flag > 0:
+                    produced = pl.tile.batch_matmul(lhs, rhs)
+                    merged = pl.yield_(produced)
+                else:
+                    merged = pl.yield_(acc_init)
+                acc = pl.tile.batch_matmul_acc(merged, lhs, rhs)
+                out_0 = pl.tile.store(acc, [0, 0, 0], out_0)
+                return out_0
+
+        with pytest.raises(ValueError) as excinfo:
+            passes.flatten_tile_nd_to_2d()(Before)
+        message = str(excinfo.value)
+        assert "allocated by 2 separate definitions" in message, message
+        assert "L0C-to-L0C copy" in message, message
+        assert "single allocation" in message, message
+        # Geometry is irrelevant here, so neither geometry remedy may appear.
+        assert "packed along COLUMNS" not in message, message
+        assert "write the batch loop out in the kernel" not in message, message
+
+    def test_batch_acc_produced_by_non_acc_op_reports_the_real_cause(self):
+        """A definition that cannot write ``Acc`` is reported as such, not as packing.
+
+        ``tile.load`` cannot write L0C at any batch size, so the same
+        accumulator fails identically at batch 1. The message must name that
+        cause and must not offer either batch-packing remedy -- a user who
+        followed "write the batch loop out" would just hit the same wall with
+        2-D operands.
+        """
+        T, K, N = 16, 128, 64
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                h: pl.Tensor[[2, T, K], pl.BF16],
+                w: pl.Tensor[[2, K, N], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[2, T, N], pl.FP32]],
+            ) -> pl.Tensor[[2, T, N], pl.FP32]:
+                lhs = pl.tile.load(h, [0, 0, 0], [2, T, K], target_memory=pl.Mem.Mat)
+                rhs = pl.tile.load(w, [0, 0, 0], [2, K, N], target_memory=pl.Mem.Mat)
+                acc_init = pl.tile.load(out_0, [0, 0, 0], [2, T, N])
+                acc = pl.tile.batch_matmul_acc(acc_init, lhs, rhs)
+                out_0 = pl.tile.store(acc, [0, 0, 0], out_0)
+                return out_0
+
+        with pytest.raises(ValueError) as excinfo:
+            passes.flatten_tile_nd_to_2d()(Before)
+        message = str(excinfo.value)
+        assert "produced by tile.load" in message, message
+        assert "cannot write Acc (L0C) at all" in message, message
+        assert "fails the same way at batch 1" in message, message
+        assert "packed along COLUMNS" not in message, message
+
+    def test_batch_acc_drained_by_move_names_the_layout_limit(self):
+        """A ``tile.move`` drain is refused for the reason that actually blocks it.
+
+        Splitting the move page-wise is easy; GATHERING the pages afterwards is
+        not. A moved page keeps L0C's ``col_major``/1024 block layout, and
+        ``tile.assemble`` cannot write that into the ``row_major`` vector tile
+        the generic ``[B*M, N]`` collapse expects. That limit is not specific to
+        accumulators -- a plain ``batch > 1`` ``tile.batch_matmul`` followed by
+        any vector op fails at the same check, at every page width -- so the
+        message must say so instead of blaming page granularity.
+        """
+        T, K, N = 16, 128, 64
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                h: pl.Tensor[[2, T, K], pl.BF16],
+                w: pl.Tensor[[2, K, N], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[2, T, N], pl.FP32]],
+            ) -> pl.Tensor[[2, T, N], pl.FP32]:
+                acc_init = pl.tile.create([2, T, N], dtype=pl.FP32, target_memory=pl.Mem.Acc)
+                lhs = pl.tile.load(h, [0, 0, 0], [2, T, K], target_memory=pl.Mem.Mat)
+                rhs = pl.tile.load(w, [0, 0, 0], [2, K, N], target_memory=pl.Mem.Mat)
+                acc = pl.tile.batch_matmul_acc(acc_init, lhs, rhs)
+                moved = pl.tile.move(acc, target_memory=pl.Mem.Vec)
+                out_0 = pl.tile.store(moved, [0, 0, 0], out_0)
+                return out_0
+
+        with pytest.raises(ValueError) as excinfo:
+            passes.flatten_tile_nd_to_2d()(Before)
+        message = str(excinfo.value)
+        assert "drained by tile.move" in message, message
+        assert "keep L0C's block layout" in message, message
+        assert "not specific to accumulators" in message, message
+
+    def test_batch_acc_narrow_unaligned_pages_stay_row_packed(self):
+        """A page at most 16 columns wide keeps the legacy row-packed lowering.
+
+        Column packing needs ``M % 16 == 0``, which is stricter than row packing's
+        ``B*M % 16 == 0``. A narrow page fits a single L0C block column, which
+        ``CanonicalizeTileSlice`` explicitly whitelists as a legal MAD destination,
+        so the row-packed form is still correct there and must keep working.
+        """
+        T, K, N = 8, 32, 16
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                h: pl.Tensor[[2, T, K], pl.BF16],
+                w: pl.Tensor[[2, K, N], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[2, T, N], pl.FP32]],
+            ) -> pl.Tensor[[2, T, N], pl.FP32]:
+                acc_init = pl.tile.create([2, T, N], dtype=pl.FP32)
+                lhs = pl.tile.load(h, [0, 0, 0], [2, T, K], target_memory=pl.Mem.Mat)
+                rhs = pl.tile.load(w, [0, 0, 0], [2, K, N], target_memory=pl.Mem.Mat)
+                acc = pl.tile.batch_matmul_acc(acc_init, lhs, rhs)
+                out_0 = pl.tile.store(acc, [0, 0, 0], out_0)
+                return out_0
+
+        after = passes.flatten_tile_nd_to_2d()(Before)
+        fn = after.get_function("main_incore_0")
+        assert fn is not None
+        calls = self._collect_calls_recursive(fn.body)
+
+        creates = [c for c in calls if c.op.name == _OP_TILE_CREATE]
+        assert len(creates) == 1
+        assert self._tuple_ints(creates[0].args[0]) == [16, 16], (
+            "an M % 16 != 0 accumulator must keep the row-packed [B*M, N] shape"
+        )
+
+        windows = self._acc_windows(calls, [16, 16])
+        assert [self._tuple_ints(w.args[2]) for w in windows] == [[0, 0], [8, 0]]
+
+        # Row packing drains as one whole-tile store, unchanged.
+        stores = [c for c in calls if c.op.name == _OP_TILE_STORE]
+        assert len(stores) == 1
+
+        # The row windows above are the ONE place this pass still writes a row
+        # window onto an Acc tile, and the docstring's claim that they are legal
+        # rests entirely on CanonicalizeTileSlice's single-block-column
+        # whitelist. Assert that directly, the way the column-packed sibling
+        # test does -- otherwise widening the fallback predicate (say to
+        # ``cols <= 32``) would still pass here while emitting a window the
+        # guard rejects. Reaching the end without raising is the assertion.
+        canonicalized = passes.canonicalize_tile_slice()(passes.infer_tile_memory_space()(after))
+        canon_fn = canonicalized.get_function("main_incore_0")
+        assert canon_fn is not None
+        canon_names = [c.op.name for c in self._collect_calls_recursive(canon_fn.body)]
+        assert canon_names.count(_OP_TILE_MATMUL_ACC) == 2, f"got call sequence {canon_names}"
 
     def test_singleton_batch_create_iter_arg_no_inline_move_after_flatten(self):
         """Issue #1235 regression: 3D ``pl.tile.create([1, M, N])`` carried

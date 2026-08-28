@@ -174,6 +174,84 @@ Key observations:
 - Reuse-input ops (`tile.store`, `matmul_acc`, `gemv_acc`) share MemRef with their designated input, preventing redundant allocs
 - Alloc statements are placed at the beginning of the function body's top-level `SeqStmts`
 
+## Slice views follow the parent's layout
+
+A `tile.slice` / `tensor.slice` result shares its parent's `base_` Ptr and adds a byte
+offset plus a narrowed view size. Where the pass can describe the parent's real storage
+layout exactly, both numbers are computed **in that layout** rather than in a fixed
+row-major model:
+
+| Parent layout | Offset of logical `(r, c)` | View span |
+| ------------- | -------------------------- | --------- |
+| `none_box` row-major dense (Vec / DDR / every `tensor.slice`) | `(r * cols + c) * elem_bytes` | Envelope from the first element to the last, in parent strides |
+| Accumulator (L0C) — `blayout=col_major`, `slayout=row_major`, `fractal=1024` — **full-row-extent window only** | `c * rows * elem_bytes` | Exactly the `cols * rows * elem_bytes` its box columns occupy, contiguous |
+
+L0C is not row-major dense: it is a grid of 16x16 boxes stored **column of boxes first**,
+so box `(r_b, c_b)` of an `[M, N]` accumulator begins at `(c_b * M/16 + r_b) * 1024` bytes.
+`tile_view_semantics::GetAccumulatorTileGeometry` recognises that dual from the parent's
+effective `TileView` and hands back the two element strides — one logical row step is one
+box width (16 elements), one logical column step is a whole physical column (`M` elements).
+
+Why the distinction matters even though a `tile.slice` normally lowers to `pto.subview`
+(which carries the *logical* window indices and re-derives the address itself): a view op
+that does **not** lower to a subview — `tile.reshape` stacked on the slice — inherits this
+byte offset and turns it into its own `pto.alloc_tile addr`. A row-major number there is
+not merely misaligned; it addresses the wrong data.
+
+### Why only a full-row-extent window
+
+That inherited offset becomes a **standalone** address, and the `alloc_tile` around it
+carries the *slice's* own `rows`. PTO derives the box-column stride from that `rows`, so
+the NZ form describes the parent's boxes only when the window keeps the parent's full row
+extent — then `rows` is unchanged and every box lands where the parent put it.
+
+`GetSliceAccumulatorGeometry` (`include/pypto/ir/transforms/utils/memref_utils.h`) is the
+single predicate both the offset and the span go through. It admits a window only when:
+
+- the parent is a 2-D, statically shaped, whole-box NZ accumulator with a 4-byte element;
+- the window keeps the parent's full row extent and starts at row 0;
+- the column origin is a multiple of 16, **or** is a run-time value — PTO lowers the very
+  same linear form at run time, so the two agree exactly, and neither side can check box
+  alignment statically.
+
+This predicate is what a batched accumulator is shaped around.
+[`FlattenTileNdTo2D`](13-flatten_tile_nd_to_2d.md#batched-accumulators-pack-along-columns)
+packs the `B` pages of a `tile.batch_matmul_acc` accumulator into one `[M, B*N]` Acc tile
+with page `b` at `[0, b*N]` — a full-row-extent window with a box-aligned column origin,
+i.e. exactly the admitted shape — and rejects the batch geometries that would not satisfy
+it (`M % 16 != 0`, `N % 16 != 0`, a non-4-byte element) rather than emitting a window this
+predicate would silently decline. So the list above is not just a description of what gets
+the better offset: it is the contract that pass compiles against.
+
+Consequence worth knowing: an admitted column window is contiguous in NZ, so its span is
+exactly the bytes it occupies. Two disjoint column windows therefore read as disjoint to
+lifetime/overlap analysis, where the row-major envelopes used to overlap and made
+MemoryReuse reject two windows carried through one loop. That is also what lets the `B`
+pages of one packed accumulator coexist: they are `B` disjoint column windows of a single
+allocation.
+
+### What keeps the row-major arithmetic, and what is still approximate
+
+Everything the predicate declines falls back, bit-for-bit, to the arithmetic these slices
+have always used. Two of those cases are genuinely row-major dense; the rest are known
+gaps, listed here so the table above is not mistaken for a claim of correctness:
+
+- **An Acc window that narrows the row extent** (or starts at a non-zero row). This is a
+  known gap, not a supported case: such a window has *no* correct standalone base address
+  at all, because its box columns are strided by the parent's `rows` while its own
+  descriptor's are strided by its own. The pass therefore leaves the pre-existing
+  row-major number in place rather than substituting a differently wrong one. The same
+  applies to a slice chained under such a window: its ancestor is already unaddressable,
+  and no leaf-local arithmetic can repair that.
+- **An Acc window whose static column origin sits inside a 16-wide box.**
+  `CanonicalizeTileSlice` explicitly whitelists exactly that window as a legal MAD
+  destination (it lies entirely inside one box column), and on that path the slice lowers
+  to `pto.subview` and this byte offset is dead — so it must not be rejected here.
+- **Fractal-512 Mat / Left / Right tiles.** These are boxed too, *not* row-major dense:
+  PTO gives them `rowStride = innerCols`, `colStride = rows`, the same shape of box
+  structure as the accumulator. Their slice offsets carry the same latent mismatch and are
+  deliberately left unchanged here; modelling them is separate work.
+
 ## ForStmt Loop-Carry Variables
 
 ForStmt has four loop-carry related variables with specific MemRef sharing rules:

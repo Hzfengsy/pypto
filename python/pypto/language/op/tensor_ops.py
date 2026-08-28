@@ -689,7 +689,7 @@ def matmul_acc(
     accumulated into. This is the split-K idiom, and it removes the need to zero
     the accumulator or to peel the first K step::
 
-        for k0 in pl.pipeline(0, K, K_TILE):
+        for k0 in pl.pipeline(0, K, K_TILE, stage=2):
             acc[t0 : t0 + R, :] = pl.matmul_acc(
                 acc[t0 : t0 + R, :], x_k, w_k, b_trans=True, init_cond=(k0 == 0)
             )

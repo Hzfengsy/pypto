@@ -80,6 +80,86 @@ inline std::optional<BoxedTileAlignment> GetBoxedTileAlignment(const TileView& v
   }
 }
 
+/// Physical geometry of an NZ-boxed accumulator (L0C) tile.
+///
+/// ``box`` is the storage granularity (16x16 for the accumulator); ``row_stride``
+/// / ``col_stride`` are the *physical element* distances covered by one logical
+/// row / column step, so the physical element index of logical ``(r, c)`` is
+/// ``r * row_stride + c * col_stride`` and one box occupies
+/// ``box.rows * box.cols`` contiguous physical elements.
+struct AccumulatorTileGeometry {
+  BoxedTileAlignment box;    ///< Physical storage granularity of one box
+  int64_t row_stride = 0;    ///< Physical elements per logical row step
+  int64_t col_stride = 0;    ///< Physical elements per logical column step
+  int64_t box_elements = 0;  ///< Physical elements in one box (box.rows * box.cols)
+};
+
+/// Physical geometry of a 2-D accumulator (L0C) tile, or nullopt when the tile
+/// is not NZ-boxed and therefore keeps row-major-dense addressing.
+///
+/// The accumulator dual is ``blayout=col_major / slayout=row_major /
+/// fractal=kAccFractal``: the tile is a grid of 16x16 boxes stored column of
+/// boxes first. One logical row step therefore advances by one box width (16
+/// elements) while one logical column step advances by a whole physical column
+/// (``shape[0]`` elements), so box ``(r_b, c_b)`` begins at
+/// ``(c_b * shape[0] / 16 + r_b) * kAccFractal`` bytes. This mirrors PTO's own
+/// subview address lowering, which scales the subview's logical offsets by
+/// exactly these strides.
+///
+/// Guards, all of which fall back to the row-major-dense arithmetic:
+/// * Any other layout — the fractal-512 Mat/Left/Right duals and every
+///   ``none_box`` (Vec / DDR / tensor) tile — is left alone. Only the
+///   ``none_box`` tiles are genuinely row-major dense; the fractal-512 duals are
+///   boxed as well, and their slice arithmetic is a separate, still-open problem
+///   that is deliberately not changed here.
+/// * A dtype whose 16x16 box is not ``kAccFractal`` bytes wide, i.e. anything
+///   but a 4-byte accumulator element. ``GetBoxedTileAlignment`` reports 16x16
+///   for every fractal-1024 view regardless of dtype, so this guard is what
+///   keeps a (nonsensical, but constructible) sub-byte accumulator on the packed
+///   row-major path instead of handing it a box grid that does not exist.
+/// * Non-2D shapes and dynamic row extents, which have no box grid.
+/// * A physical extent that is not a whole number of boxes. PTO rejects such an
+///   accumulator outright (``rows`` / ``cols`` must be multiples of the inner
+///   shape), except for the single-row form it allows — and there the NZ map
+///   degenerates to ``col_stride == 1``, i.e. to exactly the row-major-dense
+///   arithmetic the fallback already performs. So falling back is either
+///   unreachable or identical, never a silent approximation.
+///
+/// ``CompactMode`` is deliberately not a factor: PTO only widens the stride for
+/// its ``RowPlusOne`` mode, which PyPTO's ``CompactMode`` (``null`` / ``normal``)
+/// never spells, so ``normal`` addresses exactly like ``null``.
+inline std::optional<AccumulatorTileGeometry> GetAccumulatorTileGeometry(const TileView& view,
+                                                                         const std::vector<ExprPtr>& shape,
+                                                                         const DataType& dtype) {
+  if (view.fractal != kAccFractal) return std::nullopt;
+  if (view.blayout != TileLayout::col_major || view.slayout != TileLayout::row_major) return std::nullopt;
+  if (shape.size() != 2) return std::nullopt;
+
+  auto box = GetBoxedTileAlignment(view, dtype);
+  if (!box || box->rows <= 0 || box->cols <= 0) return std::nullopt;
+
+  // The box must really span `kAccFractal` bytes for these strides to describe
+  // it, which pins the element width to 4 bytes (FP32 / INT32).
+  const uint64_t storage_bits = storage_size::GetStorageBitWidth(dtype);
+  if (storage_bits == 0 || storage_bits % 8 != 0) return std::nullopt;
+  if (static_cast<uint64_t>(box->rows) * static_cast<uint64_t>(box->cols) * (storage_bits / 8) !=
+      kAccFractal) {
+    return std::nullopt;
+  }
+
+  auto rows = As<ConstInt>(shape[0]);
+  auto cols = As<ConstInt>(shape[1]);
+  if (!rows || !cols || rows->value_ <= 0 || cols->value_ <= 0) return std::nullopt;
+  if (rows->value_ % box->rows != 0 || cols->value_ % box->cols != 0) return std::nullopt;
+
+  AccumulatorTileGeometry geometry;
+  geometry.box = *box;
+  geometry.row_stride = box->cols;
+  geometry.col_stride = rows->value_;
+  geometry.box_elements = box->rows * box->cols;
+  return geometry;
+}
+
 /// Return whether two shape-like expression lists are statically identical.
 inline bool ShapeExprListsEquivalent(const std::vector<ExprPtr>& lhs, const std::vector<ExprPtr>& rhs) {
   if (lhs.size() != rhs.size()) {
@@ -296,6 +376,15 @@ inline TileView GetEffectiveTileView(const TileType& tile_type) {
 /// TileType overload that first resolves implicit memory-space layout.
 inline std::optional<BoxedTileAlignment> GetBoxedTileAlignment(const TileType& tile_type) {
   return GetBoxedTileAlignment(GetEffectiveTileView(tile_type), tile_type.dtype_);
+}
+
+/// TileType overload that first resolves implicit memory-space layout.
+///
+/// The strides are taken from the *physical* shape (``shape_``), never from
+/// ``valid_shape``: PTO scales a subview's offsets by the source tile_buf's
+/// declared rows, which PyPTO emits from ``shape_``.
+inline std::optional<AccumulatorTileGeometry> GetAccumulatorTileGeometry(const TileType& tile_type) {
+  return GetAccumulatorTileGeometry(GetEffectiveTileView(tile_type), tile_type.shape_, tile_type.dtype_);
 }
 
 }  // namespace pypto::ir::tile_view_semantics

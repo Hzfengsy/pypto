@@ -55,8 +55,8 @@ program_2d = flatten_pass(program)
 | `tile.create`/`tile.full`（>2D） | 直接使用展平的 2D 形状重建 |
 | `tile.assemble`（>2D 目标） | 用与 `tile.load` 折叠 tensor-rank 偏移相同的行主序折叠，把 ND 偏移折进展平后的 `(row, col)` 空间（`row = ((o0*d1 + o1)*d2 + o2)*… + o[k-2]`，`col = o[k-1]`）；Tile 操作数本身由其定义处的算子展平。要求 source、target 与 offset 具有相同 rank，且写入区域能折叠为连续的行区间（`IsRowMajorCollapseContiguous`），否则在前置条件阶段报错。若不折叠，偏移会以 ND rank 残留在 2D Tile 上，而 codegen 只按位置读取 `elements[0]`/`elements[1]` 并忽略其余元素，从而静默地写到错误地址 |
 | `tile.transpose` | `pto.ttrans` scratch 物化的唯一归属。进入时为 3-arg（input, axis1, axis2）。**2D**：创建一块 scratch tile（shape = 源页，位于输入所在 memory），产出 codegen-ready 的 4-arg `tile.transpose(in, a1, a2, scratch)`。**>2D**（末两轴交换）：展开为逐 batch 的 2D transpose，每个都是 4-arg 形态，scratch 从扁平 `[batch*A, B]` 池中切片，再 assemble 进合并后的 2D 输出。交换 batch 轴属用户错误 |
-| `tile.batch_matmul` | 展开为逐 batch 的 2D `tile.matmul`，处理 batch broadcast。b_trans/a_trans 操作数以一个零拷贝 `tile.transpose_view`（覆盖在自然 load 之上）出现（不再 transpose-at-load、不搬数据）；tile 级算子本身无 transpose 语义。每个操作数处理方式一致（见下方操作数处理） |
-| `tile.batch_matmul_acc` | 展开为逐 batch 的 2D `tile.matmul_acc`，按 batch 索引切分（已展平的）累加器。累加器上的内存空间决策（Vec/Acc 来回搬运、上游 `tile.create` 的可重定向生产者改写、TileView 刷新）交由 `InferTileMemorySpace`（pass 17）负责 —— 本 pass 不再发射任何 `tile.move` |
+| `tile.batch_matmul` | 展开为逐 batch 的 2D `tile.matmul`，处理 batch broadcast。b_trans/a_trans 操作数以一个零拷贝 `tile.transpose_view`（覆盖在自然 load 之上）出现（不再 transpose-at-load、不搬数据）；tile 级算子本身无 transpose 语义。每个操作数处理方式一致（见下方操作数处理）。**当结果本身就是批量累加器**（下游 `tile.batch_matmul_acc` 会继续写它）时，各页改为通过 `tile.matmul_acc(window, lhs_b, rhs_b, init_cond=True)` 写入同一块按列打包的 `Acc` tile —— 见[批量累加器按列打包](#批量累加器按列打包) |
+| `tile.batch_matmul_acc` | 展开为逐 batch 的 2D `tile.matmul_acc`，按 batch 索引取（已展平的）累加器的一个窗口：链按列打包时取 `[M, B*N]` tile 的**列**窗口 `[0, b*N]`，否则取 `[B*M, N]` tile 的旧**行**窗口 `[b*M, 0]` —— 见[批量累加器按列打包](#批量累加器按列打包)。本 pass 未直接确定的内存空间决策（行打包累加器上的 Vec/Acc 来回搬运、上游 `tile.create` 的可重定向生产者改写、TileView 刷新）交由 `InferTileMemorySpace`（pass 17）负责 —— 本 pass 不发射任何 `tile.move` |
 | 其他 Tile 操作（>2D） | 替换变量，使用 2D 类型重新创建 |
 | 1D/2D Tile 操作 | 不变 |
 
@@ -92,6 +92,118 @@ batch 重发。
 
 > 逐 batch 的 V2C move（move 来源且放不下 L1 的操作数）是后续待办；此类操作数目前
 > 仍走整块切片路径，仅在被搬运的整块 tile 放得下固定跨核 ring 时正确。
+
+## 批量累加器按列打包
+
+批量 `tile.batch_matmul_acc` 的累加器是本 pass **唯一**不按通用
+`[prod(leading), last]` 规则展平的值。它的各页沿**列**堆叠：一块 `[M, B*N]` 的
+`Acc` tile，第 `b` 页位于 `tile.slice(acc, [M, N], [0, b*N])`。
+
+### 为什么不能按行打包
+
+`Acc`（L0C）是 NZ 分块的：对 4 字节累加器元素，`[M, N]` tile 的第 `(r_b, c_b)`
+块起始于 `(c_b * M/16 + r_b) * 1024` 字节。因此当 tile 有多个块列时，**行**窗口
+是*跨步*的 —— 它的块间距是父 tile 的行数，而不是窗口自身的行数。pto-isa 的 MAD
+以裸指针紧凑写出 `[m, n]` 目标，没有目标跨步（hw-native-sys/pto-isa#253），所以按行
+打包的 `[B*M, N]` 形状根本没有正确的降级路径：每页只有前 16 列会落在正确位置。
+这正是 `CanonicalizeTileSlice`（pass 16）拒绝的形状，参见
+[16-canonicalize_tile_slice.md](16-canonicalize_tile_slice.md)。
+
+**列**窗口覆盖父 tile 的整个行范围，因此窗口自身的紧凑几何与父 tile 的几何一致，
+被丢弃的跨步也就无关紧要。`GetSliceAccumulatorGeometry` 正是给这种形状计算
+NZ 精确字节偏移（参见 [31-init_memref.md](31-init_memref.md)）。
+
+### 生产者侧的变化
+
+`LowerBatchMatmul` 过去把多 batch 结果暂存到 **Vec** —— 在 `Acc` 中汇聚各页需要
+L0C→L0C 拷贝，而 ISA 没有这条指令。这会把累加器从 `tile.matmul_acc` 唯一接受的
+内存空间里搬走。当结果是某条累加器链的根时，本 pass 现在自己分配打包后的 `Acc`
+tile，并按下面的形式写入第 `b` 页：
+
+```text
+acc_0 = tile.create([M, B*N], dtype=FP32, target_memory=Acc)
+w_b   = tile.slice(acc_b, [M, N], [0, b*N])
+m_b   = tile.matmul_acc(w_b, lhs_b, rhs_b, True)   # init_cond=True
+acc_b1 = tile.assemble(acc_b, m_b, [0, b*N])       # 自拷贝，codegen 直接省略
+```
+
+`init_cond=True` 不需要新算子：字面常量谓词会折叠到**非累加**分支，因此这里发射的
+是普通的 `pto.tmatmul ins(lhs, rhs) outs(window)`。这正是 `tile.matmul` 没有目标
+操作数、却仍能写入子区域的方式。`tile.assemble` 回写只用于串联 SSA；codegen 识别
+出它是同一窗口的自拷贝并且不发射任何指令 —— 这是必需的而不只是优化，因为 `Acc`
+目标没有合法的 `tmov`。**因此偏移元组只构造一次，同时传给 slice 和 assemble**：
+codegen 通过两个 subview 发射出的 SSA 名字来匹配，重新构造一个数值相同的偏移会
+发射出非法的 L0C→L0C 搬运。
+
+对这类结果会关闭 direct-store 融合：把它融合进下一条 `tile.store` 会吞掉链上仍然
+需要的语句。
+
+### 消费者（drain）侧的变化
+
+`[M, B*N]` tile 并不是 `[B, M, N]` 输出窗口的行主序折叠，所以单条整块
+`tile.store` 会写出错误数据，而下游没有任何环节能发现。打包累加器的 `tile.store`
+因此变成**逐页一条 store**，直接从 L0C 写出：
+
+```text
+d_b  = tile.slice(acc, [M, N], [0, b*N])
+out  = tile.store(d_b, [b, 0, 0], out, [1, M, N])
+```
+
+没有 Vec 暂存，也没有 `tile.move`：源为 `Acc` tile 的 store 被判定为 CUBE，因此留在
+cube 通道上，不涉及 `ExpandMixedKernel` 的 AIC→AIV 边界。（该边界 —— `Acc`→Vec
+搬运 —— 在所有*非*累加器的 `tile.batch_matmul` 上保持不变，它们仍经 Vec 暂存。）
+
+### 何时打包一条链
+
+这个决策在任何改写之前、按整个函数做一次（`acc_packing.cpp`），因为一条链通常跨
+多个块：`tile.create` 在 K 循环外，`tile.batch_matmul_acc` 在循环内，`tile.store`
+在循环后。改写主循环自带的预扫描是按块进行的，看不到这种结构。
+
+一条*链*是同一缓冲区别名图的连通分量 —— 包括 `tile.batch_matmul_acc` 的原地边、
+普通 SSA 别名、循环 `iter_arg` / `yield` / `return_var` 携带边，以及 `IfStmt` 汇合边。
+只有当**每个**成员都由本 pass 能逐页改写的形式产生和消费（`tile.create` 或
+`tile.batch_matmul` 根、`tile.batch_matmul_acc`、携带边、`tile.store` drain），
+且几何形状是 L0C 能寻址的，才会打包：
+
+| 条件 | 原因 |
+| ---- | ---- |
+| `M % 16 == 0` 且 `N % 16 == 0` | 父 tile 两个方向都必须是完整的 16×16 块，且页的列原点 `b*N` 必须块对齐，否则 `GetSliceAccumulatorGeometry` 会拒绝，`InitMemRef` 静默退回行主序算法 |
+| 4 字节累加器元素（FP32 / INT32） | 只有每元素 4 字节时，16×16 块才正好是 `kAccFractal`（1024）字节 |
+| `B*M*N*4` 能放进 `Acc` | 从后端读取（`GetMemSize(Acc)`），不写死 —— L0C 在 Ascend910B 上是 128 KB，在 950 上是 256 KB |
+| 无部分 `valid_shape` | 第 `b` 页的有效区域从 `b*N` 开始但只有 `N_valid` 宽，打包后的父 tile 没有单一有效矩形可以表达 |
+| `batch_count > 1` | `B == 1` 时两种打包都是同一块 `[M, N]` tile，因此现有快速路径逐字节不变 |
+
+不满足其中任一条的链保留旧的行打包降级 —— 当每页不超过 16 列时它仍然正确，因为
+此时窗口落在单个 L0C 块列内，而 `CanonicalizeTileSlice` 明确放行这种形状。注意
+`M % 16 == 0` 比行打包所需的 `B*M % 16 == 0` **更严格**，所以例如 `M = 8, B = 2,
+N = 16` 会有意退回行打包。
+
+另有三种情况连行打包也无法表达，因此无论页宽多少（包括 16）都会在这里直接报错：
+
+| 情况 | 为什么行打包也救不了 |
+| ---- | -------------------- |
+| 链中存在多于一个分配型定义（例如 `if k == 0: acc = matmul(...) else: acc = matmul_acc(acc, ...)`，或循环体内重新创建累加器） | 两个缓冲区在控制流汇合点相遇，合并它们需要 ISA 并不具备的 L0C→L0C 拷贝。若放行，程序会一直走到二十个 pass 之后的 `MemoryReuse` `YieldFixup` 并以*内部错误*崩溃 |
+| 定义方根本无法写 `Acc`（例如 `tile.load`） | 与 batch 无关 —— 同样的累加器在 `B == 1` 时以完全相同的方式失败 |
+| `N > 16` 时以 `tile.move` 排空 | 把 move 按页拆开很容易，难的是把页**聚合**回去：搬出的页保留 L0C 的 `col_major`/1024 块布局，而 `tile.assemble` 无法把它写进 `[B*M, N]` 展平所期望的 `row_major` 向量 tile。这**不是**累加器特有的限制 —— 普通的 `batch > 1` `tile.batch_matmul` 后接任意向量算子会在同一处检查失败（`pto_ops_shared.cpp`，"blayout mismatch between source and result"），所以这里不做任何打包 |
+
+这三种情况各有自己的诊断信息和规避方式；对它们**不会**打印按列打包的说明，因为
+它们都与页的几何无关。
+
+其余情况 —— 更宽但无法按列打包的页，或生产者不得不经 Vec 暂存的页 —— 会在**这里
+直接报错**，并给出 DSL 侧的规避方式，而不是发射一个地址会静默退回行主序的窗口：
+
+```text
+tile.batch_matmul_acc: cannot lower a batch-2 accumulator of 16x24 FP32 pages,
+because the page column extent N=24 is not a multiple of 16.
+The pages of a batched accumulator have to be packed along COLUMNS — one 16x48
+Acc (L0C) tile with page b at tile.slice(acc, [16, 24], [0, b * 24]) — because
+the hardware MAD writes its destination compactly and has no destination stride
+...
+Workarounds: write the batch loop out in the kernel and accumulate each page
+into its own 2-D tile (pl.matmul / pl.matmul_acc on 2-D operands); or keep the
+accumulator at most 16 columns wide, which fits a single L0C block column and
+needs no packing.
+```
 
 ## 示例
 
@@ -166,6 +278,7 @@ for c, (o,) in pl.range(0, s_dim, CHUNK, init_values=(out,)):
 | 分析 (analysis) | `src/ir/transforms/flatten_tile_nd_to_2d/analysis.cpp` | 只读的前置条件验证 |
 | 改写协调 | `src/ir/transforms/flatten_tile_nd_to_2d/rewrite.cpp` | 递归遍历语句并分派算子改写 |
 | 改写工具 | `src/ir/transforms/flatten_tile_nd_to_2d/rewrite_utils.cpp` | 共享形状、索引和容量辅助逻辑 |
+| 累加器打包 | `src/ir/transforms/flatten_tile_nd_to_2d/acc_packing.cpp` | 按整个函数决定哪些批量 `Acc` 累加器链按列打包 |
 | 批量矩阵乘改写 | `src/ir/transforms/flatten_tile_nd_to_2d/batch_matmul.cpp` | 批量矩阵乘与累加算子的分页降级 |
 | 转置改写 | `src/ir/transforms/flatten_tile_nd_to_2d/transpose.cpp` | 独立 N 维转置的降级 |
 | 验证 (verification) | `src/ir/transforms/flatten_tile_nd_to_2d/verification.cpp` | 独立验证 `TileOps2D` 后置条件 |

@@ -1288,12 +1288,24 @@ def matmul_acc(acc: Tile, lhs: Tile, rhs: Tile, init_cond: BoolLike | None = Non
     accumulated into. This is the split-K idiom, and it removes the need to zero
     the accumulator or to peel the first K step::
 
-        for k0 in pl.pipeline(0, K, K_TILE):
-            acc_t = pl.tile.slice(acc, [ROW_TILE, N], [t0, 0])
-            pl.tile.matmul_acc(acc_t, a, b, init_cond=(k0 == 0))
+        for k0 in pl.pipeline(0, K, K_TILE, stage=2):
+            acc_n = pl.tile.slice(acc, [M, N_TILE], [0, n0 * N_TILE])
+            pl.tile.matmul_acc(acc_n, a, b, init_cond=(k0 == 0))
 
     A literal ``True`` / ``False`` selects one form at compile time; a runtime
     predicate lowers to a branch over the two, with no phi on the accumulator.
+
+    Note:
+        When ``acc`` is a window of a larger ``Mem.Acc`` (L0C) tile, slice it
+        along **columns**, as above -- the window must span every row of its
+        parent, or be at most 16 columns wide inside a single 16-column block.
+        L0C stores 16x16 blocks column-major, so a *row* window of a parent with
+        more than one block column is strided, and the MAD writes its result
+        compactly from a bare pointer with no destination stride. Slicing
+        ``[ROW_TILE, N]`` at ``[t0, 0]`` out of an ``[M, N]`` accumulator is
+        therefore rejected by ``CanonicalizeTileSlice`` rather than silently
+        miscomputed. Column windows address the same L0C memory in the order the
+        hardware writes it, so nothing is lost by preferring them.
 
     Args:
         acc: Accumulator tile

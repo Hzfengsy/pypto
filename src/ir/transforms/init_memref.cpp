@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -39,6 +40,7 @@
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/storage_size.h"
+#include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_context.h"
@@ -106,6 +108,48 @@ std::optional<size_t> GetOutputReusesInputArg(const std::string& op_name) {
   return registry.GetEntry(op_name).GetOutputReusesInputArg();
 }
 
+/// Byte envelope of a static slice of an NZ-boxed accumulator (L0C) parent.
+///
+/// L0C stores 16x16 boxes column of boxes first, so the envelope is measured in
+/// whole boxes, not in row-major-dense elements: it runs from the window's first
+/// box to the end of its last one. The result is origin-independent, so it can
+/// be derived from the shapes alone exactly like the row-major form below.
+///
+/// Only reached for the windows ``GetSliceAccumulatorGeometry`` accepts — full
+/// parent row extent, box-aligned column origin — and for those the envelope is
+/// not an approximation at all: the window's box columns are consecutive, so the
+/// envelope is exactly the ``cols * rows * elem_bytes`` it occupies, and two
+/// disjoint column windows therefore read as disjoint to lifetime analysis. A row
+/// window would be strided and its envelope a gross over-approximation; that is
+/// one of the reasons the guard excludes it rather than the other way round.
+std::optional<uint64_t> StaticAccSliceViewSpanBytes(
+    const tile_view_semantics::AccumulatorTileGeometry& geometry, const ShapedTypePtr& parent,
+    const MakeTuplePtr& requested_shape, const DataType& dtype) {
+  if (requested_shape->elements_.size() != 2 || parent->shape_.size() != 2) return std::nullopt;
+
+  const std::array<int64_t, 2> box_extent = {geometry.box.rows, geometry.box.cols};
+  const std::array<int64_t, 2> strides = {geometry.row_stride, geometry.col_stride};
+
+  uint64_t last_box_start = 0;
+  for (size_t i = 0; i < requested_shape->elements_.size(); ++i) {
+    auto parent_dim = As<ConstInt>(parent->shape_[i]);
+    auto view_dim = As<ConstInt>(requested_shape->elements_[i]);
+    if (!parent_dim || !view_dim || view_dim->value_ <= 0 || view_dim->value_ > parent_dim->value_) {
+      return std::nullopt;
+    }
+    // Round up: a window narrower than one box still occupies a whole box.
+    const int64_t boxes = (view_dim->value_ + box_extent[i] - 1) / box_extent[i];
+    const uint64_t contribution = static_cast<uint64_t>(boxes - 1) * static_cast<uint64_t>(box_extent[i]) *
+                                  static_cast<uint64_t>(strides[i]);
+    if (last_box_start > std::numeric_limits<uint64_t>::max() - contribution) return std::nullopt;
+    last_box_start += contribution;
+  }
+
+  const uint64_t box_elements = static_cast<uint64_t>(geometry.box_elements);
+  if (last_box_start > std::numeric_limits<uint64_t>::max() - box_elements) return std::nullopt;
+  return storage_size::StaticStorageBytes(last_box_start + box_elements, dtype);
+}
+
 /// Byte envelope touched by a static packed slice, relative to its first
 /// element. This is deliberately distinct from the physical allocation size:
 /// L0C row padding belongs to the root allocation and must not be applied again
@@ -120,6 +164,13 @@ std::optional<uint64_t> StaticSliceViewSpanBytes(const CallPtr& call, const Shap
   auto requested_shape = As<MakeTuple>(call->args_[1]);
   if (!requested_shape || parent->shape_.size() != requested_shape->elements_.size()) {
     return std::nullopt;
+  }
+
+  // Keep the span in the same layout model as the byte offset that
+  // ComputeViewByteOffset produced for this very slice — same predicate, same
+  // inputs. Mixing the two would leave the MemRef internally inconsistent.
+  if (auto geometry = GetSliceAccumulatorGeometry(call, parent)) {
+    return StaticAccSliceViewSpanBytes(*geometry, parent, requested_shape, view->dtype_);
   }
 
   uint64_t max_linear_offset = 0;
@@ -523,7 +574,11 @@ class InitMemRefMutator : public IRMutator {
     // narrows that range to the packed parent-layout envelope it can touch.
     // Crucially, this is a VIEW span, not a fresh allocation footprint: an Acc
     // slice beginning at row 16 of a 32-row INT32 allocation must end at the
-    // root boundary, not acquire another 32 rows of L0C padding.
+    // root boundary, not acquire another 32 rows of L0C padding. The envelope
+    // is measured in the same layout model as the byte offset just computed —
+    // NZ boxes for the accumulator windows GetSliceAccumulatorGeometry accepts,
+    // row-major-dense elements for every other slice — so offset + span stays
+    // inside the root either way.
     uint64_t view_size = parent_memref->size_;  // default: same size as parent
     if (auto call = As<Call>(new_value)) {
       auto parent_shaped = std::dynamic_pointer_cast<const ShapedType>(source->GetType());

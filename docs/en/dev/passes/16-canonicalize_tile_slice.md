@@ -199,7 +199,115 @@ pack the accumulator as `[rows, N * tiles]` and slice columns.
 The check is scoped by the op registry's `set_output_reuses_input`, so it covers
 `tile.matmul_acc` / `tile.gemv_acc` / `tile.matmul_mx_acc` without naming them. It
 stays silent on anything it cannot prove: a symbolic extent, a non-`Acc` layout,
-or a dynamic column offset it cannot show stays inside one block.
+or a dynamic column offset it cannot show stays inside one block. It applies to
+the accumulator whether the op is bound to a result (`acc = pl.tile.matmul_acc(...)`)
+or written as a bare statement (`pl.tile.matmul_acc(...)`).
+
+### Resolving the accumulator operand back to its window
+
+The window an accumulator names is rarely the `tile.slice` result Var. Hoisting
+the slice out of the K loop — the natural spelling, since the window does not
+change per K step — makes the in-body operand a loop `IterArg`, a different Var
+from the slice result; a shape-preserving `tile.reshape` is another SSA name for
+the same bytes. So the pass records, for every Var, **which window that Var
+names**, not merely "is this Var a slice", and the check looks the operand up in
+that map.
+
+A Var inherits another Var's window along these *identity-preserving* edges,
+each recorded during the same single program-order sweep that collects the
+slices:
+
+| Edge | Recorded from |
+| ---- | ------------- |
+| `v = tile.slice(src, shape, offset)` | The window itself (seed); chained slices are peeled, offsets accumulated |
+| `v = w` (plain SSA alias) | `w`'s window |
+| `v = <op>(src, ...)` where the op's output lands in a source operand's storage | The source operand's window. The relation is a registry read (`OutputMemoryInheritsInput() && IsInplaceSafe()`, or `set_output_reuses_input`), never an op list — so `tile.reshape` / `tile.set_validshape` and a chained `tile.matmul_acc` are covered, while `tile.transpose` and `tile.extract` (fresh buffers) are excluded |
+| Loop `IterArg` | Its **initializer's** window (`ForStmt` / `WhileStmt`) |
+| `ForStmt` / `WhileStmt` `return_vars_[i]` | The window the trailing `pl.yield_` names for `iter_args_[i]` — **only when that is the same window the initializer names**, which is the canonical carry. A zero-trip loop returns the initializer instead, so binding a different window would claim one that a path does not name |
+| `IfStmt::return_vars_[i]` | The window both arms yield, when they provably yield the *same* one (same parent Var, equal offsets) |
+
+An edge is recorded **only when both ends provably describe the same window
+extent** — same rank, same dtype, and every dimension a compile-time constant of
+the same value. Landing in the source's storage says the two Vars name the same
+*bytes*; the extent test says the shape the check reads off the operand's own
+`TileType` is still the extent those bytes form. Together they are a proof, and
+anything unproven is left unrecorded — which reproduces the previous silence
+rather than guessing:
+
+- a **shape-changing** `tile.reshape` fails the test, so a reshaped extent is
+  never compared against the parent's rows;
+- `tile.reinterpret_view` fails it on dtype — the 16-column-block arithmetic
+  assumes a 4-byte accumulator element;
+- `tile.transpose_view` swaps the trailing two extents, so it fails it for every
+  non-square window. A *square* window passes and is harmless: the transposed
+  view spans the identical bytes with identical row and column extents, so both
+  accept rules reach the same verdict as for the untransposed window;
+- a symbolic extent fails it, matching the check's own refusal to reason about
+  symbolic shapes.
+
+Memory space is deliberately not compared: the verdict comes from the *parent*
+tile's space and the operand's extents, never from the operand's own space — and
+the tile view ops legitimately deduce a result type that leaves it unset for
+`InferTileMemorySpace` to fill in later.
+
+#### The loop back edge is checked, not recorded
+
+A carried accumulator names two windows: the initializer's on iteration 0, and
+whatever the body's trailing `pl.yield_` names on every iteration after. A Var
+cannot be recorded as naming two windows, and recording either one would make the
+other iteration's destination invisible — so the yielded window is **checked**
+against the same rule instead, with the destination extent taken from the
+`IterArg` (the type the loop gives the carry).
+
+Three conditions keep that from over-rejecting:
+
+- it fires only for carries the body actually uses as an accumulator
+  **destination**, so a carry the body merely reads is never rejected for a shape
+  no MAD writes;
+- it fires only when the loop **provably runs more than once** — constant
+  `start` / `stop` / `step` with `start + step < stop`. A single-trip loop never
+  takes its back edge; a symbolic trip count and every `while` count as
+  unprovable and stay silent;
+- it is a check, never a binding, so the map stays acyclic. No fixpoint is
+  needed and the sweep stays one forward pass.
+
+The canonical carry (`yield matmul_acc(iter_arg, ...)`) resolves straight back to
+the initializer's window, so this re-reaches the verdict the body already passed
+and costs nothing on the shapes the pipeline generates.
+
+**Known limits — all of them silent, never a false rejection:**
+
+- **An unprovable trip count leaves the back edge unchecked.** A symbolic loop
+  bound or a `while` cannot be shown to take the back edge, so a carry whose
+  yield names a worse window than its initializer goes unchecked there.
+- **An if-merge whose arms name *different* windows is not bound.** Binding
+  either one would be a claim the other path contradicts — and this map also
+  feeds the chained-slice offset arithmetic, so a wrong binding could move the
+  verdict for an unrelated slice.
+- **Interprocedural routes are out of reach.** This is a function pass, so a
+  window arriving as an InCore function parameter carries no window information.
+
+### The rejected window is not always in the kernel source
+
+A compiler-generated window can reach this check with no `tile.slice` written
+anywhere in the kernel, so the diagnostic must not assume the author can edit the
+slice it names.
+
+`FlattenTileNdTo2D` used to be the main source of such windows: it unrolled a
+`tile.batch_matmul_acc` by stacking the accumulator's batch pages **along rows**
+and slicing one page per batch (`acc_page_i = tile.slice(acc, [M, N], [i * M,
+0])`), which is exactly the rejected shape for `N > 16`. That lowering is gone —
+it now packs the pages **along columns** (`acc_page_i = tile.slice(acc, [M, N],
+[0, i * N])`), the accepted full-row-extent shape, and rejects the shapes it
+cannot pack with its own diagnostic naming the DSL workaround. See
+[Batched accumulators pack along columns](13-flatten_tile_nd_to_2d.md#batched-accumulators-pack-along-columns).
+
+The narrow row-packed form survives there for pages at most 16 columns wide,
+which this pass whitelists as a single-block window, so a row window still
+reaches this check — it is simply never one this pass rejects. The rejection
+therefore stays as written: it is the backstop that would catch any future pass
+re-introducing a strided accumulator destination, and narrowing it would let a
+silent miscompute through.
 
 This is a workaround for an upstream defect ([hw-native-sys/pto-isa#253](https://github.com/hw-native-sys/pto-isa/issues/253)),
 not a property of the DSL — `TMATMUL_ACC_IMPL` forwards the destination as a bare
@@ -228,7 +336,7 @@ deleted rather than kept.
 | Vec `tile.slice` feeding an ordinary call, inherited address provably 32-byte aligned | Untouched; keeps the zero-copy subview |
 | Chained Mat `tile.slice` (slice of a slice) | Peeled; offsets accumulated |
 | `tile.slice` with `valid_shape` / `drop_dims` | Skipped (not a plain window). If such a slice *also* fails either identity-copy condition above — a dynamic offset (e.g. a rank-reducing `t[i]`) or a non-contiguous window — while feeding a col-expand op, codegen rejects it with an `INTERNAL_CHECK` rather than emitting the source-corrupting materialization. The Acc accumulator check above still applies to such a slice: it needs only the physical base and offset, which are recorded for every window regardless of canonicalization eligibility |
-| `Acc`-resident `tile.slice` used as a matmul **accumulator**, window neither spanning the parent's full row extent nor inside one 16-column block | **Rejected** with a `ValueError` naming the column-slice spelling — the MAD has no destination stride, so the write would silently land in the wrong row tile (pto-isa#253) |
+| `Acc`-resident `tile.slice` used as a matmul **accumulator**, window neither spanning the parent's full row extent nor inside one 16-column block | **Rejected** with a `ValueError` naming the column-slice spelling — the MAD has no destination stride, so the write would silently land in the wrong row tile (pto-isa#253). The operand does not have to *be* the slice: a loop `IterArg` carrying it, a plain SSA alias, or a shape-preserving view / in-place op over it resolves back to the same window (see "Resolving the accumulator operand back to its window") |
 | Other Left/Right/Acc-resident `tile.slice`, including a *contiguous* Acc accumulator window | Untouched (no matching consumer) |
 | Functions with no canonical `tile.slice` | Returned unchanged |
 

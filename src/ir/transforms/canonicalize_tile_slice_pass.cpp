@@ -102,6 +102,35 @@
 /// ``TileRes::Rows`` into ``mad``), the shape becomes representable and this
 /// rejection must be relaxed or deleted, not kept as a permanent DSL rule.
 ///
+/// The window an accumulator operand names is rarely the ``tile.slice`` result
+/// Var itself.  Hoisting the slice out of the K loop — the natural spelling,
+/// since the window does not change per K step — turns the in-body operand into
+/// a loop ``IterArg``; a shape-preserving ``tile.reshape`` of the window is
+/// another SSA name for the same bytes.  ``SliceCollector`` therefore records a
+/// window not only for the slice result but for every Var reached from it along
+/// an *identity-preserving* edge (see ``SliceCollector::BindWindowAlias``), so
+/// the guard's lookup answers "which window does this operand name", not "is
+/// this operand a slice".  Widening that reach must never widen what the guard
+/// *rejects*: an edge is recorded only when both ends provably describe the same
+/// window extent, and anything unproven is left unrecorded — which reproduces
+/// the pre-existing silence rather than guessing.
+///
+/// A loop's *back* edge is the one place a single Var names two different
+/// windows — the initializer's on iteration 0, the yielded one afterwards — so
+/// it is checked rather than recorded, and only when the loop provably runs more
+/// than once (``SliceCollector::ResolveLoopEdges``).
+///
+/// **This guard can reject a shape the compiler itself emitted**, so the
+/// diagnostic below must explain a window the user may never have written.
+/// ``FlattenTileNdTo2D`` used to be the source of exactly that: it stacked the
+/// pages of a batched accumulator along rows, so a ``tile.batch_matmul_acc``
+/// wider than 16 columns produced the rejected window with no ``tile.slice`` in
+/// the kernel source.  It now packs those pages along *columns* — the accepted
+/// full-row-extent shape — and reports the batch shapes it cannot pack with its
+/// own diagnostic, so that lowering no longer reaches here.  The rejection stays
+/// as the backstop for any future pass that re-introduces a strided accumulator
+/// destination.
+///
 /// After all consumers are rewritten the now-dead ``tile.slice`` is dropped.
 /// Chained slices (a slice of a slice) are peeled, accumulating the offset.
 ///
@@ -138,6 +167,8 @@
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
+#include "pypto/ir/transforms/utils/op_predicates.h"
+#include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
 
 namespace pypto {
@@ -276,46 +307,94 @@ std::optional<SliceInfo> ParseCanonicalSlice(const AssignStmtPtr& assign,
 /// Number of columns in one L0C fractal box (1024 B / 4 B per INT32|FP32 = 16x16).
 constexpr int64_t kAccBlockCols = 16;
 
-/// Reject a matmul accumulator that is a *strided* window of a col-major (`Acc`)
-/// tile.  See the file header for the full derivation; the short form is that
-/// the MAD writes its `[m, n]` destination compactly from a bare pointer, so a
-/// window is only representable when it spans the parent's full row extent or
-/// occupies a single 16-column block.
+/// True when two tile types provably describe the *same window extent*: both
+/// `TileType`, same rank, same element dtype, and every dimension a `ConstInt`
+/// of the same value.
 ///
-/// Scoped by the op registry's `set_output_reuses_input` — the declared,
-/// op-level statement of "argument `i` is the in-place destination" — so it
-/// covers `tile.matmul_acc` / `tile.gemv_acc` / `tile.matmul_mx_acc` without
-/// naming them, and any future accumulator op for free.  The `col_major` +
-/// `kAccFractal` gate excludes the Vec-resident in-place ops (`tile.scatter`,
-/// `tile.fillpad_inplace`), whose row-major counterpart of this rule is handled
-/// by the rewrite paths above.
+/// This is the side condition that makes operand resolution sound.  Landing in
+/// a source's storage — which the registry predicates below establish — says
+/// the two Vars name the same *bytes*; this says the extent the guard reads
+/// off the operand's own `TileType` is still the extent of the window those
+/// bytes form.  Together they are a proof, not a heuristic, and everything
+/// unproven simply goes unrecorded (i.e. stays silent, as before):
 ///
-/// Silent on anything it cannot prove: a symbolic extent, a non-`Acc` layout, or
-/// an accumulator that is not a recorded slice all fall through untouched.  The
-/// guard exists to convert a known-wrong lowering into a diagnostic, not to
-/// second-guess shapes it cannot evaluate.
+///   * a shape-changing `tile.reshape` fails it, so the guard does not compare
+///     a reshaped extent against the parent's rows;
+///   * `tile.reinterpret_view` fails it on dtype — and the `kAccBlockCols` /
+///     `kAccFractal` arithmetic downstream assumes a 4-byte accumulator element,
+///     so a re-typed view must not inherit the window;
+///   * `tile.transpose_view` swaps the trailing two extents, so it fails it for
+///     every non-square window.  A *square* window does pass — and is harmless:
+///     the transposed view spans the identical bytes with identical row and
+///     column extents, so both the full-row-extent rule and the single-block
+///     rule reach exactly the verdict they reach for the untransposed window;
+///   * a symbolic extent fails it too (a `ConstInt` is required on both sides),
+///     matching the guard's own refusal to reason about symbolic shapes.
+///
+/// Memory space is deliberately *not* compared: the verdict is derived from the
+/// *parent* tile's space and the operand's extents, never from the operand's own
+/// space — and the tile view ops legitimately deduce a result type that leaves
+/// it unset for `InferTileMemorySpace` to fill in later.
+bool NamesSameWindowExtent(const TileTypePtr& lhs, const TileTypePtr& rhs) {
+  if (!lhs || !rhs) return false;
+  if (lhs->dtype_ != rhs->dtype_) return false;
+  if (lhs->shape_.size() != rhs->shape_.size()) return false;
+  for (size_t i = 0; i < lhs->shape_.size(); ++i) {
+    auto lhs_dim = As<ConstInt>(lhs->shape_[i]);
+    auto rhs_dim = As<ConstInt>(rhs->shape_[i]);
+    if (!lhs_dim || !rhs_dim || lhs_dim->value_ != rhs_dim->value_) return false;
+  }
+  return true;
+}
+
+/// The accumulator operand of `call` — the argument the op registry declares as
+/// the in-place destination via `set_output_reuses_input`.  Null when the call
+/// is not an accumulator op (or carries no Var there).
+///
+/// Reading the relation from the registry — rather than naming
+/// `tile.matmul_acc` / `tile.gemv_acc` / `tile.matmul_mx_acc` — is what lets the
+/// guard below cover any future accumulator op for free.
+VarPtr AccumulatorOperand(const CallPtr& call) {
+  if (!call || !call->op_) return nullptr;
+  auto& reg = OpRegistry::GetInstance();
+  if (!reg.IsRegistered(call->op_->name_)) return nullptr;
+  auto declared = reg.GetEntry(call->op_->name_).GetOutputReusesInputArg();
+  if (!declared.has_value() || *declared >= call->args_.size()) return nullptr;
+  return AsVarLike(call->args_[*declared]);
+}
+
+/// The verdict itself: reject when a `view`-shaped destination inside the window
+/// `window` is a *strided* window of a col-major (`Acc`) tile.  See the file
+/// header for the full derivation; the short form is that the MAD writes its
+/// `[m, n]` destination compactly from a bare pointer, so a window is only
+/// representable when it spans the parent's full row extent or occupies a single
+/// 16-column block.
+///
+/// The `col_major` + `kAccFractal` gate excludes the Vec-resident in-place ops
+/// (`tile.scatter`, `tile.fillpad_inplace`), whose row-major counterpart of this
+/// rule is handled by the rewrite paths above.
+///
+/// Split out of `CheckAccumulatorSliceContiguous` so the identical rule can be
+/// applied to a destination reached by a second route: the loop back edge, where
+/// a carried accumulator holds — from iteration 1 onward — the window the body's
+/// trailing `pl.yield_` names rather than the initializer's.  `view` is passed
+/// in rather than read off a Var because on that route the destination's extent
+/// is the `IterArg`'s, not the yielded value's.
+///
+/// Silent on anything it cannot prove: a symbolic extent or a non-`Acc` layout
+/// falls through untouched.  The guard exists to convert a known-wrong lowering
+/// into a diagnostic, not to second-guess shapes it cannot evaluate — a false
+/// rejection would break the *accepted* full-row-extent shape, which is
+/// load-bearing.
 ///
 /// Provisional: this rejects a shape the IR models correctly, purely because
 /// pto-isa's MAD cannot write it (hw-native-sys/pto-isa#253).  Revisit when that
 /// issue closes — if the intrinsic learns the destination stride, drop the
 /// `view_rows != parent_rows` rejection below and keep only whatever the fixed
 /// hardware still cannot express.
-void CheckAccumulatorSliceContiguous(const AssignStmtPtr& assign,
-                                     const std::unordered_map<const Var*, SliceInfo>& slices) {
-  auto call = As<Call>(assign->value_);
-  if (!call || !call->op_) return;
-  auto& reg = OpRegistry::GetInstance();
-  if (!reg.IsRegistered(call->op_->name_)) return;
-  auto declared = reg.GetEntry(call->op_->name_).GetOutputReusesInputArg();
-  if (!declared.has_value() || *declared >= call->args_.size()) return;
-
-  auto acc = AsVarLike(call->args_[*declared]);
-  if (!acc) return;
-  auto slice = slices.find(acc.get());
-  if (slice == slices.end()) return;
-
-  auto view = As<TileType>(acc->GetType());
-  auto parent = As<TileType>(slice->second.base->GetType());
+void CheckAccWindowContiguous(const CallPtr& call, const TileTypePtr& view, const SliceInfo& window) {
+  if (!call || !call->op_ || !window.base) return;
+  auto parent = As<TileType>(window.base->GetType());
   if (!view || !parent || view->shape_.size() != 2 || parent->shape_.size() != 2) return;
 
   // Only the col-major L0C orientation loses its stride at the MAD boundary.
@@ -340,7 +419,7 @@ void CheckAccumulatorSliceContiguous(const AssignStmtPtr& assign,
   // exactly like a wider one. A dynamic offset cannot be proven and is
   // rejected rather than assumed.
   if (view_cols->value_ <= kAccBlockCols) {
-    auto off_col = As<ConstInt>(slice->second.off_col);
+    auto off_col = As<ConstInt>(window.off_col);
     if (off_col && off_col->value_ >= 0 &&
         off_col->value_ / kAccBlockCols == (off_col->value_ + view_cols->value_ - 1) / kAccBlockCols) {
       return;
@@ -352,6 +431,20 @@ void CheckAccumulatorSliceContiguous(const AssignStmtPtr& assign,
   auto parent_cols = As<ConstInt>(parent->shape_[1]);
   const std::string parent_cols_text = parent_cols ? std::to_string(parent_cols->value_) : std::string("?");
 
+  // The column-packed replacement, spelled out only when the row split is a
+  // whole number of windows — an unevenly divided or degenerate parent has no
+  // single obvious rewrite, and a bogus suggestion is worse than none.
+  std::string remedy;
+  if (view_rows->value_ > 0 && parent_rows->value_ % view_rows->value_ == 0) {
+    const int64_t packed_cols = (parent_rows->value_ / view_rows->value_) * view_cols->value_;
+    const std::string rows_text = std::to_string(view_rows->value_);
+    const std::string cols_text = std::to_string(view_cols->value_);
+    remedy = " Pack the accumulator along columns rather than rows: allocate " + rows_text + "x" +
+             std::to_string(packed_cols) + " and take tile.slice(acc, [" + rows_text + ", " + cols_text +
+             "], [0, i * " + cols_text + "]) — the same L0C memory, addressed in the order the hardware " +
+             "writes it.";
+  }
+
   CHECK_SPAN(false, call->span_)
       << call->op_->name_ << ": the accumulator is a " << view_rows->value_ << "x" << view_cols->value_
       << " row window of a " << parent_rows->value_ << "x" << parent_cols_text
@@ -359,11 +452,46 @@ void CheckAccumulatorSliceContiguous(const AssignStmtPtr& assign,
          "destination — the hardware MAD writes its result compactly and has no destination stride, "
          "so only the first "
       << kAccBlockCols << " columns of each row tile would be correct.\n"
-      << "Slice the accumulator along columns instead, so each window spans every row: allocate "
-      << view_rows->value_ << "x" << (parent_rows->value_ / view_rows->value_) * view_cols->value_
-      << " and use tile.slice(acc, [" << view_rows->value_ << ", " << view_cols->value_ << "], [0, i * "
-      << view_cols->value_
-      << "]). That is the same L0C memory, addressed in the order the hardware writes it.";
+      << "An accumulator window must either span every row of its parent tile, or be at most "
+      << kAccBlockCols << " columns wide inside a single " << kAccBlockCols << "-column block." << remedy
+      << "\n"
+      // The window is not always spelled in the kernel, so the sentence above
+      // must not be the only advice on offer — see
+      // `docs/en/dev/passes/16-canonicalize_tile_slice.md`.
+      << "Note: this window may not appear in the kernel source — a compiler pass can produce it. "
+         "FlattenTileNdTo2D packs the pages of a batched accumulator along columns for exactly this "
+         "reason, and rejects the batch shapes it cannot pack with its own diagnostic, so a "
+         "batch_matmul_acc — or an ND matmul_acc, which lowers to one — no longer reaches this "
+         "limit. If you did not write the tile.slice named above, the pass that produced it is "
+         "handing the MAD a destination it cannot write; report it rather than reshaping your "
+         "kernel around it.";
+}
+
+/// Reject a matmul accumulator that is a *strided* window of a col-major (`Acc`)
+/// tile: resolve the call's declared in-place destination back to the window it
+/// names, then apply `CheckAccWindowContiguous`.
+///
+/// `windows` maps a Var to the window it *names*, not just the windows produced
+/// by a `tile.slice` — see `SliceCollector::BindWindowAlias` — so an accumulator
+/// reached through a loop carry or a shape-preserving view op is checked exactly
+/// like the slice result itself.  Because every recorded edge is geometry-
+/// preserving, the destination's extent is still read from the operand's own
+/// `TileType`.  An accumulator whose Var resolves to no recorded window falls
+/// through untouched, i.e. stays silent.
+///
+/// `value` is the statement's call expression — an `AssignStmt`'s RHS or an
+/// `EvalStmt`'s expression.  `As<Call>` is exact-kind, so a `Submit` is not
+/// covered; `Submit` cannot occur here because the pass is gated to InCore
+/// functions, whose bodies contain no task launches (see
+/// `.claude/rules/pass-submit-awareness.md`).
+void CheckAccumulatorSliceContiguous(const ExprPtr& value,
+                                     const std::unordered_map<const Var*, SliceInfo>& windows) {
+  auto call = As<Call>(value);
+  auto acc = AccumulatorOperand(call);
+  if (!acc) return;
+  auto window = windows.find(acc.get());
+  if (window == windows.end()) return;
+  CheckAccWindowContiguous(call, As<TileType>(acc->GetType()), window->second);
 }
 
 /// Phase 1 — collect every canonical `tile.slice` definition in the function,
@@ -373,11 +501,13 @@ class SliceCollector : public IRVisitor {
  public:
   std::unordered_map<const Var*, SliceInfo> slices;
   std::unordered_map<const Var*, ExprPtr> scalar_defs;
-  /// Every `tile.slice` window, canonical or not.  `slices` drives the
-  /// rewrites and is therefore restricted to the canonical 3-arg form; the Acc
-  /// safety check needs the physical base and offset of *any* window, since a
-  /// slice carrying an explicit valid_shape reaches the MAD with exactly the
-  /// same broken stride.
+  /// Which window each Var *names*, whether or not that Var is itself a
+  /// `tile.slice` result.  Seeded from every `tile.slice`, canonical or not —
+  /// `slices` drives the rewrites and is therefore restricted to the canonical
+  /// 3-arg form, while the Acc safety check needs the physical base and offset
+  /// of *any* window, since a slice carrying an explicit valid_shape reaches
+  /// the MAD with exactly the same broken stride — and then extended along
+  /// identity-preserving edges by `BindWindowAlias`.
   std::unordered_map<const Var*, SliceInfo> windows;
 
  protected:
@@ -393,20 +523,239 @@ class SliceCollector : public IRVisitor {
     }
     if (auto window = ParseSliceWindow(op, windows, known_consts_, /*require_canonical=*/false)) {
       windows.emplace(op->var_.get(), *window);
+    } else {
+      RecordAliasedWindow(op);
     }
     if (auto info = ParseCanonicalSlice(op, slices, known_consts_)) {
       slices.emplace(op->var_.get(), *info);
       return;
     }
-    CheckAccumulatorSliceContiguous(op, windows);
+    RecordCarriedAccumulatorUse(op->value_);
+    CheckAccumulatorSliceContiguous(op->value_, windows);
+  }
+
+  /// An accumulator op written as a bare statement (`pl.tile.matmul_acc(win, a,
+  /// b)`) parses to an `EvalStmt`, not an `AssignStmt`.  It reaches the MAD with
+  /// the same destination, so it must reach the same guard.
+  void VisitStmt_(const EvalStmtPtr& op) override {
+    if (!op) return;
+    IRVisitor::VisitStmt_(op);
+    RecordCarriedAccumulatorUse(op->expr_);
+    CheckAccumulatorSliceContiguous(op->expr_, windows);
+  }
+
+  /// Loop-carried windows, forward edge: bind an `IterArg` to the window its
+  /// *initializer* names.  `IRVisitor::VisitStmt_(ForStmtPtr/WhileStmtPtr)`
+  /// visits `iter_args_` before `body_`, so this fires before any in-body use of
+  /// the carried Var — which is exactly the confirmed defect (a window hoisted
+  /// out of the K loop).
+  void VisitExpr_(const IterArgPtr& op) override {
+    if (!op) return;
+    BindWindowAlias(op, op->initValue_);
+    IRVisitor::VisitExpr_(op);
+  }
+
+  /// The loop's two remaining edges, both resolvable only once the body has been
+  /// visited and every in-body definition is in `windows`.
+  void VisitStmt_(const ForStmtPtr& op) override {
+    if (!op) return;
+    IRVisitor::VisitStmt_(op);
+    ResolveLoopEdges(op->iter_args_, op->body_, op->return_vars_, RunsAtLeastTwice(op));
+  }
+
+  void VisitStmt_(const WhileStmtPtr& op) override {
+    if (!op) return;
+    IRVisitor::VisitStmt_(op);
+    // A `while` trip count is not statically known, so the back edge cannot be
+    // proven to execute; only the exit edge is resolved.
+    ResolveLoopEdges(op->iter_args_, op->body_, op->return_vars_, /*back_edge_taken=*/false);
+  }
+
+  /// An if-merge names a single window only when *both* arms yield that same
+  /// window; anything else stays unbound, i.e. silent.
+  void VisitStmt_(const IfStmtPtr& op) override {
+    if (!op) return;
+    IRVisitor::VisitStmt_(op);
+    if (op->return_vars_.empty() || !op->else_body_.has_value()) return;
+    auto then_yield = transform_utils::GetLastYieldStmt(op->then_body_);
+    auto else_yield = transform_utils::GetLastYieldStmt(*op->else_body_);
+    if (!then_yield || !else_yield) return;
+    if (then_yield->value_.size() != op->return_vars_.size()) return;
+    if (else_yield->value_.size() != op->return_vars_.size()) return;
+    for (size_t i = 0; i < op->return_vars_.size(); ++i) {
+      const SliceInfo* then_window = LookupWindow(then_yield->value_[i]);
+      const SliceInfo* else_window = LookupWindow(else_yield->value_[i]);
+      if (!then_window || !else_window || !SameWindow(*then_window, *else_window)) continue;
+      BindWindowAlias(op->return_vars_[i], then_yield->value_[i]);
+    }
   }
 
  private:
+  /// The two loop edges that only become resolvable after the body is visited.
+  ///
+  /// **Back edge (a correctness check, not a binding).**  A carried accumulator
+  /// holds the initializer's window on iteration 0 — covered by
+  /// `VisitExpr_(IterArgPtr)` — but from iteration 1 onward it holds whatever
+  /// the trailing `pl.yield_` names, and the MAD writes *that* window on every
+  /// remaining step.  So the yielded window is checked against the same rule,
+  /// with the destination extent taken from the `IterArg` (the type the loop
+  /// gives the carry).  It is checked, not recorded: a Var cannot name two
+  /// windows, and recording either one would make the *other* iteration's
+  /// destination invisible.
+  ///
+  /// The check is scoped to carries that are actually accumulator destinations
+  /// (`carried_acc_uses_`), so a carry the body only reads is never rejected for
+  /// a shape no MAD ever writes.  The canonical carry —
+  /// `yield matmul_acc(iter_arg, ...)` — resolves straight back to the
+  /// initializer's window and therefore re-reaches the verdict the body already
+  /// passed, so this costs nothing on the shapes the pipeline generates.
+  ///
+  /// `back_edge_taken` gates it: a loop that provably runs at most once never
+  /// feeds the yielded value back, so checking it there would reject a shape no
+  /// MAD ever writes.  Unprovable trip counts (symbolic bounds, `while`) count
+  /// as not taken — silence, as everywhere else in this guard.
+  ///
+  /// **Exit edge.**  `return_vars_[i]` takes the final value yielded for
+  /// `iter_args_[i]` — or, on a zero-trip loop, the initializer.  It is bound
+  /// only when those two agree on the window, which is the canonical carry
+  /// (`yield matmul_acc(iter_arg, ...)`, and the plain `yield iter_arg`); the
+  /// binding is then exact whatever the trip count. That keeps an accumulator
+  /// consumed *after* the loop (`settled = pl.yield_(...)` then
+  /// `matmul_acc(settled, ...)`) resolvable, without ever recording a window one
+  /// path does not name — which matters because `windows` also feeds
+  /// `ParseSliceWindow`'s chained-slice offset arithmetic.
+  ///
+  /// Both are single hash lookups over the map already built — no fixpoint, and
+  /// the back edge is never traversed as a *binding* edge, so `windows` stays
+  /// acyclic and the sweep stays O(N).
+  void ResolveLoopEdges(const std::vector<IterArgPtr>& iter_args, const StmtPtr& body,
+                        const std::vector<VarPtr>& return_vars, bool back_edge_taken) {
+    auto yield = transform_utils::GetLastYieldStmt(body);
+    if (!yield || yield->value_.size() != iter_args.size()) return;
+    for (size_t i = 0; i < iter_args.size(); ++i) {
+      const auto& iter_arg = iter_args[i];
+      if (!iter_arg) continue;
+      const SliceInfo* carried = LookupWindow(yield->value_[i]);
+      if (back_edge_taken && carried) {
+        auto used = carried_acc_uses_.find(iter_arg.get());
+        if (used != carried_acc_uses_.end()) {
+          CheckAccWindowContiguous(used->second, As<TileType>(iter_arg->GetType()), *carried);
+        }
+      }
+      const SliceInfo* initial = LookupWindow(iter_arg);
+      if (i < return_vars.size() && carried && initial && SameWindow(*carried, *initial)) {
+        BindWindowAlias(return_vars[i], yield->value_[i]);
+      }
+    }
+  }
+
+  /// True when the loop provably runs at least twice, i.e. the value its body
+  /// yields really does become a later iteration's carry.  Anything unprovable
+  /// — a symbolic bound, a non-positive step — answers false.
+  static bool RunsAtLeastTwice(const ForStmtPtr& op) {
+    auto start = As<ConstInt>(op->start_);
+    auto stop = As<ConstInt>(op->stop_);
+    auto step = As<ConstInt>(op->step_);
+    if (!start || !stop || !step || step->value_ <= 0) return false;
+    return start->value_ + step->value_ < stop->value_;
+  }
+
+  /// The window `expr` names, or null when it names none.
+  const SliceInfo* LookupWindow(const ExprPtr& expr) const {
+    auto var = AsVarLike(expr);
+    if (!var) return nullptr;
+    auto it = windows.find(var.get());
+    return it == windows.end() ? nullptr : &it->second;
+  }
+
+  /// True when two windows provably describe the same bytes: same parent Var and
+  /// the same offsets, either as identical expressions or as equal `ConstInt`s.
+  static bool SameWindow(const SliceInfo& lhs, const SliceInfo& rhs) {
+    if (lhs.base.get() != rhs.base.get()) return false;
+    return SameOffset(lhs.off_row, rhs.off_row) && SameOffset(lhs.off_col, rhs.off_col);
+  }
+
+  static bool SameOffset(const ExprPtr& lhs, const ExprPtr& rhs) {
+    if (lhs.get() == rhs.get()) return true;
+    auto lhs_const = As<ConstInt>(lhs);
+    auto rhs_const = As<ConstInt>(rhs);
+    return lhs_const && rhs_const && lhs_const->value_ == rhs_const->value_;
+  }
+
+  /// Remember the first accumulator op whose destination is a loop carry, so
+  /// `ResolveLoopEdges` knows which carries the MAD actually writes.  Only
+  /// `IterArg` destinations are recorded — every other destination is already
+  /// checked where it is used.
+  void RecordCarriedAccumulatorUse(const ExprPtr& value) {
+    auto call = As<Call>(value);
+    auto acc = AccumulatorOperand(call);
+    if (!acc || !As<IterArg>(acc)) return;
+    carried_acc_uses_.emplace(acc.get(), call);
+  }
+
+  /// Record `target` as naming the same window as `source`, when both provably
+  /// describe the same window extent.  Unproven edges are simply not recorded.
+  void BindWindowAlias(const VarPtr& target, const ExprPtr& source) {
+    if (!target) return;
+    auto source_var = AsVarLike(source);  // matches Var AND IterArg
+    if (!source_var) return;
+    auto it = windows.find(source_var.get());
+    if (it == windows.end()) return;
+    if (!NamesSameWindowExtent(As<TileType>(target->GetType()), As<TileType>(source_var->GetType()))) {
+      return;
+    }
+    // Copy before inserting: the insert may rehash `windows`, and taking the
+    // value by copy keeps this independent of that.
+    const SliceInfo source_window = it->second;
+    windows.emplace(target.get(), source_window);
+  }
+
+  /// A definition that is not itself a `tile.slice` but still binds a fresh SSA
+  /// name to a window's storage:
+  ///
+  ///   * a plain SSA alias `v = w` (ConvertToSSA and Simplify both leave these
+  ///     in place);
+  ///   * a call whose output lands in a source operand's storage rather than a
+  ///     buffer of its own — a buffer-aliasing view op (`tile.reshape`,
+  ///     `tile.set_validshape`, ...) or an in-place / accumulate op
+  ///     (`tile.matmul_acc`, so a chained accumulation stays checked).
+  ///
+  /// The relation is read from the op registry via
+  /// `op_predicates::OutputInheritsSourceBuffer`, so a newly added in-place or
+  /// view op is covered without editing this pass — and `tile.transpose` /
+  /// `tile.extract`, which permute or copy into a *fresh* buffer, are excluded
+  /// for the right reason rather than by name.  An in-place op names its source
+  /// through the registry's declared index; a view op declares no index, and
+  /// every inherit-input view in the registry takes its source as argument 0.
+  void RecordAliasedWindow(const AssignStmtPtr& op) {
+    if (!op || !op->var_) return;
+    if (AsVarLike(op->value_)) {
+      BindWindowAlias(op->var_, op->value_);
+      return;
+    }
+    auto call = As<Call>(op->value_);
+    if (!call || !call->op_) return;
+    // A `tile.slice` that ParseSliceWindow could not read (no 2-element offset
+    // tuple, or fewer than 3 args) carries an offset this pass cannot prove.
+    // It is an inherit-input view op, so it would otherwise fall through below
+    // and inherit its *source's* window — silently dropping that offset.
+    if (IsOp(call, "tile.slice")) return;
+    if (!op_predicates::OutputInheritsSourceBuffer(call->op_->name_)) return;
+    size_t source_index = op_predicates::BuiltinWritebackArgIndex(call->op_, call->args_.size()).value_or(0);
+    if (source_index >= call->args_.size()) return;
+    BindWindowAlias(op->var_, call->args_[source_index]);
+  }
+
   // Convert direct ConstInt SSA definitions (and their plain aliases) back to
   // constants before alignment analysis. ConvertToSSA commonly introduces
   // such Vars for literal slice offsets; treating them as dynamic causes
   // unnecessary Vec-to-Vec extracts even when the address is provably aligned.
   std::unordered_map<const Var*, ExprPtr> known_consts_;
+
+  /// Loop carries the body uses as an accumulator destination, mapped to the
+  /// first such call — the site `ResolveLoopEdges` blames when the loop's back
+  /// edge feeds that carry a window the MAD cannot write.
+  std::unordered_map<const Var*, CallPtr> carried_acc_uses_;
 };
 
 /// Phase 2 — rewrite canonicalizable `tile.slice` consumers: Mat slices are

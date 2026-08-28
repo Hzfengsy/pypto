@@ -44,7 +44,11 @@ Coverage:
   operands in ``AssignStmt`` and ``EvalStmt``, plus plain aliases and loop
   carries; provably aligned static, constant-SSA, dynamic-row, and dynamic
   known-multiple slices stay zero-copy;
-* no-op cases — no Mat slice, and safe Vec-resident slices left untouched.
+* no-op cases — no Mat slice, and safe Vec-resident slices left untouched;
+* Acc accumulator contiguity — the strided-window rejection and the two shapes
+  it accepts, both where the operand *is* the slice result and where it only
+  names that window (loop carry, plain SSA alias, shape-preserving
+  ``tile.reshape``, and an unassigned ``EvalStmt`` accumulator call).
 """
 
 import pypto.language as pl
@@ -1622,6 +1626,422 @@ class TestAccAccumulatorSliceContiguity:
         prog = self._kernel([32, 32], [16, 32], [16, 0], valid_shape=[16, 32])
         with pytest.raises(ValueError, match="not contiguous in L0C's block layout"):
             _run_pass(prog)
+
+
+class TestAccAccumulatorWindowResolution:
+    """The accumulator operand is resolved back to the window it *names*.
+
+    Every case in ``TestAccAccumulatorSliceContiguity`` slices in the same block
+    that consumes the slice, so the operand Var *is* the slice result. Real
+    kernels rarely look like that: hoisting the slice out of the K loop — the
+    natural spelling, since the window does not change per K step — makes the
+    in-body operand a loop ``IterArg``, and a shape-preserving ``tile.reshape``
+    is another SSA name for the same bytes. Both used to walk straight past the
+    guard.
+
+    The rejection boundary must not move: a window reached through a carry is
+    accepted on exactly the rules a directly-sliced one is, because
+    ``FlattenTileNdTo2D`` will emit the accepted full-row-extent shape under a
+    loop carry.
+    """
+
+    def _carried_kernel(self, acc_shape, slice_shape, offset):
+        """`acc[offset]` of shape `slice_shape` is sliced *outside* a loop and
+        accumulated inside it, so the operand is the loop's ``IterArg`` rather
+        than the slice result."""
+        rows, cols = slice_shape
+        k = 64
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[rows, k], pl.FP16],
+                w: pl.Tensor[[k, cols], pl.FP16],
+                out: pl.Out[pl.Tensor[acc_shape, pl.FP32]],
+            ) -> pl.Tensor[acc_shape, pl.FP32]:
+                x_mat: pl.Tile[[rows, k], pl.FP16, pl.Mem.Mat] = pl.tile.load(
+                    x, [0, 0], [rows, k], target_memory=pl.Mem.Mat
+                )
+                a: pl.Tile[[rows, k], pl.FP16, pl.Mem.Left] = pl.tile.move(x_mat, target_memory=pl.Mem.Left)
+                w_mat: pl.Tile[[k, cols], pl.FP16, pl.Mem.Mat] = pl.tile.load(
+                    w, [0, 0], [k, cols], target_memory=pl.Mem.Mat
+                )
+                b: pl.Tile[[k, cols], pl.FP16, pl.Mem.Right] = pl.tile.move(w_mat, target_memory=pl.Mem.Right)
+                acc = pl.tile.create(acc_shape, pl.FP32, target_memory=pl.Mem.Acc)
+                acc_win = pl.tile.slice(acc, slice_shape, offset)
+                for _k0, (carried,) in pl.range(2, init_values=(acc_win,)):
+                    stepped = pl.tile.matmul_acc(carried, a, b)
+                    settled = pl.yield_(stepped)
+                out = pl.tile.store(settled, [0, 0], out)
+                return out
+
+        return Prog
+
+    def test_loop_carried_row_window_rejected(self):
+        """The confirmed defect: the same [16, 32] row window of a [32, 32] Acc
+        tile that ``test_row_window_of_multi_block_column_acc_rejected`` catches
+        inline reaches the MAD unchecked once the slice is hoisted out of the
+        loop, and miscomputes on device."""
+        prog = self._carried_kernel([32, 32], [16, 32], [16, 0])
+        with pytest.raises(ValueError, match="not contiguous in L0C's block layout"):
+            _run_pass(prog)
+
+    def test_loop_carried_full_row_extent_window_accepted(self):
+        """The shape the guard must keep ACCEPTING, reached through the very
+        edge the rejection above travels.
+
+        This is the load-bearing non-regression case: ``FlattenTileNdTo2D`` will
+        emit exactly this column window for every batched accumulator, and under
+        a loop carry.
+
+        The accepted half alone would be vacuous — it is equally green against a
+        guard that never resolves the ``IterArg`` at all. The control below is
+        what gives it meaning: the *same* carry spelling over a parent with a
+        second block row must be rejected, and the rejection must name the bad
+        parent. So the test fails in both directions — silence (no resolution)
+        and over-rejection (the first call raises)."""
+        _run_pass(self._carried_kernel([16, 64], [16, 32], [0, 32]))
+        with pytest.raises(ValueError, match=r"16x32 row window of a 32x32"):
+            _run_pass(self._carried_kernel([32, 32], [16, 32], [16, 0]))
+
+    def test_loop_carried_single_block_column_window_accepted(self):
+        """The second accepted shape — a 16-column window inside one block
+        column — reached through a loop carry.
+
+        Paired with the straddling control for the same reason as above: same
+        carry, same 16-column width, only the column offset differs, so a green
+        accept cannot be explained by the guard never looking."""
+        _run_pass(self._carried_kernel([32, 16], [16, 16], [16, 0]))
+        with pytest.raises(ValueError, match=r"16x16 row window of a 32x32"):
+            _run_pass(self._carried_kernel([32, 32], [16, 16], [16, 8]))
+
+    def test_loop_carried_accept_and_reject_are_told_apart(self):
+        """One kernel, two carried windows: resolution must reject the strided
+        one and stay silent on the full-row-extent one.
+
+        The assertion is on the *dimensions the diagnostic names*, so the test
+        fails three different ways: silently compiling (no resolution at all,
+        i.e. the pre-fix behaviour), rejecting the legal column window (the
+        message would name ``16x32 ... of a 16x64``), or resolving to the wrong
+        parent."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 64], pl.FP16],
+                w: pl.Tensor[[64, 32], pl.FP16],
+                out: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+            ) -> pl.Tensor[[32, 32], pl.FP32]:
+                x_mat: pl.Tile[[16, 64], pl.FP16, pl.Mem.Mat] = pl.tile.load(
+                    x, [0, 0], [16, 64], target_memory=pl.Mem.Mat
+                )
+                a: pl.Tile[[16, 64], pl.FP16, pl.Mem.Left] = pl.tile.move(x_mat, target_memory=pl.Mem.Left)
+                w_mat: pl.Tile[[64, 32], pl.FP16, pl.Mem.Mat] = pl.tile.load(
+                    w, [0, 0], [64, 32], target_memory=pl.Mem.Mat
+                )
+                b: pl.Tile[[64, 32], pl.FP16, pl.Mem.Right] = pl.tile.move(w_mat, target_memory=pl.Mem.Right)
+                # Legal: the window spans every row of its [16, 64] parent.
+                acc_ok = pl.tile.create([16, 64], pl.FP32, target_memory=pl.Mem.Acc)
+                win_ok = pl.tile.slice(acc_ok, [16, 32], [0, 32])
+                for _i, (carried_ok,) in pl.range(2, init_values=(win_ok,)):
+                    stepped_ok = pl.tile.matmul_acc(carried_ok, a, b)
+                    settled_ok = pl.yield_(stepped_ok)
+                # Illegal: a row window of a two-block-column [32, 32] parent.
+                acc_bad = pl.tile.create([32, 32], pl.FP32, target_memory=pl.Mem.Acc)
+                win_bad = pl.tile.slice(acc_bad, [16, 32], [16, 0])
+                for _j, (carried_bad,) in pl.range(2, init_values=(win_bad,)):
+                    stepped_bad = pl.tile.matmul_acc(carried_bad, a, b)
+                    settled_bad = pl.yield_(stepped_bad)
+                stored_ok = pl.tile.store(settled_ok, [0, 0], out)
+                stored_all = pl.tile.store(settled_bad, [0, 0], stored_ok)
+                return stored_all
+
+        with pytest.raises(ValueError, match=r"16x32 row window of a 32x32"):
+            _run_pass(Prog)
+
+    def test_reshape_of_row_window_rejected(self):
+        """A shape-preserving ``tile.reshape`` is another SSA name for the same
+        window bytes, so it must not launder a strided accumulator past the
+        guard."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 64], pl.FP16],
+                w: pl.Tensor[[64, 32], pl.FP16],
+                out: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+            ) -> pl.Tensor[[32, 32], pl.FP32]:
+                x_mat: pl.Tile[[16, 64], pl.FP16, pl.Mem.Mat] = pl.tile.load(
+                    x, [0, 0], [16, 64], target_memory=pl.Mem.Mat
+                )
+                a: pl.Tile[[16, 64], pl.FP16, pl.Mem.Left] = pl.tile.move(x_mat, target_memory=pl.Mem.Left)
+                w_mat: pl.Tile[[64, 32], pl.FP16, pl.Mem.Mat] = pl.tile.load(
+                    w, [0, 0], [64, 32], target_memory=pl.Mem.Mat
+                )
+                b: pl.Tile[[64, 32], pl.FP16, pl.Mem.Right] = pl.tile.move(w_mat, target_memory=pl.Mem.Right)
+                acc = pl.tile.create([32, 32], pl.FP32, target_memory=pl.Mem.Acc)
+                acc_win = pl.tile.slice(acc, [16, 32], [16, 0])
+                acc_alias = pl.tile.reshape(acc_win, [16, 32])
+                acc_new = pl.tile.matmul_acc(acc_alias, a, b)
+                out = pl.tile.store(acc_new, [0, 0], out)
+                return out
+
+        with pytest.raises(ValueError, match="not contiguous in L0C's block layout"):
+            _run_pass(Prog)
+
+    def test_plain_ssa_alias_of_row_window_rejected(self):
+        """A bare rebinding produces a real ``AssignStmt`` that survives
+        ConvertToSSA and Simplify, so it is an SSA identity the guard must see
+        through."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 64], pl.FP16],
+                w: pl.Tensor[[64, 32], pl.FP16],
+                out: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+            ) -> pl.Tensor[[32, 32], pl.FP32]:
+                x_mat: pl.Tile[[16, 64], pl.FP16, pl.Mem.Mat] = pl.tile.load(
+                    x, [0, 0], [16, 64], target_memory=pl.Mem.Mat
+                )
+                a: pl.Tile[[16, 64], pl.FP16, pl.Mem.Left] = pl.tile.move(x_mat, target_memory=pl.Mem.Left)
+                w_mat: pl.Tile[[64, 32], pl.FP16, pl.Mem.Mat] = pl.tile.load(
+                    w, [0, 0], [64, 32], target_memory=pl.Mem.Mat
+                )
+                b: pl.Tile[[64, 32], pl.FP16, pl.Mem.Right] = pl.tile.move(w_mat, target_memory=pl.Mem.Right)
+                acc = pl.tile.create([32, 32], pl.FP32, target_memory=pl.Mem.Acc)
+                acc_win = pl.tile.slice(acc, [16, 32], [16, 0])
+                acc_alias = acc_win
+                acc_new = pl.tile.matmul_acc(acc_alias, a, b)
+                out = pl.tile.store(acc_new, [0, 0], out)
+                return out
+
+        with pytest.raises(ValueError, match="not contiguous in L0C's block layout"):
+            _run_pass(Prog)
+
+    def test_unassigned_accumulator_call_rejected(self):
+        """An accumulator written as a bare statement — the spelling the public
+        ``pl.tile.matmul_acc`` docstring uses — parses to an ``EvalStmt``, which
+        the collector used to skip entirely. It reaches the MAD with the same
+        destination, so it must reach the same guard."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 64], pl.FP16],
+                w: pl.Tensor[[64, 32], pl.FP16],
+                out: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+            ) -> pl.Tensor[[32, 32], pl.FP32]:
+                x_mat: pl.Tile[[16, 64], pl.FP16, pl.Mem.Mat] = pl.tile.load(
+                    x, [0, 0], [16, 64], target_memory=pl.Mem.Mat
+                )
+                a: pl.Tile[[16, 64], pl.FP16, pl.Mem.Left] = pl.tile.move(x_mat, target_memory=pl.Mem.Left)
+                w_mat: pl.Tile[[64, 32], pl.FP16, pl.Mem.Mat] = pl.tile.load(
+                    w, [0, 0], [64, 32], target_memory=pl.Mem.Mat
+                )
+                b: pl.Tile[[64, 32], pl.FP16, pl.Mem.Right] = pl.tile.move(w_mat, target_memory=pl.Mem.Right)
+                acc = pl.tile.create([32, 32], pl.FP32, target_memory=pl.Mem.Acc)
+                acc_win = pl.tile.slice(acc, [16, 32], [16, 0])
+                pl.tile.matmul_acc(acc_win, a, b)
+                out = pl.tile.store(acc, [0, 0], out)
+                return out
+
+        with pytest.raises(ValueError, match="not contiguous in L0C's block layout"):
+            _run_pass(Prog)
+
+    def test_rejection_explains_the_compiler_generated_window(self):
+        """The rejected window is not always spelled in the kernel, so the
+        diagnostic may not tell the reader to edit a slice as if one existed —
+        it has to state the rule, offer the column-packed replacement, and say
+        that a pass can produce this shape on its own.
+
+        ``FlattenTileNdTo2D`` used to be that pass; it now packs the pages of a
+        batched accumulator along columns and reports the batch shapes it cannot
+        pack itself, so the note names it as the lowering that already does the
+        right thing rather than as a pending fix."""
+        prog = self._carried_kernel([32, 32], [16, 32], [16, 0])
+        with pytest.raises(ValueError) as excinfo:
+            _run_pass(prog)
+        message = str(excinfo.value)
+        assert "span every row of its parent tile" in message
+        assert "Pack the accumulator along columns rather than rows" in message
+        # The column-packed replacement for a 16x32 window of a 32x32 parent.
+        assert "allocate 16x64" in message
+        assert "may not appear in the kernel source" in message
+        assert "FlattenTileNdTo2D packs the pages of a batched accumulator along columns" in message
+        assert "batch_matmul_acc" in message
+
+
+class TestAccAccumulatorLoopEdges:
+    """Edges a carried accumulator travels that the initializer does not cover.
+
+    ``VisitExpr_(IterArgPtr)`` binds a carry to its initializer's window, which
+    is the destination on iteration 0. Two other edges decide the destination on
+    the remaining iterations and after the loop, and both are only resolvable
+    once the body has been visited:
+
+    * the **back edge** — from iteration 1 the carry holds the window the body's
+      trailing ``pl.yield_`` names, and the MAD writes that one;
+    * the **exit edge** — ``ForStmt::return_vars_`` takes the final yielded
+      value, so an accumulator consumed after the loop resolves through it.
+    """
+
+    def _back_edge_kernel(self, big_acc_shape, win_shape, win_offset, trip):
+        """A carry whose *initializer* is a whole tile but whose *yield* names a
+        window of a second, larger accumulator. Iteration 0 writes the whole
+        tile; every later iteration writes the window."""
+        rows, cols = win_shape
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[rows, 64], pl.FP16],
+                w: pl.Tensor[[64, cols], pl.FP16],
+                out: pl.Out[pl.Tensor[big_acc_shape, pl.FP32]],
+            ) -> pl.Tensor[big_acc_shape, pl.FP32]:
+                x_mat: pl.Tile[[rows, 64], pl.FP16, pl.Mem.Mat] = pl.tile.load(
+                    x, [0, 0], [rows, 64], target_memory=pl.Mem.Mat
+                )
+                a: pl.Tile[[rows, 64], pl.FP16, pl.Mem.Left] = pl.tile.move(x_mat, target_memory=pl.Mem.Left)
+                w_mat: pl.Tile[[64, cols], pl.FP16, pl.Mem.Mat] = pl.tile.load(
+                    w, [0, 0], [64, cols], target_memory=pl.Mem.Mat
+                )
+                b: pl.Tile[[64, cols], pl.FP16, pl.Mem.Right] = pl.tile.move(
+                    w_mat, target_memory=pl.Mem.Right
+                )
+                acc_small = pl.tile.create(win_shape, pl.FP32, target_memory=pl.Mem.Acc)
+                acc_big = pl.tile.create(big_acc_shape, pl.FP32, target_memory=pl.Mem.Acc)
+                big_win = pl.tile.slice(acc_big, win_shape, win_offset)
+                for _k0, (carried,) in pl.range(trip, init_values=(acc_small,)):
+                    stepped = pl.tile.matmul_acc(carried, a, b)
+                    settled = pl.yield_(big_win)
+                out = pl.tile.store(acc_big, [0, 0], out)
+                return out
+
+        return Prog
+
+    def test_back_edge_row_window_rejected(self):
+        """The yielded window is the MAD's destination from iteration 1 onward,
+        so a strided one is just as wrong as a strided initializer."""
+        prog = self._back_edge_kernel([32, 32], [16, 32], [16, 0], trip=2)
+        with pytest.raises(ValueError, match=r"16x32 row window of a 32x32"):
+            _run_pass(prog)
+
+    def test_back_edge_full_row_extent_window_accepted(self):
+        """Same spelling, legal window — the back edge must not widen what the
+        guard rejects."""
+        _run_pass(self._back_edge_kernel([16, 64], [16, 32], [0, 32], trip=2))
+
+    def test_back_edge_of_single_trip_loop_not_checked(self):
+        """A loop that runs once never takes its back edge, so the yielded
+        window is never a destination and rejecting it would be a false
+        positive. Identical to ``test_back_edge_row_window_rejected`` but for the
+        trip count."""
+        _run_pass(self._back_edge_kernel([32, 32], [16, 32], [16, 0], trip=1))
+
+    def _exit_edge_kernel(self, acc_shape, win_shape, win_offset):
+        """The accumulator is consumed *after* the loop, through the ForStmt's
+        return var rather than the ``IterArg``."""
+        rows, cols = win_shape
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[rows, 64], pl.FP16],
+                w: pl.Tensor[[64, cols], pl.FP16],
+                out: pl.Out[pl.Tensor[acc_shape, pl.FP32]],
+            ) -> pl.Tensor[acc_shape, pl.FP32]:
+                x_mat: pl.Tile[[rows, 64], pl.FP16, pl.Mem.Mat] = pl.tile.load(
+                    x, [0, 0], [rows, 64], target_memory=pl.Mem.Mat
+                )
+                a: pl.Tile[[rows, 64], pl.FP16, pl.Mem.Left] = pl.tile.move(x_mat, target_memory=pl.Mem.Left)
+                w_mat: pl.Tile[[64, cols], pl.FP16, pl.Mem.Mat] = pl.tile.load(
+                    w, [0, 0], [64, cols], target_memory=pl.Mem.Mat
+                )
+                b: pl.Tile[[64, cols], pl.FP16, pl.Mem.Right] = pl.tile.move(
+                    w_mat, target_memory=pl.Mem.Right
+                )
+                acc = pl.tile.create(acc_shape, pl.FP32, target_memory=pl.Mem.Acc)
+                acc_win = pl.tile.slice(acc, win_shape, win_offset)
+                for _k0, (carried,) in pl.range(2, init_values=(acc_win,)):
+                    settled = pl.yield_(carried)
+                final = pl.tile.matmul_acc(settled, a, b)
+                out = pl.tile.store(acc, [0, 0], out)
+                return out
+
+        return Prog
+
+    def test_exit_edge_row_window_rejected(self):
+        """``return_vars_`` takes the final yielded value; when the carry is the
+        canonical one, that value names the initializer's window, so the guard
+        can follow it out of the loop."""
+        prog = self._exit_edge_kernel([32, 32], [16, 32], [16, 0])
+        with pytest.raises(ValueError, match=r"16x32 row window of a 32x32"):
+            _run_pass(prog)
+
+    def test_exit_edge_full_row_extent_window_accepted(self):
+        """Same spelling, legal window."""
+        _run_pass(self._exit_edge_kernel([16, 64], [16, 32], [0, 32]))
+
+    def _if_merge_kernel(self, acc_shape, win_shape, win_offset):
+        """Both arms of an ``if`` yield the same window under different SSA
+        names, so the merged Var provably names that one window."""
+        rows, cols = win_shape
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                flag: pl.Scalar[pl.INT32],
+                x: pl.Tensor[[rows, 64], pl.FP16],
+                w: pl.Tensor[[64, cols], pl.FP16],
+                out: pl.Out[pl.Tensor[acc_shape, pl.FP32]],
+            ) -> pl.Tensor[acc_shape, pl.FP32]:
+                x_mat: pl.Tile[[rows, 64], pl.FP16, pl.Mem.Mat] = pl.tile.load(
+                    x, [0, 0], [rows, 64], target_memory=pl.Mem.Mat
+                )
+                a: pl.Tile[[rows, 64], pl.FP16, pl.Mem.Left] = pl.tile.move(x_mat, target_memory=pl.Mem.Left)
+                w_mat: pl.Tile[[64, cols], pl.FP16, pl.Mem.Mat] = pl.tile.load(
+                    w, [0, 0], [64, cols], target_memory=pl.Mem.Mat
+                )
+                b: pl.Tile[[64, cols], pl.FP16, pl.Mem.Right] = pl.tile.move(
+                    w_mat, target_memory=pl.Mem.Right
+                )
+                acc = pl.tile.create(acc_shape, pl.FP32, target_memory=pl.Mem.Acc)
+                win = pl.tile.slice(acc, win_shape, win_offset)
+                if flag > 0:
+                    chosen = pl.yield_(win)
+                else:
+                    aliased = pl.tile.reshape(win, win_shape)
+                    chosen = pl.yield_(aliased)
+                done = pl.tile.matmul_acc(chosen, a, b)
+                out = pl.tile.store(acc, [0, 0], out)
+                return out
+
+        return Prog
+
+    def test_if_merge_of_one_window_row_window_rejected(self):
+        prog = self._if_merge_kernel([32, 32], [16, 32], [16, 0])
+        with pytest.raises(ValueError, match=r"16x32 row window of a 32x32"):
+            _run_pass(prog)
+
+    def test_if_merge_of_one_window_full_row_extent_accepted(self):
+        _run_pass(self._if_merge_kernel([16, 64], [16, 32], [0, 32]))
 
 
 if __name__ == "__main__":

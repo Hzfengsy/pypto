@@ -56,8 +56,8 @@ Per-statement handling:
 | `tile.create`/`tile.full` (>2D) | Rebuild with flattened 2D shape directly |
 | `tile.assemble` (>2D target) | Fold the ND offset into the flattened `(row, col)` space with the same row-major collapse `tile.load` applies to its tensor-rank offsets (`row = ((o0*d1 + o1)*d2 + o2)*… + o[k-2]`, `col = o[k-1]`); the tile operands themselves are flattened by their defining ops. Requires source, target and offset to share one rank, and the written region to collapse to a contiguous row band (`IsRowMajorCollapseContiguous`) — both rejected in the precondition phase otherwise. Without the fold the offset would keep its ND rank on a 2D tile, and codegen (which reads `elements[0]`/`elements[1]` positionally and ignores the rest) would silently place the write at the wrong address |
 | `tile.transpose` | Sole owner of `pto.ttrans` scratch materialization. Arrives 3-arg (input, axis1, axis2). **2D**: create one scratch tile (shape = SOURCE page, in the input's memory space) and emit the codegen-ready 4-arg `tile.transpose(in, a1, a2, scratch)`. **>2D** (last-two-axes swap): unroll into per-batch 2D transposes, each a 4-arg form with scratch sliced from a flat `[batch*A, B]` pool, assembled into the merged 2D output. A batch-axis swap is a user error |
-| `tile.batch_matmul` | Expand to per-batch 2D `tile.matmul`, honoring batch broadcast. A b_trans/a_trans operand arrives as a zero-copy `tile.transpose_view` over a natural load (no transpose-at-load, no copy); the tile-level op carries no transpose semantic. Each operand is handled identically (see operand handling below) |
-| `tile.batch_matmul_acc` | Expand to per-batch 2D `tile.matmul_acc`, slicing the (already-flattened) accumulator per batch index. Memory-space decisions on the accumulator (Vec/Acc round-trips, retargetable producer promotion of an upstream `tile.create`, TileView refresh) are deferred to `InferTileMemorySpace` (pass 17) — flatten emits no inline `tile.move` |
+| `tile.batch_matmul` | Expand to per-batch 2D `tile.matmul`, honoring batch broadcast. A b_trans/a_trans operand arrives as a zero-copy `tile.transpose_view` over a natural load (no transpose-at-load, no copy); the tile-level op carries no transpose semantic. Each operand is handled identically (see operand handling below). **When the result is itself a batched accumulator** (a downstream `tile.batch_matmul_acc` keeps writing it), the pages are written into ONE column-packed `Acc` tile with `tile.matmul_acc(window, lhs_b, rhs_b, init_cond=True)` instead — see [Batched accumulators pack along columns](#batched-accumulators-pack-along-columns) |
+| `tile.batch_matmul_acc` | Expand to per-batch 2D `tile.matmul_acc`, taking one window of the (already-flattened) accumulator per batch index: the **column** window `[0, b*N]` of an `[M, B*N]` tile when the chain is column-packed, the legacy **row** window `[b*M, 0]` of a `[B*M, N]` tile otherwise — see [Batched accumulators pack along columns](#batched-accumulators-pack-along-columns). Memory-space decisions the pass does not already state (Vec/Acc round-trips on a row-packed accumulator, retargetable producer promotion of an upstream `tile.create`, TileView refresh) are deferred to `InferTileMemorySpace` (pass 17) — flatten emits no inline `tile.move` |
 | Other tile ops (>2D) | Substitute vars, re-create with 2D types |
 | 1D/2D tile ops | Unchanged |
 
@@ -105,6 +105,134 @@ non-contiguous routing fires in unit tests too.
 > The per-batch V2C move case (a move-sourced operand that does not fit L1) is a
 > deferred follow-up; such an operand currently stays on the whole-slice path,
 > correct only while the moved tile fits the fixed cross-core ring.
+
+## Batched accumulators pack along columns
+
+A batched `tile.batch_matmul_acc` accumulator is the one value this pass does
+**not** flatten with the generic `[prod(leading), last]` collapse. Its pages are
+stacked along **columns** instead: one `[M, B*N]` `Acc` tile, page `b` at
+`tile.slice(acc, [M, N], [0, b*N])`.
+
+### Why rows are not an option
+
+`Acc` (L0C) is NZ-boxed: for a 4-byte accumulator element, box `(r_b, c_b)` of an
+`[M, N]` tile begins at `(c_b * M/16 + r_b) * 1024` bytes. So a **row** window of
+a tile with more than one block column is *strided* — its boxes are separated by
+the parent's row extent, not by the window's. pto-isa's MAD writes its `[m, n]`
+destination compactly from a bare pointer and carries no destination stride
+(hw-native-sys/pto-isa#253), so the row-packed `[B*M, N]` shape has no correct
+lowering at all: only the first 16 columns of each page would land right. That is
+the shape `CanonicalizeTileSlice` (pass 16) rejects; see
+[16-canonicalize_tile_slice.md](16-canonicalize_tile_slice.md).
+
+A **column** window spans the parent's full row extent, so the window's own
+compact geometry and the parent's coincide and the discarded stride cannot
+matter. `GetSliceAccumulatorGeometry` gives exactly this shape its NZ-exact byte
+offset (see [31-init_memref.md](31-init_memref.md)).
+
+### What changes on the producer
+
+`LowerBatchMatmul` used to stage a multi-batch result in **Vec** — gathering the
+pages in `Acc` would need an L0C→L0C copy, which the ISA lacks. That evacuated the
+accumulator from the only space `tile.matmul_acc` accepts. When the result roots
+an accumulator chain, the pass now allocates the packed `Acc` tile itself and
+writes page `b` with:
+
+```text
+acc_0 = tile.create([M, B*N], dtype=FP32, target_memory=Acc)
+w_b   = tile.slice(acc_b, [M, N], [0, b*N])
+m_b   = tile.matmul_acc(w_b, lhs_b, rhs_b, True)   # init_cond=True
+acc_b1 = tile.assemble(acc_b, m_b, [0, b*N])       # self-copy, elided at codegen
+```
+
+`init_cond=True` needs no new operator: a literal predicate folds to the
+**non-accumulating** arm, so this emits a plain `pto.tmatmul ins(lhs, rhs)
+outs(window)`. That is how a matmul reaches a sub-region even though `tile.matmul`
+has no destination operand. The `tile.assemble` writeback exists only to thread
+SSA; codegen recognises it as a self-copy of the same window and emits nothing —
+which is required, not merely an optimisation, since an `Acc` destination has no
+legal `tmov`. **The offset tuple is therefore built once and passed to both the
+slice and the assemble**: codegen matches the two subviews by their emitted SSA
+names, so a rebuilt (equal-valued) offset would emit an illegal L0C→L0C move.
+
+Direct-store fusion is suppressed for such a result: fusing it into the next
+`tile.store` would consume a statement the chain still needs.
+
+### What changes on the drain
+
+An `[M, B*N]` tile is not the row-major collapse of a `[B, M, N]` output window,
+so a single whole-tile `tile.store` would write garbage with nothing downstream
+able to notice. The `tile.store` of a packed accumulator becomes **one store per
+page**, straight out of L0C:
+
+```text
+d_b  = tile.slice(acc, [M, N], [0, b*N])
+out  = tile.store(d_b, [b, 0, 0], out, [1, M, N])
+```
+
+No Vec staging and no `tile.move`: a store whose source is an `Acc` tile is
+classified CUBE, so it stays on the cube lane and `ExpandMixedKernel`'s AIC→AIV
+boundary is not involved. (That boundary — the `Acc`→Vec move — is untouched on
+every *non*-accumulator `tile.batch_matmul`, which still stages through Vec.)
+
+### When a chain is packed
+
+The decision is made once for the whole function, before any rewriting
+(`acc_packing.cpp`), because a chain routinely spans blocks: the `tile.create`
+sits outside the K loop, the `tile.batch_matmul_acc` inside it, the `tile.store`
+after it. The rewrite loop's own pre-scan is per-block and cannot see that.
+
+A *chain* is a connected component of the same-buffer alias graph — the
+`tile.batch_matmul_acc` in-place edge, plain SSA aliases, loop `iter_arg` /
+`yield` / `return_var` carries, and `IfStmt` merges. It is packed only when
+**every** member is produced and consumed by a form the pass rewrites page-wise
+(a `tile.create` or `tile.batch_matmul` root, `tile.batch_matmul_acc`, a carry, or
+a `tile.store` drain) and the geometry is one L0C can address:
+
+| Requirement | Why |
+| ----------- | --- |
+| `M % 16 == 0` and `N % 16 == 0` | Both parent extents must be whole 16×16 boxes, and the page's column origin `b*N` must be box-aligned, or `GetSliceAccumulatorGeometry` declines and `InitMemRef` silently falls back to row-major arithmetic |
+| 4-byte accumulator element (FP32 / INT32) | A 16×16 box is `kAccFractal` (1024) bytes only at 4 bytes per element |
+| `B*M*N*4` fits `Acc` | Read from the backend (`GetMemSize(Acc)`), not hard-coded — L0C is 128 KB on Ascend910B and 256 KB on 950 |
+| no partial `valid_shape` | Page `b`'s valid region starts at `b*N` but is only `N_valid` wide; the packed parent has no single valid rectangle to describe that |
+| `batch_count > 1` | At `B == 1` both packings are the same `[M, N]` tile, so the existing fast paths are byte-identical and stay untouched |
+
+A chain that fails any of these keeps the legacy row-packed lowering — which is
+still correct when a page is at most 16 columns wide, since it then fits a single
+L0C block column that `CanonicalizeTileSlice` whitelists. Note `M % 16 == 0` is
+*stricter* than what row packing needs (`B*M % 16 == 0`), so e.g. `M = 8, B = 2,
+N = 16` deliberately falls back.
+
+Three further conditions defeat the row-packed fallback as well, so a chain that
+hits one is rejected at **any** page width, 16 included:
+
+| Condition | Why row packing cannot rescue it |
+| --------- | -------------------------------- |
+| more than one allocating definition in the chain (e.g. `if k == 0: acc = matmul(...) else: acc = matmul_acc(acc, ...)`, or a loop body that re-creates the accumulator) | The two buffers meet at a control-flow merge, and coalescing them needs an L0C→L0C copy the ISA does not have. Left alone, the program reaches `MemoryReuse`'s `YieldFixup` twenty passes later and dies with an *internal* error |
+| a definition that cannot write `Acc` at all (e.g. `tile.load`) | Batch-independent — the same accumulator fails identically at `B == 1` |
+| a `tile.move` drain at `N > 16` | Splitting the move page-wise is easy, but gathering the pages is not: a moved page keeps L0C's `col_major`/1024 block layout and `tile.assemble` cannot write it into the `row_major` vector tile the `[B*M, N]` collapse expects. **Not** an accumulator-specific limit — a plain `batch > 1` `tile.batch_matmul` followed by any vector op fails at the same check (`pto_ops_shared.cpp`, "blayout mismatch between source and result"), which is why nothing is packed for it |
+
+Each of these gets its own diagnostic and its own remedy; the column-packing
+rationale is deliberately **not** printed for them, since none is about page
+geometry.
+
+Anything else — a wider page that cannot be column-packed, or one whose producer
+would have to stage through Vec — is **rejected here** with a diagnostic naming
+the DSL workaround, rather than emitted with an address that would silently fall
+back to row-major:
+
+```text
+tile.batch_matmul_acc: cannot lower a batch-2 accumulator of 16x24 FP32 pages,
+because the page column extent N=24 is not a multiple of 16.
+The pages of a batched accumulator have to be packed along COLUMNS — one 16x48
+Acc (L0C) tile with page b at tile.slice(acc, [16, 24], [0, b * 24]) — because
+the hardware MAD writes its destination compactly and has no destination stride
+...
+Workarounds: write the batch loop out in the kernel and accumulate each page
+into its own 2-D tile (pl.matmul / pl.matmul_acc on 2-D operands); or keep the
+accumulator at most 16 columns wide, which fits a single L0C block column and
+needs no packing.
+```
 
 ## Example
 
@@ -188,6 +316,7 @@ The implementation is split by responsibility:
 | Analysis | `src/ir/transforms/flatten_tile_nd_to_2d/analysis.cpp` | Read-only precondition validation |
 | Rewrite orchestration | `src/ir/transforms/flatten_tile_nd_to_2d/rewrite.cpp` | Recursive statement traversal and operation dispatch |
 | Rewrite utilities | `src/ir/transforms/flatten_tile_nd_to_2d/rewrite_utils.cpp` | Shared shape, index, and capacity helpers |
+| Accumulator packing | `src/ir/transforms/flatten_tile_nd_to_2d/acc_packing.cpp` | Whole-function decision of which batched `Acc` accumulator chains pack along columns |
 | Batched matmul rewrite | `src/ir/transforms/flatten_tile_nd_to_2d/batch_matmul.cpp` | Batched matmul and matmul-acc page lowering |
 | Transpose rewrite | `src/ir/transforms/flatten_tile_nd_to_2d/transpose.cpp` | Standalone N-D transpose lowering |
 | Verification | `src/ir/transforms/flatten_tile_nd_to_2d/verification.cpp` | Independent `TileOps2D` postcondition verification |

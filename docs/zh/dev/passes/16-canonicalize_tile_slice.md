@@ -197,6 +197,93 @@ stride，于是第一个列 block 之后的每个列 block 都会落到错误的
 该检查以算子注册表的 `set_output_reuses_input` 为作用域，因此无需逐一列举即可覆盖
 `tile.matmul_acc` / `tile.gemv_acc` / `tile.matmul_mx_acc`。对于无法证明的情况它
 保持静默：符号化的 extent、非 `Acc` 布局，或无法证明落在单个 block 内的动态列偏移。
+无论该算子是绑定到结果（`acc = pl.tile.matmul_acc(...)`）还是写成裸语句
+（`pl.tile.matmul_acc(...)`），检查都同样生效。
+
+### 把累加器操作数解析回它所指的窗口
+
+累加器操作数很少就是 `tile.slice` 的结果 Var 本身。把 slice 提到 K 循环之外——这是
+最自然的写法，因为窗口不随 K 步变化——会让循环体内的操作数变成一个 `IterArg`，它与
+slice 结果是不同的 Var；保持形状的 `tile.reshape` 则是同一段字节的另一个 SSA 名字。
+因此本 pass 记录的是**每个 Var 指向哪个窗口**，而不仅仅是"这个 Var 是不是 slice"，
+检查时按操作数在该映射中查表。
+
+一个 Var 会沿下列**保持标识**的边继承另一个 Var 的窗口；这些边都在收集 slice 的那
+一次程序序遍历中一并记录：
+
+| 边 | 窗口来源 |
+| -- | -------- |
+| `v = tile.slice(src, shape, offset)` | 窗口本身（种子）；链式 slice 会被剥离并累加偏移 |
+| `v = w`（普通 SSA 别名） | `w` 的窗口 |
+| `v = <op>(src, ...)`，且该 op 的输出落在某个源操作数的存储上 | 该源操作数的窗口。这一关系来自注册表（`OutputMemoryInheritsInput() && IsInplaceSafe()`，或 `set_output_reuses_input`），而非硬编码的 op 列表——因此 `tile.reshape` / `tile.set_validshape` 以及链式 `tile.matmul_acc` 都被覆盖，而写入**新缓冲区**的 `tile.transpose` 和 `tile.extract` 被排除在外 |
+| 循环 `IterArg` | 其**初值**的窗口（`ForStmt` / `WhileStmt`） |
+| `ForStmt` / `WhileStmt` 的 `return_vars_[i]` | 循环体末尾 `pl.yield_` 为 `iter_args_[i]` 给出的窗口——**仅当它与初值指向同一窗口时**，即典型的循环携带。零次迭代的循环返回的是初值，因此绑定其他窗口就等于宣称一个某条路径并不指向的窗口 |
+| `IfStmt::return_vars_[i]` | 两个分支 yield 的窗口，且可证明两者**相同**（同一父 Var、偏移相等） |
+
+只有当两端**可证明描述同一窗口 extent** 时才记录该边——相同的 rank、相同的 dtype，
+且每一维都是取值相同的编译期常量。"输出落在源的存储上"说明两个 Var 指向同一段**字
+节**；extent 判定则说明检查从操作数自身 `TileType` 读到的形状仍是这段字节构成的窗口
+extent。两者合起来构成证明；任何无法证明的情况都不记录——即保持原有的静默，而不是
+猜测：
+
+- **改变形状**的 `tile.reshape` 不满足该判定，因此改形后的 extent 绝不会被拿来与父
+  tile 的行数比较；
+- `tile.reinterpret_view` 在 dtype 上不满足——16 列 block 的运算假定累加器元素为
+  4 字节；
+- `tile.transpose_view` 交换末两维 extent，因此对任何非方形窗口都不满足。**方形**窗
+  口会通过，且无害：转置视图覆盖完全相同的字节、行列 extent 也完全相同，两条接受规
+  则给出的结论与未转置时一致；
+- 符号化 extent 不满足该判定，这与检查本身拒绝对符号化形状做推理是一致的。
+
+内存空间刻意不参与比较：结论来自**父** tile 的内存空间与操作数的 extent，从不依赖操
+作数自身的内存空间——而这些 tile 视图算子推导出的结果类型本就会把它留空，交给
+`InferTileMemorySpace` 后续填写。
+
+#### 循环回边是被检查，而不是被记录
+
+被循环携带的累加器指向两个窗口：第 0 次迭代是初值的窗口，此后每一次迭代都是循环体
+末尾 `pl.yield_` 所指的窗口。一个 Var 无法被记录为同时指向两个窗口，而记录其中任何
+一个都会让另一次迭代的目的地变得不可见——因此对 yield 的窗口改为按同一规则做**检
+查**，目的地的 extent 取自 `IterArg`（循环赋予该携带值的类型）。
+
+三个条件保证它不会误拒：
+
+- 只对循环体真正当作累加器**目的地**使用的携带值生效，因此只被读取的携带值绝不会因
+  为一个 MAD 从不写入的形状而被拒绝；
+- 只在循环**可证明执行超过一次**时生效——`start` / `stop` / `step` 均为常量且
+  `start + step < stop`。只执行一次的循环永远不会走回边；符号化的迭代次数以及所有
+  `while` 都算作无法证明，保持静默；
+- 它只做检查、从不建立绑定，因此映射保持无环：无需不动点迭代，遍历仍是一次前向扫描。
+
+典型的循环携带（`yield matmul_acc(iter_arg, ...)`）会直接解析回初值的窗口，因此这一
+检查得到的结论与循环体内已经通过的结论相同，对流水线生成的形状没有任何额外代价。
+
+**已知边界——全部表现为静默，绝不会产生误拒：**
+
+- **无法证明的迭代次数会让回边不被检查。** 符号化的循环上界或 `while` 无法证明会走
+  回边，因此若某个携带值的 yield 指向比初值更糟的窗口，在那里不会被检查到。
+- **两个分支指向**不同**窗口的 if 合并不会被绑定。** 绑定其中任何一个都会做出另一条
+  路径否定的断言——而该映射同时还服务于链式 slice 的偏移运算，错误的绑定可能改变某
+  个无关 slice 的结论。
+- **跨函数的路径不在覆盖范围内。** 这是一个 function pass，因此作为 InCore 函数参数
+  传入的窗口不携带窗口信息。
+
+### 被拒绝的窗口未必出现在 kernel 源码中
+
+编译器生成的窗口可能在 kernel 源码中根本没有对应的 `tile.slice` 却触发本检查，因此
+诊断信息不能假定作者可以去修改它所指的那个 slice。
+
+`FlattenTileNdTo2D` 过去是这类窗口的主要来源：它展开 `tile.batch_matmul_acc` 时把
+累加器的各个 batch page **沿行**堆叠，并为每个 batch 切出一页
+（`acc_page_i = tile.slice(acc, [M, N], [i * M, 0])`），当 `N > 16` 时这正是被拒绝的
+形状。该下降路径已被移除——现在各页**沿列**打包
+（`acc_page_i = tile.slice(acc, [M, N], [0, i * N])`），即被接受的"覆盖全部行范围"的
+形状；无法按列打包的形状由它自己报错，并给出 DSL 侧的规避方式。参见
+[批量累加器按列打包](13-flatten_tile_nd_to_2d.md#批量累加器按列打包)。
+
+窄于等于 16 列的页仍保留旧的行打包形式，而本 pass 把这种窗口作为"单块列"放行，因此
+行窗口依然会到达本检查——只是不再是本 pass 会拒绝的那一种。因此该拒绝规则保持原样：
+它是防止未来某个 pass 再次引入跨步累加器目的地的兜底，收窄它就会放过一次静默算错。
 
 这是针对上游缺陷（[hw-native-sys/pto-isa#253](https://github.com/hw-native-sys/pto-isa/issues/253)）
 的规避，而不是 DSL 的固有属性——`TMATMUL_ACC_IMPL` 把目的地退化为裸 `.data()`
@@ -224,7 +311,7 @@ stride，应放宽或删除该拒绝，而不是把它保留为长期规则。
 | 喂给普通 call、继承地址可证明按 32 字节对齐的 Vec `tile.slice` | 保持原样；继续使用零拷贝 subview |
 | 链式 Mat `tile.slice`（slice 的 slice） | 剥离；累加偏移 |
 | 带 `valid_shape` / `drop_dims` 的 `tile.slice` | 跳过（不是普通窗口）。若这样的 slice 同时不满足上述任一恒等拷贝条件——动态偏移（例如降秩的 `t[i]`）或非连续窗口——并喂给 col-expand op，codegen 会以 `INTERNAL_CHECK` 直接报错，而不是生成会破坏源 tile 的代码。上面的 Acc 累加器检查对这类 slice 仍然生效：它只需要物理基址和偏移，而这些信息对每个窗口都会记录，与是否可规范化无关 |
-| 用作 matmul **累加器**、且窗口既不覆盖父 tile 全部行范围、也不落在单个 16 列 block 内的 `Acc` `tile.slice` | **拒绝**并抛出 `ValueError`，错误信息给出切列的写法——MAD 没有目的地 stride，该写入会静默落到错误的行 tile 上（pto-isa#253） |
+| 用作 matmul **累加器**、且窗口既不覆盖父 tile 全部行范围、也不落在单个 16 列 block 内的 `Acc` `tile.slice` | **拒绝**并抛出 `ValueError`，错误信息给出切列的写法——MAD 没有目的地 stride，该写入会静默落到错误的行 tile 上（pto-isa#253）。操作数不必**就是**该 slice：循环 `IterArg` 携带、普通 SSA 别名，或保持形状的视图 / 原地算子都会被解析回同一窗口（见"把累加器操作数解析回它所指的窗口"） |
 | 其他位于 Left/Right/Acc 的 `tile.slice`，含**连续**的 Acc 累加器窗口 | 不处理（无匹配的消费者） |
 | 不含规范 `tile.slice` 的 function | 原样返回 |
 

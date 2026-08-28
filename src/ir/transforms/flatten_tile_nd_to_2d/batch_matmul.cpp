@@ -550,8 +550,16 @@ BatchMatmulResult LowerBatchMatmul(const AssignStmtPtr& assign, const CallPtr& c
       << "Internal error: tile.batch_matmul inner dimensions must match, but got " << lhs_cols << " and "
       << rhs_rows;
 
+  // A result that roots a column-packed accumulator chain is consumed by a
+  // downstream tile.batch_matmul_acc, so it must stay a live Acc tile: fusing it
+  // into the next tile.store would consume a statement the chain still needs and
+  // leave the accumulator undefined. Its drain is emitted per page by the
+  // tile.store branch in rewrite.cpp instead.
+  const AccPackingPlan* acc_plan = ctx.AccPackingForVar(assign->var_);
+
   // Detect direct-store fusion opportunity.
-  auto direct_store = DetectDirectStore(stmts, stmt_index, assign->var_);
+  auto direct_store =
+      acc_plan != nullptr ? DirectStoreInfo{} : DetectDirectStore(stmts, stmt_index, assign->var_);
 
   // Fast path: batch_count == 1, non-fused, and no dtype cast required. The
   // result tile is exactly what a single tile.matmul produces (2D, Acc). Skip
@@ -567,7 +575,7 @@ BatchMatmulResult LowerBatchMatmul(const AssignStmtPtr& assign, const CallPtr& c
   // would leak the wider accumulator dtype (e.g. fp32/int32) instead of the
   // expected output dtype, and the cast must be inserted in Vec memory by the
   // general path below.
-  if (batch_count == 1 && !direct_store.detected) {
+  if (batch_count == 1 && !direct_store.detected && acc_plan == nullptr) {
     auto output_batch_indices = BuildBatchIndices(0, output_batch_dims);
     int64_t lhs_batch_idx =
         BuildOperandFlatBatchIndex(lhs_batch_dims, output_batch_dims, output_batch_indices);
@@ -591,6 +599,77 @@ BatchMatmulResult LowerBatchMatmul(const AssignStmtPtr& assign, const CallPtr& c
     }
     // Discard the speculative pages and matmul (no out.stmts modification yet);
     // fall through to the general path which inserts the required tile.cast.
+  }
+
+  // Column-packed batched accumulator: this matmul's result IS the accumulator a
+  // downstream tile.batch_matmul_acc keeps writing, so it has to stay in Acc.
+  // Allocate ONE [M, B*N] Acc tile and write page b straight into a column
+  // window with tile.matmul_acc(window, lhs_b, rhs_b, init_cond=True) — a
+  // literal predicate folds to a plain non-accumulating `pto.tmatmul` writing
+  // INTO the window (src/backend/common/pto_ops_elementwise.cpp), which is how a
+  // matmul reaches a sub-region at all, since tile.matmul has no destination
+  // operand.
+  //
+  // This is the one batch_matmul path that must NOT stage through Vec. The
+  // Acc->Vec move below stays for every other multi-batch matmul, where
+  // ExpandMixedKernel relies on it to see the AIC->AIV boundary; here it would
+  // evacuate the result from the only memory space tile.matmul_acc accepts.
+  if (acc_plan != nullptr) {
+    INTERNAL_CHECK_SPAN(acc_plan->batch_count == batch_count && acc_plan->rows == lhs_rows &&
+                            acc_plan->cols == rhs_cols && acc_plan->dtype == orig_result_type->dtype_,
+                        span)
+        << "Internal error: the column-packed accumulator plan (" << acc_plan->batch_count << " x "
+        << acc_plan->rows << "x" << acc_plan->cols << ") disagrees with the tile.batch_matmul rooting it ("
+        << batch_count << " x " << lhs_rows << "x" << rhs_cols << ")";
+
+    auto packed_shape = std::make_shared<MakeTuple>(
+        Make2DShapeExprs(acc_plan->rows, batch_count * acc_plan->cols, span), span);
+    std::vector<std::pair<std::string, std::any>> packed_kw = {
+        {"dtype", acc_plan->dtype},
+        {"target_memory", MemorySpace::Acc},
+    };
+    auto create_acc = op_registry.Create("tile.create", {packed_shape}, packed_kw, span);
+    VarPtr current_acc = std::make_shared<Var>(assign->var_->name_hint_, create_acc->GetType(), span);
+    out.stmts.push_back(std::make_shared<AssignStmt>(current_acc, create_acc, assign->span_));
+
+    for (int64_t i = 0; i < batch_count; ++i) {
+      auto output_batch_indices = BuildBatchIndices(i, output_batch_dims);
+      int64_t lhs_batch_idx =
+          BuildOperandFlatBatchIndex(lhs_batch_dims, output_batch_dims, output_batch_indices);
+      int64_t rhs_batch_idx =
+          BuildOperandFlatBatchIndex(rhs_batch_dims, output_batch_dims, output_batch_indices);
+
+      auto lhs_page = ExtractBatchPage(lhs_info, lhs_dims, lhs_batch_dims, lhs_batch_idx, "lhs", ctx,
+                                       op_registry, span, assign->span_);
+      auto rhs_page = ExtractBatchPage(rhs_info, rhs_dims, rhs_batch_dims, rhs_batch_idx, "rhs", ctx,
+                                       op_registry, span, assign->span_);
+      out.stmts.insert(out.stmts.end(), lhs_page.stmts.begin(), lhs_page.stmts.end());
+      out.stmts.insert(out.stmts.end(), rhs_page.stmts.begin(), rhs_page.stmts.end());
+
+      const std::string suffix = std::to_string(i);
+      // ONE offset node, shared by the window and its writeback. Codegen elides
+      // the self-copy by comparing the two subviews' EMITTED SSA names, so
+      // rebuilding an equal-valued offset would emit an L0C->L0C `pto.tmov` the
+      // ISA has no instruction for (src/backend/common/pto_ops_datamove.cpp).
+      auto acc_offset = MakeShapeTupleFromInts({0, i * acc_plan->cols}, span);
+      auto acc_shape = MakeShapeTupleFromInts({acc_plan->rows, acc_plan->cols}, span);
+      auto acc_slice = op_registry.Create("tile.slice", {current_acc, acc_shape, acc_offset}, span);
+      auto acc_page_var = std::make_shared<Var>("acc_page_" + suffix, acc_slice->GetType(), span);
+      out.stmts.push_back(std::make_shared<AssignStmt>(acc_page_var, acc_slice, assign->span_));
+
+      auto init_true = std::make_shared<ConstBool>(true, span);
+      auto matmul =
+          op_registry.Create("tile.matmul_acc", {acc_page_var, lhs_page.var, rhs_page.var, init_true}, span);
+      auto matmul_var = std::make_shared<Var>("matmul_" + suffix, matmul->GetType(), span);
+      out.stmts.push_back(std::make_shared<AssignStmt>(matmul_var, matmul, assign->span_));
+
+      auto assemble = op_registry.Create("tile.assemble", {current_acc, matmul_var, acc_offset}, span);
+      current_acc = std::make_shared<Var>(current_acc->name_hint_, assemble->GetType(), span);
+      out.stmts.push_back(std::make_shared<AssignStmt>(current_acc, assemble, assign->span_));
+    }
+
+    out.output_var = current_acc;
+    return out;
   }
 
   // Allocate output tile (non-fused path only).
@@ -745,9 +824,19 @@ BatchMatmulResult LowerBatchMatmul(const AssignStmtPtr& assign, const CallPtr& c
 //   acc[..., M, N] += lhs[..., M, K] @ rhs[..., K, N]   (with batch broadcast)
 //
 // The 2D backend only supports tile.matmul_acc on rank-2 tiles. After earlier
-// flattening (which has already turned the original ND acc into its flat 2D form
-// [batch_count*M, N]), this lowering unrolls the batch dim into a sequence of
-// per-batch tile.matmul_acc calls writing into the corresponding row-band of acc.
+// flattening the original ND acc is already a flat 2D tile, and this lowering
+// unrolls the batch dim into per-batch tile.matmul_acc calls writing one window
+// of it. WHICH window depends on how the accumulator was packed:
+//
+//   * COLUMN-packed (the default for a real batch, decided once per chain by
+//     BuildAccPackingMap): the flat acc is [M, B*N] and page b is the column
+//     window [0, b*N]. A column window spans the parent's full row extent, so
+//     its compact geometry and the parent's coincide -- which is what makes it a
+//     legal MAD destination on L0C, where the hardware carries no destination
+//     stride.
+//   * ROW-packed (the legacy shape, kept only for pages at most 16 columns wide,
+//     which fit one L0C block column): the flat acc is [B*M, N] and page b is
+//     the row window [b*M, 0].
 //
 // Direct-store fusion is intentionally not applied here — the canonical use is
 // "y_acc = matmul; for k: y_acc = matmul_acc(y_acc, ...); store(y_acc)" where
@@ -778,9 +867,13 @@ BatchMatmulAccResult LowerBatchMatmulAcc(const AssignStmtPtr& assign, const Call
       << "FlattenTileNdTo2D: tile.batch_matmul_acc expects acc to be 2D after flatten, got rank "
       << acc_type->shape_.size();
 
+  // How this accumulator's pages are laid out in the flat tile. Keyed on the
+  // PRE-substitution operand, which is what BuildAccPackingMap walked.
+  const AccPackingPlan* acc_plan = ctx.AccPackingFor(call->args_[0]);
+
   // The optional init_cond predicate is loop-invariant across the batch unroll:
-  // each emitted tile.matmul_acc is the sole writer of its own row band of acc,
-  // so "overwrite instead of accumulate" applies band by band. Forward it
+  // each emitted tile.matmul_acc is the sole writer of its own window of acc, so
+  // "overwrite instead of accumulate" applies window by window. Forward it
   // verbatim rather than dropping it — a silently dropped predicate would
   // accumulate into an uninitialized accumulator on the k == 0 step.
   const ExprPtr init_cond = call->args_.size() == 4 ? Substitute(call->args_[3], ctx.var_map) : nullptr;
@@ -836,16 +929,34 @@ BatchMatmulAccResult LowerBatchMatmulAcc(const AssignStmtPtr& assign, const Call
       << "Internal error: tile.batch_matmul_acc inner dimensions must match, got " << lhs_cols << " and "
       << rhs_rows;
 
-  // Sanity check on flat acc shape: should be [batch_count*M, N].
+  // Sanity check on the flat acc shape: [M, batch_count*N] when column-packed,
+  // [batch_count*M, N] on the legacy row-packed path.
   auto acc_rows_const = As<ConstInt>(acc_type->shape_[0]);
   auto acc_cols_const = As<ConstInt>(acc_type->shape_[1]);
   CHECK(acc_rows_const && acc_cols_const)
       << "FlattenTileNdTo2D: tile.batch_matmul_acc expects static acc dims after flatten";
-  CHECK(acc_rows_const->value_ == batch_count * lhs_rows)
-      << "FlattenTileNdTo2D: tile.batch_matmul_acc acc rows " << acc_rows_const->value_ << " != batch_count("
-      << batch_count << ") * M(" << lhs_rows << ")";
-  CHECK(acc_cols_const->value_ == rhs_cols) << "FlattenTileNdTo2D: tile.batch_matmul_acc acc cols "
-                                            << acc_cols_const->value_ << " != N(" << rhs_cols << ")";
+  const int64_t expected_acc_rows = acc_plan != nullptr ? lhs_rows : batch_count * lhs_rows;
+  const int64_t expected_acc_cols = acc_plan != nullptr ? batch_count * rhs_cols : rhs_cols;
+  // Both are pass invariants, not user errors: the flat acc shape was chosen by
+  // this pass's own tile.create branch from the very AccPackingPlan read back
+  // here, and a genuine user shape mismatch is already rejected at op
+  // construction by DeduceTileBatchMatMulAccType. They stay load-bearing —
+  // without them a missed AccPackingFor lookup would silently emit row offsets
+  // onto a column-packed tile — but a failure is a compiler bug, so it must
+  // read as one and carry the IR location.
+  INTERNAL_CHECK_SPAN(acc_rows_const->value_ == expected_acc_rows, span)
+      << "Internal error: FlattenTileNdTo2D tile.batch_matmul_acc acc rows " << acc_rows_const->value_
+      << " != " << expected_acc_rows << " (batch_count=" << batch_count << ", M=" << lhs_rows
+      << ", packing=" << (acc_plan != nullptr ? "column" : "row") << ")";
+  INTERNAL_CHECK_SPAN(acc_cols_const->value_ == expected_acc_cols, span)
+      << "Internal error: FlattenTileNdTo2D tile.batch_matmul_acc acc cols " << acc_cols_const->value_
+      << " != " << expected_acc_cols << " (batch_count=" << batch_count << ", N=" << rhs_cols
+      << ", packing=" << (acc_plan != nullptr ? "column" : "row") << ")";
+  if (acc_plan != nullptr) {
+    INTERNAL_CHECK_SPAN(acc_plan->batch_count == batch_count, span)
+        << "Internal error: the column-packed accumulator plan carries batch_count " << acc_plan->batch_count
+        << " but this tile.batch_matmul_acc unrolls " << batch_count;
+  }
 
   // Memory-space concerns (Vec/Acc round-trips on the acc operand, retargetable
   // producer promotion of the loop-carried tile.create, and matching TileView
@@ -909,7 +1020,16 @@ BatchMatmulAccResult LowerBatchMatmulAcc(const AssignStmtPtr& assign, const Call
     out.stmts.insert(out.stmts.end(), rhs_page.stmts.begin(), rhs_page.stmts.end());
 
     auto suffix = std::to_string(i);
-    auto acc_offset = MakeShapeTupleFromInts({i * lhs_rows, 0}, span);
+    // Column-packed: page b is the FULL-row-extent window at [0, b*N], the shape
+    // GetSliceAccumulatorGeometry can address exactly in L0C's NZ layout and the
+    // one CanonicalizeTileSlice accepts as a MAD destination. Row-packed (only
+    // reachable for N <= 16, one L0C block column) keeps the legacy [b*M, 0].
+    //
+    // Built ONCE and passed to both the tile.slice and its tile.assemble
+    // writeback: codegen elides that self-copy by comparing the two subviews'
+    // emitted SSA names, and an L0C->L0C copy has no instruction to fall back on.
+    auto acc_offset = acc_plan != nullptr ? MakeShapeTupleFromInts({0, i * rhs_cols}, span)
+                                          : MakeShapeTupleFromInts({i * lhs_rows, 0}, span);
     auto acc_shape = MakeShapeTupleFromInts({lhs_rows, rhs_cols}, span);
     auto acc_slice = op_registry.Create("tile.slice", {current_acc, acc_shape, acc_offset}, span);
     auto acc_page_var = std::make_shared<Var>("acc_page_" + suffix, acc_slice->GetType(), span);

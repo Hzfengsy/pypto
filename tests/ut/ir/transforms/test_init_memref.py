@@ -206,6 +206,13 @@ class TestBasic:
         The root [32,128] owns 16 KiB. Its [16,128] slice at row 16 starts at
         byte 8192 and spans the remaining 8192 bytes; treating the view like a
         fresh 32-row allocation would incorrectly record [8192,24576).
+
+        This is a *row* window, so it keeps the row-major-dense arithmetic: it
+        narrows the parent's row extent, and a narrowed L0C window has no correct
+        standalone base address at all (its box columns are strided by the
+        parent's row count, its own descriptor's by its own). The NZ path
+        deliberately declines it rather than swapping one wrong number for
+        another — see `GetSliceAccumulatorGeometry`.
         """
         _backend.reset_for_testing()
         _backend.set_backend_type(BackendType.Ascend910B)
@@ -612,6 +619,250 @@ class TestSliceView:
 
         with pytest.raises(ValueError, match="Packed 4-bit slice origins must be byte-aligned"):
             passes.init_mem_ref()(Before)
+
+    @staticmethod
+    def _acc_column_window_program(col_offset: int, window_cols: int = 128):
+        """A BF16 matmul producing an Acc [16, 256] FP32, sliced to one column window."""
+
+        @pl.program
+        class AccColumnWindow:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[16, 128], pl.BF16],
+                input_b: pl.Tensor[[128, 256], pl.BF16],
+                output: pl.Out[pl.Tensor[[16, window_cols], pl.FP32]],
+            ) -> pl.Tensor[[16, window_cols], pl.FP32]:
+                a_mat: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    input_a, [0, 0], [16, 128], target_memory=pl.Mem.Mat
+                )
+                b_mat: pl.Tile[[128, 256], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    input_b, [0, 0], [128, 256], target_memory=pl.Mem.Mat
+                )
+                a_l0: pl.Tile[[16, 128], pl.BF16, pl.Mem.Left] = pl.tile.move(
+                    a_mat, target_memory=pl.Mem.Left
+                )
+                b_l0: pl.Tile[[128, 256], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    b_mat, target_memory=pl.Mem.Right
+                )
+                acc: pl.Tile[[16, 256], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(a_l0, b_l0)
+                win: pl.Tile[[16, window_cols], pl.FP32, pl.Mem.Acc] = pl.tile.slice(
+                    acc, [16, window_cols], [0, col_offset]
+                )
+                output = pl.tile.store(win, [0, 0], output)
+                return output
+
+        return AccColumnWindow
+
+    def test_acc_column_window_uses_nz_box_byte_offset(self):
+        """An Acc column window is addressed in NZ boxes, not row-major elements.
+
+        L0C stores 16x16 boxes column of boxes first, so column 128 of a
+        [16, 256] FP32 accumulator is box column 8 of a 1x16 box grid and begins
+        at (8 * 16/16 + 0) * 1024 = 8192 bytes. Its boxes are consecutive, so the
+        envelope is the contiguous 8 * 1024 = 8192 bytes it actually occupies.
+
+        The row-major-dense formula would report (0 * 256 + 128) * 4 = 512 with a
+        15872-byte envelope. That number is not an L0C address: PTO rejects it
+        outright when it is not 512-aligned, and silently reads the wrong data
+        when it is (a ``tile.reshape`` stacked on this slice inherits the offset
+        without going through ``pto.subview``).
+        """
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        printed = ir.python_print(passes.init_mem_ref()(self._acc_column_window_program(128)))
+        assert "pl.tile.alloc(pl.Mem.Acc, 16384)" in printed
+        root = re.search(
+            r"acc: .*pl\.MemRef\((mem_acc_\d+), pl\.const\(0, pl\.INT64\), 16384\), pl\.Mem\.Acc",
+            printed,
+        )
+        view = re.search(
+            r"win: .*pl\.MemRef\((mem_acc_\d+), (?:8192|pl\.const\(8192, pl\.INT64\)), 8192\), "
+            r"pl\.Mem\.Acc",
+            printed,
+        )
+        assert root and view and root.group(1) == view.group(1), printed
+
+    def test_acc_zero_offset_column_window_spans_only_its_boxes(self):
+        """At offset 0 the NZ envelope still narrows to the window's own boxes.
+
+        The row-major envelope of a [16, 128] window of a [16, 256] parent runs
+        to the last element of the last row (15872 bytes) even though the window
+        physically occupies only its first 8 boxes. In NZ those boxes are
+        contiguous, so the view records 8192 — which is what makes two disjoint
+        column windows read as disjoint by lifetime/overlap analysis.
+        """
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        printed = ir.python_print(passes.init_mem_ref()(self._acc_column_window_program(0)))
+        assert re.search(
+            r"win: .*pl\.MemRef\(mem_acc_\d+, (?:0|pl\.const\(0, pl\.INT64\)), 8192\), pl\.Mem\.Acc",
+            printed,
+        ), printed
+
+    def test_two_acc_column_windows_get_disjoint_byte_ranges(self):
+        """Two halves of an Acc row are physically disjoint and must record so.
+
+        In NZ the two [16, 128] halves of a [16, 256] FP32 accumulator occupy
+        [0, 8192) and [8192, 16384) — adjacent, non-overlapping. The row-major
+        model reported [0, 15872) and [512, 16384), which overlap heavily and
+        made lifetime/overlap analysis treat two disjoint buffers as aliasing
+        (MemoryReuse rejects two such windows carried through one loop).
+        """
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[16, 128], pl.BF16],
+                input_b: pl.Tensor[[128, 256], pl.BF16],
+                out0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+                out1: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                a_mat: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    input_a, [0, 0], [16, 128], target_memory=pl.Mem.Mat
+                )
+                b_mat: pl.Tile[[128, 256], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    input_b, [0, 0], [128, 256], target_memory=pl.Mem.Mat
+                )
+                a_l0: pl.Tile[[16, 128], pl.BF16, pl.Mem.Left] = pl.tile.move(
+                    a_mat, target_memory=pl.Mem.Left
+                )
+                b_l0: pl.Tile[[128, 256], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    b_mat, target_memory=pl.Mem.Right
+                )
+                acc: pl.Tile[[16, 256], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(a_l0, b_l0)
+                w0: pl.Tile[[16, 128], pl.FP32, pl.Mem.Acc] = pl.tile.slice(acc, [16, 128], [0, 0])
+                w1: pl.Tile[[16, 128], pl.FP32, pl.Mem.Acc] = pl.tile.slice(acc, [16, 128], [0, 128])
+                r0: pl.Tensor[[16, 128], pl.FP32] = pl.tile.store(w0, [0, 0], out0)
+                _r1: pl.Tensor[[16, 128], pl.FP32] = pl.tile.store(w1, [0, 0], out1)
+                return r0
+
+        printed = ir.python_print(passes.init_mem_ref()(Before))
+        ranges = {}
+        for name in ("w0", "w1"):
+            match = re.search(
+                rf"{name}: .*pl\.MemRef\(mem_acc_\d+, (?:pl\.const\()?(\d+)(?:, pl\.INT64\))?, (\d+)\), "
+                r"pl\.Mem\.Acc",
+                printed,
+            )
+            assert match, f"{name} MemRef not found in:\n{printed}"
+            start = int(match.group(1))
+            ranges[name] = (start, start + int(match.group(2)))
+
+        assert ranges["w0"] == (0, 8192), printed
+        assert ranges["w1"] == (8192, 16384), printed
+        assert ranges["w0"][1] <= ranges["w1"][0], f"windows overlap: {ranges}"
+
+    def test_acc_sub_box_column_origin_keeps_row_major_offset(self):
+        """A column origin inside a 16x16 box stays on the row-major arithmetic.
+
+        The NZ form ``c * rows`` only describes a whole box column, so an origin
+        at column 8 is outside what it can express. It must NOT become an error
+        here: CanonicalizeTileSlice explicitly whitelists exactly this window as a
+        legal MAD destination (it lies entirely inside box column 0, so there is
+        no second box column for the MAD's compact write to mis-stride), and on
+        that path the slice lowers to ``pto.subview`` and this byte offset is
+        dead. So the guard declines and the pre-existing row-major numbers stand:
+        (0 * 256 + 8) * 4 = 32, envelope (15 * 256 + 15 + 1) * 4 = 15424.
+        """
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        printed = ir.python_print(passes.init_mem_ref()(self._acc_column_window_program(8, window_cols=16)))
+        assert re.search(
+            r"win: .*pl\.MemRef\(mem_acc_\d+, (?:32|pl\.const\(32, pl\.INT64\)), 15424\), pl\.Mem\.Acc",
+            printed,
+        ), printed
+
+    def test_acc_dynamic_column_origin_uses_nz_stride(self):
+        """A run-time column origin is scaled by the NZ stride, not the row pitch.
+
+        This is the shape the split-K accumulator window actually has in
+        ``tests/st/runtime/ops/test_matmul_acc_init_cond.py``:
+        ``pl.tile.slice(acc, [M, NT], [0, t * NT])``. Nothing static can be
+        checked, so the guard admits it on the strength of PTO lowering the very
+        same linear form at run time: one logical column step is ``rows`` physical
+        elements, giving ``t * 64 * 16 * 4``. The row-major model would emit
+        ``t * 64 * 256 * 4`` — a different address for every non-zero ``t``.
+        """
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[16, 128], pl.BF16],
+                input_b: pl.Tensor[[128, 256], pl.BF16],
+                output: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+            ) -> pl.Tensor[[16, 256], pl.FP32]:
+                a_mat: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    input_a, [0, 0], [16, 128], target_memory=pl.Mem.Mat
+                )
+                b_mat: pl.Tile[[128, 256], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    input_b, [0, 0], [128, 256], target_memory=pl.Mem.Mat
+                )
+                a_l0: pl.Tile[[16, 128], pl.BF16, pl.Mem.Left] = pl.tile.move(
+                    a_mat, target_memory=pl.Mem.Left
+                )
+                b_l0: pl.Tile[[128, 256], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    b_mat, target_memory=pl.Mem.Right
+                )
+                acc: pl.Tile[[16, 256], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(a_l0, b_l0)
+                for t in pl.range(4):
+                    win: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.slice(acc, [16, 64], [0, t * 64])
+                    _sq: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.mul(win, win)
+                output = pl.tile.store(acc, [0, 0], output)
+                return output
+
+        printed = ir.python_print(passes.init_mem_ref()(Before))
+        assert re.search(
+            r"win: .*pl\.MemRef\(mem_acc_\d+, t \* 64 \* 16 \* 4, 4096\), pl\.Mem\.Acc",
+            printed,
+        ), printed
+        assert "* 64 * 256 * 4" not in printed, printed
+
+    def test_vec_column_window_keeps_row_major_byte_offset(self):
+        """The NZ path is Acc-only: a Vec parent keeps its row-major arithmetic.
+
+        Same [16, 256] FP32 shape and same [16, 128] column window as the Acc
+        cases above, but ``Mem.Vec`` is ``none_box`` row-major dense, so the
+        offset stays (0 * 256 + 128) * 4 = 512 and the envelope stays the
+        row-major 15872 bytes.
+        """
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[16, 256], pl.FP32],
+                output: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                tile_a: pl.Tile[[16, 256], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                    input_a, [0, 0], [16, 256], target_memory=pl.Mem.Vec
+                )
+                win: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Vec] = pl.tile.slice(
+                    tile_a, [16, 128], [0, 128]
+                )
+                return pl.store(win, [0, 0], output)
+
+        printed = ir.python_print(passes.init_mem_ref()(Before))
+        assert "pl.tile.alloc(pl.Mem.Vec, 16384)" in printed
+        assert re.search(
+            r"win: .*pl\.MemRef\(mem_vec_\d+, (?:512|pl\.const\(512, pl\.INT64\)), 15872\), "
+            r"pl\.Mem\.Vec",
+            printed,
+        ), printed
 
 
 class TestYieldMemRef:

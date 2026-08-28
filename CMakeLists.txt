@@ -203,6 +203,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/window_externalization/localizers.cpp
     src/ir/transforms/window_externalization/orch_rewriter.cpp
     src/ir/transforms/window_externalization/pass.cpp
+    src/ir/transforms/flatten_tile_nd_to_2d/acc_packing.cpp
     src/ir/transforms/flatten_tile_nd_to_2d/analysis.cpp
     src/ir/transforms/flatten_tile_nd_to_2d/batch_matmul.cpp
     src/ir/transforms/flatten_tile_nd_to_2d/pass.cpp

@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <any>
+#include <array>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
@@ -36,6 +37,7 @@
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/storage_size.h"
+#include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
 
@@ -400,17 +402,135 @@ inline ExprPtr MulByteOffsets(const ExprPtr& lhs, const ExprPtr& rhs) {
   return std::make_shared<Mul>(lhs, rhs, DataType::INDEX, Span::unknown());
 }
 
+/// Compute the byte offset of a slice of an NZ-boxed accumulator (L0C) tile.
+///
+/// L0C is not row-major dense: it is a grid of 16x16 boxes stored column of
+/// boxes first, so the physical element index of logical ``(r, c)`` is
+/// ``r * row_stride + c * col_stride`` with the strides from
+/// ``GetAccumulatorTileGeometry``. Applying the row-major formula here yields an
+/// address that is not merely misaligned but points at the wrong data whenever a
+/// consumer reads it (a ``tile.reshape`` stacked on the slice does exactly that,
+/// because it inherits this offset without going through ``pto.subview``).
+///
+/// Only ever reached through ``GetSliceAccumulatorGeometry``, which is what
+/// establishes that this linear form is a faithful standalone address: the
+/// window keeps the parent's full row extent, its row origin is 0, and its
+/// column origin is either a box multiple or a run-time value PTO scales by the
+/// very same stride. Read that function before widening this one.
+inline ExprPtr ComputeAccumulatorSliceByteOffset(const std::vector<ExprPtr>& offsets,
+                                                 const tile_view_semantics::AccumulatorTileGeometry& geometry,
+                                                 const DataType& dtype, const Span& span) {
+  INTERNAL_CHECK_SPAN(offsets.size() == 2, span)
+      << "Internal error: accumulator slice offset rank (" << offsets.size()
+      << ") must be 2; GetAccumulatorTileGeometry only accepts 2-D accumulators";
+
+  const std::array<int64_t, 2> strides = {geometry.row_stride, geometry.col_stride};
+
+  ExprPtr elements = MakeZeroByteOffset();
+  for (size_t i = 0; i < offsets.size(); ++i) {
+    elements = AddByteOffsets(
+        elements,
+        MulByteOffsets(offsets[i], std::make_shared<ConstInt>(strides[i], DataType::INDEX, Span::unknown())));
+  }
+
+  // GetAccumulatorTileGeometry only reports a geometry when one 16x16 box is
+  // exactly `kAccFractal` bytes, which pins the element width to 4 bytes, so the
+  // packed sub-byte handling in ComputeSliceByteOffset is genuinely unreachable
+  // from here. That makes this an internal invariant, not a user-facing one.
+  const uint64_t storage_bits = storage_size::GetStorageBitWidth(dtype);
+  INTERNAL_CHECK_SPAN(storage_bits > 0 && storage_bits % 8 == 0, span)
+      << "Internal error: accumulator dtype must have a whole-byte storage width, got " << dtype.ToString();
+  return MulByteOffsets(elements, std::make_shared<ConstInt>(static_cast<int64_t>(storage_bits / 8),
+                                                             DataType::INDEX, Span::unknown()));
+}
+
+/// Resolve the NZ box geometry a `tile.slice`'s byte offset and view span must
+/// use, or nullopt when the pre-existing row-major-dense arithmetic is kept.
+///
+/// The NZ form `(r * 16 + c * rows) * elem_bytes` is a *standalone* address, and
+/// that is the whole difficulty. A `tile.slice` usually lowers to `pto.subview`,
+/// which carries the logical window indices and re-derives the address itself —
+/// but a `tile.reshape` stacked on the slice inherits this byte offset and turns
+/// it into its own `pto.alloc_tile addr`, carrying the *slice's* `rows`. PTO
+/// derives the box-column stride from that `rows`, so the offset is a faithful
+/// re-description of the parent only when the window keeps the parent's full row
+/// extent; then `rows` is unchanged and every box lands where the parent put it.
+///
+/// Guards, each falling back to row-major-dense:
+///  * not a `tile.slice`, or a parent that is not an NZ-boxed accumulator;
+///  * a non-2-D window, or one whose row extent is dynamic or narrower than the
+///    parent's. A row-narrowing window has NO correct standalone base address —
+///    its box columns are strided by the parent's `rows`, its descriptor's by its
+///    own — so it is left on the arithmetic it has always had rather than swapped
+///    for a differently wrong number. See docs/en/dev/passes/31-init_memref.md.
+///  * a non-zero row origin, which is only reachable together with a narrowed row
+///    extent and is unrepresentable for the same reason;
+///  * a static column origin that is not a multiple of the 16-wide box. Such a
+///    window lies inside one box column and `CanonicalizeTileSlice` explicitly
+///    whitelists it as a legal MAD destination, where this offset is dead; it
+///    must therefore not be rejected here.
+///
+/// A *dynamic* column origin is accepted: PTO lowers the very same linear form at
+/// run time, so the two agree exactly, and neither side can check box alignment
+/// statically.
+///
+/// Deliberately a pure function of `(call, parent_type)`: InitMemRef and
+/// MemoryReuse both derive a view's offset from exactly these two inputs and
+/// must not disagree.
+inline std::optional<tile_view_semantics::AccumulatorTileGeometry> GetSliceAccumulatorGeometry(
+    const CallPtr& call, const TypePtr& parent_type) {
+  if (!call || !IsOp(call, "tile.slice")) return std::nullopt;
+
+  auto parent_tile = As<TileType>(parent_type);
+  if (!parent_tile) return std::nullopt;
+  auto geometry = tile_view_semantics::GetAccumulatorTileGeometry(*parent_tile);
+  if (!geometry) return std::nullopt;
+
+  // tile.slice(input, shape, offset[, valid_shape]); `shape` is the pre-drop
+  // window, so it is the one that lines up with the parent's rank.
+  if (call->args_.size() < 3) return std::nullopt;
+  auto window = As<MakeTuple>(call->args_[1]);
+  auto offsets = As<MakeTuple>(call->args_[2]);
+  if (!window || !offsets) return std::nullopt;
+  if (window->elements_.size() != 2 || offsets->elements_.size() != 2) return std::nullopt;
+
+  // GetAccumulatorTileGeometry already established a static 2-D parent shape.
+  auto parent_rows = As<ConstInt>(parent_tile->shape_[0]);
+  auto window_rows = As<ConstInt>(window->elements_[0]);
+  if (!parent_rows || !window_rows || parent_rows->value_ != window_rows->value_) return std::nullopt;
+
+  auto row_offset = As<ConstInt>(offsets->elements_[0]);
+  if (!row_offset || row_offset->value_ != 0) return std::nullopt;
+
+  if (auto col_offset = As<ConstInt>(offsets->elements_[1])) {
+    if (col_offset->value_ < 0 || col_offset->value_ % geometry->box.cols != 0) return std::nullopt;
+  }
+  return geometry;
+}
+
 /// Compute byte offset for a slice operation.
 /// byte_offset = (o0 * s1 * ... * sN + o1 * s2 * ... * sN + ... + oN) * storage_bits / 8
 ///
 /// MemRef carries a byte offset rather than a nibble offset. Packed 4-bit
 /// slices therefore require a static, byte-aligned logical origin in v1.
-inline ExprPtr ComputeSliceByteOffset(const std::vector<ExprPtr>& offsets,
-                                      const std::vector<ExprPtr>& parent_shape, const DataType& dtype,
-                                      const Span& span) {
+///
+/// @param acc_geometry NZ box geometry, supplied by ``GetSliceAccumulatorGeometry``
+///        for the accumulator (L0C) windows it can address exactly. Every other
+///        slice passes nullopt and keeps the arithmetic below bit-for-bit — both
+///        the genuinely row-major-dense parents (Vec / DDR / tensor) and the ones
+///        this pass does not yet model (the fractal-512 Mat / Left / Right duals,
+///        and accumulator windows that narrow the row extent).
+inline ExprPtr ComputeSliceByteOffset(
+    const std::vector<ExprPtr>& offsets, const std::vector<ExprPtr>& parent_shape, const DataType& dtype,
+    const Span& span,
+    const std::optional<tile_view_semantics::AccumulatorTileGeometry>& acc_geometry = std::nullopt) {
   INTERNAL_CHECK(offsets.size() == parent_shape.size())
       << "Internal error: slice offset rank (" << offsets.size() << ") must match parent shape rank ("
       << parent_shape.size() << ")";
+
+  if (acc_geometry.has_value()) {
+    return ComputeAccumulatorSliceByteOffset(offsets, *acc_geometry, dtype, span);
+  }
 
   ExprPtr result = MakeZeroByteOffset();
 
@@ -470,7 +590,15 @@ inline ExprPtr ComputeViewByteOffset(const CallPtr& call, const TypePtr& parent_
       offsets.push_back(call->args_[offset_arg_idx]);
     }
 
-    return ComputeSliceByteOffset(offsets, shaped->shape_, shaped->dtype_, call->span_);
+    // An accumulator (L0C) parent is NZ-boxed, not row-major dense. Ask for the
+    // box strides; every other parent — including tensor.slice, which has no
+    // TileType at all — yields nullopt and keeps the row-major arithmetic
+    // bit-for-bit. This must stay a pure function of (call, parent_type):
+    // MemoryReuse re-derives the same offset from the same two inputs when it
+    // re-anchors a view onto a retargeted buffer, and the two must agree.
+    auto acc_geometry = GetSliceAccumulatorGeometry(call, parent_type);
+
+    return ComputeSliceByteOffset(offsets, shaped->shape_, shaped->dtype_, call->span_, acc_geometry);
   }
 
   // Non-slice view ops (reshape, transpose, extract):

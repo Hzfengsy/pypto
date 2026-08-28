@@ -94,6 +94,7 @@ fixable = ["ALL"]
 # Python binding is unused but structurally required by the pass output.
 "tests/ut/ir/transforms/test_expand_mixed_kernel.py" = ["E501"]
 "tests/ut/ir/transforms/test_flatten_tile_nd_to_2d.py" = ["F841"]
+"tests/ut/ir/transforms/test_canonicalize_tile_slice.py" = ["F841"]
 "tests/ut/ir/transforms/test_init_memref.py" = ["E501"]
 "tests/ut/ir/transforms/test_memory_reuse.py" = ["E501"]
 "tests/ut/ir/transforms/test_infer_tile_memory_space.py" = ["E501"]
