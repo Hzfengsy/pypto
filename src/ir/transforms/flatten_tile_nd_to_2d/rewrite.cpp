@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <any>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -122,6 +123,68 @@ TypePtr WithCarriedMemRef(const TypePtr& deduced, const AssignStmtPtr& assign) {
                                       deduced_tile->tile_view_, carried_space);
   }
   return CloneTypeWithMemRef(deduced, memref, carried_space);
+}
+
+/**
+ * @brief Emit the per-page drain of a column-packed batched accumulator.
+ *
+ * The pages sit side by side in ONE `[M, B*N]` Acc tile, so there is no single
+ * 2D buffer whose row-major collapse is the `[B, M, N]` output window. Each page
+ * is stored as a column window at its own batch offset — the same per-page shape
+ * `LowerBatchMatmul`'s direct-store fusion already emits, straight out of L0C
+ * with no Vec staging (a store whose source is an Acc tile classifies CUBE, so
+ * it needs no cross-core move).
+ *
+ * `BuildAccPackingMap` has already verified the store is the 3-arg form with
+ * tensor-rank offsets, so the checks below guard a pass invariant, not user
+ * input.
+ *
+ * @return The Var bound by the last page's store, which threads the tensor.
+ */
+VarPtr EmitPackedAccumulatorDrain(const AccPackingPlan& plan, const CallPtr& call,
+                                  const AssignStmtPtr& assign, const FlattenContext& ctx,
+                                  const OpRegistry& op_registry, const Span& span,
+                                  std::vector<StmtPtr>* result) {
+  auto packed = Substitute(call->args_[0], ctx.var_map);
+  auto offsets = As<MakeTuple>(Substitute(call->args_[1], ctx.var_map));
+  ExprPtr out_tensor = Substitute(call->args_[2], ctx.var_map);
+  INTERNAL_CHECK_SPAN(offsets && offsets->elements_.size() == plan.nd_shape.size(), span)
+      << "Internal error: column-packed accumulator drain expects rank-" << plan.nd_shape.size()
+      << " tile.store offsets";
+
+  const size_t batch_rank = plan.batch_dims.size();
+  std::vector<ExprPtr> partition_shape;
+  partition_shape.reserve(plan.nd_shape.size());
+  for (size_t i = 0; i < batch_rank; ++i) {
+    partition_shape.push_back(std::make_shared<ConstInt>(1, DataType::INDEX, span));
+  }
+  partition_shape.push_back(std::make_shared<ConstInt>(plan.rows, DataType::INDEX, span));
+  partition_shape.push_back(std::make_shared<ConstInt>(plan.cols, DataType::INDEX, span));
+
+  auto page_shape = MakeShapeTupleFromInts({plan.rows, plan.cols}, span);
+  VarPtr last_store;
+  for (int64_t batch = 0; batch < plan.batch_count; ++batch) {
+    const std::string suffix = std::to_string(batch);
+    auto page_offset = MakeShapeTupleFromInts({0, batch * plan.cols}, span);
+    auto page = op_registry.Create("tile.slice", {packed, page_shape, page_offset}, span);
+    auto page_var = std::make_shared<Var>("acc_drain_" + suffix, page->GetType(), span);
+    result->push_back(std::make_shared<AssignStmt>(page_var, page, assign->span_));
+
+    auto batch_indices = BuildBatchIndices(batch, plan.batch_dims);
+    auto store_offsets = std::make_shared<MakeTuple>(
+        BuildBatchAdjustedOffsets(offsets->elements_, batch_indices, batch_rank, span), span);
+    auto page_store = op_registry.Create(
+        "tile.store",
+        {page_var, store_offsets, out_tensor, std::make_shared<MakeTuple>(partition_shape, span)},
+        call->kwargs_, span);
+    last_store = std::make_shared<Var>(assign->var_->name_hint_ + "_" + suffix, page_store->GetType(),
+                                       assign->var_->span_);
+    result->push_back(std::make_shared<AssignStmt>(last_store, page_store, assign->span_));
+    out_tensor = last_store;
+  }
+  INTERNAL_CHECK_SPAN(last_store, span)
+      << "Internal error: a column-packed accumulator always has at least one page";
+  return last_store;
 }
 
 /**
@@ -831,55 +894,11 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
     // Signature: (tile, offsets, output_tensor[, shapes])
     if (IsOp(call, "tile.store")) {
       // ---- Column-packed batched accumulator: one store per batch page ----
-      // The pages of the accumulator sit side by side in ONE [M, B*N] Acc tile,
-      // so there is no single 2D buffer whose row-major collapse is the [B,M,N]
-      // output window. Emit page b as a column window and store it into the
-      // tensor at batch offset b — the same per-page shape LowerBatchMatmul's
-      // direct-store fusion already emits, straight out of L0C with no Vec
-      // staging (a store whose source is an Acc tile classifies CUBE, so it
-      // needs no cross-core move). BuildAccPackingMap has already verified the
-      // store is the 3-arg form with tensor-rank offsets.
+      // See EmitPackedAccumulatorDrain for why the pages cannot share one 2D
+      // buffer, and BuildAccPackingMap for the chain analysis that decides it.
       if (const auto* acc_plan = ctx.AccPackingFor(call->args_[0])) {
-        auto packed = Substitute(call->args_[0], ctx.var_map);
-        auto offsets = As<MakeTuple>(Substitute(call->args_[1], ctx.var_map));
-        ExprPtr out_tensor = Substitute(call->args_[2], ctx.var_map);
-        INTERNAL_CHECK_SPAN(offsets && offsets->elements_.size() == acc_plan->nd_shape.size(), span)
-            << "Internal error: column-packed accumulator drain expects rank-" << acc_plan->nd_shape.size()
-            << " tile.store offsets";
-
-        const size_t batch_rank = acc_plan->batch_dims.size();
-        std::vector<ExprPtr> partition_shape;
-        partition_shape.reserve(acc_plan->nd_shape.size());
-        for (size_t i = 0; i < batch_rank; ++i) {
-          partition_shape.push_back(std::make_shared<ConstInt>(1, DataType::INDEX, span));
-        }
-        partition_shape.push_back(std::make_shared<ConstInt>(acc_plan->rows, DataType::INDEX, span));
-        partition_shape.push_back(std::make_shared<ConstInt>(acc_plan->cols, DataType::INDEX, span));
-
-        auto page_shape = MakeShapeTupleFromInts({acc_plan->rows, acc_plan->cols}, span);
-        VarPtr last_store;
-        for (int64_t batch = 0; batch < acc_plan->batch_count; ++batch) {
-          const std::string suffix = std::to_string(batch);
-          auto page_offset = MakeShapeTupleFromInts({0, batch * acc_plan->cols}, span);
-          auto page = op_registry.Create("tile.slice", {packed, page_shape, page_offset}, span);
-          auto page_var = std::make_shared<Var>("acc_drain_" + suffix, page->GetType(), span);
-          result.push_back(std::make_shared<AssignStmt>(page_var, page, assign->span_));
-
-          auto batch_indices = BuildBatchIndices(batch, acc_plan->batch_dims);
-          auto store_offsets = std::make_shared<MakeTuple>(
-              BuildBatchAdjustedOffsets(offsets->elements_, batch_indices, batch_rank, span), span);
-          auto page_store = op_registry.Create(
-              "tile.store",
-              {page_var, store_offsets, out_tensor, std::make_shared<MakeTuple>(partition_shape, span)},
-              call->kwargs_, span);
-          last_store = std::make_shared<Var>(assign->var_->name_hint_ + "_" + suffix, page_store->GetType(),
-                                             assign->var_->span_);
-          result.push_back(std::make_shared<AssignStmt>(last_store, page_store, assign->span_));
-          out_tensor = last_store;
-        }
-        INTERNAL_CHECK_SPAN(last_store, span)
-            << "Internal error: a column-packed accumulator always has at least one page";
-        ctx.Insert(assign->var_, last_store);
+        ctx.Insert(assign->var_,
+                   EmitPackedAccumulatorDrain(*acc_plan, call, assign, ctx, op_registry, span, &result));
         continue;
       }
 
