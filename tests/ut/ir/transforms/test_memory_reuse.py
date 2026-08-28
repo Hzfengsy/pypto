@@ -2782,6 +2782,60 @@ class TestYieldFixup:
             _run_pipeline(_divergent_acc_phi_program())
 
 
+class TestNestedCarryLifetimeCarrier:
+    """A nested loop's carry init is the *enclosing* loop's IterArg.
+
+    `RegisterReturnVars` maps each return_var onto the variable that owns the
+    carried buffer, so that a use of the return_var keeps that buffer alive.
+    An IterArg owns no buffer of its own -- like return_vars, iter-args are
+    deliberately absent from `ordered_defs_` / `var_def_order_` -- so the chain
+    has to be walked to the `AssignStmt`-defined tile underneath it.
+    """
+
+    def test_nested_carry_resolves_to_the_defining_tile(self):
+        """The whole carry nest shares the outermost init's buffer.
+
+        `r_inner` is the inner loop's return var, read after the inner loop but
+        inside the outer body. Its lifetime carrier is `init_0` -- two carry hops
+        up -- and every tile in the nest must land on that one buffer.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[64, 64], pl.FP32],
+                output: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                init_0: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(x, [0, 0], [64, 64])
+                for _i, (outer,) in pl.range(0, 4, init_values=(init_0,)):
+                    for _j, (inner,) in pl.range(0, 4, init_values=(outer,)):
+                        n: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.add(inner, inner)
+                        r_inner = pl.yield_(n)
+                    # Post-inner-loop use of the inner return var.
+                    tail: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.add(r_inner, r_inner)
+                    r_outer = pl.yield_(tail)
+                result: pl.Tensor[[64, 64], pl.FP32] = pl.store(r_outer, [0, 0], output)
+                return result
+
+        printed = ir.python_print(_run_pipeline(Before))
+
+        # One Vec buffer for the whole nest -- nothing is allocated alongside it.
+        allocs = [line for line in printed.splitlines() if "pl.tile.alloc(pl.Mem.Vec" in line]
+        assert len(allocs) == 1, f"expected a single Vec allocation, got {len(allocs)}: {allocs}"
+        buffer_name = allocs[0].split(":")[0].strip()
+
+        # Every tile in the carry nest lands on it -- including the return vars,
+        # which are YieldStmt results rather than AssignStmt definitions.
+        for name in ["init_0", "n", "r_inner", "tail", "r_outer"]:
+            decl = next((line for line in printed.splitlines() if line.strip().startswith(f"{name}:")), None)
+            assert decl is not None, f"{name} missing from the transformed program"
+            assert f"pl.MemRef({buffer_name}," in decl, (
+                f"the nested carry chain must share {buffer_name}; {name} did not: {decl.strip()}"
+            )
+
+
 class TestControlFlow:
     """Tests for correct lifetime analysis across control flow boundaries."""
 

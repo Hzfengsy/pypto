@@ -2564,6 +2564,163 @@ class TestInferTileMemorySpaceIterArgInherit:
             )
 
 
+class TestInferTileMemorySpaceLoopCarriedOperand:
+    """A *loop-carried* operand is an ``IterArg``, which ``As<Var>`` does not match.
+
+    Every stage that reads call arguments has to use ``AsVarLike`` or the operand
+    falls through the whole pass: Phase 0 records no demand for it, Phase 2 queues
+    no ``tile.move``, Phase 3 substitutes nothing, and the ``TileMemoryInferred``
+    verifier does not even report the resulting violation.
+    """
+
+    def test_carried_operand_in_a_forbidden_space_gets_its_move(self):
+        """Regression: a Vec tile carried into ``tile.matmul``'s Right slot.
+
+        ``tile.matmul`` constrains input 1 to Right. The operand here is the loop's
+        own iter-arg sitting in Vec, so Phase 2 must queue a Vec -> Right move and
+        Phase 3 must insert it and rewrite the operand.
+
+        Before the fix all four stages read the argument with ``As<Var>``, which
+        returns null for an ``IterArg``. The matmul kept its Vec operand -- IR no
+        target can execute -- and the property verifier stayed silent about it,
+        so the violation only surfaced in the backend.
+        """
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[64, 64], pl.FP32],
+                b: pl.Tensor[[64, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                a_mat = pl.load(a, [0, 0], [64, 64], target_memory=pl.MemorySpace.Mat)
+                # Pinned to Vec, so the carried operand really does violate
+                # matmul's Right constraint rather than being placed around it.
+                w0 = pl.load(b, [0, 0], [64, 64], target_memory=pl.MemorySpace.Vec)
+                acc = pl.tile.create([64, 64], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+                w = w0
+                for _i in pl.range(2):
+                    a_l = pl.move(a_mat, target_memory=pl.MemorySpace.Left)
+                    c = pl.matmul(a_l, w)
+                    acc = pl.tile.add(acc, pl.move(c, target_memory=pl.MemorySpace.Vec))
+                    # Rebind so `w` stays a genuine carry rather than being
+                    # hoisted out of the loop; assemble is inherit-input, so it
+                    # keeps `w` on the Vec its pinned producer gave it.
+                    w = pl.tile.assemble(w, w, [0, 0])
+                out = pl.store(acc, [0, 0], out)
+                return out
+
+        After = passes.infer_tile_memory_space()(passes.convert_to_ssa()(Before))
+        printed = ir.python_print(After)
+
+        matmul_line = next(line for line in printed.splitlines() if "tile.matmul(" in line)
+        # The Right operand must be a moved tile, never the raw Vec iter-arg.
+        assert "_Right" in matmul_line, (
+            "a loop-carried matmul operand in Vec must be moved to Right, but the "
+            f"iter-arg was passed through unmoved: {matmul_line.strip()}"
+        )
+        move_lines = [line for line in printed.splitlines() if "Mem.Right" in line and "tile.move(" in line]
+        assert move_lines, "expected an inserted Vec -> Right tile.move for the carried operand"
+
+    def test_carried_demand_reaches_the_producer_outside_the_loop(self):
+        """A demand raised inside the loop body must reach the carry's init producer.
+
+        Phase 1 seeds each iter-arg's space *from its init*, so the space the body
+        demands of the iter-arg is the space the init producer has to be placed in.
+        Phase 0 therefore records an ``iter_arg -> init`` demand edge alongside the
+        inherit-input ones.
+
+        Here the carried weight feeds ``tile.matmul_acc``'s Right slot. A cube
+        operand demand resolves a retargetable DDR producer to Mat (L1 is the only
+        buffer a tload can fill that MTE1 can then move into L0B). Without the
+        carry edge the load defaulted to Vec and the operand was routed
+        GM -> UB -> L0B, putting a cube-only operand on the vector core.
+        """
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[64, 64], pl.FP32],
+                b: pl.Tensor[[64, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                a_l = pl.move(
+                    pl.load(a, [0, 0], [64, 64], target_memory=pl.MemorySpace.Mat),
+                    target_memory=pl.MemorySpace.Left,
+                )
+                # No target_memory: the pass places it, and the only signal is
+                # the demand raised on the carry inside the body.
+                w = pl.load(b, [0, 0], [64, 64])
+                acc = pl.tile.create([64, 64], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc)
+                for _i in pl.range(2):
+                    acc = pl.tile.matmul_acc(acc, a_l, w)
+                    # Rebind so `w` is genuinely carried rather than hoisted.
+                    w = pl.tile.assemble(w, w, [0, 0])
+                out = pl.store(pl.move(acc, target_memory=pl.MemorySpace.Vec), [0, 0], out)
+                return out
+
+        After = passes.infer_tile_memory_space()(passes.convert_to_ssa()(Before))
+        printed = ir.python_print(After)
+
+        load_line = next(line for line in printed.splitlines() if "tile.load(" in line and "b__ssa" in line)
+        assert "Mem.Mat" in load_line, (
+            "the Right demand raised on the carried operand must reach the init "
+            f"producer and stage it through Mat, not Vec: {load_line.strip()}"
+        )
+
+    def test_carried_accumulator_demand_reaches_an_unpromoted_create(self):
+        """The reported case: the loop yields the carry itself, not the op's result.
+
+        The ordinary accumulator shape is masked by the ForStmt yield
+        back-propagation, which promotes the init carrier from the yielded value.
+        That stand-in disappears the moment the loop yields something other than
+        the constrained op's result -- here `pl.yield_(a)` yields the carry
+        itself, so the `Acc` demand can only reach `acc0` through the carry edge.
+
+        Before the fix `acc0` resolved to `Vec` and the program was rejected with
+        `tile.matmul_acc requires argument 0 to live in Acc memory`.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 16], pl.FP32],
+                y: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                lhs_l = pl.move(
+                    pl.load(x, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat),
+                    target_memory=pl.MemorySpace.Left,
+                )
+                rhs_r = pl.move(
+                    pl.load(y, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat),
+                    target_memory=pl.MemorySpace.Right,
+                )
+                acc0: pl.Tile[[16, 16], pl.FP32] = pl.tile.create([16, 16], dtype=pl.FP32)
+                for _i, (a,) in pl.range(0, 4, 1, init_values=(acc0,)):
+                    _tmp = pl.matmul_acc(a, lhs_l, rhs_r)
+                    r = pl.yield_(a)
+                out = pl.store(pl.move(r, target_memory=pl.MemorySpace.Vec), [0, 0], out)
+                return out
+
+        After = passes.infer_tile_memory_space()(Before)
+        printed = ir.python_print(After)
+
+        create_line = next(line for line in printed.splitlines() if "tile.create(" in line)
+        assert "Mem.Acc" in create_line, (
+            "the carried accumulator's Acc demand must reach the unset tile.create; "
+            f"got: {create_line.strip()}"
+        )
+
+
 class TestLoopInvariantMatResidency:
     """Regression coverage for tensor-loop stationary operand residency (#2077)."""
 

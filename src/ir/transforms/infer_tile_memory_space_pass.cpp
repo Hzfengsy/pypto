@@ -100,6 +100,26 @@ class DemandCollector : public IRVisitor {
     IRVisitor::VisitStmt_(op);
   }
 
+  /// A loop carry is a demand edge like any other view chain: Phase 1 seeds each
+  /// iter-arg's space *from its init*, so whatever space the body demands of the
+  /// iter-arg is the space the init producer has to be placed in. Recording
+  /// `iter_arg -> init` lets a demand raised inside the body reach the producer
+  /// outside the loop -- e.g. a `tile.create` accumulator carried into
+  /// `tile.matmul_acc` is then born in Acc instead of defaulting to Vec.
+  ///
+  /// Emplaced before descending so the reverse sweep still sees strictly
+  /// backward edges: the body's edges are appended after this one and are
+  /// therefore visited first, by which time the iter-arg's own demand is known.
+  void VisitStmt_(const ForStmtPtr& op) override {
+    for (const auto& iter_arg : op->iter_args_) {
+      if (!iter_arg) continue;
+      if (auto init_var = AsVarLike(iter_arg->initValue_)) {
+        edges_.emplace_back(iter_arg, init_var);
+      }
+    }
+    IRVisitor::VisitStmt_(op);
+  }
+
   /// Propagate demand backward through OutputMemoryInheritsInput() ops.
   /// Edges `dst -> src` are captured in program order during the forward visit;
   /// since the inherit-input relation flows strictly backward (dst defined
@@ -118,8 +138,9 @@ class DemandCollector : public IRVisitor {
 
  private:
   std::map<VarPtr, MemorySpace> demands_;
-  // `dst -> src` edges for ops with OutputMemoryInheritsInput(), captured in
-  // program order. Walked in reverse in PropagateThroughInheritInputOps.
+  // `dst -> src` demand edges -- ops with OutputMemoryInheritsInput(), plus each
+  // loop carry's `iter_arg -> init` -- captured in program order. Walked in
+  // reverse in PropagateThroughInheritInputOps.
   std::vector<std::pair<VarPtr, VarPtr>> edges_;
   void RecordDirectDemands(const CallPtr& call) {
     auto& reg = OpRegistry::GetInstance();
@@ -129,7 +150,10 @@ class DemandCollector : public IRVisitor {
     for (size_t i = 0; i < spec->input_constraints.size() && i < call->args_.size(); ++i) {
       const auto& allowed = spec->input_constraints[i];
       if (allowed.empty()) continue;
-      auto var = As<Var>(call->args_[i]);
+      // AsVarLike (not As<Var>) so a loop-carried operand is matched — an
+      // IterArg has its own ObjectKind, so As<Var> returns null for it and the
+      // operand's demand goes unrecorded (kind_traits).
+      auto var = AsVarLike(call->args_[i]);
       if (!var) continue;
       // Preferred space: the first allowed entry. Backends are expected to list
       // the canonical choice first (e.g. tile.store uses {Vec, Acc} — a Vec
@@ -148,7 +172,7 @@ class DemandCollector : public IRVisitor {
     if (!reg.IsRegistered(call->op_->name_)) return;
     if (!reg.GetEntry(call->op_->name_).OutputMemoryInheritsInput()) return;
     for (const auto& arg : call->args_) {
-      auto var = As<Var>(arg);
+      auto var = AsVarLike(arg);
       if (!var) continue;
       if (!As<TileType>(var->GetType()) && !As<TensorType>(var->GetType())) continue;
       edges_.emplace_back(dst, var);
@@ -208,7 +232,7 @@ class TileMemorySpaceAnalyzer : public IRVisitor {
         // Non-tile ops producing TileType: default to Vec
         var_memory_[op->var_] = MemorySpace::Vec;
       }
-    } else if (auto src_var = As<Var>(op->value_)) {
+    } else if (auto src_var = AsVarLike(op->value_)) {
       // Plain SSA alias `y = x`. Inherit x's memory space onto y so later
       // phases (MoveCollector, Phase 3) see a consistent memory_space on the
       // alias. The Python frontend emits these when eliding no-op
@@ -261,7 +285,11 @@ class TileMemorySpaceAnalyzer : public IRVisitor {
     for (size_t i = 0; i < op->return_vars_.size(); ++i) {
       if (!As<TileType>(op->return_vars_[i]->GetType())) continue;
       if (i >= yield_stmt->value_.size()) continue;
-      auto yield_var = As<Var>(yield_stmt->value_[i]);
+      // AsVarLike so a body that yields a carried value untouched (`yield w`,
+      // where `w` is this loop's own iter-arg or an enclosing one) still
+      // resolves — As<Var> returns null for IterArg and the return_var would
+      // keep a stale annotation.
+      auto yield_var = AsVarLike(yield_stmt->value_[i]);
       if (!yield_var) continue;
 
       // Fallback to the TileType annotation handles IfStmt return_vars — they
@@ -288,7 +316,10 @@ class TileMemorySpaceAnalyzer : public IRVisitor {
         // whether or not the analyzer has already recorded it — e.g. an IfStmt
         // return_var used as the loop init is never visited by the AssignStmt
         // path, so it would otherwise keep its old memory space.
-        if (auto init_var = As<Var>(op->iter_args_[i]->initValue_);
+        // AsVarLike to match the seeding loop above: a nested loop's init is the
+        // enclosing iter-arg, which As<Var> would skip, leaving the outer carry
+        // disagreeing with the promoted inner one.
+        if (auto init_var = AsVarLike(op->iter_args_[i]->initValue_);
             init_var && As<TileType>(init_var->GetType())) {
           var_memory_[init_var] = *yield_memory;
         }
@@ -517,7 +548,11 @@ class MoveCollector : public IRVisitor {
       const auto& allowed_spaces = (*constraints)[i];
       if (allowed_spaces.empty()) continue;
 
-      auto var = As<Var>(call->args_[i]);
+      // AsVarLike: a loop-carried operand is an IterArg, which As<Var> skips.
+      // Skipping it queues no tile.move, so the op keeps an operand in a space
+      // its input_constraints forbid -- e.g. a Vec tile carried into
+      // tile.matmul's Right slot, which no target can execute.
+      auto var = AsVarLike(call->args_[i]);
       if (!var) continue;
       auto it = var_memory_.find(var);
       if (it == var_memory_.end()) continue;
@@ -701,7 +736,9 @@ class TileMemorySpaceMutator : public IRMutator {
     for (size_t i = 0; i < op->args_.size(); ++i) {
       bool substituted = false;
       if (constraints && i < constraints->size() && !(*constraints)[i].empty()) {
-        if (auto var = As<Var>(op->args_[i])) {
+        // AsVarLike so the substitution keys match the ones Phase 2 recorded and
+        // InsertMovesForConsumer created, IterArg operands included.
+        if (auto var = AsVarLike(op->args_[i])) {
           MoveKey key = {var, (*constraints)[i][0]};
           auto move_it = created_moves_.find(key);
           if (move_it != created_moves_.end()) {
@@ -929,7 +966,9 @@ class TileMemorySpaceMutator : public IRMutator {
 
     for (size_t i = 0; i < constraints->size() && i < call->args_.size(); ++i) {
       if ((*constraints)[i].empty()) continue;
-      auto var = As<Var>(call->args_[i]);
+      // AsVarLike: must match the key Phase 2 recorded for an IterArg operand,
+      // otherwise the needed move is never emitted.
+      auto var = AsVarLike(call->args_[i]);
       if (!var) continue;
 
       MoveKey key = {var, (*constraints)[i][0]};
@@ -972,7 +1011,9 @@ class TileMemorySpaceMutator : public IRMutator {
                       const Span& span, std::optional<TileLayout> required_blayout = std::nullopt,
                       std::optional<TileLayout> required_slayout = std::nullopt) {
     auto mutated_producer = IRMutator::VisitExpr(original_var);
-    auto mutated_producer_var = As<Var>(mutated_producer);
+    // AsVarLike: an IterArg producer stays an IterArg through the mutator, and
+    // As<Var> would trip the check below on a perfectly valid loop carry.
+    auto mutated_producer_var = AsVarLike(mutated_producer);
     INTERNAL_CHECK_SPAN(mutated_producer_var, span)
         << "Internal error: inferred tile-memory producer is not a Var expression";
 
@@ -1129,7 +1170,10 @@ class TileMemoryInferredVerifier : public IRVisitor {
       const auto& allowed_spaces = (*constraints)[i];
       if (allowed_spaces.empty()) continue;
 
-      auto var = As<Var>(call->args_[i]);
+      // AsVarLike for the same reason the pass itself uses it: verifying a
+      // narrower set of operands than the pass places is how a violated
+      // constraint on a loop-carried operand stayed invisible.
+      auto var = AsVarLike(call->args_[i]);
       if (!var) continue;
       auto tile_type = As<TileType>(var->GetType());
       if (!tile_type || !tile_type->memory_space_.has_value()) continue;

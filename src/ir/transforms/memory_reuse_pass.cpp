@@ -1242,18 +1242,44 @@ class LifetimeAnalyzer : public IRVisitor {
     loop_scopes_.push_back({loop_start, loop_end});
   }
 
+  /// Resolve a loop carry's init to the variable that actually owns the buffer.
+  ///
+  /// A nested loop seeds its carry from the *enclosing* loop's IterArg, and an
+  /// IterArg is an alias of its own init rather than a definition in its own
+  /// right -- like return_vars, iter-args are deliberately absent from
+  /// `ordered_defs_` / `var_def_order_`, so they carry no lifetime of their own.
+  /// Walking the carry chain to the first non-IterArg therefore lands on the
+  /// AssignStmt-defined tile whose buffer the whole loop nest shares, which is
+  /// the variable a use of any return_var in that nest has to keep alive.
+  ///
+  /// Returns nullptr when the chain does not end at a tracked carrier; the
+  /// caller then records no mapping, exactly as before.
+  [[nodiscard]] VarPtr ResolveCarryInitCarrier(const ExprPtr& init_value) const {
+    auto var = AsVarLike(init_value);
+    // An init is always defined before its own loop, so the chain is acyclic in
+    // well-formed IR; the visited set bounds it anyway rather than hanging.
+    std::set<const Var*> seen;
+    while (var) {
+      auto iter_arg = As<IterArg>(var);
+      if (!iter_arg) return var;
+      if (!seen.insert(var.get()).second) return nullptr;
+      var = AsVarLike(iter_arg->initValue_);
+    }
+    return nullptr;
+  }
+
   void RegisterReturnVars(const std::vector<IterArgPtr>& iter_args, const std::vector<VarPtr>& return_vars) {
     size_t count = std::min(return_vars.size(), iter_args.size());
     for (size_t i = 0; i < count; ++i) {
       const auto& rv = return_vars[i];
       if (!As<TileType>(rv->GetType())) continue;
 
-      // Map return_var -> initValue var so that post-loop uses of the
-      // return_var extend the initValue's lifetime (not the return_var's).
+      // Map return_var -> the init's buffer carrier so that post-loop uses of the
+      // return_var extend that carrier's lifetime (not the return_var's).
       // We do NOT register return_vars in ordered_defs_ -- they must not
       // participate in sharing group computation, which would inflate
       // group lifetimes and block unrelated reuse opportunities.
-      auto init_var = As<Var>(iter_args[i]->initValue_);
+      auto init_var = ResolveCarryInitCarrier(iter_args[i]->initValue_);
       if (init_var && var_def_order_.count(init_var)) {
         return_var_to_init_var_[rv] = init_var;
       }

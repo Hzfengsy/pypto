@@ -43,11 +43,17 @@ Each InCore function is processed in five phases implemented as IR visitors / mu
 Walks the function body once and records two pieces of information:
 
 1. For every `Call` whose op has `input_constraints` registered in `OpRegistry`, the *first* allowed memory space for each constrained input is recorded as a "demand" on the input variable. Backends list the canonical (cheapest, no-move) space first — e.g. `tile.store` lists `{Vec, Acc}` so a Vec producer needs no move and an Acc-origin tile keeps its space.
-2. For every op marked `OutputMemoryInheritsInput()` (e.g. `tile.fillpad`, `tile.slice`, `tile.reshape`), an edge `dst → src` from output var to first tile-typed input is captured in program order.
+2. Two kinds of `dst → src` demand edge, captured in program order:
+   - For every op marked `OutputMemoryInheritsInput()` (e.g. `tile.fillpad`, `tile.slice`, `tile.reshape`), an edge from output var to first tile-typed input.
+   - For every loop carry, an edge `iter_arg → init`. Phase 1 seeds each iter-arg's space *from its init*, so whatever space the body demands of the iter-arg is the space the init producer has to be placed in.
 
-Demands are then propagated *backward* through those edges by a single reverse-order sweep. Because inherit-input ops in SSA always have `dst` defined after `src`, one reverse pass reaches the fixed point in O(N). When two demands collide on the same var, a non-`Vec` demand wins (`ShouldOverrideDemand`) — `Vec` is the permissive default and a specialized demand from a compute op should override it.
+Demands are then propagated *backward* through those edges by a single reverse-order sweep. Both edge kinds run strictly backward in SSA — an inherit-input `dst` is defined after its `src`, and a carry's init is defined before the loop — so one reverse pass reaches the fixed point in O(N). A loop's carry edge is emplaced before descending into its body, so the body's edges are swept first and the iter-arg's own demand is known by the time the carry edge is read. When two demands collide on the same var, a non-`Vec` demand wins (`ShouldOverrideDemand`) — `Vec` is the permissive default and a specialized demand from a compute op should override it.
 
 This phase is what lets `slice(tensor) → fillpad → matmul` push the matmul's `Left`/`Right` demand all the way back to the `tile.slice` output. Phase 1 then resolves that producer to `Mat` — the staging space a cube demand maps to, per the table below — and Phase 2 inserts the `Mat -> Left` / `Mat -> Right` move. The demand is what selects `Mat` over `Vec`; without it the operand would take the longer GM -> UB -> L1 -> L0 route.
+
+The carry edge extends the same reasoning across a loop boundary: a weight loaded outside the loop and carried into a `matmul` operand slot is staged through `Mat`, instead of defaulting to `Vec` and routing a cube-only operand GM -> UB -> L0B through the vector core.
+
+**Kind traits.** Every stage that reads a call argument, yield value, or carry init uses `AsVarLike`, never `As<Var>`. A loop-carried operand is an `IterArg`, which has its own `ObjectKind` and so does not match `As<Var>` (see `ir-kind-traits.md`). Reading one with `As<Var>` makes the operand invisible to the whole pipeline at once: Phase 0 records no demand, Phase 2 queues no `tile.move`, Phase 3 substitutes nothing, and the `TileMemoryInferred` verifier does not report the resulting constraint violation either — so a `tile.matmul` keeps a `Vec` operand in its `Right` slot and the failure surfaces only in the backend.
 
 ### Phase 1 — Forward analysis (`TileMemorySpaceAnalyzer`)
 

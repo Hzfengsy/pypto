@@ -43,11 +43,17 @@ program_inferred = infer_pass(program)
 对函数体执行一次遍历，记录两类信息：
 
 1. 对于其算子在 `OpRegistry` 中注册了 `input_constraints` 的每一个 `Call`，把每个受约束输入的 *第一个* 允许 memory space 记录为该输入变量的 "需求"。后端会把规范的（无需 move、最便宜的）space 排在第一位——例如 `tile.store` 列出 `{Vec, Acc}`，因此 Vec 生产者无需 move，Acc 来源的 tile 也保留原 space。
-2. 对于标记了 `OutputMemoryInheritsInput()` 的算子（如 `tile.fillpad`、`tile.slice`、`tile.reshape`），按程序顺序记录一条从输出变量指向第一个 tile 类型输入的 `dst → src` 边。
+2. 按程序顺序记录两类 `dst → src` 需求边：
+   - 对于标记了 `OutputMemoryInheritsInput()` 的算子（如 `tile.fillpad`、`tile.slice`、`tile.reshape`），记录一条从输出变量指向第一个 tile 类型输入的边。
+   - 对于每个循环携带（loop carry），记录一条 `iter_arg → init` 边。阶段 1 会**根据 init 为每个 iter-arg 播种** space，因此循环体对 iter-arg 提出的 space 需求，正是 init 生产者必须被放置的 space。
 
-随后在这些边上**反向**传播需求：单次反向序遍历即可达到不动点。这是因为 SSA 中 inherit-input 算子的 `dst` 总在 `src` 之后定义，一次反向扫描即可完成 O(N) 的不动点。当同一变量上两个需求冲突时，非 `Vec` 的需求获胜（`ShouldOverrideDemand`）——`Vec` 是宽松的默认值，应被来自 compute 算子的特化需求覆盖。
+随后在这些边上**反向**传播需求：单次反向序遍历即可达到不动点。两类边在 SSA 中都严格向后——inherit-input 算子的 `dst` 总在 `src` 之后定义，而 carry 的 init 定义在循环之前——因此一次反向扫描即可完成 O(N) 的不动点。循环的 carry 边在下降进入循环体*之前*记录，于是循环体内的边会被先扫描，读到 carry 边时该 iter-arg 自身的需求已经确定。当同一变量上两个需求冲突时，非 `Vec` 的需求获胜（`ShouldOverrideDemand`）——`Vec` 是宽松的默认值，应被来自 compute 算子的特化需求覆盖。
 
 正是这一阶段使 `slice(tensor) → fillpad → matmul` 链能把 matmul 的 `Left` / `Right` 需求一直传回 `tile.slice` 的输出。随后阶段 1 把该生产者解析为 `Mat` —— 即下表中 cube 需求所映射的中转 space —— 再由阶段 2 插入 `Mat -> Left` / `Mat -> Right` 搬运。正是该需求让结果选择 `Mat` 而非 `Vec`；否则操作数会走更长的 GM -> UB -> L1 -> L0 路径。
+
+carry 边把同样的推理延伸到循环边界之外：在循环外加载、并被携带进 `matmul` 操作数槽位的权重，会被中转到 `Mat`，而不是退化为 `Vec` 并让一个纯 cube 操作数经由 vector core 走 GM -> UB -> L0B。
+
+**Kind traits。** 所有读取调用实参、yield 值或 carry init 的环节一律使用 `AsVarLike`，绝不使用 `As<Var>`。循环携带的操作数是 `IterArg`，它拥有自己的 `ObjectKind`，因此不会被 `As<Var>` 匹配（参见 `ir-kind-traits.md`）。一旦用 `As<Var>` 读取，该操作数会对整条流水线同时隐身：阶段 0 不记录需求，阶段 2 不排队 `tile.move`，阶段 3 不做替换，`TileMemoryInferred` 校验器也不会报告由此产生的约束违规——于是 `tile.matmul` 的 `Right` 槽位保留了一个 `Vec` 操作数，问题只在后端才暴露。
 
 ### 阶段 1 — 前向分析（`TileMemorySpaceAnalyzer`）
 
