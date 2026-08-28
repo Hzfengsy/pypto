@@ -699,6 +699,22 @@ def _build_all_to_all_v_before():
     return AllToAllV
 
 
+def _min_clamps(values: list) -> list:
+    """``ir.Min`` nodes among ``values``, looking through an enclosing ``ir.Max``.
+
+    The send-count clamp is two-sided — ``max(min(count, MAX_RECV), 0)`` — so the
+    Min bounding against capacity is nested inside the Max flooring at zero, and
+    is not the top-level value of the AssignStmt.
+    """
+    found = []
+    for value in values:
+        if isinstance(value, ir.Min):
+            found.append(value)
+        elif isinstance(value, ir.Max):
+            found.extend(o for o in (value.left, value.right) if isinstance(o, ir.Min))
+    return found
+
+
 def test_all_to_all_v_push_loop_is_bounded_by_runtime_send_counts():
     """The push loop is bounded by ``send_counts[dest]`` read at runtime, not by
     the compile-time MAX_RECV capacity — a capacity-bounded loop would transfer
@@ -724,7 +740,7 @@ def test_all_to_all_v_push_loop_is_bounded_by_runtime_send_counts():
 
     # The runtime count is clamped against the capacity, so a count larger than
     # MAX_RECV cannot push into the next destination's slice of the peer window.
-    clamps = [v for v in probe.assign_values if isinstance(v, ir.Min)]
+    clamps = _min_clamps(probe.assign_values)
     assert clamps, "the runtime send count must be clamped (min) against the MAX_RECV capacity"
     clamp_operands = [
         operand.value
@@ -735,6 +751,129 @@ def test_all_to_all_v_push_loop_is_bounded_by_runtime_send_counts():
     assert _AAV_MAX_RECV in clamp_operands, (
         f"the clamp must bound the count by MAX_RECV ({_AAV_MAX_RECV}); "
         f"constant clamp operands found: {clamp_operands}"
+    )
+
+
+class _GuardProbe(ir.IRVisitor):
+    """Record Call op names by whether they sit inside an ``IfStmt`` body."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.guarded: list[str] = []
+        self.unguarded: list[str] = []
+        self._if_depth = 0
+
+    def visit_for_stmt(self, op: ir.ForStmt) -> None:
+        self._walk_stmt(op.body)
+
+    def visit_if_stmt(self, op: ir.IfStmt) -> None:
+        self._if_depth += 1
+        self._walk_stmt(op.then_body)
+        if op.else_body is not None:
+            self._walk_stmt(op.else_body)
+        self._if_depth -= 1
+
+    def visit_assign_stmt(self, op: ir.AssignStmt) -> None:
+        if isinstance(op.value, ir.Call):
+            bucket = self.guarded if self._if_depth > 0 else self.unguarded
+            bucket.append(op.value.op.name)
+
+    def _walk_stmt(self, stmt: ir.Stmt) -> None:
+        # Same trampoline caveat as _StmtProbe: nested statement callbacks are
+        # not redispatched to Python overrides, so recurse explicitly.
+        if isinstance(stmt, ir.SeqStmts):
+            for child in stmt.stmts:
+                self._walk_stmt(child)
+        elif isinstance(stmt, ir.ForStmt):
+            self.visit_for_stmt(stmt)
+        elif isinstance(stmt, ir.IfStmt):
+            self.visit_if_stmt(stmt)
+        elif isinstance(stmt, ir.AssignStmt):
+            self.visit_assign_stmt(stmt)
+
+
+def _collect_tile_puts(prog) -> list:
+    """Every ``pld.tile.put`` call in the lowered program, guarded or not."""
+    put_op = ir.get_op("pld.tile.put").name
+    return [
+        value
+        for value in _probe_stmts(prog).assign_values
+        if isinstance(value, ir.Call) and value.op.name == put_op
+    ]
+
+
+def test_all_to_all_v_transfer_shape_is_the_runtime_row_count():
+    """The TPUT transfer extent is the runtime row count, not MAX_RECV.
+
+    Regression lock. The transfer shape used to be the compile-time
+    ``[MAX_RECV, SIZE]``, so every peer got the full capacity block and the
+    padding rows crossed the interconnect regardless of how few rows were
+    actually being sent.
+
+    Nothing else in the suite pins this down: the shape can silently revert to a
+    constant and every other test still passes, because correctness is
+    unaffected (the receiver uses ``recv_counts`` either way). Only the bytes on
+    the wire change, which no functional test observes.
+    """
+    After = passes.lower_composite_ops()(_build_all_to_all_v_before())
+    puts = _collect_tile_puts(After)
+    assert puts, "expected a pld.tile.put per destination"
+
+    for put in puts:
+        transfer_shape = put.args[6]
+        assert isinstance(transfer_shape, ir.MakeTuple), "transfer shape must be a shape tuple"
+        rows, cols = transfer_shape.elements[0], transfer_shape.elements[1]
+        assert not isinstance(rows, ir.ConstInt), (
+            "transfer rows regressed to the compile-time constant "
+            f"{rows.value}; the full MAX_RECV capacity would cross the wire again"
+        )
+        assert isinstance(cols, ir.ConstInt) and cols.value == _AAV_SIZE, (
+            f"transfer cols must stay the static row width ({_AAV_SIZE})"
+        )
+
+
+def test_all_to_all_v_row_count_is_clamped_below_by_zero():
+    """``rows`` is clamped on both sides, not just against MAX_RECV.
+
+    The lower clamp only became load-bearing once ``rows`` started sizing the
+    transfer. Before that a negative ``send_counts`` merely produced a negative
+    TNOTIFY payload; now it would be a negative transfer extent.
+    """
+    After = passes.lower_composite_ops()(_build_all_to_all_v_before())
+    probe = _probe_stmts(After)
+
+    floors = [v for v in probe.assign_values if isinstance(v, ir.Max)]
+    assert floors, "the runtime send count must be clamped below by 0 (max)"
+    floor_operands = [
+        operand.value
+        for floor in floors
+        for operand in (floor.left, floor.right)
+        if isinstance(operand, ir.ConstInt)
+    ]
+    assert 0 in floor_operands, (
+        f"the lower clamp must floor the count at 0; constant operands found: {floor_operands}"
+    )
+
+
+def test_all_to_all_v_count_notify_is_not_inside_the_push_guard():
+    """The push is guarded on ``rows > 0``; the count notify is not.
+
+    A destination receiving zero rows still needs ``recv_counts = 0`` published,
+    or it reads a stale count from a previous invocation. So the guard must wrap
+    the ``pld.tile.put`` only. This asserts the notify survives outside any
+    conditional.
+    """
+    After = passes.lower_composite_ops()(_build_all_to_all_v_before())
+    probe = _GuardProbe()
+    probe.visit_program(After)
+
+    put_op = ir.get_op("pld.tile.put").name
+    notify_op = ir.get_op("pld.system.notify").name
+
+    assert put_op in probe.guarded, "the pld.tile.put must sit inside the rows > 0 guard"
+    assert notify_op in probe.unguarded, (
+        "the recv_counts notify must stay OUTSIDE the rows > 0 guard — a zero-row "
+        "destination would otherwise read a stale recv_counts"
     )
 
 

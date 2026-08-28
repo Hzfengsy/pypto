@@ -634,9 +634,10 @@ TypePtr DeduceTensorAllToAllVType(const std::vector<ExprPtr>& args,
       << target_dim0->value_ << ")";
 
   // send_counts: per-destination row counts, read at runtime by the lowering
-  // (``tensor.read``) to bound each destination's push loop — this is what
-  // makes the exchange genuinely variable-size rather than a padded transfer
-  // of the full MAX_RECV capacity.  Tensor-like so counts that live in a
+  // (``tensor.read``) and used for two distinct things — it sizes the TPUT
+  // transfer extent (so only the payload crosses the wire, not the full
+  // MAX_RECV capacity) and it is published to the peer as recv_counts (so the
+  // receiver knows which rows are valid).  Tensor-like so counts that live in a
   // window (e.g. published by a preceding exchange) are accepted too.
   auto counts_type = AsTensorTypeLike(args[3]->GetType());
   CHECK(counts_type) << "pld.tensor.all_to_all_v send_counts must be a Tensor or DistributedTensor, got "
@@ -694,23 +695,21 @@ TypePtr DeduceTensorAllToAllVType(const std::vector<ExprPtr>& args,
 REGISTER_OP("pld.tensor.all_to_all_v")
     .set_description(
         "All-to-all: variable-size personalized exchange (push-based, "
-        "window-as-result).  Each rank pushes a full MAX_RECV-row capacity "
-        "block to each peer via ``pld.tile.put``, into a 2D staging window "
-        "[NR*MAX_RECV, SIZE] addressed with flat row-index arithmetic "
-        "``dest*MAX_RECV+r``; only ``send_counts[dest]`` of those rows — a "
-        "runtime, data-dependent count — are logically valid.  MAX_RECV is "
-        "the compile-time per-peer capacity; counts above it are clamped.  "
-        "The push always transfers the full MAX_RECV-row capacity block per "
-        "destination (a compile-time-sized ``pld.tile.put``, independent of "
-        "the runtime count) — rows beyond a sender's actual count still cross "
-        "the wire, but the receiver skips them using ``recv_counts`` "
-        "(MPI_Alltoallv semantics apply to the logical result, not the wire "
-        "transfer).  During the same push phase each rank also publishes "
-        "``min(send_counts[dest], MAX_RECV)`` into peer ``dest``'s "
+        "window-as-result).  Each rank pushes ``rows = clamp(send_counts[dest], "
+        "0, MAX_RECV)`` rows to each peer via ``pld.tile.put``, into a 2D "
+        "staging window [NR*MAX_RECV, SIZE] addressed with flat row-index "
+        "arithmetic ``dest*MAX_RECV+r``; MAX_RECV is the compile-time per-peer "
+        "capacity.  The transfer extent is the runtime count ``[rows, SIZE]``, "
+        "so only the payload crosses the wire — rows past the transfer extent "
+        "in the receiver's capacity slot are left unwritten, never filled with "
+        "the sender's surplus.  Those bytes are UNINITIALISED and may decode as "
+        "NaN/Inf, unlike the finite FP32 surplus the old full-capacity push left "
+        "there: trim to ``recv_counts`` BEFORE computing over the capacity "
+        "block, or NaN propagates into otherwise-valid rows.  During the same push phase "
+        "each rank publishes that same clamped count into peer ``dest``'s "
         "``recv_counts[my_rank, 0]`` via ``pld.system.notify`` (Set) — the "
         "receive-side count vector (MPI_Alltoallv recvcounts) identifying how "
-        "many of the physically-transferred rows are logically valid, so the "
-        "receiver can skip the rest. "
+        "many rows are logically valid, so the receiver skips the rest.  "
         "Returns the target window so the caller can read back via "
         "``tile.load`` — same pattern as the symmetric "
         "``pld.tensor.all_to_all`` intrinsic.")

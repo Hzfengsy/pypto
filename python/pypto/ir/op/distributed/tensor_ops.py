@@ -473,17 +473,28 @@ def all_to_all_v(
     ``send_counts`` [NR] / [NR, 1] holding the number of rows to send to each
     destination, and window-bound INT32 ``recv_counts`` [NR, 1] that receives
     per-source valid-row counts after the barrier (published via
-    ``pld.system.notify`` as ``min(send_counts[dest], MAX_RECV)``). Powered by
-    LowerCompositeOps into a 2-phase push-based decomposition (push → barrier),
-    returning the target window. Each push transfers a full MAX_RECV-row
-    capacity block regardless of the runtime count; the caller reads back
-    from the window with ``pl.load``, using ``recv_counts[src, 0]`` to know
-    how many of the physically-transferred rows are logically valid.
+    ``pld.system.notify`` as ``clamp(send_counts[dest], 0, MAX_RECV)``). Powered
+    by LowerCompositeOps into a 2-phase push-based decomposition (push →
+    barrier), returning the target window. Each push transfers exactly
+    ``clamp(send_counts[dest], 0, MAX_RECV)`` rows — the transfer extent is the
+    runtime ``[rows, SIZE]``, so padding up to the capacity never crosses the
+    wire; the caller reads back from the window with ``pl.load``, using
+    ``recv_counts[src, 0]`` to know how many rows arrived.
 
-    ``send_counts`` is read at runtime, so the counts may be data-dependent;
-    each count is clamped to the per-peer capacity ``MAX_RECV =
-    target.shape[0] // NR``. The barrier signal is self-clearing (restored to
-    zero after each call) and safe to reuse inside a ``for``/``while`` loop.
+    ``send_counts`` is read at runtime, so the counts may be data-dependent.
+    The clamp is two-sided against the per-peer capacity ``MAX_RECV =
+    target.shape[0] // NR``: a count above it is capped, and a **negative**
+    count is floored at ``0`` — so a negative ``send_counts[dest]`` publishes
+    ``recv_counts = 0`` rather than the negative value. The barrier signal is
+    self-clearing (restored to zero after each call) and safe to reuse inside a
+    ``for``/``while`` loop.
+
+    .. warning::
+
+       Rows past the transfer extent are never written, and window memory is not
+       guaranteed zeroed — those bytes are *uninitialised* and may decode as
+       **NaN or Inf**. Trim to ``recv_counts`` **before** computing over the
+       dense ``[NR*MAX_RECV, SIZE]`` block, or NaN propagates into valid rows.
     """
     actual_span = _get_span_or_capture(span, frame_offset=1)
     _args: list[Expr] = [input, target, signal, send_counts, recv_counts]

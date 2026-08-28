@@ -995,10 +995,10 @@ def all_to_all_v(
     5-arg form: ``pld.tensor.all_to_all_v(input, target, signal, send_counts,
     recv_counts)``.
 
-    Each rank pushes a full ``MAX_RECV``-row capacity block to peer ``dest``;
-    only ``send_counts[dest]`` of those rows are logically valid — the counts
-    are read at runtime, so they may be data-dependent (e.g. MoE tokens per
-    expert), but they do not change the transfer size.  Mirrors the symmetric
+    Each rank pushes ``clamp(send_counts[dest], 0, MAX_RECV)`` rows to peer
+    ``dest`` — the counts are read at runtime, so they may be data-dependent
+    (e.g. MoE tokens per expert), and they **do** set the transfer size, so
+    padding up to the capacity never crosses the wire.  Mirrors the symmetric
     ``pld.tensor.all_to_all`` otherwise: rows are pushed into a flat 2D staging
     window via ``pld.tile.put``, and the window is returned so the caller can
     read back via ``pl.load``.  There is no built-in read-back phase — the user
@@ -1010,24 +1010,38 @@ def all_to_all_v(
     [NR*MAX_RECV, SIZE] — the staging window that doubles as the result;
     rank ``src``'s rows land at ``src*MAX_RECV ...``.
 
-    ``MAX_RECV = target.shape[0] // NR`` is both the compile-time per-peer
-    *capacity* and the fixed transfer size: it fixes the row-index arithmetic
-    so a receiver can locate each sender's block without knowing that
-    sender's count, and every push transfers exactly ``MAX_RECV`` rows
-    regardless of the runtime count.  Counts are clamped to ``MAX_RECV``.
-    Rows beyond a sender's count still physically cross the wire but are
-    logically invalid — as with ``MPI_Alltoallv``, the receiver must not read
-    past its published ``recv_counts`` entry; the tail is not zeroed, so
-    treat it as containing stale/undefined data, not zeros.
+    ``MAX_RECV = target.shape[0] // NR`` is the compile-time per-peer
+    *capacity*: it fixes the row-index arithmetic so a receiver can locate each
+    sender's block without knowing that sender's count.  It is **not** the
+    transfer size — the transfer extent is the runtime ``[rows, SIZE]``, where
+    ``rows = clamp(send_counts[dest], 0, MAX_RECV)``.
+
+    The clamp is two-sided.  A count above ``MAX_RECV`` is capped so it cannot
+    push into the next destination's slice; a **negative** count is floored at
+    ``0``, and since the published value is that same clamped count, a negative
+    ``send_counts[dest]`` publishes ``recv_counts = 0`` rather than the negative
+    number.
+
+    Rows beyond a sender's count are **not written at all** — they no longer
+    cross the wire.  As with ``MPI_Alltoallv``, the receiver must not read past
+    its published ``recv_counts`` entry.
+
+    .. warning::
+
+       Trim to ``recv_counts`` **before** doing arithmetic over the capacity
+       block.  The untouched tail is *uninitialised* and may decode as **NaN or
+       Inf** — not merely as a wrong-but-finite value.  Code that reduces or
+       otherwise computes across the dense ``[NR*MAX_RECV, SIZE]`` block and
+       masks by ``recv_counts`` afterwards will propagate NaN into
+       otherwise-valid rows.  Mask first, then compute.
 
     During the same push, each rank also publishes
-    ``min(send_counts[dest], MAX_RECV)`` into peer ``dest``'s
+    ``clamp(send_counts[dest], 0, MAX_RECV)`` into peer ``dest``'s
     ``recv_counts[my_rank, 0]`` via ``pld.system.notify`` (Set). After the
-    barrier, ``recv_counts[src, 0]`` tells this rank how many of the
-    physically-transferred rows from ``src`` are logically valid — use that
+    barrier, ``recv_counts[src, 0]`` tells this rank how many rows ``src``
+    sent — which is now also exactly how many were transferred — so use that
     count to know where to stop reading. This is the MPI_Alltoallv recvcounts
-    side (published value is the clamped logical count, not the physical
-    transfer size).
+    side.
 
     The barrier ``signal`` is self-clearing (restored to zero after each call)
     and safe to reuse inside a ``for``/``while`` loop.
@@ -1045,7 +1059,8 @@ def all_to_all_v(
             preceding exchange).
         recv_counts: :class:`pld.DistributedTensor` INT32 [NR, 1] — after the
             call, ``recv_counts[src, 0]`` holds how many rows ``src`` actually
-            sent here (clamped to ``MAX_RECV``) (InOut).
+            sent here, and how many were transferred — the count is clamped
+            to ``[0, MAX_RECV]``, so a negative input publishes ``0`` (InOut).
 
     Returns:
         The ``target`` :class:`pld.DistributedTensor` with received chunks.

@@ -107,28 +107,45 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
   // (dest == my_rank), matching HCCL identity / the InCore composite's
   // EmitFor over [0, nranks) with no self-exclusion.
   //
-  //   rows = min(send_counts[dest], max_recv)   -- runtime scalar, clamped
-  //          (no floor at 0 — matches LowerTensorAllToAllVRule's
-  //          MakeMin(cast(count, INDEX), max_recv) exactly, so HOST and
-  //          InCore agree bit-for-bit on a negative send_counts input)
+  //   rows = clamp(send_counts[dest], 0, max_recv)  -- runtime scalar,
+  //          clamped on BOTH sides. Matches LowerTensorAllToAllVRule's
+  //          MakeMax(MakeMin(cast(count, INDEX), max_recv), 0) exactly, so
+  //          HOST and InCore agree bit-for-bit on every input, including a
+  //          negative send_counts.
   //   TNOTIFY(recv_counts[dest]'s window, slot my_rank) = rows  (Set)
-  //   TPUT input[dest*max_recv : (dest+1)*max_recv, :]
-  //        -> target[my_rank*max_recv : (my_rank+1)*max_recv, :]
+  //   TPUT input[dest*max_recv : dest*max_recv + rows, :]
+  //        -> target[my_rank*max_recv : my_rank*max_recv + rows, :]
   //
-  // The TPUT ALWAYS transfers the full max_recv-row block, regardless of
-  // `rows` — this reproduces LowerTensorAllToAllVRule exactly (its
-  // pld.tile.put transfer_shape is the compile-time {max_recv, SIZE}, never
-  // gated by the runtime count). Rows beyond a sender's `rows` therefore
-  // DO cross the interconnect (as whatever bytes happen to be in that
-  // capacity slot of `input`); the receiver skips them via recv_counts.
-  // This is intentional InCore/HOST parity, not a shortcut: it keeps the
-  // two lowering paths bit-for-bit identical on the wire and avoids a
-  // second, functionally divergent all_to_all_v implementation.
+  // The TPUT transfers exactly `rows` rows, not the full max_recv capacity —
+  // only the payload crosses the interconnect. Rows past `rows` in the
+  // destination's capacity slot are simply not written, and the receiver
+  // identifies the valid ones via recv_counts (unchanged semantics).
+  //
+  // The unwritten tail of the destination's capacity slot therefore holds
+  // whatever was already in the window. Window memory is not *guaranteed*
+  // zeroed and can carry over within a process, so those bytes are undefined
+  // (a freshly allocated window has been seen reading zero, and a reused one
+  // reading values like -1.2e+32).
+  // Previously the full-capacity push filled them with the sender's surplus
+  // rows, which were equally meaningless but were always FINITE FP32. The tail
+  // has therefore changed in KIND, not just in value: uninitialised bytes may
+  // decode as NaN/Inf. A consumer that reduces over the dense capacity block
+  // and masks by recv_counts afterwards - the natural MoE dispatch shape - was
+  // correct before and would now propagate NaN into valid rows. Trim to
+  // recv_counts BEFORE computing.
+  // recv_counts is what makes either correct, and always was: only code reading
+  // past recv_counts can tell the difference, and it was already reading data
+  // it had no right to.
+  //
+  // InCore/HOST wire parity is deliberate and preserved: LowerTensorAllToAllVRule
+  // emits the same [rows, SIZE] transfer, so the two lowering paths stay
+  // bit-for-bit identical and there is no second, divergent implementation.
   // ==================================================================
   for (int dest = 0; dest < nranks; ++dest) {
     int32_t raw_count = send_counts_base[dest];
     int64_t rows64 = static_cast<int64_t>(raw_count);
     if (rows64 > max_recv) rows64 = max_recv;
+    if (rows64 < 0) rows64 = 0;
     int32_t rows = static_cast<int32_t>(rows64);
 
     __gm__ int32_t *remote_recv_slot = CommRemotePtr(comm_ctx, recv_counts_base + my_rank, dest);
@@ -139,11 +156,13 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     int64_t dst_row_offset = static_cast<int64_t>(my_rank) * max_recv * row_numel;
     __gm__ {{dtype_cpp}} *remote_block = CommRemotePtr(comm_ctx, target + dst_row_offset, dest);
 
-    // The per-destination block [max_recv, SIZE] is contiguous in the dense
-    // row-major [NR*max_recv, SIZE] layout, so it is flattened into one
-    // 1D-chunked TPUT loop (same tiling shape as symmetric all_to_all's
-    // single-row loop, generalized to max_recv*row_numel elements).
-    int64_t block_numel = max_recv * row_numel;
+    // The pushed block [rows, SIZE] is contiguous in the dense row-major
+    // [NR*max_recv, SIZE] layout, so it is flattened into one 1D-chunked TPUT
+    // loop (same tiling shape as symmetric all_to_all's single-row loop,
+    // generalized to rows*row_numel elements). rows == 0 makes block_numel 0
+    // and the loop below simply does not execute, so no TPUT is issued for a
+    // destination getting nothing — matching the InCore rail's rows > 0 guard.
+    int64_t block_numel = rows64 * row_numel;
     for (int64_t base = 0; base < block_numel; base += tile_cols) {
       int64_t chunk64 = block_numel - base;
       if (chunk64 > tile_cols) chunk64 = tile_cols;
