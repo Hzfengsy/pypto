@@ -752,10 +752,20 @@ ChainVerdict JudgeChain(ChainCollector& graph, const std::vector<const Var*>& me
     }
   }
 
-  // Aggregate-initialize every field in one expression. Default-constructing and
-  // then assigning field by field makes clang's analyzer report `batch_count` as
-  // uninitialized when the plan is later moved into the optional, even though the
-  // in-class initializers cover it.
+  // Aggregate-initialize every field in one expression rather than
+  // default-constructing and assigning field by field.
+  //
+  // The NOLINT is an unavoidable false positive, not a silenced defect. `head` is
+  // `*chain_seeds.front()` -- a deref of a pointer collected in `RecordSeed`, a
+  // different function -- so the analyzer cannot see where the pointee was built
+  // and models every `head` field as undefined. It then reports that undefined
+  // value flowing into `batch_count` when `ChainVerdict` is moved out of this
+  // function through `std::optional`'s move constructor. Every `AccSeed` field has
+  // an in-class initializer (`batch_count = 1`), `RecordSeed` assigns
+  // `batch_count` before publishing the seed, and it returns early for
+  // `batch_count <= 1`, so no seed with an undefined or unusable `batch_count`
+  // ever reaches here.
+  // NOLINTNEXTLINE(clang-analyzer-core.uninitialized.Assign)
   verdict.plan = AccPackingPlan{batch_count, rows, cols, head.dtype, head.batch_dims, head.nd_shape};
   return verdict;
 }
