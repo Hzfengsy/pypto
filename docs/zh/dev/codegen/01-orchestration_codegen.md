@@ -450,6 +450,51 @@ if (condition) {
 }
 ```
 
+#### `ArrayType` return_vars（数组 phi）
+
+若 `if` 的条件是运行期值（不会在编译期折叠），在其分支中写入 `pl.array` 的某个
+元素会使该数组成为分支结果。`arr[i] = v` 是 SSA 函数式的——它会脱糖为
+`arr = pl.array.update_element(arr, i, v)`——因此 `ConvertToSSA` 会发现 `arr`
+在两个分支间产生分歧，并为它合成一个 `IfStmt` return_var：
+
+```python
+if i < n:                       # n 为运行期值，该判断会保留到 codegen
+    tids[i] = tid               # tids 分歧 => ArrayType phi
+```
+
+这样的 phi **不会**被声明。`ArrayType` SSA 值是对唯一后端 C 栈数组的*引用*，
+而非可拷贝的值：每个 `array.update_element` 都会把结果别名到其输入的 emit 名字
+上，因此两个分支修改的是同一块存储，合并本身是空操作。原生 C 数组既不能由类型
+声明出来，也不能整体赋值——向 `GetCppType` 索取该类型属于内部错误。
+
+取而代之的是：每个分支的 `YieldStmt` 记录它解析到的后端数组，待两个分支都生成
+完毕后再把 phi 的 emit 名字绑定到该数组，使 `if` 之后的读取直接落到它：
+
+```cpp
+TaskId tids[8];             // 唯一的后端数组
+...
+if ((i < static_cast<int64_t>(n))) {
+    tids[i] = p_tid;            // 原地写入；没有 phi 变量，也没有拷贝
+} else {
+}
+```
+
+这里有两条次序约束：
+
+- **解析发生在每个分支的 yield 处**，而不是预先扫描分支体。被 yield 的值并不总是
+  `array.update_element` 的结果——当数组是在*嵌套*控制流中被更新时，分支 yield 的
+  是内层 `if` / `for` 自己的 ArrayType return_var。到 yield 时该嵌套语句已经完成
+  绑定，因此一次查表即可覆盖任意嵌套深度。这同时把每个 phi 的开销降为 O(1)：不会
+  重复遍历任何分支子树。
+- **安装发生在两个分支都生成之后**，且在外层进行，因为每个生成的 `SIMPLER_SCOPE` 都会
+  在进入时快照、退出时还原 `array_carry_vars_`（参见 [Manual Scope 与 TaskId
+  降级](#manual-scope-与-taskid-降级)）——在分支体内部做的注册会在其右花括号处被
+  丢弃。PTO 后端捕获并绑定其原地 return_var 的方式与此相同。
+
+两个分支必须指向同一块后端数组。若在每个分支中各自创建*不同*的数组，就没有唯一的
+数组可供 phi 绑定，会以面向用户的 `CHECK` 报错——请在 `if` 之前创建数组，并在分支
+内写入其元素。
+
 ## Python API
 
 ```python

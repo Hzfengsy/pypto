@@ -324,6 +324,10 @@ class LoweringBuilder {
     return MakeNe(left, right, span);
   }
 
+  ExprPtr Gt(const ExprPtr& left, const ExprPtr& right, const Span& span) {
+    return MakeGt(left, right, span);
+  }
+
   // ---- Collective-op helpers (DRY extraction for barrier/broadcast/allgather/
   //      reduce_scatter/allreduce) ----
 
@@ -1995,25 +1999,24 @@ ExprPtr LowerTensorAllToAllRule(const CallPtr& call, const std::vector<ExprPtr>&
 // send_counts, recv_counts) extends the symmetric all_to_all's
 // window-as-result pattern: the intrinsic returns target, and the caller
 // reads back from the window with tile.load.  During the push phase each
-// rank also publishes the *clamped* ``min(send_counts[dest], MAX_RECV)``
+// rank also publishes the *clamped* ``clamp(send_counts[dest], 0, MAX_RECV)``
 // into peer ``dest``'s ``recv_counts[my_rank, 0]`` via ``pld.system.notify``
 // (Set) — MPI_Alltoallv recvcounts — so after the barrier the receiver knows
-// how many of the physically-transferred rows at the tail of each source's
-// MAX_RECV slot are logically valid. Notify writes a scalar INT32 cell (same
-// path as the barrier signal), so ``recv_counts`` stays ``[NR, 1]`` and no
-// post-convert ``tensor.create`` scratch is needed (ConvertTensorToTileOps
-// already ran before this pass).
+// which rows of each source's MAX_RECV slot are logically valid. Notify
+// writes a scalar INT32 cell (same path as the barrier signal), so
+// ``recv_counts`` stays ``[NR, 1]`` and no post-convert ``tensor.create``
+// scratch is needed (ConvertTensorToTileOps already ran before this pass).
 //
 // 2-phase push-based decomposition:
 //
 //   Phase 1 (push):
 //     For each dest ∈ [0, NR):
-//       rows = min(send_counts[dest], MAX_RECV)        // runtime scalar read
+//       rows = clamp(send_counts[dest], 0, MAX_RECV)   // runtime scalar read
 //       notify(recv_counts, dest, [my_rank, 0], rows, Set)  // clamped count
-//       // Single pld.tile.put per destination: contiguous [MAX_RECV, SIZE]
-//       // block at input[dest*MAX_RECV, :] → target[my_rank*MAX_RECV, :].
-//       // Transfer shape is static [MAX_RECV, SIZE] (PTOAS requires static
-//       // partition-view dims for pto.comm.tput).  A [1, SIZE] staging tile
+//       // Single pld.tile.put per destination: contiguous [rows, SIZE] block
+//       // at input[dest*MAX_RECV, :] → target[my_rank*MAX_RECV, :]. The
+//       // transfer shape is the runtime [rows, SIZE] (PTOAS accepts dynamic
+//       // partition-view dims on pto.comm.tput).  A [1, SIZE] staging tile
 //       // feeds the TPUT engine, which 2-D-slides the transfer through it.
 //
 //   Phase 2: self-clearing credit barrier
@@ -2021,16 +2024,16 @@ ExprPtr LowerTensorAllToAllRule(const CallPtr& call, const std::vector<ExprPtr>&
 //     EmitEpilogueReset(-1) — subtracts the credit back to zero after the call
 //
 // MAX_RECV = target.shape[0] / NR (both must be compile-time constants) is
-// both the per-peer *capacity* and the fixed transfer size: it fixes the flat
-// row-index arithmetic (dest*MAX_RECV+r) so a receiver can locate each
-// sender's block without knowing that sender's count, and it sizes every
-// pld.tile.put identically regardless of the runtime count.  Counts are
-// clamped to MAX_RECV so an out-of-range count cannot push past peer dest's
-// capacity slice.  Rows beyond a sender's actual count still physically cross
-// the wire, but are logically invalid — the receiver uses recv_counts[src]
-// (already clamped to MAX_RECV at publish time) to know how many leading rows
-// of source src's block to use, the same MPI_Alltoallv semantics applied to
-// the logical result rather than the wire transfer.
+// the per-peer *capacity*: it fixes the flat row-index arithmetic
+// (dest*MAX_RECV+r) so a receiver can locate each sender's block without
+// knowing that sender's count.  Counts are clamped to [0, MAX_RECV] so an
+// out-of-range (or negative) count cannot push past peer dest's capacity
+// slice or produce a negative extent.  The transfer moves exactly
+// clamp(send_counts[dest], 0, MAX_RECV) rows per destination — rows beyond
+// the runtime count never cross the wire, and the receiver uses
+// recv_counts[src] (the same clamped value, published at push time) to know
+// how many leading rows of source src's block are valid, the same
+// MPI_Alltoallv semantics applied to the logical result.
 // ============================================================================
 
 ExprPtr LowerTensorAllToAllVRule(const CallPtr& call, const std::vector<ExprPtr>& args, LoweringBuilder& b) {
@@ -2094,14 +2097,15 @@ ExprPtr LowerTensorAllToAllVRule(const CallPtr& call, const std::vector<ExprPtr>
   auto max_recv_expr = std::make_shared<ConstInt>(max_recv_value, DataType::INDEX, span);
 
   // Per-destination staging tile: static [1, SIZE] — pto-isa auto-chunks the
-  // transfer through it.  The Transfer shape is static [MAX_RECV, SIZE]
-  // (PTOAS requires static partition-view dims for pto.comm.tput).
+  // transfer through it. The stage stays static (UB is allocated statically)
+  // even though the transfer extent is dynamic.
   auto stage_shape = std::make_shared<MakeTuple>(std::vector<ExprPtr>{one_idx, size_expr}, span);
 
   // ---- Phase 1: push per-destination blocks to peer windows ----
   // One shared [1, SIZE] VEC staging tile reused across all destinations;
-  // a single pld.tile.put per destination transfers the full [MAX_RECV, SIZE]
-  // capacity per peer (static partition-view size, required by PTOAS).
+  // a single pld.tile.put per destination transfers [rows, SIZE], where rows is
+  // the runtime send count clamped to [0, MAX_RECV] — so only the payload
+  // crosses the wire, not the full capacity block.
   // Flat row-index arithmetic:
   // source[dest*MAX_RECV, :] → target[my_rank*MAX_RECV, :].
   auto put_stage =
@@ -2130,39 +2134,62 @@ ExprPtr LowerTensorAllToAllVRule(const CallPtr& call, const std::vector<ExprPtr>
                       reg.Create("tensor.read",
                                  {send_counts, std::make_shared<MakeTuple>(count_indices, span)}, {}, span),
                       span);
-        auto rows = body.Bind(
-            "aav_rows", MakeMin(MakeCast(count_value, DataType::INDEX, span), max_recv_expr, span), span);
+        // Clamped on BOTH sides: above by MAX_RECV (a larger count would push
+        // into the next destination's slice of the peer window) and below by 0.
+        // The lower clamp matters because ``rows`` now sizes the transfer: a
+        // negative ``send_counts`` would otherwise yield a negative extent. The
+        // HOST builtin kernel applies the identical two-sided clamp, so the two
+        // rails stay bit-for-bit identical on the wire for every input,
+        // including negative counts.
+        auto rows =
+            body.Bind("aav_rows",
+                      MakeMax(MakeMin(MakeCast(count_value, DataType::INDEX, span), max_recv_expr, span),
+                              zero_idx, span),
+                      span);
 
         // Publish the *clamped* transfer count into peer dest's
         // recv_counts[my_rank, 0] via TNOTIFY Set — same scalar-cell path as
         // the barrier signal, including self (peer offset is 0 for self).
-        // The TPUT transfers the full MAX_RECV capacity; the published
-        // clamped value tells the receiver how many rows are valid.
+        // Emitted UNCONDITIONALLY, outside the rows > 0 guard below: a
+        // destination receiving zero rows still needs recv_counts = 0 published,
+        // or it would read a stale count from a previous invocation.
         auto count_i32 = body.Bind("aav_count_i32", MakeCast(rows, DataType::INT32, span), span);
         body.Bind("aav_count_notify",
                   reg.Create("pld.system.notify", {recv_counts, dest_var, my_recv_offsets, count_i32},
                              {{"op", static_cast<int>(NotifyOp::kSet)}}, span),
                   span);
 
-        // Single pld.tile.put per destination transferring the full
-        // [MAX_RECV, SIZE] capacity (static — required by PTOAS).
-        // The [1, SIZE] VEC staging tile feeds the TPUT engine, which
-        // 2-D-slides the larger transfer through it.
+        // Single pld.tile.put per destination transferring exactly the rows
+        // being sent. The [1, SIZE] VEC staging tile feeds the TPUT engine,
+        // which 2-D-slides the larger transfer through it.
         // 2D source offsets: input[dest * MAX_RECV, :]
         auto src_offsets = std::make_shared<MakeTuple>(
             std::vector<ExprPtr>{dest_base, std::make_shared<ConstInt>(0, DataType::INDEX, span)}, span);
         // 2D target offsets: target[my_rank * MAX_RECV, :]
         auto dst_offsets = std::make_shared<MakeTuple>(
             std::vector<ExprPtr>{my_base, std::make_shared<ConstInt>(0, DataType::INDEX, span)}, span);
-        // Static transfer shape: [MAX_RECV, SIZE] — required by PTOAS
-        // (pto.comm.tput partition-view dims must be static).
-        auto transfer_shape =
-            std::make_shared<MakeTuple>(std::vector<ExprPtr>{max_recv_expr, size_expr}, span);
-        body.Bind("aav_put",
+        // Dynamic transfer shape: [rows, SIZE] — only the rows actually being
+        // sent cross the interconnect, instead of the full MAX_RECV capacity.
+        // PTOAS accepts dynamic partition-view dims on pto.comm.tput
+        // (TPutOp::verify passes CommGlobalShapePolicy::AllowDynamicPartitionView),
+        // and pld.tile.put needs no chunk_rows attr: it takes an explicit
+        // [1, SIZE] staging tile, and ValidateStageFitsTransfer skips dynamic
+        // dims because the runtime extent bounds them.
+        auto transfer_shape = std::make_shared<MakeTuple>(std::vector<ExprPtr>{rows, size_expr}, span);
+        // Skip the push entirely for a destination getting no rows — a
+        // zero-extent transfer has no defined TPUT behaviour. The count TNOTIFY
+        // above stays outside this guard on purpose.
+        body.EmitIf(
+            body.Gt(rows, zero_idx, span),
+            [&](LoweringBuilder& then_body) {
+              then_body.Bind(
+                  "aav_put",
                   reg.Create("pld.tile.put",
                              {target, dest_var, input, put_stage, dst_offsets, src_offsets, transfer_shape},
                              {{"atomic", static_cast<int>(AtomicType::kNone)}}, span),
                   span);
+            },
+            /*else_fn=*/nullptr, span);
       },
       span);
 

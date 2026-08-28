@@ -45,7 +45,7 @@ program_inferred = infer_pass(program)
 1. 对于其算子在 `OpRegistry` 中注册了 `input_constraints` 的每一个 `Call`，把每个受约束输入的 *第一个* 允许 memory space 记录为该输入变量的 "需求"。后端会把规范的（无需 move、最便宜的）space 排在第一位——例如 `tile.store` 列出 `{Vec, Acc}`，因此 Vec 生产者无需 move，Acc 来源的 tile 也保留原 space。
 2. 按程序顺序记录两类 `dst → src` 需求边：
    - 对于标记了 `OutputMemoryInheritsInput()` 的算子（如 `tile.fillpad`、`tile.slice`、`tile.reshape`），记录一条从输出变量指向第一个 tile 类型输入的边。
-   - 对于每个循环携带（loop carry），记录一条 `iter_arg → init` 边。阶段 1 会**根据 init 为每个 iter-arg 播种** space，因此循环体对 iter-arg 提出的 space 需求，正是 init 生产者必须被放置的 space。
+   - 对于每个循环携带（loop carry），记录一条 `iter_arg → init` 边。阶段 1 会**根据 init 为每个 iter-arg 播种** space，因此循环体对 iter-arg 提出的 space 需求，正是 init 生产者必须被放置的 space。`pl.while_` 与 `pl.range` 的携带是同一种构造——`iter_args_` / `return_vars_` / `body_` 结构相同——因此 `WhileStmt` 记录同样的边，并获得同样的阶段 1 播种与反向传播。
 
 随后在这些边上**反向**传播需求：单次反向序遍历即可达到不动点。两类边在 SSA 中都严格向后——inherit-input 算子的 `dst` 总在 `src` 之后定义，而 carry 的 init 定义在循环之前——因此一次反向扫描即可完成 O(N) 的不动点。循环的 carry 边在下降进入循环体*之前*记录，于是循环体内的边会被先扫描，读到 carry 边时该 iter-arg 自身的需求已经确定。当同一变量上两个需求冲突时，非 `Vec` 的需求获胜（`ShouldOverrideDemand`）——`Vec` 是宽松的默认值，应被来自 compute 算子的特化需求覆盖。
 
@@ -68,7 +68,9 @@ carry 边把同样的推理延伸到循环边界之外：在循环外加载、�
 对每个带 `return_vars_` 的 `ForStmt`，访问完函数体后，分析器把每个 yield 变量的 memory space 拷贝到对应的 `return_var_`。同样的 space 还会被强制写到：
 
 - 对应的 `iter_arg_` —— 用于覆盖累加器模式：循环体写入了 init 载体尚不具备的 space（如来自 `matmul_acc` 的 `Acc`）。过去这一步是必需的，因为 `tile.create` 默认打上 `Vec`、必须由反向传播覆盖；如今未指定 space 的 `tile.create` 会直接依据需求解析为 `Acc`，反向传播只需覆盖 `AssignStmt` 遍历访问不到的载体。如果不做这一步反向传播，最终的 `tile.store` 读到的是 Vec 类型 tile，会导致 `ExpandMixedKernel` 误判为混合 kernel，进而生成错误的 AIC/AIV IR。
-- `iter_arg_` 下面的 TileType `init_var_` 载体 —— 处理 `IfStmt` 的 `return_var`（永远不会作为 `AssignStmt` 被访问）作为循环 init 的情形。
+- `iter_arg_` 下面的 TileType `init_var_` 载体 —— 处理 `IfStmt` 的 `return_var`（永远不会作为 `AssignStmt` 被访问）作为循环 init 的情形，以及嵌套循环以外层循环的 `IterArg` 作为 init 的情形。后者无法由外层循环自身的反向传播代劳：外层的反向传播要等整个循环体分析完才执行，因此循环体中途消费外层携带值的算子（如 `tile.reshape` 这类 `output_inherits_input` 算子）只能按该时刻的取值解析。
+
+yield 查表与 init 载体查表都使用 `AsVarLike` 而非 `As<Var>`。原样透传的携带值——`pl.yield_(a, b_next)` 中的透传槽位——本身就是 `IterArg`，而嵌套循环也以外层循环的 `IterArg` 作为携带值的种子；`IterArg` 拥有独立的 `ObjectKind`，`As<Var>` 对两者都返回 null，于是该槽位被静默跳过。参见 `.claude/rules/ir-kind-traits.md`。
 
 对每个带 `return_vars_` 的 `IfStmt`，分析器同样从分支 yield 记录每个 TileType phi 的 memory space（以 then 分支为准，else 分支作为兜底，phi 自身的标注作为最后兜底）。这是上述 `ForStmt` 循环携带传播的对偶，同样是关键的一步：若缺失，phi 永远不会进入 `var_memory_`，而所有查表的消费方都会在查不到时静默降级——`InheritFromInput` 会退化到从其他实参继承，阶段 2 的 `CheckInputConstraints` 会直接跳过该实参（**不**排入任何 `tile.move`，于是算子声明的输入空间就被违反了），阶段 3 也会跳过重新标注。暴露该问题的形态是：对 `if`/`else` 累加器 phi 做 `pl.cast` 时，尽管 `tile.cast` 要求 `Vec`，实参却仍停留在 `Acc`，使得 `ExpandMixedKernel` 找不到可下降为 `tpush_to_aiv` / `tpop_from_aic` 对的边界 `tile.move`。这里从 yield 推导而非直接读取 phi 的标注，是因为分支可能在同一轮运行中被重新推断（即上文的累加器模式），此时该标注已经过时。
 

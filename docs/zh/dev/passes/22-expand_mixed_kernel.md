@@ -503,10 +503,12 @@ class After:
 | 属性 | 值 |
 | ---- | -- |
 | 所需 | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure |
-| 产生 | SSAForm, MixedKernelExpanded, NormalizedStmtStructure, HardSyncallOccupancyValid |
-| 失效 | — |
+| 产生 | SSAForm, MixedKernelExpanded, NormalizedStmtStructure, HardSyncallOccupancyValid, AccCompactValid |
+| 失效 | AccCompactValid |
 
 `HardSyncallOccupancyValid` 在此产生，并非因为本 pass 做了什么改写，而是因为它把每个 kernel 的 `FunctionType` 解析为 AIV/AIC/Group——这正是硬 syncall 占用率 verifier 所依赖的前置条件。该 verifier 只在本 pass 之后触发一次。
+
+`AccCompactValid` 在此失效并重新产生：Cube->Vector 边界的 `tile.move` 在本 pass 中被重建为 tpush/tpop 对，并带上新构造的消费者类型，因此 Acc compact 契约必须在这份新 IR 上重新校验，而不能沿用 `InferTileMemorySpace` 的结论。
 
 ## 属性验证器
 

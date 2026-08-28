@@ -465,6 +465,58 @@ if (condition) {
 }
 ```
 
+#### `ArrayType` return_vars (array phis)
+
+Writing one element of a `pl.array` under an `if` whose condition survives to
+codegen makes the array a branch result. `arr[i] = v` is SSA-functional — it
+desugars to `arr = pl.array.update_element(arr, i, v)` — so `ConvertToSSA` sees
+`arr` diverge between the branches and synthesizes an `IfStmt` return_var for
+it:
+
+```python
+if i < n:                       # runtime-valued n — the guard survives
+    tids[i] = tid               # tids diverges => ArrayType phi
+```
+
+Such a phi is **not** declared. An `ArrayType` SSA value is a *reference* to one
+backing C-stack array rather than a copyable value: every `array.update_element`
+aliases its result onto its input's emit name, so both branches mutate the same
+storage and the merge is a no-op. A raw C array could not be declared from its
+type nor assigned anyway — asking `GetCppType` for one is an internal error.
+
+Instead, each branch's `YieldStmt` records the backing array it resolves to, and
+the phi's emit name is bound onto it once both branches are emitted, so reads
+after the `if` resolve straight to that array:
+
+```cpp
+TaskId tids[8];             // the one backing array
+...
+if ((i < static_cast<int64_t>(n))) {
+    tids[i] = p_tid;            // in-place; no phi variable, no copy
+} else {
+}
+```
+
+Two ordering constraints shape this:
+
+- **Resolution happens at each branch's yield**, not by pre-scanning the branch.
+  The yielded value is not always an `array.update_element` result — when the
+  array is updated under *nested* control flow, the branch yields the inner
+  `if` / `for`'s own ArrayType return_var. By yield time that nested statement
+  has already been bound, so one lookup resolves every nesting depth. This also
+  keeps the work O(1) per phi: no branch subtree is traversed twice.
+- **Installation happens after both branches**, at the enclosing level, because
+  every generated `SIMPLER_SCOPE` snapshots and restores `array_carry_vars_` (see
+  [Manual Scope and TaskId Lowering](#manual-scope-and-taskid-lowering)) — a
+  registration made inside a branch body would be discarded at its closing
+  brace. The PTO backend captures and binds its in-place return_vars the same
+  way.
+
+Both branches must name the same backing array. Creating a *different* array in
+each branch leaves nothing single to bind the phi onto, and is rejected with a
+user-facing `CHECK` — create the array before the `if` and write its elements
+inside the branches instead.
+
 ## Python API
 
 ```python

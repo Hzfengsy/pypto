@@ -30,11 +30,13 @@ push-based TPUT pattern with FIVE window-bound resources:
      window-bound ``DistributedTensor`` — ``EmitBuiltinWindowCollectiveDispatch``
      has no dispatch path for a plain ``Tensor`` arg. A real ergonomic cost of
      the narrowing, not a test artifact.
-  3. **All-to-all-v** (``builtin.tensor.all_to_all_v``): the kernel pushes the
-     full ``MAX_RECV``-row capacity block per destination into ``data_buf``,
-     publishes the clamped ``min(send_counts[dest], MAX_RECV)`` into peer
-     ``recv_counts[my_rank, 0]`` via TNOTIFY, and synchronises with one
-     barrier.
+  3. **All-to-all-v** (``builtin.tensor.all_to_all_v``): the kernel pushes only
+     ``rows = clamp(send_counts[dest], 0, MAX_RECV)`` rows per destination into
+     ``data_buf`` — the padding up to ``MAX_RECV`` never crosses the wire —
+     publishes that same clamped count into peer ``recv_counts[my_rank, 0]``
+     via TNOTIFY, and synchronises with one barrier. The clamp is two-sided and
+     identical to ``LowerTensorAllToAllVRule``'s, keeping the HOST and InCore
+     rails bit-for-bit identical on the wire for every input.
   4. **Consume** (``consume_step``): each rank reads ``recv_counts`` to learn
      how many rows each source actually sent, then reads back only those valid
      rows from ``data_buf``.
@@ -124,12 +126,25 @@ def _build_host_all_to_all_v_program(n_ranks: int, max_recv: int):
             out: pl.Out[pl.Tensor[[total, SIZE], pl.FP32]],
             recv_out: pl.Out[pl.Tensor[[nr, 1], pl.INT32]],
         ) -> tuple[pl.Tensor[[total, SIZE], pl.FP32], pl.Tensor[[nr, 1], pl.INT32]]:
+            # Two loops whose row ranges partition each sender's slot, so every
+            # row of the window reaches `out` exactly once and `out` ends up
+            # FULLY written. That matters: a `pl.Out` tensor is write-only on
+            # the device (the host buffer is never uploaded), so a row the
+            # kernel skipped would come back as undefined memory rather than as
+            # window content — and the host-side tail check would be inspecting
+            # that, not the window.
+            #   [base, base + recv_counts[src])       valid -- checked vs golden
+            #   [base + recv_counts[src], base + mr)  tail  -- bounded-transfer check
             for src in pl.range(nr):
                 n_rows_i32 = pl.read(recv_counts, [src, 0])
                 pl.write(recv_out, [src, 0], n_rows_i32)
                 n_rows = pl.cast(n_rows_i32, pl.INDEX)
                 base = src * mr
                 for r in pl.range(n_rows):
+                    flat_row = base + r
+                    chunk = pl.load(data, [flat_row, 0], [1, SIZE])
+                    out = pl.store(chunk, [flat_row, 0], out)
+                for r in pl.range(n_rows, mr):
                     flat_row = base + r
                     chunk = pl.load(data, [flat_row, 0], [1, SIZE])
                     out = pl.store(chunk, [flat_row, 0], out)
@@ -216,10 +231,9 @@ class TestL3HostTensorAllToAllV:
 
         # Rank r sends to dest d: rows dest*mr+k for k=0..n_rows-1.
         # Value = r*1000 + d*100 + k*10 + j%10 (same formula as the InCore ST).
-        # The TPUT transfers the full per-destination capacity block (max_recv
-        # rows, derived at kernel entry from the runtime nranks); rows beyond
-        # n_rows are sent as well — the receiver uses recv_counts to skip the
-        # unwritten window holes.
+        # The TPUT transfers only [n_rows, SIZE] per destination — rows beyond
+        # n_rows are never pushed. The receiver uses recv_counts to identify the
+        # valid rows; the rest of its capacity slot stays unwritten.
         inputs = torch.zeros((nr, total, SIZE), dtype=torch.float32)
         send_counts = torch.zeros((nr, nr, 1), dtype=torch.int32)
         for r in range(nr):
@@ -251,6 +265,120 @@ class TestL3HostTensorAllToAllV:
                     assert torch.allclose(got_row, expected_row, atol=1e-5), (
                         f"P={nr} rank={rank} src={src} row={k}: "
                         f"max diff = {(got_row - expected_row).abs().max().item()}"
+                    )
+
+
+def _effective_rows(count: int, max_recv: int) -> int:
+    """Rows actually transferred and published: ``clamp(count, 0, MAX_RECV)``."""
+    return max(0, min(count, max_recv))
+
+
+# Deliberately duplicated from the InCore ST
+# (``collectives/test_l3_tensor_all_to_all_v_intrinsic.py``) rather than
+# imported: the point is to drive BOTH lowering rails independently with the
+# same counts against the same golden. If the rails ever diverge on the wire,
+# one of the two files fails. Keep the two case tables in sync.
+_SKEW_CASES = {
+    "zero_and_full": lambda nr, mr: [[0 if d % 2 == 0 else mr for d in range(nr)] for _ in range(nr)],
+    "one_and_full": lambda nr, mr: [[1 if d % 2 == 0 else mr for d in range(nr)] for _ in range(nr)],
+    "over_capacity": lambda nr, mr: [[mr + 3 for _ in range(nr)] for _ in range(nr)],
+    "negative": lambda nr, mr: [[-2 if d % 2 == 0 else mr for d in range(nr)] for _ in range(nr)],
+}
+
+
+class TestL3HostTensorAllToAllVSkew:
+    """HOST-rail boundary coverage: 0, 1, capacity, over-capacity, negative counts.
+
+    Mirrors the InCore cases in
+    ``collectives/test_l3_tensor_all_to_all_v_intrinsic.py`` — same counts, same
+    golden — so a wire divergence between the rails surfaces as a golden
+    mismatch in one file or the other.
+
+    **Coverage caveat:** the surplus-row tail check below skips ``src == rank``
+    on this rail only (see #2546). Payload rows and ``recv_counts`` are still
+    checked for every ``(rank, src)`` pair; the InCore file checks the tail on
+    all pairs including its self slot.
+    """
+
+    @pytest.mark.parametrize("case", sorted(_SKEW_CASES))
+    @pytest.mark.parametrize("n_ranks", [2, 4])
+    def test_host_all_to_all_v_skewed_counts(self, test_config, device_ids, n_ranks, case):
+        if len(device_ids) < n_ranks:
+            pytest.skip(f"host all_to_all_v P={n_ranks} needs {n_ranks} devices, got {device_ids}")
+
+        nr = n_ranks
+        mr = MAX_RECV
+        total = nr * mr
+        raw = _SKEW_CASES[case](nr, mr)
+
+        compiled = ir.compile(
+            _build_host_all_to_all_v_program(nr, mr),
+            platform=test_config.platform,
+            distributed_config=DistributedConfig(device_ids=device_ids[:nr], num_sub_workers=0),
+        )
+
+        # Fill every destination's FULL capacity slot so an over-send would be
+        # visible as written padding rows below. ``salt`` keeps each
+        # (case, n_ranks) payload unique: window memory is not zero-initialised
+        # and persists across tests in the same process, so an unwritten row can
+        # otherwise hold the identical pattern an earlier test wrote — which is
+        # indistinguishable from a real over-send and fails spuriously.
+        salt = (sorted(_SKEW_CASES).index(case) + 1) * 100000 + nr * 10000
+        inputs = torch.zeros((nr, total, SIZE), dtype=torch.float32)
+        send_counts = torch.zeros((nr, nr, 1), dtype=torch.int32)
+        for r in range(nr):
+            for d in range(nr):
+                send_counts[r, d, 0] = raw[r][d]
+                base = d * mr
+                for k in range(mr):
+                    for j in range(SIZE):
+                        inputs[r, base + k, j] = float(salt + r * 1000 + d * 100 + k * 10 + j % 10)
+
+        outputs = torch.zeros((nr, total, SIZE), dtype=torch.float32)
+        recv_outputs = torch.zeros((nr, nr, 1), dtype=torch.int32)
+        compiled(inputs, send_counts, outputs, recv_outputs)
+
+        for rank in range(nr):
+            for src in range(nr):
+                n_rows = _effective_rows(raw[src][rank], mr)
+
+                got_count = int(recv_outputs[rank, src, 0].item())
+                assert got_count == n_rows, (
+                    f"P={nr} case={case} rank={rank} src={src}: recv_counts={got_count} "
+                    f"!= clamped({raw[src][rank]}) = {n_rows}"
+                )
+
+                base = src * mr
+                for k in range(n_rows):
+                    expected_row = inputs[src, rank * mr + k, :]
+                    got_row = outputs[rank, base + k, :]
+                    assert torch.allclose(got_row, expected_row, atol=1e-5), (
+                        f"P={nr} case={case} rank={rank} src={src} row={k}: "
+                        f"max diff = {(got_row - expected_row).abs().max().item()}"
+                    )
+
+                # The sender's surplus rows must never arrive. `outputs` now
+                # mirrors the whole window (the consume loop copies the tail
+                # rows too), so this inspects window content rather than an
+                # unwritten region of a write-only `pl.Out` buffer.
+                #
+                # Asserted as exactly zero: the runtime zeroes a comm-domain
+                # window at allocation, before the handle is published to peers
+                # (``aclrtMemset`` in ``comm_hccl.cpp``'s ``alloc_domain``), so
+                # a row no TPUT ever wrote must still read 0. Every payload is
+                # ``salt + ...`` with ``salt > 0``, so a transferred row can
+                # never be mistaken for an untouched one.
+                #
+                # The self slot is no longer skipped. It was excluded because
+                # the rank's own staged input showed up here even when nothing
+                # was transferred (#2546) — but that was the undefined `out`
+                # tail, not the window.
+                for k in range(n_rows, mr):
+                    got_row = outputs[rank, base + k, :]
+                    assert torch.all(got_row == 0.0), (
+                        f"P={nr} case={case} rank={rank} src={src} row={k}: an untransferred row is "
+                        f"not zero — the HOST transfer is not bounded by the runtime count "
+                        f"(got {got_row[:4].tolist()}...)"
                     )
 
 

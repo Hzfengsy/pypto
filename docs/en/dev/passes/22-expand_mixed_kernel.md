@@ -542,10 +542,12 @@ class After:
 | Property | Value |
 | -------- | ----- |
 | Required | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure |
-| Produced | SSAForm, MixedKernelExpanded, NormalizedStmtStructure, HardSyncallOccupancyValid |
-| Invalidated | — |
+| Produced | SSAForm, MixedKernelExpanded, NormalizedStmtStructure, HardSyncallOccupancyValid, AccCompactValid |
+| Invalidated | AccCompactValid |
 
 `HardSyncallOccupancyValid` is produced here not by anything this pass rewrites, but because resolving each kernel's `FunctionType` to AIV/AIC/Group is the precondition the hard-syncall occupancy verifier depends on. That verifier fires once, right after this pass.
+
+`AccCompactValid` is invalidated and re-produced because the Cube->Vector boundary `tile.move` is rebuilt here as a tpush/tpop pair with a freshly built consumer type, so the Acc compact contract has to be re-checked on that new IR rather than trusted from `InferTileMemorySpace`.
 
 ## Property Verifier
 
