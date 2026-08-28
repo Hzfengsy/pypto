@@ -4,20 +4,20 @@
 
 编排代码生成遵循与 [PTO 代码生成](00-pto_codegen.md#设计原则严格的-1-to-1-映射)相同的原则：从 IR 到生成 C++ 代码的**严格 1-to-1 转换**。代码生成不应执行优化、分析或间接转换——此类工作属于前置 Pass。
 
-例如，返回值到参数的追踪（将被调用者返回值映射回 `Out` 参数）是分析工作，应由代码生成之前的 Pass 解决。[`NormalizeReturnOrder`](../passes/25-normalize_return_order.md) pass 现在会在代码生成之前完成此规范化，使编排代码生成可以直接将 `return[i]` 映射到 `out_indices[i]`，无需追踪 `tile.store`/yield 链。
+例如，返回值到参数的追踪（将被调用者返回值映射回 `Out` 参数）是分析工作，应由代码生成之前的 Pass 解决。[`NormalizeReturnOrder`](../passes/26-normalize_return_order.md) pass 现在会在代码生成之前完成此规范化，使编排代码生成可以直接将 `return[i]` 映射到 `out_indices[i]`，无需追踪 `tile.store`/yield 链。
 
-同样，判断一个 `ForStmt` iter_arg 是否需要物化 carry 变量，过去要在循环体上跑别名等价不动点。[`ClassifyIterArgCarry`](../passes/45-classify_iter_arg_carry.md) pass 现在把该判定（以及 TaskId fence 数组的 extent）打在 `ForStmt::attrs_` 上，codegen 直接读 `iter_arg_rebind_<i>` / `iter_arg_array_size_<i>`，不再自行推导。
+同样，判断一个 `ForStmt` iter_arg 是否需要物化 carry 变量，过去要在循环体上跑别名等价不动点。[`ClassifyIterArgCarry`](../passes/47-classify_iter_arg_carry.md) pass 现在把该判定（以及 TaskId fence 数组的 extent）打在 `ForStmt::attrs_` 上，codegen 直接读 `iter_arg_rebind_<i>` / `iter_arg_array_size_<i>`，不再自行推导。
 
 ## 概述
 
-编排代码生成器（Orchestration Codegen）生成 PTO2 运行时 C++ 代码，用于管理昇腾硬件上的任务图执行。[PTO 代码生成](00-pto_codegen.md)产生 InCore 核函数代码（Tile 级计算），而编排代码生成器产生主机侧代码，负责：
+编排代码生成器（Orchestration Codegen）生成 simpler 运行时 C++ 代码，用于管理昇腾硬件上的任务图执行。[PTO 代码生成](00-pto_codegen.md)产生 InCore 核函数代码（Tile 级计算），而编排代码生成器产生主机侧代码，负责：
 
 - 从 `ChipTaskArgs` 借用设备侧描述符作为 `ChipTensor` 引用
 - 构建 `CoreTaskArgs` 对象，调用 `add_input`/`add_output`/`add_inout`/`add_scalar` 对参数分类（manual scope 的依赖边通过一个 `set_dependencies` 栈数组单独发出——见 [Manual Scope 与 TaskId 降级](#manual-scope-与-taskid-降级)）
 - 通过 `rt_submit_*_task` 向 AIC（CUBE）或 AIV（VECTOR）核心提交任务
-- 处理控制流（循环、条件分支），使用 `PTO2_SCOPE`
+- 处理控制流（循环、条件分支），使用 `SIMPLER_SCOPE`
 
-**流水线：** `IR（Orchestration 函数）→ OrchestrationCodegen → C++（PTO2 运行时 API）`
+**流水线：** `IR（Orchestration 函数）→ OrchestrationCodegen → C++（simpler 运行时 API）`
 
 **源码位置：** `src/codegen/orchestration/orchestration_codegen.cpp`
 
@@ -48,7 +48,7 @@ IR 访问器，预扫描函数体以收集：
 
 - **AssignStmt** → 张量操作、函数调用或别名生成
 - **ForStmt** → `for` 循环及迭代参数初始化和 yield 更新
-- **IfStmt** → 每个分支带 `PTO2_SCOPE` 的条件块及返回变量处理
+- **IfStmt** → 每个分支带 `SIMPLER_SCOPE` 的条件块及返回变量处理
 - **YieldStmt** → 循环携带值的变量重赋值
 
 ### 操作注册表
@@ -73,16 +73,16 @@ REGISTER_ORCHESTRATION_OP("tensor.slice", TensorSliceHandler);
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
-#include "pto_orchestration_api.h"
+#include "orchestration_api.h"
 ```
 
 ### 阶段 2–3：入口点
 
 ```cpp
 // 阶段 2：配置函数 — 返回期望的参数数量
-PTO2OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs& orch_args) {
+OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs& orch_args) {
     (void)orch_args;
-    return PTO2OrchestrationConfig{ .expected_arg_count = 3 };
+    return OrchestrationConfig{ .expected_arg_count = 3 };
 }
 
 // 阶段 3：入口函数签名
@@ -107,21 +107,21 @@ const ChipTensor& tmp = alloc_0.get_ref(0);
 
 ### 阶段 6–8：任务提交与控制流
 
-所有任务提交包裹在顶层 `PTO2_SCOPE()` 中。codegen 不再依据 `for` / `if` 结构
-决定 scope 位置：[MaterializeRuntimeScopes](../passes/44-materialize_runtime_scopes.md)
+所有任务提交包裹在顶层 `SIMPLER_SCOPE()` 中。codegen 不再依据 `for` / `if` 结构
+决定 scope 位置：[MaterializeRuntimeScopes](../passes/46-materialize_runtime_scopes.md)
 pass 会向 IR 中插入显式的 AUTO `RuntimeScopeStmt` 节点（函数体以及每个
-`for` / `if` 体），codegen 从这些节点 1:1 地 emit `PTO2_SCOPE`（manual scope
-降级为 `PTO2_SCOPE(PTO2ScopeMode::MANUAL)`）：
+`for` / `if` 体），codegen 从这些节点 1:1 地 emit `SIMPLER_SCOPE`（manual scope
+降级为 `SIMPLER_SCOPE(ScopeMode::MANUAL)`）：
 
 ```cpp
-PTO2_SCOPE() {
+SIMPLER_SCOPE() {
     CoreTaskArgs params_t0;
     params_t0.add_input(ext_a);
     params_t0.add_input(ext_b);
     params_t0.add_output(tmp);               // 预分配张量使用 add_output(const ChipTensor&)
     rt_submit_aiv_task(0, params_t0);
 
-    // ForStmt 示例 — 普通 for 循环，不嵌套独立的 PTO2_SCOPE
+    // ForStmt 示例 — 普通 for 循环，不嵌套独立的 SIMPLER_SCOPE
     for (int64_t i = start; i < stop; i += step) {
         // 任务提交
     }
@@ -190,7 +190,7 @@ params_t1.add_input(ext_output);  // result -> ext_output（无别名声明）
 
 结果别名到哪个 `Out`/`InOut` 参数是查表而非启发式——也不是分析。
 `ReturnParamsExplicit` 属性
-（[`NormalizeReturnOrder`](../passes/25-normalize_return_order.md)）保证：
+（[`NormalizeReturnOrder`](../passes/26-normalize_return_order.md)）保证：
 每个"写回参数"的张量返回值**就是**该参数本身（指针同一性）。因此 codegen 直接
 从被调用者的 `ReturnStmt` 上读取"返回位置 → 参数下标"映射
 （`ir::return_lineage::ExplicitReturnedParamIndices`）：无需 SSA 遍历、无需递归
@@ -216,7 +216,7 @@ IR 层，只服务于在该属性建立**之前**运行的那些 pass。
 | `Vec`（默认） | VECTOR (AIV) | `rt_submit_aiv_task` |
 
 **例外 —— 双 AIV 核函数。** 带 `dual_aiv_dispatch` 标记的 AIV 核函数（即任何 `split_aiv`
-核函数，参见 [`SplitVectorKernel`](../passes/23-split_vector_kernel.md)）必须在一个 cluster 的
+核函数，参见 [`SplitVectorKernel`](../passes/24-split_vector_kernel.md)）必须在一个 cluster 的
 **两个**向量核上同时运行 —— `pl.split_aiv` 区域通过 `aiv_id` 给每条 lane 分派互不相交的工作。
 而 `rt_submit_aiv_task` 只填 AIV0 槽位，运行时会把它调度为 *AIV 形状*的任务 —— 每个 block 一个
 AIV 核：第二条 lane 根本不会启动，而唯一启动的那条读到的 `get_sub_block_id()`，运行时明确说明在
@@ -328,13 +328,13 @@ def orch_basic(
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
-#include "pto_orchestration_api.h"
+#include "orchestration_api.h"
 
 extern "C" {
 
-PTO2OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs& orch_args) {
+OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs& orch_args) {
     (void)orch_args;
-    return PTO2OrchestrationConfig{ .expected_arg_count = 3 };
+    return OrchestrationConfig{ .expected_arg_count = 3 };
 }
 
 void aicpu_orchestration_entry(const ChipTaskArgs& orch_args) {
@@ -343,7 +343,7 @@ void aicpu_orchestration_entry(const ChipTaskArgs& orch_args) {
     const ChipTensor& ext_b = orch_args.tensor(1).ref();
     const ChipTensor& ext_d = orch_args.tensor(2).ref();
 
-    PTO2_SCOPE() {
+    SIMPLER_SCOPE() {
         // 内部张量 — 在 scope 入口通过 alloc_tensors 预分配
         uint32_t c_ci_shapes[2] = {16, 16};
         TensorCreateInfo c_ci(c_ci_shapes, 2, DataType::FLOAT32);
@@ -405,7 +405,7 @@ for i in pl.range(0, 4):
 ```
 
 ```cpp
-// 生成的 C++（位于顶层 PTO2_SCOPE 内部）
+// 生成的 C++（位于顶层 SIMPLER_SCOPE 内部）
 ChipTensor acc = ext_acc;  // 迭代参数初始化
 for (int64_t i = 0; i < 4; i += 1) {
     CoreTaskArgs params_t0;
@@ -436,19 +436,64 @@ else:
 ```cpp
 // 生成的 C++
 if (condition) {
-    PTO2_SCOPE() {
+    SIMPLER_SCOPE() {
         CoreTaskArgs params_t0;
         // ... add_input / add_inout 调用 ...
         rt_submit_aiv_task(0, params_t0);
     }
 } else {
-    PTO2_SCOPE() {
+    SIMPLER_SCOPE() {
         CoreTaskArgs params_t1;
         // ... add_input / add_inout 调用 ...
         rt_submit_aiv_task(1, params_t1);
     }
 }
 ```
+
+#### `ArrayType` return_vars（数组 phi）
+
+若 `if` 的条件是运行期值（不会在编译期折叠），在其分支中写入 `pl.array` 的某个
+元素会使该数组成为分支结果。`arr[i] = v` 是 SSA 函数式的——它会脱糖为
+`arr = pl.array.update_element(arr, i, v)`——因此 `ConvertToSSA` 会发现 `arr`
+在两个分支间产生分歧，并为它合成一个 `IfStmt` return_var：
+
+```python
+if i < n:                       # n 为运行期值，该判断会保留到 codegen
+    tids[i] = tid               # tids 分歧 => ArrayType phi
+```
+
+这样的 phi **不会**被声明。`ArrayType` SSA 值是对唯一后端 C 栈数组的*引用*，
+而非可拷贝的值：每个 `array.update_element` 都会把结果别名到其输入的 emit 名字
+上，因此两个分支修改的是同一块存储，合并本身是空操作。原生 C 数组既不能由类型
+声明出来，也不能整体赋值——向 `GetCppType` 索取该类型属于内部错误。
+
+取而代之的是：每个分支的 `YieldStmt` 记录它解析到的后端数组，待两个分支都生成
+完毕后再把 phi 的 emit 名字绑定到该数组，使 `if` 之后的读取直接落到它：
+
+```cpp
+TaskId tids[8];             // 唯一的后端数组
+...
+if ((i < static_cast<int64_t>(n))) {
+    tids[i] = p_tid;            // 原地写入；没有 phi 变量，也没有拷贝
+} else {
+}
+```
+
+这里有两条次序约束：
+
+- **解析发生在每个分支的 yield 处**，而不是预先扫描分支体。被 yield 的值并不总是
+  `array.update_element` 的结果——当数组是在*嵌套*控制流中被更新时，分支 yield 的
+  是内层 `if` / `for` 自己的 ArrayType return_var。到 yield 时该嵌套语句已经完成
+  绑定，因此一次查表即可覆盖任意嵌套深度。这同时把每个 phi 的开销降为 O(1)：不会
+  重复遍历任何分支子树。
+- **安装发生在两个分支都生成之后**，且在外层进行，因为每个生成的 `SIMPLER_SCOPE` 都会
+  在进入时快照、退出时还原 `array_carry_vars_`（参见 [Manual Scope 与 TaskId
+  降级](#manual-scope-与-taskid-降级)）——在分支体内部做的注册会在其右花括号处被
+  丢弃。PTO 后端捕获并绑定其原地 return_var 的方式与此相同。
+
+两个分支必须指向同一块后端数组。若在每个分支中各自创建*不同*的数组，就没有唯一的
+数组可供 phi 绑定，会以面向用户的 `CHECK` 报错——请在 `if` 之前创建数组，并在分支
+内写入其元素。
 
 ## Python API
 
@@ -467,7 +512,7 @@ orch_code = files["orchestration/orch_func_name.cpp"]
 
 ## Manual Scope 与 TaskId 降级
 
-`with pl.manual_scope():` 区域被降级为 `PTO2_SCOPE(PTO2ScopeMode::MANUAL)`
+`with pl.manual_scope():` 区域被降级为 `SIMPLER_SCOPE(ScopeMode::MANUAL)`
 代码块，区域内 runtime 的 auto OverlapMap 关闭。每个 task 的 params 始终
 声明为普通的 `CoreTaskArgs <task_var>;`。orchestration codegen 把所需的依赖边
 物化为一个定长栈数组加一次 `set_dependencies` 调用：
@@ -476,14 +521,14 @@ orch_code = files["orchestration/orch_func_name.cpp"]
 CoreTaskArgs params_t1;
 params_t1.add_input(...);
 // ...
-PTO2TaskId params_t1_deps[K];          // K = 精确的 dep 边数
+TaskId params_t1_deps[K];          // K = 精确的 dep 边数
 uint32_t params_t1_deps_count = 0;
 params_t1_deps[params_t1_deps_count++] = tid;                          // 新鲜生产者——不加守卫
 if (carry.is_valid()) params_t1_deps[params_t1_deps_count++] = carry;  // 循环 carry——可能无效
 params_t1.set_dependencies(params_t1_deps, params_t1_deps_count);
 ```
 
-只有当 TaskId 可能合法地持有 `PTO2TaskId::invalid()` 哨兵时，dep 槽位才被
+只有当 TaskId 可能合法地持有 `TaskId::invalid()` 哨兵时，dep 槽位才被
 `if (task_id.is_valid())` 包裹，因为 invalid id 绝不能进入
 `set_dependencies`；而**新鲜的直接生产者** TaskId 静态上恒为有效，因此其插入
 不加守卫（issue #1966）。完整的分类见 [TaskId 的来源](#taskid-的来源)。
@@ -496,7 +541,7 @@ parser：parser 把用户的 `pl.submit(..., deps=[tid1, tid2])` kwarg 写入类
 `manual_dep_edges` 的形态已不存在——ManualDepsOnSubmitOnly 结构性属性会校验
 任何跨函数 `Call` 都不携带它；只有 `system.task_dummy` barrier op 作为 fanin
 契约保留该 attr。编译器推导的依赖边来自
-[`AutoDeriveTaskDependencies`](../passes/38-auto_derive_task_dependencies.md)，
+[`AutoDeriveTaskDependencies`](../passes/39-auto_derive_task_dependencies.md)，
 保存在 `Call.attrs["compiler_manual_dep_edges"]`（独立的 key，允许出现在普通
 call 上）。该 pass 从不分析用户写的 MANUAL scope——在 `pl.manual_scope()` 内，
 显式的 `deps=[...]` 仍是唯一的依赖边来源。它只分析 AUTO 区域，且仅当编译期开关
@@ -519,25 +564,25 @@ call 上）。该 pass 从不分析用户写的 MANUAL scope——在 `pl.manual
 
 | Producer 种类 | codegen 发出的 C++ |
 | ------------- | ------------------ |
-| `pl.submit` 的 producer TaskId（增广 Call 的 TaskId tuple 元素） | `PTO2TaskId <tid_name> = task_<n>_outs.task_id();`，其中 `task_<n>_outs` 是 submit 捕获的 `TaskOutputTensors` |
-| `None` 种子（`deps=[None]` 条目中的字面量，或 TaskId iter_arg init） | `PTO2TaskId::invalid()` |
+| `pl.submit` 的 producer TaskId（增广 Call 的 TaskId tuple 元素） | `TaskId <tid_name> = task_<n>_outs.task_id();`，其中 `task_<n>_outs` 是 submit 捕获的 `TaskOutputTensors` |
+| `None` 种子（`deps=[None]` 条目中的字面量，或 TaskId iter_arg init） | `TaskId::invalid()` |
 | 循环 carry iter_arg（穿行循环的 TaskId 配套） | for 循环中穿行的命名变量——标量或数组，见下 |
-| 数组槽读取（`prev = tids[k]`——对 `Array[TASK_ID]` 的 `array.get_element`） | `PTO2TaskId <name> = <arr>[k];`——一个标量快照局部变量；dep 引用该局部变量而非重新读取槽位，因此之后的 `tids[k] = ...` 覆写不会改变它 |
+| 数组槽读取（`prev = tids[k]`——对 `Array[TASK_ID]` 的 `array.get_element`） | `TaskId <name> = <arr>[k];`——一个标量快照局部变量；dep 引用该局部变量而非重新读取槽位，因此之后的 `tids[k] = ...` 覆写不会改变它 |
 
 `pl.submit` call 的 kernel-result tuple 元素与普通多输出 kernel call 一样，
 直接 alias kernel 的 `Out`/`InOut` 参数。
 
-当 id 可能持有 `PTO2TaskId::invalid()` 哨兵时，dep 数组填充条目才会被
+当 id 可能持有 `TaskId::invalid()` 哨兵时，dep 数组填充条目才会被
 `if (<task_id>.is_valid())` 包裹（首轮迭代的 iter_arg carry、未写入的数组槽、
 数组槽读取，或 `None` 种子）。而**新鲜的 `pl.submit` producer** TaskId 静态上
 恒为有效，因此 `EmitManualDeps` 对其插入不加守卫（issue #1966）；其余所有标量
 （string 形式）TaskId 仍保留守卫。array-carry iter_arg 则按元素逐槽生成带守卫的填充。
 
-**词法作用域生命周期。** TaskId 绑定命名的是在其产生所在的 `PTO2_SCOPE { ... }`
-块内声明的 C++ 局部变量（`PTO2TaskId tid = ...`）。每个 `PTO2_SCOPE`（AUTO 或
+**词法作用域生命周期。** TaskId 绑定命名的是在其产生所在的 `SIMPLER_SCOPE { ... }`
+块内声明的 C++ 局部变量（`TaskId tid = ...`）。每个 `SIMPLER_SCOPE`（AUTO 或
 MANUAL）在进入时快照 `manual_task_id_map_` 与 `array_carry_vars_`、退出时恢复，
 因此在某作用域内产生的绑定不会泄漏到外层作用域（否则其标识符会超出 C++ 作用域）。
-循环 / 分支的 carry 在其 body 的 `PTO2_SCOPE` *之前*声明，因此能正确地在块结束后存活。
+循环 / 分支的 carry 在其 body 的 `SIMPLER_SCOPE` *之前*声明，因此能正确地在块结束后存活。
 
 ### 无法解析的依赖边
 
@@ -552,7 +597,7 @@ MANUAL）在进入时快照 `manual_task_id_map_` 与 `array_carry_vars_`、退�
 
 来源由 attr key 判定。注意 `attrs["dummy_task"]` **不是**作者身份标记：parser 会把
 它打在用户书写的 `pl.system.task_dummy(deps=[...])` 上，与
-[`ExpandManualPhaseFence`](../passes/39-expand_manual_phase_fence.md) 给自己合成的
+[`ExpandManualPhaseFence`](../passes/40-expand_manual_phase_fence.md) 给自己合成的
 barrier 打的完全相同，因此所有 `manual_dep_edges` 载体一律强制校验。合成的 barrier
 只会引用其所改写的 manual scope 内仍然活跃的 TaskId，故其 fanin 必然可解析。
 
@@ -571,14 +616,14 @@ body 内捕获 TaskId、却在循环之后依赖它。修复方式是把消费�
 但其底层数组声明于 *外层* 作用域的 array carry 必须在恢复后存活。这就是将
 `manual_scope` 产生的 TaskId loop-carry 进 `Array[TASK_ID]` 的场景（issue #1811）——
 例如从外层 `pl.range` 循环的底层存储穿入的 `pl.parallel` array carry，每次迭代写入
-一个槽位（`carry[n] = prod_tid`）。外层循环的 `YieldStmt` 在 `PTO2_SCOPE(MANUAL)`
+一个槽位（`carry[n] = prod_tid`）。外层循环的 `YieldStmt` 在 `SIMPLER_SCOPE(MANUAL)`
 块 *之后* 发出并引用该 carry；若将其抹除会丢失被 loop-carry 的 TaskId，并触发
 *scalar yield to array carry* 的 `INTERNAL_CHECK`。因此退出时 codegen 会保留底层存储
 为 enclosing-scope-valid（由不在该作用域 local 集合中的标识符命名）的 array carry，
 仅回退作用域内局部的那些。
 
 **跨作用域张量与 `manual_scope`。** `manual_scope` 是一个*调度*区域，而非存储/取值
-作用域：它所触及的张量会透明地流向 `PTO2_SCOPE(MANUAL) { ... }` 块*之后*的 task。
+作用域：它所触及的张量会透明地流向 `SIMPLER_SCOPE(MANUAL) { ... }` 块*之后*的 task。
 因此块后读取者所命名的任何标识符都不能是 manual scope 内的局部 C++ 标识符——否则它会
 在右花括号处失效，读取者的 `add_input(...)` 将引用一个超出作用域的名字（`.cpp` 随即
 无法通过 C++ 编译，issue #1697）。两种机制保证这一点，二者都以名字是否*在外层作用域
@@ -592,7 +637,7 @@ body 内捕获 TaskId、却在循环之后依赖它。修复方式是把消费�
 
 - **分配提升（allocation hoisting）。** 在块*内部*创建的缓冲（`pl.create_tensor`
   → `alloc_tensors`）只是存储预留、没有调度依赖，因此其声明被提升到外层作用域。codegen
-  会缓冲每个 `PTO2_SCOPE(MANUAL)` 块体，并把提升后的 `alloc_tensors` 声明刷写到块头
+  会缓冲每个 `SIMPLER_SCOPE(MANUAL)` 块体，并把提升后的 `alloc_tensors` 声明刷写到块头
   之前。该批次按构造即在外层作用域有效（形状引用了作用域局部值的 create 会被排除并保持
   原位）。
 
@@ -606,7 +651,7 @@ body 内捕获 TaskId、却在循环之后依赖它。修复方式是把消费�
 而不是"last-write wins"的标量。pass 在 IR 中保留 iter_arg 为
 `Scalar[TASK_ID]`；codegen 识别这一形态（Parallel + TaskId iter_arg）后：
 
-1. 在 iter_arg 声明处分配定长数组：`PTO2TaskId arr[N];`，初始化时
+1. 在 iter_arg 声明处分配定长数组：`TaskId arr[N];`，初始化时
    广播标量 init（init 为标量时）或按槽位拷贝（init 本身是数组时——
    例如 case1 内层 `pl.parallel` 的 init 来自外层 `pl.range` 的数组 carry）。
 2. 每个 parallel iter 体内把新产生的 task id 写入一个槽位：
@@ -683,18 +728,18 @@ with pl.manual_scope():
 生成 C++（骨架）：
 
 ```cpp
-PTO2_SCOPE(PTO2ScopeMode::MANUAL) {
-    PTO2TaskId out__rv_v2__tid[N_BRANCHES];                    // 外层 rv = 数组
+SIMPLER_SCOPE(ScopeMode::MANUAL) {
+    TaskId out__rv_v2__tid[N_BRANCHES];                    // 外层 rv = 数组
     for (int64_t i = 0; i < N_BRANCHES; ++i)
-        out__rv_v2__tid[i] = PTO2TaskId::invalid();            // 广播 None 种子
+        out__rv_v2__tid[i] = TaskId::invalid();            // 广播 None 种子
     for (int64_t phase = 0; phase < N_PHASES; phase += 1) {
-        PTO2TaskId out__rv_v4__tid[N_BRANCHES];                // 内层 rv = 数组
+        TaskId out__rv_v4__tid[N_BRANCHES];                // 内层 rv = 数组
         for (int64_t i = 0; i < N_BRANCHES; ++i)
             out__rv_v4__tid[i] = out__rv_v2__tid[i];           // 按槽位拷贝
         for (int64_t branch = 0; branch < N_BRANCHES; branch += 1) {
             int64_t row = ...;
             CoreTaskArgs params_t0; /* ... */
-            PTO2TaskId params_t0_deps[N_BRANCHES];             // 按数组 carry N 定长
+            TaskId params_t0_deps[N_BRANCHES];             // 按数组 carry N 定长
             uint32_t params_t0_deps_count = 0;
             for (int64_t k = 0; k < N_BRANCHES; ++k) {         // 多依赖 fanout
                 if (out__rv_v2__tid[k].is_valid())
@@ -702,7 +747,7 @@ PTO2_SCOPE(PTO2ScopeMode::MANUAL) {
             }
             params_t0.set_dependencies(params_t0_deps, params_t0_deps_count);
             TaskOutputTensors task_0_outs = rt_submit_aiv_task(0, params_t0);
-            PTO2TaskId out__ssa_v5__tid = task_0_outs.task_id();
+            TaskId out__ssa_v5__tid = task_0_outs.task_id();
             out__rv_v4__tid[branch] = out__ssa_v5__tid;        // 槽位 yield
         }
         for (int64_t i = 0; i < N_BRANCHES; ++i)

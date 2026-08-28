@@ -59,6 +59,8 @@ class IRProperty(Enum):
     IterArgCarryClassified = ...
     AccToGmStoreValid = ...
     AtomicAddDtypeValid = ...
+    AccCompactValid = ...
+    GraphBoundaryLegalized = ...
 
 class IRPropertySet:
     """A set of IR properties backed by a bitset."""
@@ -135,6 +137,7 @@ class DiagnosticCheck(Enum):
     TileInnermostDimGranularity = ...
     OutParamWriteDropped = ...
     ScalarWriteLineShared = ...
+    InParamWritten = ...
 
 class DiagnosticCheckSet:
     """A set of diagnostic checks backed by a bitset."""
@@ -506,6 +509,22 @@ def convert_tensor_to_tile_ops() -> Pass:
 def optimize_orch_tensors() -> Pass:
     """Create a pass that optimizes tensor buffer usage in orchestration and InCore functions."""
 
+def block_nz_tensor_views() -> Pass:
+    """Create a pass that rewrites logical ``pl.NZ`` tensors into blocked NZ form.
+
+    An NZ ``TensorType`` shape ``[..., R, C]`` becomes ``[..., C/c0, R/16, 16, c0]``,
+    where ``c0`` is the number of elements in a 32-byte C0 line (``256 / dtype
+    bits``) — the blocked rank-(r+2) form pto-isa's ``Layout::NZ`` GlobalTensor
+    requires. Every consuming ``tile.load`` has its offsets / shapes / valid_shape
+    rewritten into blocked coordinates while its logical 2-D destination
+    ``TileType`` is preserved.
+
+    Must run after ``convert_tensor_to_tile_ops`` and **after**
+    ``flatten_tile_nd_to_2d`` — it requires ``TileOps2D``, because blocking a
+    load whose tile is still ND-rank yields a call whose type annotation and
+    argument ranks cannot both be printed.
+    """
+
 def flatten_tile_nd_to_2d() -> Pass:
     """Create a pass that flattens ND tile ops to 2D in InCore functions."""
 
@@ -730,6 +749,21 @@ def lower_host_tensor_collectives() -> Pass:
 def materialize_dist_tensor_ctx() -> Pass:
     """Materialize CommCtx parameters and arguments for DistributedTensor function parameters."""
 
+def legalize_graph_boundary() -> Pass:
+    """Make every ``FunctionType.Graph`` function legal to record and replay.
+
+    Hoists each boundary scalar a Graph body *derives* out to its call sites.
+    Under ``host_build_graph`` a boundary scalar is tracked by the address of its
+    argument slot, so a value computed inside the region has no slot and would be
+    frozen at its first-call value on every later replay, with no warning.
+
+    Also rejects, at compile time, the boundary shapes the runtime would decline
+    to cache — an oversized or empty tensor boundary, runtime-allocated outputs,
+    return values, nested graphs, and call sites carrying explicit dependencies
+    or a dispatch predicate. Almost all of those degrade to a silent non-graph
+    fallback at runtime, which no numerical test can detect.
+    """
+
 def materialize_valid_shape_symbols() -> Pass:
     """Materialize a Scalar[INDEX] parameter per unbindable device-kernel valid_shape symbol.
 
@@ -756,7 +790,7 @@ def materialize_runtime_scopes() -> Pass:
     ``RuntimeScopeStmt`` (``manual=False``) nodes wrapping the function body and
     each ``ForStmt`` / ``IfStmt`` branch body, while skipping insertion inside a
     manual ``RuntimeScopeStmt`` (the runtime forbids AUTO nested in MANUAL).
-    Codegen then emits ``PTO2_SCOPE`` only from ``RuntimeScopeStmt`` nodes, 1:1
+    Codegen then emits ``SIMPLER_SCOPE`` only from ``RuntimeScopeStmt`` nodes, 1:1
     with the IR.
 
     Runs last in the pipeline (after the final :func:`simplify`) so no other
@@ -996,6 +1030,7 @@ __all__ = [
     "outline_hierarchy_scopes",
     "convert_tensor_to_tile_ops",
     "optimize_orch_tensors",
+    "block_nz_tensor_views",
     "flatten_tile_nd_to_2d",
     "legalize_tile_cast",
     "auto_tile_matmul_l0",
@@ -1012,6 +1047,7 @@ __all__ = [
     "simplify",
     "lower_composite_ops",
     "materialize_dist_tensor_ctx",
+    "legalize_graph_boundary",
     "materialize_valid_shape_symbols",
     "flatten_call_expr",
     "inline_functions",

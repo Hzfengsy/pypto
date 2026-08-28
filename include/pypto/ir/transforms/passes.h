@@ -267,6 +267,24 @@ Pass MaterializeDistTensorCtx();
 Pass MaterializeValidShapeSymbols();
 
 /**
+ * @brief Make every FunctionType::Graph function legal to record and replay
+ *
+ * Hoists each boundary scalar a Graph body *derives* out to its call sites: the
+ * host_build_graph runtime tracks a boundary scalar by the address of its
+ * argument slot, so a value computed inside the region has no slot and would be
+ * frozen at its first-call value on every later replay, with no warning.
+ *
+ * Also rejects, at compile time, the boundary shapes the runtime would decline
+ * to cache — an oversized or empty tensor boundary, runtime-allocated outputs,
+ * return values, nested graphs, and call sites carrying explicit dependencies or
+ * a dispatch predicate. Almost all of those degrade to a silent non-graph
+ * fallback at runtime, which no numerical test can detect.
+ *
+ * @return Program-level pass
+ */
+Pass LegalizeGraphBoundary();
+
+/**
  * @brief Create a loop unrolling pass
  *
  * Expands ForStmt nodes with ForKind::Unroll into inlined copies of the loop
@@ -461,6 +479,35 @@ Pass ConvertTensorToTileOps();
  * - Input IR must have tile ops in InCore functions (run ConvertTensorToTileOps first)
  */
 Pass OptimizeOrchTensors();
+
+/**
+ * @brief Rewrite logical ``pl.NZ`` tensors into pto-isa's blocked NZ form
+ *
+ * A ``pl.Tensor[[..., R, C], dtype, pl.NZ]`` annotation asserts that the GM
+ * bytes are already in PTO-native NZ fractal order while the DSL keeps the
+ * logical shape and slicing. pto-isa describes such a buffer with a blocked
+ * rank-(r+2) GlobalTensor, so this pass rewrites:
+ *
+ *   - every NZ ``TensorType`` shape to ``[..., C/c0, R/16, 16, c0]``, where
+ *     ``c0`` is the number of elements in a 32-byte C0 line (``256 / bits``);
+ *     strides stay empty for ``MaterializeTensorStrides``, whose plain
+ *     row-major rule already yields pto-isa's NZ strides once blocked;
+ *   - every consuming ``tile.load``'s offsets / shapes / valid_shape into
+ *     blocked coordinates, preserving the logical 2-D destination ``TileType``.
+ *
+ * Milestone 1 scope: read-only, ``target_memory=Mat`` only, whole-byte dtypes,
+ * static shapes, ``R % 16 == 0`` and ``C % c0 == 0`` with equally aligned slice
+ * offsets. Anything else is rejected rather than silently mis-addressed.
+ *
+ * Requirements:
+ * - Input IR must have tile ops (run ConvertTensorToTileOps first)
+ * - Must run **after** FlattenTileNdTo2D (requires ``TileOps2D``): the
+ *   destination tile must already be the logical 2-D operand, or the rewritten
+ *   ``tile.load`` has a type annotation and argument ranks that cannot both be
+ *   printed. FlattenTileNdTo2D skips its ND2NZ window collapse for NZ sources,
+ *   so the logical window is still intact here.
+ */
+Pass BlockNzTensorViews();
 
 /**
  * @brief Flatten ND tile ops to 2D in InCore functions
@@ -899,7 +946,7 @@ Pass FoldNoOpReshape();
  * @brief Materialize implicit orchestration scopes as explicit RuntimeScopeStmt nodes
  *
  * The simpler runtime wraps regions of an Orchestration function in
- * ``PTO2_SCOPE()`` blocks. Historically the orchestration codegen decided where
+ * ``SIMPLER_SCOPE()`` blocks. Historically the orchestration codegen decided where
  * to emit those wrappers from the for/if structure: the whole function body, and
  * each ForStmt / IfStmt branch body, were wrapped implicitly (suppressed inside a
  * manual ``RuntimeScopeStmt``). That embedded codegen policy in the printer.
@@ -910,7 +957,7 @@ Pass FoldNoOpReshape();
  *  - wrapping each ForStmt body and each IfStmt then/else body,
  *
  * while skipping insertion anywhere inside a manual ``RuntimeScopeStmt`` (the
- * runtime forbids AUTO nested in MANUAL). Codegen then emits ``PTO2_SCOPE`` only
+ * runtime forbids AUTO nested in MANUAL). Codegen then emits ``SIMPLER_SCOPE`` only
  * from ``RuntimeScopeStmt`` nodes, staying 1:1 with the IR.
  *
  * Runs last in the pipeline (after the final Simplify) so no other transform has
@@ -930,7 +977,7 @@ Pass MaterializeRuntimeScopes();
  *    variable is declared and the yield assigns back to it (issue #1286).
  *
  * Inside a ``pl.manual_scope`` a ``Scalar[TASK_ID]`` carry additionally lowers to
- * a ``PTO2TaskId[N]`` array whose extent N comes from the loop's (or a threaded
+ * a ``TaskId[N]`` array whose extent N comes from the loop's (or a threaded
  * inner loop's) constant trip count.
  *
  * The orchestration codegen used to derive both from an alias-equivalence

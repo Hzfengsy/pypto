@@ -103,8 +103,9 @@ torch_codegen(node: _ir.Program | _ir.Function, check_shapes: bool = False) -> s
 
 字面量谓词会直接折叠成它所选中的那一支，这与 PTO codegen 选择 `pto.tmatmul` 而非
 `pto.tmatmul.acc`（而不是对编译期常量发射 `scf.if`）的做法一致。`_acc_init` 是
-preamble 中的辅助函数；`tile.batch_matmul_acc` 和 `tile.gemv_acc` 共用同一个
-emitter，因此一旦这些算子将来支持该谓词，它们可以直接受益。
+preamble 中的辅助函数，为所有累加型 matmul 共用，因此它们都通过这同一个 handler
+处理该谓词：`tile.matmul_acc`、`tensor.matmul_acc`、`tile.batch_matmul_acc` 与
+`tile.gemv_acc`（GEMV 就是 M 为 1 的 matmul，跑在同一个 cube MAD 上）。
 
 ### cross-core 相关映射
 
@@ -124,7 +125,7 @@ emitter，因此一旦这些算子将来支持该谓词，它们可以直接受�
 
 奇数 code 按 tile 的**运行时** valid extent 校验，而非物理 box：偶数 box 配奇数 valid
 extent（box 16、`valid_shape` 15）正是它们存在的场景。只有
-[LowerAutoVectorSplit](../passes/20-lower_auto_vector_split.md) 对 ragged 边界做了均分时
+[LowerAutoVectorSplit](../passes/21-lower_auto_vector_split.md) 对 ragged 边界做了均分时
 才会带上 `lane_stride`，此时运行时按该步长切分而不是按 box 折半。`push_to_aic` /
 `pop_from_aiv` 拒绝奇数 code，与 PTO codegen 一致——pto-isa 没有奇数的 Vector→Cube 传输。
 

@@ -234,7 +234,7 @@ def test_for_stmt_with_task_id_array_iter_arg_codegen():
     """ArrayType[TASK_ID, 4] iter_arg — same shape, opaque-handle dtype.
 
     Phase-fence lowering materialises this exact form. Codegen must emit
-    ``PTO2TaskId <name>[4]`` (not a numeric C type) and the in-place
+    ``TaskId <name>[4]`` (not a numeric C type) and the in-place
     slot-write pattern.
     """
     import re  # noqa: PLC0415
@@ -242,21 +242,21 @@ def test_for_stmt_with_task_id_array_iter_arg_codegen():
     program, orch_func = _build_array_iter_arg_program(DataType.TASK_ID, 4)
     code = codegen.generate_orchestration(program, orch_func).code
     # ``array.create`` op codegen must special-case TASK_ID so the
-    # declaration uses ``PTO2TaskId``, not the ``unknown`` fallback that
+    # declaration uses ``TaskId``, not the ``unknown`` fallback that
     # ``DataType::TASK_ID.ToCTypeString`` would otherwise return.
-    assert re.search(r"PTO2TaskId\s+\w+\[4\]", code), code
+    assert re.search(r"TaskId\s+\w+\[4\]", code), code
     assert "unknown" not in code, code
 
 
 def test_array_create_task_id_uses_invalid_sentinel():
-    """``array.create(N, TASK_ID)`` lowers to a ``PTO2TaskId[N]`` declaration
-    plus a per-slot fill with ``PTO2TaskId::invalid()``.
+    """``array.create(N, TASK_ID)`` lowers to a ``TaskId[N]`` declaration
+    plus a per-slot fill with ``TaskId::invalid()``.
 
-    Critical correctness: ``PTO2TaskId`` is an opaque handle whose
+    Critical correctness: ``TaskId`` is an opaque handle whose
     "invalid" sentinel is NOT bit-zero. Zero-initialising would silently
     mark every slot as a real "task id 0" reference, causing the runtime
     fence to wait on a bogus dep on the first parallel iteration. The
-    legacy codegen explicitly broadcast ``PTO2TaskId::invalid()`` over the
+    legacy codegen explicitly broadcast ``TaskId::invalid()`` over the
     array; this regression test pins the same behaviour for the
     pass-emitted path.
     """
@@ -275,10 +275,10 @@ def test_array_create_task_id_uses_invalid_sentinel():
     program = ir.Program([orch_func], "test_array_create_task_id", ir.Span.unknown())
     program, orch_func = _classify_carries(program)
     code = codegen.generate_orchestration(program, orch_func).code
-    assert re.search(r"PTO2TaskId\s+\w+\[4\];", code), code
+    assert re.search(r"TaskId\s+\w+\[4\];", code), code
     # Per-slot init with the invalid sentinel — NOT ``= {0};`` (which
     # would zero-byte-init, valid for integer dtypes but wrong here).
-    assert re.search(r"\w+\[__init_i\]\s*=\s*PTO2TaskId::invalid\(\);", code), code
+    assert re.search(r"\w+\[__init_i\]\s*=\s*TaskId::invalid\(\);", code), code
     assert "unknown" not in code, code
 
 
@@ -305,7 +305,7 @@ def test_array_create_int_still_uses_zero_init():
 
 
 def test_array_get_element_task_id_uses_pto2_task_id_type():
-    """``array.get_element`` on a TASK_ID array emits a ``PTO2TaskId`` local,
+    """``array.get_element`` on a TASK_ID array emits a ``TaskId`` local,
     not the ``unknown`` fallback of ``DataType::ToCTypeString``.
     """
     import re  # noqa: PLC0415
@@ -325,8 +325,8 @@ def test_array_get_element_task_id_uses_pto2_task_id_type():
     program = ir.Program([orch_func], "test_array_get_element_task_id", ir.Span.unknown())
     program, orch_func = _classify_carries(program)
     code = codegen.generate_orchestration(program, orch_func).code
-    # The local for the get_element result must be ``PTO2TaskId``, not ``unknown``.
-    assert re.search(r"PTO2TaskId\s+v\s*=\s*\w+\[", code), code
+    # The local for the get_element result must be ``TaskId``, not ``unknown``.
+    assert re.search(r"TaskId\s+v\s*=\s*\w+\[", code), code
     assert "unknown" not in code, code
 
 
@@ -389,9 +389,9 @@ def test_nested_seq_parallel_task_id_array_carry_codegen():
 
     An ArrayType carry is in-place-update semantics, so all SSA renames of
     the logical array (the ``array.create`` result, the outer carry, the
-    inner carry) collapse onto one C-stack array. Pins: (1) PTO2TaskId, not
+    inner carry) collapse onto one C-stack array. Pins: (1) TaskId, not
     'unknown'; (2) exactly one backing array, declared with the
-    ``PTO2TaskId::invalid()`` sentinel; (3) no copy-in / copy-out / yield
+    ``TaskId::invalid()`` sentinel; (3) no copy-in / copy-out / yield
     self-copy between distinct arrays.
     """
     import re  # noqa: PLC0415
@@ -404,15 +404,15 @@ def test_nested_seq_parallel_task_id_array_carry_codegen():
     # No fallback "unknown" dtype anywhere.
     assert "unknown" not in code, code
 
-    # Exactly one PTO2TaskId[N] array — the array.create result, reused by
+    # Exactly one TaskId[N] array — the array.create result, reused by
     # both loop carries.
-    decls = re.findall(rf"PTO2TaskId\s+(\w+)\[{n_inner}\]", code)
+    decls = re.findall(rf"TaskId\s+(\w+)\[{n_inner}\]", code)
     assert len(decls) == 1, code
     arr = decls[0]
     # ``array.create``'s output must use the invalid sentinel — anything
     # else (notably ``= {0};``) silently produces a "task id 0" reference
     # and breaks the runtime fence.
-    assert re.search(rf"{arr}\[__init_i\]\s*=\s*PTO2TaskId::invalid\(\);", code), code
+    assert re.search(rf"{arr}\[__init_i\]\s*=\s*TaskId::invalid\(\);", code), code
 
     # No slot-by-slot copy-in / copy-out between distinct arrays — the carries
     # alias the single backing array.
@@ -652,6 +652,266 @@ def test_incore_array_loop_build_then_dynamic_read():
     get_pos = next(i for i, ln in enumerate(lines) if "pto.local_array_get" in ln)
     get_ctx = "\n".join(lines[max(0, get_pos - 4) : get_pos + 1])
     assert re.search(r"arith\.index_cast .* to index", get_ctx), get_ctx
+
+
+def _compile_orch(program_cls) -> str:
+    """Run the Default pass pipeline + orchestration codegen.
+
+    Unlike ``_generate_orch``, this goes through ConvertToSSA, so an array
+    rebound under an ``if`` reaches codegen as a real ``IfStmt`` ArrayType
+    return_var (a phi) rather than a single straight-line Var.
+    """
+    from pypto import backend  # noqa: PLC0415
+    from pypto.backend import BackendType  # noqa: PLC0415
+    from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
+
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend910B)
+
+    pm = PassManager.get_strategy(OptimizationStrategy.Default)
+    optimized = pm.run_passes(program_cls)
+    for func in optimized.functions.values():
+        if func.func_type == ir.FunctionType.Orchestration:
+            return codegen.generate_orchestration(optimized, func).code
+    raise AssertionError("no Orchestration function found in program")
+
+
+def test_orch_array_store_under_runtime_predicate_shares_one_backing():
+    """A runtime-predicated array store mutates the one backing C-stack array.
+
+    ConvertToSSA gives the ``if`` an ArrayType return_var (the array is rebound
+    in one branch only). An ArrayType SSA value names a backing array rather
+    than a copyable value, so the phi must be *aliased* onto that array — a raw
+    C array is not assignable, and declaring one from its type is impossible.
+    Orchestration counterpart of
+    ``test_incore_array_if_else_assignment_shares_one_backing``.
+    """
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            n_live: pl.Tensor[[1], pl.INT32],
+            out: pl.Out[pl.Tensor[[16], pl.INT32]],
+        ) -> pl.Tensor[[16], pl.INT32]:
+            n: pl.Scalar[pl.INT32] = pl.read(n_live, [0])
+            arr = pl.array.create(8, pl.INT32)
+            for i in pl.range(8):
+                if i < n:
+                    arr[i] = i
+            v: pl.Scalar[pl.INT32] = arr[0]
+            pl.write(out, [0], v)
+            return out
+
+    code = _compile_orch(Prog)
+    # Exactly one backing declaration — the phi adds none.
+    decls = [ln for ln in code.splitlines() if "int32_t arr[8]" in ln]
+    assert len(decls) == 1, code
+    # The predicated write lands in place on that array...
+    assert "arr[i] = i;" in code, code
+    # ...and the post-if read resolves to the same array, not to a phi copy.
+    assert "arr[0]" in code, code
+    # No slot-by-slot copy loop was emitted for the phi (nothing to copy).
+    assert "__yield_i" not in code, code
+
+
+def test_orch_array_store_under_runtime_predicate_without_loop():
+    """The predicate alone triggers the phi — the enclosing loop is incidental."""
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            n_live: pl.Tensor[[1], pl.INT32],
+            out: pl.Out[pl.Tensor[[16], pl.INT32]],
+        ) -> pl.Tensor[[16], pl.INT32]:
+            n: pl.Scalar[pl.INT32] = pl.read(n_live, [0])
+            arr = pl.array.create(8, pl.INT32)
+            if n > 0:
+                arr[0] = 7
+            v: pl.Scalar[pl.INT32] = arr[0]
+            pl.write(out, [0], v)
+            return out
+
+    code = _compile_orch(Prog)
+    decls = [ln for ln in code.splitlines() if "int32_t arr[8]" in ln]
+    assert len(decls) == 1, code
+    assert "arr[0] = 7;" in code, code
+
+
+def test_orch_array_store_in_both_branches_shares_one_backing():
+    """Writing in both branches still targets the single backing array."""
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            n_live: pl.Tensor[[1], pl.INT32],
+            out: pl.Out[pl.Tensor[[16], pl.INT32]],
+        ) -> pl.Tensor[[16], pl.INT32]:
+            n: pl.Scalar[pl.INT32] = pl.read(n_live, [0])
+            arr = pl.array.create(8, pl.INT32)
+            if n > 0:
+                arr[0] = 7
+            else:
+                arr[0] = 1
+            v: pl.Scalar[pl.INT32] = arr[0]
+            pl.write(out, [0], v)
+            return out
+
+    code = _compile_orch(Prog)
+    decls = [ln for ln in code.splitlines() if "int32_t arr[8]" in ln]
+    assert len(decls) == 1, code
+    # Both branch writes name the same array.
+    assert "arr[0] = 7;" in code, code
+    assert "arr[0] = 1;" in code, code
+
+
+def test_orch_array_store_under_nested_if_shares_one_backing():
+    """An array updated under a *nested* runtime `if` still resolves to one array.
+
+    The outer `if`'s phi yields the inner `if`'s phi, not an
+    ``array.update_element`` result. Resolution therefore has to run at yield
+    time, once the inner statement has bound its own return_var — pre-scanning
+    the outer branch for update_element chains would not find one.
+    """
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            n_live: pl.Tensor[[1], pl.INT32],
+            out: pl.Out[pl.Tensor[[16], pl.INT32]],
+        ) -> pl.Tensor[[16], pl.INT32]:
+            n: pl.Scalar[pl.INT32] = pl.read(n_live, [0])
+            arr = pl.array.create(8, pl.INT32)
+            if n > 0:
+                if n > 1:
+                    arr[0] = 7
+            v: pl.Scalar[pl.INT32] = arr[0]
+            pl.write(out, [0], v)
+            return out
+
+    code = _compile_orch(Prog)
+    decls = [ln for ln in code.splitlines() if "int32_t arr[8]" in ln]
+    assert len(decls) == 1, code
+    assert "arr[0] = 7;" in code, code
+    assert "__yield_i" not in code, code
+
+
+def test_orch_array_store_in_loop_inside_if_shares_one_backing():
+    """A loop nested in an `if` branch also resolves back to the one array.
+
+    Here the outer `if`'s phi yields the ForStmt's ArrayType return_var — a
+    second nested-control-flow shape the yield-time resolution must cover.
+    """
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            n_live: pl.Tensor[[1], pl.INT32],
+            out: pl.Out[pl.Tensor[[16], pl.INT32]],
+        ) -> pl.Tensor[[16], pl.INT32]:
+            n: pl.Scalar[pl.INT32] = pl.read(n_live, [0])
+            arr = pl.array.create(8, pl.INT32)
+            if n > 0:
+                for i in pl.range(4):
+                    arr[i] = i
+            v: pl.Scalar[pl.INT32] = arr[0]
+            pl.write(out, [0], v)
+            return out
+
+    code = _compile_orch(Prog)
+    decls = [ln for ln in code.splitlines() if "int32_t arr[8]" in ln]
+    assert len(decls) == 1, code
+    assert "arr[i] = i;" in code, code
+
+
+def test_orch_array_created_inside_branch_is_rejected_with_user_error():
+    """A per-branch array cannot back the phi — reject it with an actionable message.
+
+    Each branch creates its own storage, so the two branches resolve to
+    different backing arrays and there is nothing single to bind the phi onto.
+    That is a user-expressible construct orchestration cannot lower, so it must
+    surface as a ValueError naming the fix, not as an internal assertion about a
+    type the author never wrote.
+    """
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            n_live: pl.Tensor[[1], pl.INT32],
+            out: pl.Out[pl.Tensor[[16], pl.INT32]],
+        ) -> pl.Tensor[[16], pl.INT32]:
+            n: pl.Scalar[pl.INT32] = pl.read(n_live, [0])
+            if n > 0:
+                arr = pl.array.create(8, pl.INT32)
+                arr[0] = 7
+            else:
+                arr = pl.array.create(8, pl.INT32)
+                arr[0] = 1
+            v: pl.Scalar[pl.INT32] = arr[0]
+            pl.write(out, [0], v)
+            return out
+
+    with pytest.raises(ValueError, match="different array in each branch"):
+        _compile_orch(Prog)
+
+
+def test_orch_task_id_array_store_under_runtime_predicate():
+    """A predicated TaskId publish stays readable as a dependency afterwards.
+
+    The shape the DSL documents for handing a TaskId between orchestration
+    phases: publish into a ``pl.array`` of TASK_ID under a runtime guard, then
+    depend on a slot of it. The phi must alias the backing array or the
+    consumer's ``deps=[...]`` would read an array nothing wrote.
+    """
+
+    rows, cols, tile_r = 64, 16, 16
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            x: pl.Tensor[[rows, cols], pl.FP32],
+            n_live: pl.Tensor[[1], pl.INT32],
+            out: pl.Out[pl.Tensor[[rows, cols], pl.FP32]],
+        ) -> pl.Tensor[[rows, cols], pl.FP32]:
+            n: pl.Scalar[pl.INT32] = pl.read(n_live, [0])
+            tids = pl.array.create(4, pl.TASK_ID)
+            with pl.manual_scope():
+                for g in pl.parallel(4):
+                    row: pl.Scalar[pl.INDEX] = g * tile_r
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prod") as tid:
+                        t: pl.Tile[[tile_r, cols], pl.FP32] = pl.load(x, [row, 0], [tile_r, cols])
+                        r: pl.Tile[[tile_r, cols], pl.FP32] = pl.add(t, t)
+                        out = pl.store(r, [row, 0], out)
+                    if g < n:
+                        tids[g] = tid
+                for g2 in pl.parallel(4):
+                    row2: pl.Scalar[pl.INDEX] = g2 * tile_r
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cons", deps=[tids[g2]]):
+                        t2: pl.Tile[[tile_r, cols], pl.FP32] = pl.load(x, [row2, 0], [tile_r, cols])
+                        r2: pl.Tile[[tile_r, cols], pl.FP32] = pl.add(t2, t2)
+                        out = pl.store(r2, [row2, 0], out)
+            return out
+
+    code = _compile_orch(Prog)
+    decls = [ln for ln in code.splitlines() if "TaskId tids[4]" in ln]
+    assert len(decls) == 1, code
+    # The guarded publish writes the backing array in place...
+    assert "tids[g] = " in code, code
+    # ...and the consumer's dependency reads a slot of that same array.
+    assert "tids[g2]" in code, code
 
 
 if __name__ == "__main__":

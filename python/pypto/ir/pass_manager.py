@@ -176,6 +176,14 @@ class PassManager:
         tile_pto_passes: tuple[PassFactory, ...] = (
             passes.lower_composite_ops,
             passes.flatten_tile_nd_to_2d,
+            # Rewrite `pl.NZ` tensors into pto-isa's blocked rank-(r+2) form and
+            # retarget their tile.load coordinates. Runs immediately after
+            # FlattenTileNdTo2D so the destination tile is already the logical 2D
+            # operand: blocking a still-ND-rank tile would leave a tile.load whose
+            # annotation and argument ranks cannot both be printed. Flatten skips
+            # its ND2NZ window collapse for NZ sources so the logical window is
+            # still intact here.
+            passes.block_nz_tensor_views,
             # Expand non-native tile.cast (src,dst) pairs into shortest native
             # cast chains (e.g. A5 INT32→FP16 → INT32→FP32→FP16) before
             # AutoTileMatmulL0 may FIXPIPE-fold already-native f32→bf16/f16.
@@ -244,8 +252,14 @@ class PassManager:
             passes.lower_host_tensor_collectives,
             passes.materialize_dist_tensor_ctx,
             passes.simplify,
+            # Hoist each boundary scalar a Graph body derives out to its call
+            # sites, and reject the graphs the host_build_graph runtime could not
+            # record. Runs here because argument directions and cross-task edges
+            # are already known, while scopes are not yet materialised around the
+            # statements it moves.
+            passes.legalize_graph_boundary,
             # Insert explicit AUTO RuntimeScopeStmt nodes (function body + for/if
-            # bodies) into Orchestration functions so codegen emits PTO2_SCOPE
+            # bodies) into Orchestration functions so codegen emits SIMPLER_SCOPE
             # 1:1 from the IR. Runs after the final Simplify and after every
             # rewriting transform, so none of them has to reason about the
             # inserted scope wrappers.
