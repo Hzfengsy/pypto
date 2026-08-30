@@ -484,7 +484,17 @@ class SimplifyMutator : public arith::IRMutatorWithAnalyzer {
         op->iter_args_, [this](const auto& ia) { return MaybeRebuildIterArg(ia); }, &iter_args_changed);
 
     auto new_condition = SimplifyExpr(op->condition_);
+
+    // Snapshot var_remap_ around the body visit, as ForStmt does. VisitScopedBody
+    // unbinds scalars but not remaps, and a nested fold inside the body (Fold A on
+    // an IfStmt, Fold B on a single-trip ForStmt) records `outer_var -> body-local
+    // value`. Leaking that past the loop rewrites post-loop uses of a leak-mode
+    // body var into a value from one iteration's interior -- silently wrong, since
+    // the var is still in scope so no verifier flags it. The MaybeRebuildIterArg
+    // additions above are captured in the baseline (they stay valid after the loop).
+    auto baseline_remap = var_remap_;
     auto new_body = VisitScopedBody(op->body_);
+    var_remap_ = std::move(baseline_remap);
 
     // Rebuild return_vars after the body so folds discovered inside it are
     // visible in the return types (same ordering rationale as ForStmt).

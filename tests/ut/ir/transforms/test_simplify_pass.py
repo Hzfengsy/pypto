@@ -550,6 +550,75 @@ class TestControlFlow:
         assert isinstance(condition, ir.Lt)
         assert condition.left.same_as(iter_arg)
 
+    def test_while_body_fold_does_not_leak_var_remap_past_the_loop(self):
+        """A fold inside a while body must not rewrite uses after the loop.
+
+        ``VisitScopedBody`` unbinds scalars but not ``var_remap_``. A nested fold
+        records ``outer_var -> body-local value``: the single-trip inner
+        ``pl.range(0, 1)`` fires Fold B, which binds ``acc_next -> acc + 1`` with
+        ``acc`` substituted by its init ``i``.
+
+        Leaking that past the loop rewrote the post-loop ``acc_next`` into
+        ``i + 1`` — silently *wrong*, not merely dangling: ``acc_next`` holds what
+        the last iteration computed, which equals the post-loop ``i``, so ``i + 1``
+        is off by one, and ``i`` being in scope means no verifier flags it.
+
+        The same program with a ``for`` as the outer loop is checked alongside it:
+        ``ForStmt`` has snapshotted ``var_remap_`` around its body all along, so
+        the two loop kinds must agree here.
+
+        Pre-SSA on purpose — leak-mode bodies only exist before SSA conversion,
+        and this pass runs at pipeline position 5 and again at 46.
+
+        Verification is disabled for the two pass runs: Fold B lifts the inner body
+        by *substitution* rather than by emitting ``AssignStmt(rv, yielded)``, so in
+        leak mode the surviving post-loop reference has no defining statement and
+        trips ``UseAfterDef``. That is a pre-existing Fold B limitation which the
+        ``for`` half of this test shows is identical for both loop kinds; it is not
+        what this test pins.
+        """
+
+        @pl.program
+        class WhileOuter:
+            @pl.function
+            def main(self, out: pl.Tensor[[8], pl.INDEX]):
+                i: pl.Scalar[pl.INDEX] = 0
+                acc_next: pl.Scalar[pl.INDEX] = 0
+                while i < 4:
+                    for j, (acc,) in pl.range(0, 1, init_values=(i,)):
+                        acc_next = pl.yield_(acc + 1)
+                    i = i + 1
+                pl.tensor.write(out, [0], acc_next)
+
+        @pl.program
+        class ForOuter:
+            @pl.function
+            def main(self, out: pl.Tensor[[8], pl.INDEX]):
+                acc_next: pl.Scalar[pl.INDEX] = 0
+                for k in pl.range(4):
+                    for j, (acc,) in pl.range(0, 1, init_values=(k,)):
+                        acc_next = pl.yield_(acc + 1)
+                pl.tensor.write(out, [0], acc_next)
+
+        def post_loop_operand(program):
+            with passes.PassContext([]):
+                after = passes.simplify()(program)
+            func = next(iter(after.functions.values()))
+            body = func.body
+            stmts = body.stmts if isinstance(body, ir.SeqStmts) else [body]
+            call = next(s.expr for s in stmts if isinstance(s, ir.EvalStmt) and isinstance(s.expr, ir.Call))
+            assert isinstance(call, ir.Call)
+            return call.args[-1]
+
+        for label, program in (("while", WhileOuter), ("for", ForOuter)):
+            operand = post_loop_operand(program)
+            # Before the fix the `while` case produced an `Add` here — the
+            # loop-private `i + 1` substituted into a use outside the loop.
+            assert isinstance(operand, ir.Var), (
+                f"{label}: post-loop use was rewritten to {operand.as_python()}"
+            )
+            assert operand.name_hint.startswith("acc_next"), label
+
     def test_sequential_stmts(self):
         """Multiple statements should all be simplified."""
 
