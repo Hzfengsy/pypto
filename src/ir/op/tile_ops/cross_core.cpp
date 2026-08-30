@@ -302,9 +302,11 @@ TypePtr DeduceSplitReshapeTensor(const std::vector<ExprPtr>& args,
   const int split = ReadSplitAttr(kwargs, op_name, args[0]->span_);
   if (split == 0) {
     // Task-parallel (NONE) region: the op marks the crossing and preserves the
-    // shape (see DeduceSplitReshape). Return the operand's type unchanged — its
-    // view is already canonical, so re-wrapping it could only break the
-    // print -> parse round-trip the halving path has to work around below.
+    // shape (see DeduceSplitReshape). The operand's type is returned unchanged
+    // rather than rebuilt: a TensorType carries no memory space or tile layout
+    // to strip (which is why the tile deducer rebuilds and this one does not),
+    // and its view was already canonicalized at construction, so a rebuild
+    // would yield a structurally identical type.
     return args[0]->GetType();
   }
 
