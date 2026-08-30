@@ -101,6 +101,22 @@ ForStmtPtr FindForStmtByReturnVar(const StmtPtr& body, const Var* target) {
   return finder.result;
 }
 
+/// True when @p dir names an argument slot the callee writes — i.e. one that
+/// orchestration codegen aliases the call's result to.
+///
+/// ``NoDep`` belongs here. It is an *ordering* claim (``pl.at(no_dep_args=[t])``
+/// suppresses the dependency edges), not an identity one: the callee still
+/// writes through that same tensor and returns it, and codegen's own alias
+/// (``CollectOutIndices``) reads the *callee's* ``ParamDirection``, which
+/// ``no_dep_args`` never touches. Omitting it here made codegen and this pass
+/// disagree about one call — the carry was classified ``rebind``, so codegen
+/// materialised a fresh ``TaskTensor`` for a slot it was simultaneously
+/// aliasing.
+[[nodiscard]] bool IsOutputSideDirection(ArgDirection dir) {
+  return dir == ArgDirection::OutputExisting || dir == ArgDirection::InOut || dir == ArgDirection::Output ||
+         dir == ArgDirection::NoDep;
+}
+
 /// Alias forest over a loop body: maps each Var that is *another name for an
 /// existing buffer* to the Var it aliases.
 ///
@@ -108,7 +124,7 @@ ForStmtPtr FindForStmtByReturnVar(const StmtPtr& body, const Var* target) {
 /// ``X → source(X) → …`` lands on ``A``. Four rules produce an edge:
 ///
 ///   * ``tensor.assemble``: the result aliases its first arg (the write target).
-///   * Output_existing/inout calls: the result aliases the Out/InOut arg the
+///   * Calls with output-side args: the result aliases the Out/InOut arg the
 ///     callee actually returns (traced via ``return_lineage``, so a kernel with
 ///     a GM-scratch Out param does not capture the alias).
 ///   * ``TupleGetItemExpr``: climb to the tuple-producing call/submit and
@@ -221,10 +237,7 @@ class AliasForest {
       int64_t out_seen = 0;
       const auto target_idx = static_cast<int64_t>(tge->index_);
       for (size_t a = 0; a < tdirs.size(); ++a) {
-        if (tdirs[a] != ArgDirection::OutputExisting && tdirs[a] != ArgDirection::InOut &&
-            tdirs[a] != ArgDirection::Output) {
-          continue;
-        }
+        if (!IsOutputSideDirection(tdirs[a])) continue;
         if (out_seen == target_idx) {
           auto out_arg = AsVarLike(tcall->args_[a]);
           return out_arg ? out_arg.get() : nullptr;
@@ -243,18 +256,18 @@ class AliasForest {
       return first_arg ? first_arg.get() : nullptr;
     }
 
-    // Calls with output_existing/inout args (e.g. InCore kernels): the result
-    // aliases the Out/InOut arg the callee actually returns, mirroring the
-    // codegen alias ``const TaskTensor& result = args[out_idx];``. For kernels with
-    // multiple Out params (e.g. real result + GM scratch passed through pl.spmd
-    // mixed dispatch), tracing the ReturnStmt back to its Param avoids aliasing
-    // the result to an arbitrary scratch tensor.
+    // Calls with output-side args (e.g. InCore kernels): the result aliases the
+    // Out/InOut arg the callee actually returns, mirroring the codegen alias
+    // ``const TaskTensor& result = args[out_idx];``. For kernels with multiple
+    // Out params (e.g. real result + GM scratch passed through pl.spmd mixed
+    // dispatch), tracing the ReturnStmt back to its Param avoids aliasing the
+    // result to an arbitrary scratch tensor.
     auto call_dirs = call->GetArgDirections();
     if (call_dirs.size() != call->args_.size()) return nullptr;
     FunctionPtr callee = program ? program->GetFunction(call->op_->name_) : nullptr;
     std::optional<size_t> returned_idx = return_lineage::ExplicitReturnedParamIndex(callee);
     for (size_t a = 0; a < call_dirs.size(); ++a) {
-      if (call_dirs[a] != ArgDirection::OutputExisting && call_dirs[a] != ArgDirection::InOut) continue;
+      if (!IsOutputSideDirection(call_dirs[a])) continue;
       if (returned_idx.has_value() && a != *returned_idx) continue;
       auto out_arg = AsVarLike(call->args_[a]);
       return out_arg ? out_arg.get() : nullptr;

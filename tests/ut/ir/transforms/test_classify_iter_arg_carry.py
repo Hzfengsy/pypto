@@ -375,5 +375,39 @@ def test_pass_metadata():
     assert p.get_required_properties().contains(passes.IRProperty.CallDirectionsResolved)
 
 
+def test_no_dep_arg_carry_is_not_a_rebind():
+    """``no_dep_args`` suppresses ordering, not buffer identity.
+
+    ``pl.at(no_dep_args=[out])`` stamps the *call-site* direction ``NoDep``; the
+    callee's ``ParamDirection`` stays ``Out``/``InOut``, which is what codegen's
+    own result alias (``CollectOutIndices``) reads. Classifying such a carry as a
+    rebind would have codegen materialise a fresh ``TaskTensor`` for a slot it is
+    simultaneously aliasing to the arg.
+
+    Written in the scope form because ``no_dep_args`` is a ``pl.at`` / ``pl.submit``
+    keyword, so the outliner has to run first — which is also what introduces the
+    carry (see OutlineIncoreScopes, "store targets written inside control flow").
+    """
+
+    @pl.program
+    class Prog:
+        @pl.function
+        def main(
+            self,
+            x: pl.Tensor[[N, M], pl.FP32],
+            out: pl.Out[pl.Tensor[[N, M], pl.FP32]],
+        ) -> pl.Tensor[[N, M], pl.FP32]:
+            for _i in pl.range(4):
+                with pl.at(level=pl.Level.CORE_GROUP, no_dep_args=[out]):
+                    t = pl.load(x, [0, 0], [N, M])
+                    pl.store(t, [0, 0], out)
+            return out
+
+    outlined = passes.outline_incore_scopes()(passes.convert_to_ssa()(Prog))
+    loops = _for_stmts(_orch_func(_classify(outlined)).body)
+    assert len(loops) == 1
+    assert _carry_attrs(loops[0]) == {"iter_arg_rebind_0": False}
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

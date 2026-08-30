@@ -39,8 +39,10 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/utils/auto_name_utils.h"
 #include "pypto/ir/transforms/utils/deferred_wait_contract.h"
+#include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/result_alias_utils.h"
 #include "pypto/ir/transforms/utils/return_lineage_utils.h"
+#include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/transforms/utils/var_collectors.h"
 #include "pypto/ir/type.h"
 
@@ -895,6 +897,377 @@ StmtPtr ScopeOutliner::VisitStmt_(const SpmdScopeStmtPtr& op) { return VisitScop
 // descends into the body via VisitScopeKind's non-target branch, preserving
 // the nested SplitAivScopeStmt inside the outlined InCore function body.
 StmtPtr ScopeOutliner::VisitStmt_(const SplitAivScopeStmtPtr& op) { return VisitScopeKind(op); }
+
+// ============================================================================
+// Control flow: threading store-target renames out as real carries
+// ============================================================================
+
+namespace {
+
+/// Append @p extra to @p body's trailing YieldStmt, adding one when the body has
+/// none (a loop that carried nothing yields nothing today).
+///
+/// Walks the same spine as ``GetLastYieldStmt``: the trailing yield is the last
+/// element of the outermost SeqStmts chain. A statement kind that hides a yield
+/// from this walk gets a *new* trailing yield instead, which is why the caller
+/// checks the resulting arity.
+StmtPtr AppendTrailingYieldValues(const StmtPtr& body, const std::vector<ExprPtr>& extra, const Span& span) {
+  if (extra.empty()) return body;
+  if (auto yield = As<YieldStmt>(body)) {
+    auto values = yield->value_;
+    values.insert(values.end(), extra.begin(), extra.end());
+    return std::make_shared<YieldStmt>(values, yield->span_);
+  }
+  if (auto seq = As<SeqStmts>(body)) {
+    auto stmts = seq->stmts_;
+    if (!stmts.empty() && transform_utils::GetLastYieldStmt(stmts.back())) {
+      stmts.back() = AppendTrailingYieldValues(stmts.back(), extra, span);
+    } else {
+      stmts.push_back(std::make_shared<YieldStmt>(extra, span));
+    }
+    return SeqStmts::Flatten(std::move(stmts), seq->span_);
+  }
+  return SeqStmts::Flatten({body, std::make_shared<YieldStmt>(extra, span)}, span);
+}
+
+/// Rebind loop-body references from a carry's seed onto the carry itself.
+///
+/// Not ``transform_utils::Substitute``: that one re-visits whatever it
+/// substitutes in, so a chained map (A->B, B->C) settles. That is exactly wrong
+/// here, because the replacement is an ``IterArg`` whose ``initValue_`` *is* the
+/// Var being replaced — re-visiting rewrites the seed inside the carry into a
+/// self-reference and mints a second, unbound IterArg. The map is built in one
+/// step and needs no chain resolution, so a carry is terminal in both
+/// directions: substituted in verbatim, and never descended into afterwards
+/// (the base visitor would otherwise reach its ``initValue_`` when the carry
+/// resurfaces as a nested loop's init value).
+class CarryRebindMutator : public IRMutator {
+ public:
+  explicit CarryRebindMutator(const std::unordered_map<const Var*, VarPtr>& seed_to_carry)
+      : seed_to_carry_(seed_to_carry) {
+    for (const auto& [seed, carry] : seed_to_carry_) carries_.insert(carry.get());
+  }
+
+ protected:
+  // Var and IterArg get separate overrides rather than VisitVarLike_: a seed may
+  // itself be an enclosing loop's IterArg (see .claude/rules/ir-kind-traits.md),
+  // and neither may fall through to the base visitor on a hit.
+  ExprPtr VisitExpr_(const VarPtr& op) override {
+    auto it = seed_to_carry_.find(op.get());
+    return it != seed_to_carry_.end() ? it->second : IRMutator::VisitExpr_(op);
+  }
+  ExprPtr VisitExpr_(const IterArgPtr& op) override {
+    auto it = seed_to_carry_.find(op.get());
+    if (it != seed_to_carry_.end()) return it->second;
+    if (carries_.count(op.get()) > 0) return op;
+    return IRMutator::VisitExpr_(op);
+  }
+
+ private:
+  const std::unordered_map<const Var*, VarPtr>& seed_to_carry_;
+  std::unordered_set<const Var*> carries_;
+};
+
+/// Index of @p var among @p iter_args, or ``npos``.
+size_t FindIterArgSlot(const std::vector<IterArgPtr>& iter_args, const Var* var) {
+  for (size_t i = 0; i < iter_args.size(); ++i) {
+    if (iter_args[i].get() == var) return i;
+  }
+  return std::string::npos;
+}
+
+}  // namespace
+
+void ScopeOutliner::NoteStoreTargetRename(const VarPtr& original, const VarPtr& seed, const VarPtr& fresh) {
+  if (body_rename_stack_.empty()) return;
+  auto& frame = body_rename_stack_.back();
+  auto it = std::find_if(frame.begin(), frame.end(), [&](const BodyStoreRename& rename) {
+    return rename.original.get() == original.get();
+  });
+  if (it != frame.end()) {
+    // Renamed again by a later scope in the same body: the carry still starts
+    // from the value the body was entered with, only the yielded value moves on.
+    it->body_values.push_back(fresh);
+    return;
+  }
+  frame.push_back(BodyStoreRename{original, seed, {fresh}});
+}
+
+StmtPtr ScopeOutliner::VisitControlFlowBody(const StmtPtr& body, std::vector<BodyStoreRename>* renames) {
+  body_rename_stack_.emplace_back();
+  auto visited = VisitStmt(body);
+  *renames = std::move(body_rename_stack_.back());
+  body_rename_stack_.pop_back();
+  return visited;
+}
+
+std::vector<IterArgPtr> ScopeOutliner::MakeCarryIterArgs(const std::vector<BodyStoreRename>& renames,
+                                                         const Span& span) {
+  std::vector<IterArgPtr> iter_args;
+  iter_args.reserve(renames.size());
+  for (const auto& rename : renames) {
+    auto iter_arg = std::make_shared<IterArg>(GenerateFreshSSAName(rename.original->name_hint_, "iter"),
+                                              rename.original->GetType(), rename.seed, span);
+    RegisterVar(iter_arg);
+    iter_args.push_back(iter_arg);
+  }
+  return iter_args;
+}
+
+std::vector<VarPtr> ScopeOutliner::MakeCarryReturnVars(const std::vector<BodyStoreRename>& renames,
+                                                       const Span& span) {
+  std::vector<VarPtr> return_vars;
+  return_vars.reserve(renames.size());
+  for (const auto& rename : renames) {
+    auto return_var = std::make_shared<Var>(GenerateFreshSSAName(rename.original->name_hint_, "rv"),
+                                            rename.original->GetType(), span);
+    RegisterVar(return_var);
+    return_vars.push_back(return_var);
+  }
+  return return_vars;
+}
+
+StmtPtr ScopeOutliner::BuildCarriedLoopBody(const StmtPtr& body, const std::vector<BodyStoreRename>& renames,
+                                            const std::vector<IterArgPtr>& carry_iter_args,
+                                            size_t total_carries, const Span& span) const {
+  INTERNAL_CHECK_SPAN(renames.size() == carry_iter_args.size(), span)
+      << "Internal error: carry iter_arg count does not match the rename count";
+  std::unordered_map<const Var*, VarPtr> seed_to_iter_arg;
+  std::vector<ExprPtr> yields;
+  yields.reserve(renames.size());
+  for (size_t i = 0; i < renames.size(); ++i) {
+    seed_to_iter_arg[renames[i].seed.get()] = carry_iter_args[i];
+    yields.push_back(renames[i].body_values.back());
+  }
+  // Rebind before appending: the yielded values are bound *inside* the body and
+  // so are never seeds, but keeping the order explicit makes that obvious.
+  CarryRebindMutator rebinder(seed_to_iter_arg);
+  auto result = AppendTrailingYieldValues(rebinder.VisitStmt(body), yields, span);
+  auto yield = transform_utils::GetLastYieldStmt(result);
+  INTERNAL_CHECK_SPAN(yield && yield->value_.size() == total_carries, span)
+      << "Internal error: loop body yields " << (yield ? yield->value_.size() : 0)
+      << " values after threading " << renames.size() << " store-target carries, expected " << total_carries;
+  return result;
+}
+
+void ScopeOutliner::RetargetBodyValues(const std::vector<BodyStoreRename>& renames,
+                                       const std::vector<VarPtr>& visible_values) {
+  INTERNAL_CHECK(renames.size() == visible_values.size())
+      << "Internal error: carry value count does not match the rename count";
+  std::unordered_map<const Var*, VarPtr> visible;
+  for (size_t i = 0; i < renames.size(); ++i) {
+    for (const auto& body_value : renames[i].body_values) {
+      visible[body_value.get()] = visible_values[i];
+    }
+  }
+  for (auto& [key, value] : store_target_renames_) {
+    auto it = visible.find(value.get());
+    if (it != visible.end()) value = it->second;
+  }
+}
+
+void ScopeOutliner::PublishCarries(const std::vector<BodyStoreRename>& renames,
+                                   const std::vector<VarPtr>& return_vars) {
+  INTERNAL_CHECK(renames.size() == return_vars.size())
+      << "Internal error: carry return_var count does not match the rename count";
+  // Tell the enclosing body first: it must be handed the seed *this* body
+  // started from, before the sweep below rewrites the map entry.
+  for (size_t i = 0; i < renames.size(); ++i) {
+    NoteStoreTargetRename(renames[i].original, renames[i].seed, return_vars[i]);
+  }
+  RetargetBodyValues(renames, return_vars);
+}
+
+/// Split @p renames into the ones this loop must newly carry and the ones it
+/// already carries.
+///
+/// A store target that *is* one of the loop's own iter_args is already threaded
+/// through the loop; giving it a second carry seeded with itself would make the
+/// loop carry its own carry, and the seed would not even be in scope at the loop
+/// header. Its post-loop value is simply the matching return_var, so it needs
+/// republishing but no new slot.
+void ScopeOutliner::SplitAlreadyCarried(const std::vector<BodyStoreRename>& renames,
+                                        const std::vector<IterArgPtr>& iter_args,
+                                        const std::vector<IterArgPtr>& visited_iter_args,
+                                        const std::vector<VarPtr>& return_vars, const Span& span,
+                                        std::vector<BodyStoreRename>* fresh,
+                                        std::vector<BodyStoreRename>* carried,
+                                        std::vector<VarPtr>* carried_values) const {
+  for (const auto& rename : renames) {
+    // The rename's seed comes from var_objects_, which holds the *pre-visit* Var
+    // objects, so match the original iter_args first and the visited ones second
+    // (IRMutator clones an IterArg whose initValue this pass renamed).
+    size_t slot = FindIterArgSlot(iter_args, rename.seed.get());
+    if (slot == std::string::npos) slot = FindIterArgSlot(visited_iter_args, rename.seed.get());
+    if (slot == std::string::npos) {
+      fresh->push_back(rename);
+      continue;
+    }
+    INTERNAL_CHECK_SPAN(slot < return_vars.size(), span)
+        << "Internal error: loop carries " << iter_args.size() << " values but declares only "
+        << return_vars.size() << " return_vars, so the carry at slot " << slot
+        << " has no value visible after the loop";
+    carried->push_back(rename);
+    carried_values->push_back(return_vars[slot]);
+  }
+}
+
+StmtPtr ScopeOutliner::VisitStmt_(const ForStmtPtr& op) {
+  // Only the body can outline a scope: the bounds, the iter_arg seeds and the
+  // return_vars are all expressions. So one frame around the whole node is
+  // enough, and IRMutator's own traversal can stay in charge.
+  body_rename_stack_.emplace_back();
+  auto visited = IRMutator::VisitStmt_(op);
+  auto renames = std::move(body_rename_stack_.back());
+  body_rename_stack_.pop_back();
+  if (renames.empty()) return visited;
+
+  auto loop = As<ForStmt>(visited);
+  INTERNAL_CHECK_SPAN(loop, op->span_)
+      << "Internal error: ScopeOutliner mutated a ForStmt into " << (visited ? visited->TypeName() : "null");
+
+  std::vector<BodyStoreRename> fresh;
+  std::vector<BodyStoreRename> carried;
+  std::vector<VarPtr> carried_values;
+  SplitAlreadyCarried(renames, op->iter_args_, loop->iter_args_, loop->return_vars_, loop->span_, &fresh,
+                      &carried, &carried_values);
+  RetargetBodyValues(carried, carried_values);
+  if (fresh.empty()) return visited;
+
+  auto carry_iter_args = MakeCarryIterArgs(fresh, loop->span_);
+  auto return_vars = MakeCarryReturnVars(fresh, loop->span_);
+  auto result = MutableCopy(loop);
+  result->body_ = BuildCarriedLoopBody(loop->body_, fresh, carry_iter_args,
+                                       loop->iter_args_.size() + fresh.size(), loop->span_);
+  result->iter_args_.insert(result->iter_args_.end(), carry_iter_args.begin(), carry_iter_args.end());
+  result->return_vars_.insert(result->return_vars_.end(), return_vars.begin(), return_vars.end());
+  PublishCarries(fresh, return_vars);
+  return result;
+}
+
+StmtPtr ScopeOutliner::VisitStmt_(const WhileStmtPtr& op) {
+  body_rename_stack_.emplace_back();
+  auto visited = IRMutator::VisitStmt_(op);
+  auto renames = std::move(body_rename_stack_.back());
+  body_rename_stack_.pop_back();
+  if (renames.empty()) return visited;
+
+  auto loop = As<WhileStmt>(visited);
+  INTERNAL_CHECK_SPAN(loop, op->span_) << "Internal error: ScopeOutliner mutated a WhileStmt into "
+                                       << (visited ? visited->TypeName() : "null");
+
+  std::vector<BodyStoreRename> fresh;
+  std::vector<BodyStoreRename> carried;
+  std::vector<VarPtr> carried_values;
+  SplitAlreadyCarried(renames, op->iter_args_, loop->iter_args_, loop->return_vars_, loop->span_, &fresh,
+                      &carried, &carried_values);
+  RetargetBodyValues(carried, carried_values);
+  if (fresh.empty()) return visited;
+
+  auto carry_iter_args = MakeCarryIterArgs(fresh, loop->span_);
+  auto return_vars = MakeCarryReturnVars(fresh, loop->span_);
+  auto result = MutableCopy(loop);
+  result->body_ = BuildCarriedLoopBody(loop->body_, fresh, carry_iter_args,
+                                       loop->iter_args_.size() + fresh.size(), loop->span_);
+  result->iter_args_.insert(result->iter_args_.end(), carry_iter_args.begin(), carry_iter_args.end());
+  result->return_vars_.insert(result->return_vars_.end(), return_vars.begin(), return_vars.end());
+  PublishCarries(fresh, return_vars);
+  return result;
+}
+
+StmtPtr ScopeOutliner::VisitStmt_(const IfStmtPtr& op) {
+  INTERNAL_CHECK_SPAN(op->condition_, op->span_) << "Internal error: IfStmt has null condition";
+  auto new_condition = VisitExpr(op->condition_);
+
+  // The branches are alternatives, not a sequence: a rename the then branch made
+  // is not visible in the else branch, so the else branch has to start from the
+  // same incoming values.
+  auto incoming = store_target_renames_;
+  std::vector<BodyStoreRename> then_renames;
+  auto new_then_body = VisitControlFlowBody(op->then_body_, &then_renames);
+  auto after_then = store_target_renames_;
+
+  store_target_renames_ = incoming;
+  std::vector<BodyStoreRename> else_renames;
+  std::optional<StmtPtr> new_else_body;
+  if (op->else_body_.has_value()) {
+    new_else_body = VisitControlFlowBody(*op->else_body_, &else_renames);
+  }
+  auto after_else = store_target_renames_;
+
+  // Rejoin: keep every entry either branch added or changed. The store targets
+  // among them are retargeted onto the if's return_vars by PublishCarries below;
+  // post-store aliases ride along on that same sweep.
+  store_target_renames_ = std::move(incoming);
+  for (const auto* branch : {&after_then, &after_else}) {
+    for (const auto& [key, value] : *branch) {
+      auto it = store_target_renames_.find(key);
+      if (it == store_target_renames_.end() || it->second.get() != value.get()) {
+        store_target_renames_[key] = value;
+      }
+    }
+  }
+
+  // One carry per store target either branch wrote; the branch that did not
+  // write it yields the value it came in with.
+  std::vector<BodyStoreRename> renames = then_renames;
+  std::vector<VarPtr> then_values;
+  std::vector<VarPtr> else_values;
+  then_values.reserve(renames.size());
+  for (const auto& rename : renames) then_values.push_back(rename.body_values.back());
+  for (const auto& rename : else_renames) {
+    auto it = std::find_if(renames.begin(), renames.end(), [&](const BodyStoreRename& merged) {
+      return merged.original.get() == rename.original.get();
+    });
+    if (it == renames.end()) {
+      renames.push_back(rename);
+      then_values.push_back(rename.seed);
+    } else {
+      it->body_values.insert(it->body_values.end(), rename.body_values.begin(), rename.body_values.end());
+    }
+  }
+  else_values.reserve(renames.size());
+  for (const auto& rename : renames) {
+    auto it = std::find_if(else_renames.begin(), else_renames.end(), [&](const BodyStoreRename& branch) {
+      return branch.original.get() == rename.original.get();
+    });
+    else_values.push_back(it == else_renames.end() ? rename.seed : it->body_values.back());
+  }
+
+  StmtPtr result_then = new_then_body;
+  std::optional<StmtPtr> result_else = new_else_body;
+  std::vector<VarPtr> new_return_vars = op->return_vars_;
+  if (!renames.empty()) {
+    // An `if` that already returns values must have both branches yielding, so
+    // the missing-else shortcut below is only sound when it returned nothing.
+    INTERNAL_CHECK_SPAN(op->else_body_.has_value() || op->return_vars_.empty(), op->span_)
+        << "Internal error: IfStmt declares " << op->return_vars_.size()
+        << " return_vars but has no else branch to yield them";
+    auto return_vars = MakeCarryReturnVars(renames, op->span_);
+    result_then = AppendTrailingYieldValues(
+        new_then_body, std::vector<ExprPtr>(then_values.begin(), then_values.end()), op->span_);
+    // An ``if`` with no else still has to produce a value on the untaken path.
+    result_else =
+        AppendTrailingYieldValues(new_else_body.value_or(SeqStmts::Flatten({}, op->span_)),
+                                  std::vector<ExprPtr>(else_values.begin(), else_values.end()), op->span_);
+    new_return_vars.insert(new_return_vars.end(), return_vars.begin(), return_vars.end());
+    const size_t expected = op->return_vars_.size() + renames.size();
+    for (const auto& branch : {result_then, *result_else}) {
+      auto yield = transform_utils::GetLastYieldStmt(branch);
+      INTERNAL_CHECK_SPAN(yield && yield->value_.size() == expected, op->span_)
+          << "Internal error: IfStmt branch yields " << (yield ? yield->value_.size() : 0)
+          << " values after threading " << renames.size() << " store-target carries, expected " << expected;
+    }
+    PublishCarries(renames, return_vars);
+  }
+
+  auto result = MutableCopy(op);
+  result->condition_ = std::move(new_condition);
+  result->then_body_ = std::move(result_then);
+  result->else_body_ = std::move(result_else);
+  result->return_vars_ = std::move(new_return_vars);
+  return result;
+}
 
 /// True when `name` is already claimed by this function (`known_names_`) or,
 /// when the pass opts in, by any earlier function in the program
@@ -1782,12 +2155,32 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
  *
  * E.g. "buf_0" -> "buf_1", "x_2" -> "x_3".  Falls back to appending "_1".
  */
-std::string ScopeOutliner::GenerateFreshSSAName(const std::string& original_name) const {
+std::string ScopeOutliner::GenerateFreshSSAName(const std::string& original_name,
+                                                const std::string& role) const {
   std::unordered_set<std::string> used_names;
   for (const auto& [var, _] : var_types_) {
     used_names.insert(var->name_hint_);
   }
-  return auto_name::GenerateFreshNameLike(original_name, used_names);
+  if (role.empty()) {
+    return auto_name::GenerateFreshNameLike(original_name, used_names);
+  }
+  // Same search as GenerateFreshNameLike, but stamping the requested role rather
+  // than inheriting the source name's — a carry derived from ``t__ssa_v0`` must
+  // read ``t__iter_v1``, not ``t__ssa_v1``.
+  auto parsed = auto_name::Parse(original_name);
+  int version = parsed.version.value_or(-1) + 1;
+  std::string candidate;
+  do {
+    candidate = auto_name::BuildName(parsed.base_name, parsed.qualifier, role, version);
+    ++version;
+  } while (used_names.count(candidate) > 0);
+  return candidate;
+}
+
+void ScopeOutliner::RegisterVar(const VarPtr& var) {
+  var_types_[var.get()] = var->GetType();
+  var_objects_[var.get()] = var;
+  known_names_.insert(var->name_hint_);
 }
 
 /**
@@ -1808,10 +2201,11 @@ VarPtr ScopeOutliner::CreateFreshStoreTargetVar(const VarPtr& original_var, cons
   std::string fresh_name = GenerateFreshSSAName(original_var->name_hint_);
   auto type = original_var->GetType();
   auto fresh_var = std::make_shared<Var>(fresh_name, type, span);
+  auto current = store_target_renames_.find(original_var.get());
+  NoteStoreTargetRename(original_var, current != store_target_renames_.end() ? current->second : original_var,
+                        fresh_var);
   store_target_renames_[original_var.get()] = fresh_var;
-  var_types_[fresh_var.get()] = type;
-  var_objects_[fresh_var.get()] = fresh_var;
-  known_names_.insert(fresh_name);
+  RegisterVar(fresh_var);
   return fresh_var;
 }
 

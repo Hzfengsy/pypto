@@ -37,12 +37,18 @@ fence 算子，不会改动 Orchestration `ForStmt` 的 iter_arg。
 | 规则 | 边 |
 | ---- | -- |
 | `tensor.assemble` | 结果别名到 `args[0]`（写入目标） |
-| Out / InOut 调用 | 结果别名到 callee 真正*返回*的那个 Out/InOut 实参（经 `return_lineage` 追踪，因此 GM scratch 的 Out 参数不会误抢别名） |
+| 输出侧（output-side）调用 | 结果别名到 callee 真正*返回*的那个被写实参（经 `return_lineage` 追踪，因此 GM scratch 的 Out 参数不会误抢别名） |
 | `TupleGetItemExpr` | `ret_tuple[i]` 别名到产生该 tuple 的 `Call` / `Submit` 的第 i 个输出侧实参 |
 | 嵌套 `ForStmt` | 穿过嵌套循环的 carry 以该循环的 `return_var` 重新出现，而它别名到嵌套循环的 init 值 |
 
-assemble 规则与 Out/InOut 规则不可能在同一条赋值上同时命中：`tensor.assemble` 是
+assemble 规则与输出侧规则不可能在同一条赋值上同时命中：`tensor.assemble` 是
 builtin op，而 `DeriveCallDirections` 只给非 builtin 调用打 `arg_directions`。
+
+**输出侧（output-side）指 `OutputExisting` / `InOut` / `Output` / `NoDep`。**
+`NoDep`（来自 `pl.at(no_dep_args=[t])`）表达的是*顺序*断言，而非身份断言：callee 仍然
+通过同一个张量写入并返回它。代码生成自身的别名（`CollectOutIndices`）读取的是 *callee 的*
+`ParamDirection`，而 `no_dep_args` 从不改动它——因此这里遗漏 `NoDep` 会让两者产生分歧：
+携带值被判定为 `rebind`，而代码生成同时又对该槽位做了别名。
 
 `ArrayType` 的 iter_arg 被**排除**在嵌套循环规则之外。与 `TensorType`（指向缓冲区的
 指针别名）不同，`ArrayType` iter_arg 在每一层都拥有一份*全新的* C 栈数组。把内层

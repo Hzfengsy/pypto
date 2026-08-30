@@ -208,7 +208,100 @@ class ScopeOutliner : public IRMutator {
   // the nested SplitAivScopeStmt inside the outlined InCore function body.
   StmtPtr VisitStmt_(const SplitAivScopeStmtPtr& op) override;
 
+  /**
+   * @brief Thread store-target renames made inside a control-flow body out of it.
+   *
+   * A scope that writes a captured tensor is replaced by a call whose result is
+   * bound to a *fresh* SSA name (see CreateFreshStoreTargetVar). When that scope
+   * sits inside a loop or an ``if``, the fresh Var is bound inside the body and
+   * is therefore out of scope afterwards — but ``store_target_renames_`` is flat
+   * and function-wide, so without these overrides every later reference to the
+   * store target still resolves to that body-local Var. The result reads as
+   * ``for ...: t__ssa_v1 = self.k_incore_0(..., t__ssa_v0)`` followed by a use of
+   * ``t__ssa_v1`` after the loop: a dangling reference that ``SSAVerify`` rejects
+   * ("used outside its defining scope").
+   *
+   * Nothing miscompiles today only because every SSA version of an orchestration
+   * tensor denotes the same GM buffer. The def-use edge is still wrong, so each
+   * override rebuilds the statement with a real carry: the value on entry seeds a
+   * new ``IterArg``, the body yields the fresh Var, and a new ``return_var``
+   * becomes the value visible afterwards. ``ClassifyIterArgCarry`` (pass 47) sees
+   * the yield in the iter_arg's alias class (the Out-call and TupleGetItem rules)
+   * and marks the carry *trivial*, so codegen is unchanged.
+   */
+  StmtPtr VisitStmt_(const ForStmtPtr& op) override;
+  StmtPtr VisitStmt_(const WhileStmtPtr& op) override;
+  StmtPtr VisitStmt_(const IfStmtPtr& op) override;
+
  private:
+  /// One store target that a control-flow body renamed, and the values that
+  /// bracket the body.
+  struct BodyStoreRename {
+    VarPtr original;                  ///< the ``store_target_renames_`` key (always the *original* Var)
+    VarPtr seed;                      ///< the value current on entry to the body — the carry's init
+    std::vector<VarPtr> body_values;  ///< values bound inside the body, in order; the last is yielded
+  };
+
+  /// Record @p fresh as the current value of store target @p original.
+  ///
+  /// When a control-flow body is open, the rename is also noted on the innermost
+  /// frame so that body can thread it out as a carry. @p seed is the value
+  /// current *before* the rename; a target renamed by N sibling scopes in one
+  /// body keeps the first seed and appends each value, because the intermediate
+  /// ones may still be held by a post-store alias entry that the publish sweep
+  /// has to retarget too.
+  void NoteStoreTargetRename(const VarPtr& original, const VarPtr& seed, const VarPtr& fresh);
+
+  /// Visit @p body with a fresh control-flow frame open, collecting into @p renames
+  /// every store target the body renamed.
+  StmtPtr VisitControlFlowBody(const StmtPtr& body, std::vector<BodyStoreRename>* renames);
+
+  /// One fresh ``IterArg`` per rename, seeded with that rename's entry value.
+  [[nodiscard]] std::vector<IterArgPtr> MakeCarryIterArgs(const std::vector<BodyStoreRename>& renames,
+                                                          const Span& span);
+
+  /// One fresh return ``Var`` per rename — the value visible after the statement.
+  [[nodiscard]] std::vector<VarPtr> MakeCarryReturnVars(const std::vector<BodyStoreRename>& renames,
+                                                        const Span& span);
+
+  /// Rebind @p body onto @p carry_iter_args and append each rename's last value
+  /// to its trailing yield (adding one when the loop carried nothing before).
+  ///
+  /// The seed is defined *outside* the loop, so every reference to it inside the
+  /// body means "this buffer" — which is exactly what the carry now names.
+  /// @p total_carries is the expected post-append yield arity, checked here.
+  [[nodiscard]] StmtPtr BuildCarriedLoopBody(const StmtPtr& body, const std::vector<BodyStoreRename>& renames,
+                                             const std::vector<IterArgPtr>& carry_iter_args,
+                                             size_t total_carries, const Span& span) const;
+
+  /// Point every ``store_target_renames_`` entry holding one of @p renames'
+  /// body-local values at the matching entry of @p visible_values.
+  ///
+  /// The sweep is by *value*, not by key: OutlineScope also registers
+  /// scope-local post-store aliases that name the same store target, and those
+  /// entries hold a body-local Var that is equally out of scope afterwards.
+  void RetargetBodyValues(const std::vector<BodyStoreRename>& renames,
+                          const std::vector<VarPtr>& visible_values);
+
+  /// RetargetBodyValues, plus telling the enclosing control-flow frame (if any)
+  /// about each carry, so a nested loop's carry is threaded on out of the outer
+  /// loop too.
+  void PublishCarries(const std::vector<BodyStoreRename>& renames, const std::vector<VarPtr>& return_vars);
+
+  /// Split @p renames into the ones this loop must newly carry (@p fresh) and the
+  /// ones it already carries (@p carried, with their post-loop @p carried_values).
+  ///
+  /// A store target that *is* one of the loop's own iter_args is already threaded
+  /// through the loop; giving it a second carry seeded with itself would make the
+  /// loop carry its own carry, and the seed would not even be in scope at the
+  /// loop header. Its post-loop value is simply the matching return_var.
+  void SplitAlreadyCarried(const std::vector<BodyStoreRename>& renames,
+                           const std::vector<IterArgPtr>& iter_args,
+                           const std::vector<IterArgPtr>& visited_iter_args,
+                           const std::vector<VarPtr>& return_vars, const Span& span,
+                           std::vector<BodyStoreRename>* fresh, std::vector<BodyStoreRename>* carried,
+                           std::vector<VarPtr>* carried_values) const;
+
   /// True when `name` is already claimed by this function (`known_names_`) or,
   /// when the pass opts in, by any earlier function in the program
   /// (`reserved_func_names_`).
@@ -247,8 +340,16 @@ class ScopeOutliner : public IRMutator {
    * @brief Generate a fresh SSA name by incrementing the numeric suffix.
    *
    * E.g. "buf_0" -> "buf_1", "x_2" -> "x_3".  Falls back to appending "_1".
+   *
+   * @param role Optional SSA role to stamp instead of the name's current one —
+   *             ``"iter"`` for a loop carry, ``"rv"`` for a return var, matching
+   *             what ConvertToSSA emits. Empty keeps the existing role.
    */
-  [[nodiscard]] std::string GenerateFreshSSAName(const std::string& original_name) const;
+  [[nodiscard]] std::string GenerateFreshSSAName(const std::string& original_name,
+                                                 const std::string& role = "") const;
+
+  /// Register @p var in the symbol table so later fresh-name generation avoids it.
+  void RegisterVar(const VarPtr& var);
 
   /**
    * @brief Create a fresh Var for a store-target output and register the rename.
@@ -312,7 +413,16 @@ class ScopeOutliner : public IRMutator {
   std::unordered_set<const Var*> required_outputs_;
   /// Accumulates across scopes intentionally (not saved/restored like func_name_
   /// etc.) so that subsequent scopes and statements see the renamed variables.
+  ///
+  /// Flat and function-wide, so an entry outlives the control-flow body that
+  /// created it. The ForStmt / WhileStmt / IfStmt overrides are what keep that
+  /// safe: they retarget each entry onto a value the following statements can
+  /// actually see. Do not write this map directly from a path that can run
+  /// inside a control-flow body — go through NoteStoreTargetRename so the
+  /// enclosing frame learns the rename and can thread it out.
   std::unordered_map<const Var*, VarPtr> store_target_renames_;
+  /// Open control-flow frames, innermost last. Empty at the function's top level.
+  std::vector<std::vector<BodyStoreRename>> body_rename_stack_;
   ScopeKind target_scope_kind_;
   FunctionType outlined_func_type_;
   std::string name_suffix_;

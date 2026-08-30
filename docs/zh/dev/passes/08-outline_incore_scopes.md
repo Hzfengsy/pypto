@@ -50,8 +50,10 @@ program_outlined = outline_pass(program)
 5. **替换作用域**：将 `InCoreScopeStmt` 替换为：
    - 带有输入参数的提取函数调用
    - 每个输出变量对应一个 AssignStmt
-6. **添加到程序**：将提取的函数添加到程序的函数列表中
-7. **提升父函数**：至少提取出一个作用域的 Opaque 父函数将变为 `Orchestration`——
+6. **贯穿控制流**：当作用域位于循环或 `if` 内部时，为被捕获的写目标绑定的新名字会
+   变成该语句上真正的循环携带值（loop carry，见下）
+7. **添加到程序**：将提取的函数添加到程序的函数列表中
+8. **提升父函数**：至少提取出一个作用域的 Opaque 父函数将变为 `Orchestration`——
    并在此之前先折叠其参数动态维度读取（见下）
 
 **参数动态维度读取在提升时折叠**：tensor 声明的 extent *就是*它的运行期
@@ -296,6 +298,53 @@ def main_incore_0(self, a, b, out):
     out_b = pl.mul(c_tile, 2.0)
     return (out, out_b)  # out_a → param `out`; out_b is kernel-local, kept as-is
 ```
+
+### 在控制流内部写入的写目标（store target）
+
+写入被捕获张量的作用域会被替换为一次调用，其结果绑定到一个**全新的** SSA 名字
+（`out` -> `out__ssa_v1`），此后对该张量的每一次引用都解析到这个新名字。当作用域位于
+循环或 `if` 内部时，这个新名字绑定在**作用域体内部**，因此语句之后的引用读到的是一个
+已经超出作用域（out of scope）的 Var。为此本 pass 将该重命名贯穿出去，做成真正的循环
+携带值（loop carry）：入口处的值作为新 `IterArg` 的初值，作用域体 yield 新的 Var，
+新增的 `return_var` 才是后续语句看到的值。
+
+**变换前**（作用域每次迭代写一次 `out`，ReturnStmt 读取它）：
+
+```python
+for i in pl.range(4):
+    with pl.at(level=pl.Level.CORE_GROUP):
+        t = pl.load(a, [i * 64, 0], [64, 128])
+        pl.store(pl.mul(t, 2.0), [i * 64, 0], out)
+return out
+```
+
+**变换后**：
+
+```python
+for i__idx_v0, (out__iter_v1,) in pl.range(4, init_values=(out__ssa_v0,)):
+    out__ssa_v1 = self.k_incore_0(a__ssa_v0, i__idx_v0, out__iter_v1)
+    out__rv_v1 = pl.yield_(out__ssa_v1)
+return out__rv_v1
+```
+
+`if` 同样如此处理，未写入的分支 yield 它进入时的值——源码没有 `else` 时会合成一个，
+使未走到的路径也能产出一个值。
+
+携带值遵循的规则：
+
+| 场景 | 结果 |
+| ---- | ---- |
+| 同一作用域体内 N 个同级作用域写同一目标 | 只增加一个槽位；作用域体 yield 最后一个值 |
+| 嵌套循环 | 内层携带值再作为外层循环的携带值贯穿出去 |
+| 目标本身已是该循环的 iter_arg | 不新增槽位；后续引用解析到该槽位的 `return_var` |
+| 作用域位于函数顶层 | 保持不变——新名字本就在作用域内 |
+
+**代码生成不受影响。** yield 的值是被调函数在其返回的参数上的调用结果，因此
+[`ClassifyIterArgCarry`](47-classify_iter_arg_carry.md) 会把它归入该 iter_arg 的别名类
+（其 Out/InOut 调用规则与 `TupleGetItemExpr` 规则），并将该携带值标记为 **trivial**：
+iter_arg 与 return_var 都按初值的名字发射。这个携带值是 SSA 记账，而非新缓冲区。
+没有它同样不会编译错——编排层张量的每个 SSA 版本都指向同一块 GM 缓冲区——但 def-use
+图是错的，`SSAVerify` / `UseAfterDef` 会拒绝这样的 IR。
 
 ## 实现
 

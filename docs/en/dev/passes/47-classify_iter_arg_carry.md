@@ -39,13 +39,20 @@ source, so the edges form a forest and the class query is a memoized chain walk
 | Rule | Edge |
 | ---- | ---- |
 | `tensor.assemble` | the result aliases `args[0]` (the write target) |
-| Out / InOut call | the result aliases the Out/InOut arg the callee actually *returns* (traced via `return_lineage`, so a GM-scratch Out param never captures the alias) |
+| output-side call | the result aliases the written arg the callee actually *returns* (traced via `return_lineage`, so a GM-scratch Out param never captures the alias) |
 | `TupleGetItemExpr` | `ret_tuple[i]` aliases the i-th output-side arg of the tuple-producing `Call` / `Submit` |
 | nested `ForStmt` | a carry threaded through a nested loop re-emerges as that loop's `return_var`, which aliases the nested loop's init value |
 
-The assemble rule and the Out/InOut rule can never both fire on one assignment:
+The assemble rule and the output-side rule can never both fire on one assignment:
 `tensor.assemble` is a builtin op, and `DeriveCallDirections` stamps
 `arg_directions` on non-builtin calls only.
+
+**Output-side means `OutputExisting` / `InOut` / `Output` / `NoDep`.** `NoDep`
+(from `pl.at(no_dep_args=[t])`) is an *ordering* claim, not an identity one: the
+callee still writes through that same tensor and returns it. Codegen's own alias
+(`CollectOutIndices`) reads the *callee's* `ParamDirection`, which `no_dep_args`
+never touches — so leaving `NoDep` out here made the two disagree, classifying a
+`no_dep` carry as `rebind` while codegen simultaneously aliased that slot.
 
 `ArrayType` iter_args are **excluded** from the nested-loop rule. Unlike a
 `TensorType` (a pointer-to-buffer alias), an `ArrayType` iter_arg owns a *fresh*

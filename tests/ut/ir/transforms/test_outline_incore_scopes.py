@@ -3489,5 +3489,297 @@ class TestOutlineCachePolicy:
             self._outline(Before)
 
 
+class TestOutlineScopeInControlFlow:
+    """A scope inside a loop or an ``if`` must not leak its store-target rename.
+
+    Outlining a scope that writes a captured tensor binds the call result to a
+    *fresh* SSA name. When the scope sits inside a control-flow body that name is
+    bound inside the body, so anything after the statement that still resolves the
+    store target to it reads a Var that is out of scope. ``ScopeOutliner`` threads
+    the rename out as a real carry instead: the value on entry seeds an
+    ``IterArg``, the body yields the fresh Var, and a new ``return_var`` is what
+    the following statements see.
+
+    Nothing miscompiled before the fix — every SSA version of an orchestration
+    tensor denotes the same GM buffer — so these tests assert on the *def-use
+    graph*: SSAForm and UseAfterDef, plus the shape of the resulting carry.
+    """
+
+    @staticmethod
+    def _outline(program) -> ir.Program:
+        return passes.outline_incore_scopes()(passes.convert_to_ssa()(program))
+
+    @staticmethod
+    def _structural_errors(program: ir.Program) -> list[str]:
+        props = passes.IRPropertySet()
+        props.insert(passes.IRProperty.SSAForm)
+        props.insert(passes.IRProperty.UseAfterDef)
+        return [
+            d.message
+            for d in passes.PropertyVerifierRegistry.verify(props, program)
+            if d.severity == passes.DiagnosticSeverity.Error
+        ]
+
+    @staticmethod
+    def _stmts(node) -> list[ir.Stmt]:
+        body = node.body
+        assert isinstance(body, ir.SeqStmts), f"expected a SeqStmts body, got {type(body).__name__}"
+        return list(body.stmts)
+
+    @staticmethod
+    def _loop(stmt: ir.Stmt) -> ir.ForStmt:
+        assert isinstance(stmt, ir.ForStmt), f"expected a ForStmt, got {type(stmt).__name__}"
+        return stmt
+
+    @staticmethod
+    def _name(expr) -> str:
+        assert isinstance(expr, ir.Var), f"expected a Var, got {type(expr).__name__}"
+        return expr.name_hint
+
+    @classmethod
+    def _bound_name(cls, stmt: ir.Stmt) -> str:
+        assert isinstance(stmt, ir.AssignStmt), f"expected an AssignStmt, got {type(stmt).__name__}"
+        return stmt.var.name_hint
+
+    @classmethod
+    def _call_args(cls, stmt: ir.Stmt) -> list:
+        assert isinstance(stmt, ir.AssignStmt), f"expected an AssignStmt, got {type(stmt).__name__}"
+        value = stmt.value
+        assert isinstance(value, ir.Call), f"expected a Call value, got {type(value).__name__}"
+        return list(value.args)
+
+    def test_loop_writer_read_after_the_loop_is_threaded_as_a_carry(self):
+        """The canonical shape: written by an in-loop scope, read by a later one."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[256, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 128], pl.FP32]],
+            ) -> pl.Tensor[[256, 128], pl.FP32]:
+                scratch = pl.create_tensor([256, 128], pl.FP32)
+                for i in pl.range(4):
+                    with pl.at(level=pl.Level.CORE_GROUP):
+                        t = pl.load(a, [i * 64, 0], [64, 128])
+                        pl.store(pl.mul(t, 2.0), [i * 64, 0], scratch)
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    t2 = pl.load(scratch, [0, 0], [64, 128])
+                    pl.store(t2, [0, 0], out)
+                return out
+
+        After = self._outline(Before)
+        assert not self._structural_errors(After)
+
+        stmts = self._stmts(After.get_function("main"))
+        loop = self._loop(stmts[1])
+        # The loop carried nothing before; it now carries `scratch` alone.
+        assert len(loop.iter_args) == 1
+        assert len(loop.return_vars) == 1
+        assert self._name(loop.iter_args[0].initValue) == self._bound_name(stmts[0])
+        # ...and the consumer after the loop reads the return var, not a body-local.
+        assert self._name(self._call_args(stmts[2])[0]) == loop.return_vars[0].name_hint
+
+    def test_loop_writer_read_by_the_return_stmt_is_threaded_as_a_carry(self):
+        """The other consumer route: a plain post-loop reference."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[256, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 128], pl.FP32]],
+            ) -> pl.Tensor[[256, 128], pl.FP32]:
+                for i in pl.range(4):
+                    with pl.at(level=pl.Level.CORE_GROUP):
+                        t = pl.load(a, [i * 64, 0], [64, 128])
+                        pl.store(pl.mul(t, 2.0), [i * 64, 0], out)
+                return out
+
+        After = self._outline(Before)
+        assert not self._structural_errors(After)
+
+        stmts = self._stmts(After.get_function("main"))
+        loop = self._loop(stmts[0])
+        assert len(loop.iter_args) == 1
+        ret = stmts[1]
+        assert isinstance(ret, ir.ReturnStmt)
+        assert self._name(ret.value[0]) == loop.return_vars[0].name_hint
+
+    def test_carry_is_appended_after_an_existing_one(self):
+        """An existing carry keeps its slot; the store target is appended after it.
+
+        Also the ``manual_dep`` / ``deps=`` shape from the dependency guide: the
+        TaskId array is what puts the loop in SSA mode, so before the fix this
+        was the variant ``UseAfterDef`` could see.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[256, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 128], pl.FP32]],
+            ) -> pl.Tensor[[256, 128], pl.FP32]:
+                scratch = pl.create_tensor([256, 128], pl.FP32, manual_dep=True)
+                writers = pl.array.create(4, pl.TASK_ID)
+                for i in pl.range(4):
+                    with pl.at(level=pl.Level.CORE_GROUP) as tid:
+                        t = pl.load(a, [i * 64, 0], [64, 128])
+                        pl.store(pl.mul(t, 2.0), [i * 64, 0], scratch)
+                    writers[i] = tid
+                with pl.at(level=pl.Level.CORE_GROUP, deps=[writers]):
+                    t2 = pl.load(scratch, [0, 0], [64, 128])
+                    pl.store(t2, [0, 0], out)
+                return out
+
+        After = self._outline(Before)
+        assert not self._structural_errors(After)
+
+        loop = self._loop(self._stmts(After.get_function("main"))[2])
+        # `writers` was already carried; `scratch` is appended after it.
+        assert len(loop.iter_args) == 2
+        assert len(loop.return_vars) == 2
+        assert loop.iter_args[0].name_hint.startswith("writers")
+        assert loop.iter_args[1].name_hint.startswith("scratch")
+        # The submit inside the body now reads the carry, not the pre-loop value.
+        assert loop.iter_args[1].name_hint in python_print(loop.body)
+
+    def test_nested_loops_thread_the_carry_out_of_both(self):
+        """An inner-loop carry re-emerges as the outer loop's carry."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[256, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 128], pl.FP32]],
+            ) -> pl.Tensor[[256, 128], pl.FP32]:
+                scratch = pl.create_tensor([256, 128], pl.FP32)
+                for i in pl.range(2):
+                    for j in pl.range(2):
+                        with pl.at(level=pl.Level.CORE_GROUP):
+                            t = pl.load(a, [(i * 2 + j) * 64, 0], [64, 128])
+                            pl.store(pl.mul(t, 2.0), [(i * 2 + j) * 64, 0], scratch)
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    t2 = pl.load(scratch, [0, 0], [64, 128])
+                    pl.store(t2, [0, 0], out)
+                return out
+
+        After = self._outline(Before)
+        assert not self._structural_errors(After)
+
+        stmts = self._stmts(After.get_function("main"))
+        outer = self._loop(stmts[1])
+        inner = self._loop(self._stmts(outer)[0])
+        assert len(outer.iter_args) == 1
+        assert len(inner.iter_args) == 1
+        # The inner carry is seeded from the outer one, which is seeded from the
+        # tensor as it was before either loop.
+        assert self._name(inner.iter_args[0].initValue) == outer.iter_args[0].name_hint
+        assert self._name(outer.iter_args[0].initValue) == self._bound_name(stmts[0])
+
+    def test_two_sibling_scopes_in_one_loop_share_one_carry(self):
+        """N scopes writing the same target in one body still add a single slot."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[256, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 128], pl.FP32]],
+            ) -> pl.Tensor[[256, 128], pl.FP32]:
+                scratch = pl.create_tensor([256, 128], pl.FP32)
+                for i in pl.range(2):
+                    with pl.at(level=pl.Level.CORE_GROUP):
+                        t0 = pl.load(a, [i * 64, 0], [64, 128])
+                        pl.store(pl.mul(t0, 2.0), [i * 64, 0], scratch)
+                    with pl.at(level=pl.Level.CORE_GROUP):
+                        t1 = pl.load(a, [i * 64, 0], [64, 128])
+                        pl.store(pl.mul(t1, 3.0), [i * 64, 0], scratch)
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    t2 = pl.load(scratch, [0, 0], [64, 128])
+                    pl.store(t2, [0, 0], out)
+                return out
+
+        After = self._outline(Before)
+        assert not self._structural_errors(After)
+
+        loop = self._loop(self._stmts(After.get_function("main"))[1])
+        assert len(loop.iter_args) == 1
+        assert len(loop.return_vars) == 1
+
+    def test_if_branch_writer_yields_and_the_else_yields_the_incoming_value(self):
+        """A conditional write must not escape its branch.
+
+        Worse than the loop case before the fix: the fresh Var existed only on the
+        taken path, yet the read after the ``if`` was unconditional.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[256, 128], pl.FP32],
+                flag: pl.Scalar[pl.INT32],
+                out: pl.Out[pl.Tensor[[256, 128], pl.FP32]],
+            ) -> pl.Tensor[[256, 128], pl.FP32]:
+                scratch = pl.create_tensor([256, 128], pl.FP32)
+                if flag > 0:
+                    with pl.at(level=pl.Level.CORE_GROUP):
+                        t = pl.load(a, [0, 0], [64, 128])
+                        pl.store(pl.mul(t, 2.0), [0, 0], scratch)
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    t2 = pl.load(scratch, [0, 0], [64, 128])
+                    pl.store(t2, [0, 0], out)
+                return out
+
+        After = self._outline(Before)
+        assert not self._structural_errors(After)
+
+        stmts = self._stmts(After.get_function("main"))
+        if_stmt = stmts[1]
+        assert isinstance(if_stmt, ir.IfStmt), f"expected an IfStmt, got {type(if_stmt).__name__}"
+        assert len(if_stmt.return_vars) == 1
+        # The source had no `else`; one is synthesised so the untaken path still
+        # produces a value — the tensor as it was before the `if`.
+        else_body = if_stmt.else_body
+        assert else_body is not None
+        assert self._bound_name(stmts[0]) in python_print(else_body)
+        assert self._name(self._call_args(stmts[2])[0]) == if_stmt.return_vars[0].name_hint
+
+    def test_scope_outside_control_flow_is_unchanged(self):
+        """The top-level case must keep resolving to the plain renamed Var."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[256, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 128], pl.FP32]],
+            ) -> pl.Tensor[[256, 128], pl.FP32]:
+                scratch = pl.create_tensor([256, 128], pl.FP32)
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    t = pl.load(a, [0, 0], [64, 128])
+                    pl.store(pl.mul(t, 2.0), [0, 0], scratch)
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    t2 = pl.load(scratch, [0, 0], [64, 128])
+                    pl.store(t2, [0, 0], out)
+                return out
+
+        After = self._outline(Before)
+        assert not self._structural_errors(After)
+
+        stmts = self._stmts(After.get_function("main"))
+        assert self._name(self._call_args(stmts[2])[0]) == self._bound_name(stmts[1])
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
