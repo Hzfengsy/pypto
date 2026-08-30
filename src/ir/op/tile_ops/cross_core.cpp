@@ -27,7 +27,6 @@
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
-#include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/printer.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/type_inference.h"
@@ -333,17 +332,10 @@ TypePtr DeduceSplitReshapeTensor(const std::vector<ExprPtr>& args,
   // rationale as the tile deducer). Memory space is a tile-level concept and is
   // re-attached when ConvertTensorToTileOps lowers this to tile.aiv_shard.
   //
-  // Canonicalize a redundant view away, mirroring the tile path: TileType's
-  // constructor drops a tile_view whose valid_shape matches the shape (the
-  // implicit view), but TensorType performs no such canonicalization. So only
-  // attach a tensor_view when the reshaped valid_shape is a genuine partial
-  // (differs from the reshaped shape). A redundant valid_shape == shape view
-  // otherwise breaks the print -> parse round-trip: the printer collapses it to
-  // a bare ``pl.TensorView()`` presence marker that reparses to an empty
-  // valid_shape (structurally != the shape-sized valid_shape).
-  if (tile_view_semantics::ShapeExprListsEquivalent(reshaped.valid, reshaped.shape)) {
-    return std::make_shared<TensorType>(std::move(reshaped.shape), tensor_type->dtype_, std::nullopt);
-  }
+  // A redundant view needs no guard here: TensorType's constructor canonicalizes
+  // it away, clearing a valid_shape equal to the shape and then resetting the
+  // otherwise-default view to nullopt (CanonicalizeTensorViewInPlace). Same as
+  // the tile deducer above, which hands TileType an unconditional TileView.
   TensorView tensor_view({}, TensorLayout::ND, std::move(reshaped.valid));
   return std::make_shared<TensorType>(std::move(reshaped.shape), tensor_type->dtype_, std::nullopt,
                                       std::make_optional(std::move(tensor_view)));
