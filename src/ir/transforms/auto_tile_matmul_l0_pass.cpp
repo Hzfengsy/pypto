@@ -405,9 +405,34 @@ enum class MatmulKind {
   kBias,
 };
 
+/// The cube op triple one matmul family is emitted with.  GEMV is the ``m == 1``
+/// specialization of the same cube contract -- pto-isa's ``pto.mad`` selects the
+/// A-vector operand organization via its ``disable_gemv`` clause when ``%m == 1``
+/// -- so the K-loop emitters differ between the two families only in which op
+/// names they construct.  Everything else (extract windows, accumulator
+/// threading, the peel) is shared.
+struct CubeOpNames {
+  const char* fresh;
+  const char* acc;
+  const char* bias;
+  /// True for the GEMV family: ``m`` is structurally 1 and the accumulator is a
+  /// full 16-row fractal whose valid rectangle is one row.
+  bool gemv;
+};
+constexpr CubeOpNames kMatmulOps{"tile.matmul", "tile.matmul_acc", "tile.matmul_bias", false};
+constexpr CubeOpNames kGemvOps{"tile.gemv", "tile.gemv_acc", "tile.gemv_bias", true};
+
 struct KLoopRewrite {
   AssignStmtPtr original;
   MatmulKind kind = MatmulKind::kFresh;
+  /// Which cube family to emit.  ``kGemvOps`` pins ``m`` at 1 (see AnalyzeMatmul).
+  CubeOpNames ops = kMatmulOps;
+  /// Kwargs copied verbatim onto every emitted block.  Empty for the matmul
+  /// family; the GEMV ops carry ``acc_phase``, which the DSL always spells even
+  /// at its default, so dropping it would make the rewrite fail to round-trip.
+  /// AnalyzeMatmul only admits ``acc_phase == "unspecified"``, so copying the
+  /// same value onto every K block cannot misplace a reduction boundary.
+  std::vector<std::pair<std::string, std::any>> op_kwargs;
   VarPtr lhs_src;                 ///< [M, K] left operand — Mat- or Vec-resident
   VarPtr rhs_src;                 ///< [K, N] right operand — Mat-resident
   VarPtr bias_src;                ///< optional [1, N] bias — Mat- or Bias-resident
@@ -516,11 +541,19 @@ VarPtr BuildBiasOperand(std::vector<StmtPtr>& stmts, const VarPtr& bias_src, int
 /// body; ``BuildKLoopRewrite`` head-peels its first K block instead, which
 /// reaches the same one-buffer chain without a predicate.  No caller therefore
 /// passes a bias operand here.
-StmtPtr BuildMatmulBody(const VarPtr& ko_var, const IterArgPtr& c_iter, const AssignStmtPtr& sa,
-                        const AssignStmtPtr& sb, const std::string& base, const Span& sp) {
+/// Create one cube call, forwarding @p kwargs only when the family has any --
+/// the matmul path keeps the exact no-kwarg ``Create`` overload it always used.
+CallPtr MakeCubeCall(const std::string& op_name, const std::vector<ExprPtr>& args,
+                     const std::vector<std::pair<std::string, std::any>>& kwargs, const Span& sp) {
   auto& reg = OpRegistry::GetInstance();
+  return kwargs.empty() ? reg.Create(op_name, args, sp) : reg.Create(op_name, args, kwargs, sp);
+}
+
+StmtPtr BuildMatmulBody(const VarPtr& ko_var, const IterArgPtr& c_iter, const AssignStmtPtr& sa,
+                        const AssignStmtPtr& sb, const std::string& base, const Span& sp,
+                        const CubeOpNames& ops, const std::vector<std::pair<std::string, std::any>>& kwargs) {
   auto init_cond = MakeEq(ko_var, MakeIndex(0, sp), sp);
-  auto c_call = reg.Create("tile.matmul_acc", {ExprPtr(c_iter), sa->var_, sb->var_, init_cond}, sp);
+  auto c_call = MakeCubeCall(ops.acc, {ExprPtr(c_iter), sa->var_, sb->var_, init_cond}, kwargs, sp);
   auto c_var = std::make_shared<Var>(base + "_l0_c_acc", c_call->GetType(), sp);
   auto c_assign = std::make_shared<AssignStmt>(c_var, c_call, sp);
   auto body_yield = std::make_shared<YieldStmt>(std::vector<ExprPtr>{c_var}, sp);
@@ -536,8 +569,8 @@ StmtPtr BuildMatmulBody(const VarPtr& ko_var, const IterArgPtr& c_iter, const As
 /// operand and the emitted call ANDs it with the generated ``ko == 0``.
 StmtPtr BuildMatmulAccBody(const IterArgPtr& c_iter, const AssignStmtPtr& sa, const AssignStmtPtr& sb,
                            const std::string& base, const Span& sp, const ExprPtr& user_init_cond,
-                           const VarPtr& ko_var) {
-  auto& reg = OpRegistry::GetInstance();
+                           const VarPtr& ko_var, const CubeOpNames& ops,
+                           const std::vector<std::pair<std::string, std::any>>& kwargs) {
   std::vector<ExprPtr> args{ExprPtr(c_iter), sa->var_, sb->var_};
   if (user_init_cond) {
     INTERNAL_CHECK_SPAN(ko_var, sp)
@@ -549,7 +582,7 @@ StmtPtr BuildMatmulAccBody(const IterArgPtr& c_iter, const AssignStmtPtr& sa, co
     // introduced here.
     args.push_back(MakeAnd(user_init_cond, MakeEq(ko_var, MakeIndex(0, sp), sp), sp));
   }
-  auto c_call = reg.Create("tile.matmul_acc", args, sp);
+  auto c_call = MakeCubeCall(ops.acc, args, kwargs, sp);
   auto c_var = std::make_shared<Var>(base + "_l0_c_acc", c_call->GetType(), sp);
   auto c_assign = std::make_shared<AssignStmt>(c_var, c_call, sp);
   auto outer_yield = std::make_shared<YieldStmt>(std::vector<ExprPtr>{c_var}, sp);
@@ -598,9 +631,16 @@ RewriteResult BuildKLoopRewrite(const KLoopRewrite& r) {
   // ``tile.matmul_bias`` is the exception: it has no ``init_cond`` operand, so
   // its first K block is head-peeled below and *is* the seed — a placeholder
   // here would be dead.
+  // Both the bias family and a fresh GEMV take their accumulator from the first
+  // K block instead of a minted placeholder -- ``tile.matmul_bias`` because it
+  // has no ``init_cond`` to predicate one with, ``tile.gemv`` because the
+  // placeholder shape ``[m, n]`` is ``[1, n]`` while ``tile.gemv_acc`` requires
+  // the ``[16, n]`` accumulator ``BuildGemvResultType`` declares.  Both reach the
+  // same single-L0C-buffer chain.
+  const bool seed_from_first_block = is_bias || (r.ops.gemv && r.kind == MatmulKind::kFresh);
   ExprPtr loop_init;
   TypePtr loop_iter_type;
-  if (num_full >= 2 && !is_bias) {
+  if (num_full >= 2 && !seed_from_first_block) {
     if (is_acc) {
       loop_init = r.acc_init;
       loop_iter_type = r.acc_init->GetType();
@@ -650,11 +690,11 @@ RewriteResult BuildKLoopRewrite(const KLoopRewrite& r) {
     if (acc_in) {
       std::vector<ExprPtr> mm_args{acc_in, sa->var_, sb->var_};
       if (init_cond) mm_args.push_back(init_cond);
-      call = reg.Create("tile.matmul_acc", mm_args, sp);
+      call = MakeCubeCall(r.ops.acc, mm_args, r.op_kwargs, sp);
     } else if (bias_operand) {
-      call = reg.Create("tile.matmul_bias", {sa->var_, sb->var_, bias_operand}, sp);
+      call = MakeCubeCall(r.ops.bias, {sa->var_, sb->var_, bias_operand}, r.op_kwargs, sp);
     } else {
-      call = reg.Create("tile.matmul", {sa->var_, sb->var_}, sp);
+      call = MakeCubeCall(r.ops.fresh, {sa->var_, sb->var_}, r.op_kwargs, sp);
     }
     auto cvar = std::make_shared<Var>(base + "_l0_c" + tag, call->GetType(), sp);
     out.push_back(sa);
@@ -679,8 +719,8 @@ RewriteResult BuildKLoopRewrite(const KLoopRewrite& r) {
     // predicated it.  The bias path passes neither: its seed already holds the
     // first block's product, so every block here accumulates.
     StmtPtr body = (k_lo == 0 && r.kind == MatmulKind::kFresh)
-                       ? BuildMatmulBody(ko_var, c_iter, sa, sb, base, sp)
-                       : BuildMatmulAccBody(c_iter, sa, sb, base, sp, user_cond, ko_var);
+                       ? BuildMatmulBody(ko_var, c_iter, sa, sb, base, sp, r.ops, r.op_kwargs)
+                       : BuildMatmulAccBody(c_iter, sa, sb, base, sp, user_cond, ko_var, r.ops, r.op_kwargs);
     std::vector<std::pair<std::string, std::any>> attrs = {{kPipelineStagesAttr, /*pipeline_stages=*/2}};
     // Loop return var: an intermediate when a partial tail follows (named
     // distinctly so round-trip names stay unique), else the final result.
@@ -696,7 +736,7 @@ RewriteResult BuildKLoopRewrite(const KLoopRewrite& r) {
   // --- Full blocks: a pipelined K-loop when there are >= 2 of them, else a
   //     single straight-line block (a 1-trip pipeline loop would be degenerate).
   VarPtr main_var;
-  if (is_bias && num_full >= 2) {
+  if (seed_from_first_block && num_full >= 2) {
     // Head-peel the first K block.  ``tile.matmul_bias`` applies the bias
     // exactly once *and* mints the accumulator, so the remaining blocks
     // accumulate into it uniformly and the whole chain stays on one L0C buffer.
@@ -742,6 +782,10 @@ RewriteResult BuildKLoopRewrite(const KLoopRewrite& r) {
 struct MatmulTiling {
   AssignStmtPtr assign;
   MatmulKind kind = MatmulKind::kFresh;
+  /// Which cube family this call belongs to; see ``CubeOpNames``.
+  CubeOpNames ops = kMatmulOps;
+  /// The original call's kwargs, copied onto every emitted block.
+  std::vector<std::pair<std::string, std::any>> op_kwargs;
   VarPtr lhs;         ///< [M, K] left operand — Mat (or Vec for the PV pattern; see stage_lhs_to_mat)
   VarPtr rhs;         ///< [K, N] right operand — Mat
   VarPtr bias;        ///< optional [1, N] bias for tile.matmul_bias
@@ -794,6 +838,8 @@ KLoopRewrite MakeKLoop(const MatmulTiling& t, ExprPtr mi, ExprPtr ni, int64_t m_
   KLoopRewrite r;
   r.original = t.assign;
   r.kind = t.kind;
+  r.ops = t.ops;
+  r.op_kwargs = t.op_kwargs;
   r.lhs_src = t.lhs;
   r.rhs_src = t.rhs;
   r.bias_src = t.bias;
@@ -859,18 +905,50 @@ std::optional<MatmulTiling> AnalyzeMatmul(
   // operation kind once so operand indexing and later legality decisions cannot
   // drift into inconsistent combinations of boolean flags.
   MatmulKind kind;
+  CubeOpNames ops = kMatmulOps;
   if (IsOp(call, "tile.matmul")) {
     kind = MatmulKind::kFresh;
   } else if (IsOp(call, "tile.matmul_acc")) {
     kind = MatmulKind::kAccumulate;
   } else if (IsOp(call, "tile.matmul_bias")) {
     kind = MatmulKind::kBias;
+  } else if (IsOp(call, "tile.gemv")) {
+    kind = MatmulKind::kFresh;
+    ops = kGemvOps;
+  } else if (IsOp(call, "tile.gemv_acc")) {
+    kind = MatmulKind::kAccumulate;
+    ops = kGemvOps;
+  } else if (IsOp(call, "tile.gemv_bias")) {
+    kind = MatmulKind::kBias;
+    ops = kGemvOps;
   } else {
     return std::nullopt;
   }
+  const bool is_gemv = ops.gemv;
   const bool is_acc = kind == MatmulKind::kAccumulate;
   const bool is_bias = kind == MatmulKind::kBias;
   const std::string& op_name = call->op_->name_;
+
+  // ``acc_phase`` marks a position in a *user-managed* K reduction -- "partial
+  // while more K chunks remain, final for the last chunk" (docs/en/dev/ir/
+  // 05-operators.md).  Re-chunking K underneath it changes which block is the
+  // last one, so a phase-carrying GEMV is left for the user to tile: splitting a
+  // "final" call into blocks that are each still labelled "final" would mark
+  // every intermediate block as the end of the reduction.  The default carries
+  // no phase attribute at all (codegen emits nothing for "unspecified"), so
+  // copying it onto every block is exact.
+  if (is_gemv) {
+    const auto acc_phase = call->GetKwarg<std::string>("acc_phase", "unspecified");
+    if (acc_phase != "unspecified") {
+      hints.emplace_back(DiagnosticSeverity::PerfHint, kPassName, 0, "PH-AT-013",
+                         op_name + ": acc_phase=\"" + acc_phase +
+                             "\" places this call within a K reduction the caller is chunking, so the "
+                             "pass cannot re-chunk K underneath it; left untouched (tile K by hand, or "
+                             "drop acc_phase to let AutoTileMatmulL0 do it)",
+                         assign->span_);
+      return std::nullopt;
+    }
+  }
 
   // Operand layout: (lhs, rhs) for matmul; (acc, lhs, rhs[, init_cond]) for
   // matmul_acc; (lhs, rhs, bias) for matmul_bias.
@@ -1092,6 +1170,17 @@ std::optional<MatmulTiling> AnalyzeMatmul(
   cfg.min_m = handler->GetMinL0TileDim();
   cfg.min_n = handler->GetMinL0TileDim();
   cfg.min_k = handler->GetMinL0TileDim();
+  if (is_gemv) {
+    // GEMV pins M at 1 by construction (``BuildGemvResultType`` requires a
+    // single physical lhs row), so the M axis has no design space for the
+    // chooser to search and the cube minimum does not apply to it -- pto-isa's
+    // ``pto.mad`` takes ``%m`` from the operand's *valid* rows and documents
+    // ``%m = 1`` as a first-class case via ``disable_gemv``.  ``l0c_align_m``
+    // stays at the backend value, so the accumulator is still budgeted as the
+    // full 16-row fractal it physically is.
+    cfg.min_m = 1;
+    cfg.align_m = 1;
+  }
   if (is_bias) {
     cfg.min_m = std::max(cfg.min_m, cfg.align_m);
     cfg.min_n = std::max(cfg.min_n, cfg.align_n);
@@ -1190,6 +1279,20 @@ std::optional<MatmulTiling> AnalyzeMatmul(
   // Already L0-sized — nothing to do.
   if (res.m == M && res.n == N && res.k == K) return std::nullopt;
 
+  // A GEMV tiles the reduction only.  N-tiling would need the M/N grid emitter,
+  // whose store-folding and Mat-scratch placement walk an M grid that does not
+  // exist at m == 1.  One L0C accumulator holds ``l0c_bytes / (l0c_align_m *
+  // bytes_c)`` output columns at m == 1 (2048 for an FP32 accumulator on 910B),
+  // so this declines only unusually wide GEMVs.
+  if (is_gemv && res.n != N) {
+    hints.emplace_back(DiagnosticSeverity::PerfHint, kPassName, 0, "PH-AT-012",
+                       op_name + ": N=" + std::to_string(N) +
+                           " needs N-tiling, which is not implemented for the GEMV family (its M axis "
+                           "is structurally 1, so there is no output grid to walk); left untouched",
+                       assign->span_);
+    return std::nullopt;
+  }
+
   // A Bias-resident vector can be reused for K-tiling or M-only tiling, but the
   // architectural bias table cannot form an N sub-window. Normal pre-inference
   // inputs are Mat-resident and take the supported load-backed Mat window ->
@@ -1221,6 +1324,8 @@ std::optional<MatmulTiling> AnalyzeMatmul(
   MatmulTiling t;
   t.assign = assign;
   t.kind = kind;
+  t.ops = ops;
+  t.op_kwargs = call->kwargs_;
   t.lhs = lhs;
   t.rhs = rhs;
   t.bias = bias_var;

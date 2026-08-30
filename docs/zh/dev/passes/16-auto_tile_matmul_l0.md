@@ -81,6 +81,23 @@ program_tiled = l0_tile_pass(program)
 
 本 pass 是 `ProgramPass`，对每个函数走 `IRMutator`；当函数内没有触发任何改写时，返回原函数（不会发生 `MutableCopy` 开销）。
 
+### GEMV 系列
+
+`tile.gemv` / `gemv_acc` / `gemv_bias` 与 matmul 系列共用本 pass 的 K-loop 发射器。
+GEMV 是同一 cube 契约在 `m == 1` 时的特化——pto-isa 的 `pto.mad` 在 `%m == 1` 时通过
+`disable_gemv` 子句选择 A 向量（A-vector）操作数组织方式——因此两者的差别只在于发射器
+构造哪些 op 名字，以及 chooser 的驱动方式：
+
+- **`min_m == align_m == 1`。** GEMV 按构造把 M 钉在 1（`BuildGemvResultType` 要求
+  lhs 只有一个物理行），所以 M 轴没有可供搜索的设计空间，cube 最小值也不适用于它。
+  `l0c_align_m` 保持 backend 给出的取值，因此累加器仍按其物理上确实占用的完整 16 行
+  分形（fractal）来计入预算。
+- **全新的 `tile.gemv` 会 head-peel 第一个 K 块**，而不是从 `tile.create` 占位符播种。
+  占位符会是 `[m, n] == [1, n]`，而 `tile.gemv_acc` 要求 `BuildGemvResultType` 声明的
+  `[16, n]` 累加器。head-peel 同样得到单个 L0C buffer 的累加链——与 bias 系列已经在用
+  的形状一致，底层原因也相同。
+- **只做 K 切分。** 本 pass 拒绝的两种形态见 Diagnostics 中的 `PH-AT-012` / `PH-AT-013`。
+
 ## Cost model & design space (`ChooseL0Tile`)
 
 `ChooseL0Tile` 通过**穷举式 roofline 搜索**挑选 L0 GEMM tile，而非闭式公式。对每个合法且对齐的 `(m, n, k)`（每维都是 `GetL0FractalAlignment()` 的倍数，L0C 预算按 `AlignUp(m, l0c_align_m) × n` 计算），它以核心 cycle 估算 wall-clock 并返回最小者：
@@ -324,6 +341,10 @@ L0/Mat 容量与 fractal 对齐都来自当前 `BackendHandler`。Pass 优先从
 | 静态 Mat 矩阵操作数与 `[1,N]` Mat/Bias 源的 `tile.matmul_bias`，输出可放进 L0c 但 K 不可 | K 切分；第一个 block 为 head-peel 出的直线 `matmul_bias`，为每个输出块初始化一次，其余 block 的循环使用 `matmul_acc`（无 `IfStmt`，单一 L0C buffer） |
 | 静态 Mat 矩阵操作数与仅使用一次、且到调用之间只有同层 load 的 Mat-resident bias load 的 `tile.matmul_bias`，输出超过 L0c，且只有一次 direct store 或只被后续矩阵乘操作数使用 | 用逐 N 块 tensor→Mat 窗口 load 替换完整 load 后做 M/N 切分；使用与新 `tile.matmul` 相同的 direct-GM 或 Mat-scratch 放置 |
 | 左操作数为 Vec，或已位于 Bias 且需要 N 切分的 `tile.matmul_bias` | 跳过；新路径要求原生 Mat 矩阵操作数，且不能发出 Bias-to-Bias 子窗口抽取 |
+| 左操作数为 `[1, K]` Mat、右操作数为 Mat，输出可放进 L0c 但 K 放不下的 `tile.gemv` | 做 K 切分；第一个 K 块被 head-peel 成直线的 `tile.gemv` 以铸出累加器，其余块的循环使用 `tile.gemv_acc`（单个 L0C buffer，与 `matmul_bias` 同理） |
+| 相同条件下的 `tile.gemv_acc` / `tile.gemv_bias` | 与各自的 matmul 对应形式完全一致地做 K 切分——`gemv_acc` 把调用方的累加器穿过循环，`gemv_bias` 做 head-peel |
+| 需要 N 切分的 GEMV（`[16, N]` fp32 超过单个 L0c 累加器） | 以 `PerfHint`（`PH-AT-012`）跳过——`m == 1` 时不存在可供 M/N 网格发射器遍历的输出网格 |
+| 带 `acc_phase="partial"` / `"final"` 的 GEMV | 以 `PerfHint`（`PH-AT-013`）跳过——该 phase 标记的是调用方自行分块的 K 归约中的位置 |
 | 已经是 L0 大小（`(m, n, k) == (M, N, K)`）的 matmul | 不动 |
 | 输出超过 L0c 但 M/N 放置不适用——非规范的独立 `matmul_acc`、Vec 左操作数、非矩阵乘操作数消费者、或 `[M, N]` 超过 Mat/L1 的链式 matmul scratch | 以 `PerfHint`（`PH-AT-006`）跳过 |
 | `K` 不是 cube 分形 16 的倍数 | 以 `PerfHint`（`PH-AT-007`）跳过——不存在分形对齐的 K 切分 |
@@ -343,6 +364,8 @@ L0/Mat 容量与 fractal 对齐都来自当前 `BackendHandler`。Pass 优先从
 | `PH-AT-008` | `ChooseL0Tile` 返回了 fallback 配置并附带 perf hint |
 | `PH-AT-009` | 该 backend 需要 bf16/f16 的片上 Mat scratch（如 Ascend910B），但超大链式 matmul 的中间结果是 f32——在消费 matmul 之前把 matmul 结果 cast 成 bf16/f16；否则留在延后路径上 |
 | `PH-AT-010` | fits-L0c 链式 matmul 的 cast 无法折叠进 cube FIXPIPE（FIXPIPE 仅以就近取偶把 `f32 → bf16/f16` 降精度）：源非 f32，或舍入模式不是 `rint`（例如默认的 `round`，或 `floor`/`ceil`/`trunc`/`odd`/`none`）。保留在 Vector `pto.tcvt` 路径——一次 cube→vector→cube 往返，在较大 `[M, N]` 下可能撑爆 Vec buffer。对 f32 结果使用 `mode="rint"` 即可留在 cube 上。 |
+| `PH-AT-012` | GEMV 需要 N 切分——`m == 1` 时单个累加器可容纳 `l0c_bytes / (l0c_align_m * bytes_c)` 个输出列（910B 上 FP32 累加器为 2048），而 M 结构性为 1 时 M/N 网格发射器要遍历的输出网格并不存在。该调用保持不变。 |
+| `PH-AT-013` | GEMV 带有 `acc_phase="partial"` 或 `"final"`，标记的是它在*调用方*自行分块的 K 归约中的位置。在其之下重新分块 K 会改变哪一块才是最后一块，因此该调用留给用户手动切分。去掉 `acc_phase` 即可让本 pass 切分 K。 |
 | `PH-AT-011` | 带 bias 的 matmul 无法形成合法 Bias 窗口：Mat→Bias dtype 不受 backend 支持、矩阵操作数不在 Mat、N 窗口无法从同 scope 的直接 load 重建、Bias 容量不足，或 M/N/K 不满足 layout box 对齐。该调用保持不变。 |
 
 ## 相关 Pass

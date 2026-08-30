@@ -946,6 +946,7 @@ def _assert_unchanged_by_pass(before, after):
 
 
 _TILE_MATMUL_ACC = ir.get_op("tile.matmul_acc").name
+_TILE_GEMV_OPS = frozenset({ir.get_op("tile.gemv").name, ir.get_op("tile.gemv_acc").name})
 
 
 def _matmul_acc_calls(node) -> list:
@@ -960,6 +961,20 @@ def _matmul_acc_calls(node) -> list:
     class _Collector(ir.IRVisitor):
         def visit_call(self, call):  # type: ignore[override]
             if isinstance(call.op, ir.Op) and call.op.name == _TILE_MATMUL_ACC:
+                calls.append(call)
+            super().visit_call(call)
+
+    _Collector().visit_program(node)
+    return calls
+
+
+def _gemv_calls(node) -> list:
+    """Every ``tile.gemv`` / ``tile.gemv_acc`` Call under ``node``, in visit order."""
+    calls: list = []
+
+    class _Collector(ir.IRVisitor):
+        def visit_call(self, call):  # type: ignore[override]
+            if isinstance(call.op, ir.Op) and call.op.name in _TILE_GEMV_OPS:
                 calls.append(call)
             super().visit_call(call)
 
@@ -4733,6 +4748,241 @@ class TestAutoTileMatmulL0FitsL0cCastFold:
             tcvt += mlir.count("pto.tcvt")
         assert tinsert >= 1, "the bf16 downcast must lower to the cube FIXPIPE pto.tinsert"
         assert tcvt == 0, "no Vector pto.tcvt — the cast is folded into the cube writeback"
+
+
+class TestAutoTileMatmulL0Gemv:
+    """K-tiling for the GEMV family.
+
+    GEMV is the ``m == 1`` specialization of the same cube contract (pto-isa
+    ``pto.mad`` selects the A-vector operand organization via ``disable_gemv``
+    when ``%m == 1``), so it shares the K-loop emitter with ``tile.matmul`` and
+    differs only in the op names and in the M axis having no design space: the
+    chooser is driven with ``min_m == align_m == 1`` while ``l0c_align_m`` stays
+    at the backend value, so the accumulator is still budgeted as the full
+    16-row fractal that ``BuildGemvResultType`` declares.
+    """
+
+    def test_gemv_k_tiled_head_peels_first_block(self):
+        """1x64 @ 2048 BF16 -> the chooser picks (m=1, n=64, k=256).
+
+        A fresh GEMV cannot seed the chain from a ``tile.create`` placeholder the
+        way ``tile.matmul`` does: the placeholder would be ``[m, n] == [1, 64]``
+        while ``tile.gemv_acc`` requires the ``[16, 64]`` accumulator. The first K
+        block is head-peeled as a ``tile.gemv`` instead -- the same shape the bias
+        family uses -- so the whole chain still lands on one L0C buffer.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[1, 2048], pl.BF16],
+                rhs: pl.Tensor[[2048, 64], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                lhs_mat: pl.Tile[[1, 2048], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [1, 2048], target_memory=pl.Mem.Mat
+                )
+                rhs_mat: pl.Tile[[2048, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [2048, 64], target_memory=pl.Mem.Mat
+                )
+                c = pl.tile.gemv(lhs_mat, rhs_mat)
+                out = pl.store(c, [0, 0], out)
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[1, 2048], pl.BF16],
+                rhs: pl.Tensor[[2048, 64], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                lhs_mat: pl.Tile[[1, 2048], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [1, 2048], target_memory=pl.Mem.Mat
+                )
+                rhs_mat: pl.Tile[[2048, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [2048, 64], target_memory=pl.Mem.Mat
+                )
+                # Head-peeled first K block: this tile.gemv IS the accumulator seed.
+                a0: pl.Tile[[1, 256], pl.BF16, pl.Mem.Left] = pl.tile.extract(
+                    lhs_mat, 0, 0, shape=[1, 256], target_memory=pl.Mem.Left
+                )
+                b0: pl.Tile[[256, 64], pl.BF16, pl.Mem.Right] = pl.tile.extract(
+                    rhs_mat, 0, 0, shape=[256, 64], target_memory=pl.Mem.Right
+                )
+                c0 = pl.tile.gemv(a0, b0)
+                # Remaining K blocks accumulate into it uniformly -- no predicate
+                # needed, because the seed already holds block 0's product.
+                for ko, (c_iter,) in pl.pipeline(256, 2048, 256, init_values=(c0,), stage=2):
+                    sa: pl.Tile[[1, 256], pl.BF16, pl.Mem.Left] = pl.tile.extract(
+                        lhs_mat, 0, ko, shape=[1, 256], target_memory=pl.Mem.Left
+                    )
+                    sb: pl.Tile[[256, 64], pl.BF16, pl.Mem.Right] = pl.tile.extract(
+                        rhs_mat, ko, 0, shape=[256, 64], target_memory=pl.Mem.Right
+                    )
+                    c_acc = pl.tile.gemv_acc(c_iter, sa, sb)
+                    c = pl.yield_(c_acc)
+                out = pl.store(c, [0, 0], out)
+                return out
+
+        After = passes.auto_tile_matmul_l0()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_gemv_keeps_the_sixteen_row_accumulator(self):
+        """Every accumulator in the rewrite is [16, N] physical / [1, N] valid.
+
+        That is the shape ``BuildGemvResultType`` declares and the one the cube
+        actually drains (``mad`` lays the product out at a
+        ``ceil(M/16)*16`` L0C pitch). A [1, N] accumulator anywhere in the chain
+        would under-declare L0C by a whole fractal.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[1, 2048], pl.BF16],
+                rhs: pl.Tensor[[2048, 64], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                lhs_mat: pl.Tile[[1, 2048], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [1, 2048], target_memory=pl.Mem.Mat
+                )
+                rhs_mat: pl.Tile[[2048, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [2048, 64], target_memory=pl.Mem.Mat
+                )
+                c = pl.tile.gemv(lhs_mat, rhs_mat)
+                out = pl.store(c, [0, 0], out)
+                return out
+
+        After = passes.auto_tile_matmul_l0()(Before)
+        calls = _gemv_calls(After)
+        assert calls, "the rewrite must emit at least one gemv call"
+        for call in calls:
+            ty = call.type
+            assert [d.value for d in ty.shape] == [16, 64], (
+                f"a gemv accumulator must stay a whole 16-row fractal, got {ty}"
+            )
+            assert [d.value for d in ty.tile_view.valid_shape] == [1, 64], (
+                f"a gemv accumulator's valid rectangle is one row, got {ty}"
+            )
+
+    def test_gemv_acc_k_tiled_threads_caller_accumulator(self):
+        """A user-written ``tile.gemv_acc`` K-tiles onto the caller's accumulator.
+
+        No head-peel here: the caller supplied the seed, so every block --
+        including the first -- accumulates, exactly as ``tile.matmul_acc`` does.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[1, 2048], pl.BF16],
+                rhs: pl.Tensor[[2048, 64], pl.BF16],
+                acc_init: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc, pl.TileView(valid_shape=[1, 64])],
+                out: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                lhs_mat: pl.Tile[[1, 2048], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [1, 2048], target_memory=pl.Mem.Mat
+                )
+                rhs_mat: pl.Tile[[2048, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [2048, 64], target_memory=pl.Mem.Mat
+                )
+                c = pl.tile.gemv_acc(acc_init, lhs_mat, rhs_mat)
+                out = pl.store(c, [0, 0], out)
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[1, 2048], pl.BF16],
+                rhs: pl.Tensor[[2048, 64], pl.BF16],
+                acc_init: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc, pl.TileView(valid_shape=[1, 64])],
+                out: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                lhs_mat: pl.Tile[[1, 2048], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [1, 2048], target_memory=pl.Mem.Mat
+                )
+                rhs_mat: pl.Tile[[2048, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [2048, 64], target_memory=pl.Mem.Mat
+                )
+                for ko, (c_iter,) in pl.pipeline(0, 2048, 256, init_values=(acc_init,), stage=2):
+                    sa: pl.Tile[[1, 256], pl.BF16, pl.Mem.Left] = pl.tile.extract(
+                        lhs_mat, 0, ko, shape=[1, 256], target_memory=pl.Mem.Left
+                    )
+                    sb: pl.Tile[[256, 64], pl.BF16, pl.Mem.Right] = pl.tile.extract(
+                        rhs_mat, ko, 0, shape=[256, 64], target_memory=pl.Mem.Right
+                    )
+                    c_acc = pl.tile.gemv_acc(c_iter, sa, sb)
+                    c = pl.yield_(c_acc)
+                out = pl.store(c, [0, 0], out)
+                return out
+
+        After = passes.auto_tile_matmul_l0()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_gemv_that_fits_l0_is_left_untouched(self):
+        """A GEMV whose whole reduction already fits L0 needs no tiling."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[1, 128], pl.BF16],
+                rhs: pl.Tensor[[128, 64], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                lhs_mat: pl.Tile[[1, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [1, 128], target_memory=pl.Mem.Mat
+                )
+                rhs_mat: pl.Tile[[128, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [128, 64], target_memory=pl.Mem.Mat
+                )
+                c = pl.tile.gemv(lhs_mat, rhs_mat)
+                out = pl.store(c, [0, 0], out)
+                return out
+
+        After = passes.auto_tile_matmul_l0()(Before)
+        ir.assert_structural_equal(After, Before)
+
+    def test_gemv_needing_n_tiling_is_declined(self, capfd):
+        """N=2048 does not fit one L0C accumulator at m=1, and the GEMV family has
+        no N-tiling path: the M/N grid emitter walks an output grid that does not
+        exist when M is structurally 1. The call is left untouched with PH-AT-012
+        rather than silently mis-tiled.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[1, 256], pl.BF16],
+                rhs: pl.Tensor[[256, 2048], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 2048], pl.FP32]],
+            ) -> pl.Tensor[[16, 2048], pl.FP32]:
+                lhs_mat: pl.Tile[[1, 256], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [1, 256], target_memory=pl.Mem.Mat
+                )
+                rhs_mat: pl.Tile[[256, 2048], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [256, 2048], target_memory=pl.Mem.Mat
+                )
+                c = pl.tile.gemv(lhs_mat, rhs_mat)
+                out = pl.store(c, [0, 0], out)
+                return out
+
+        After = passes.auto_tile_matmul_l0()(Before)
+        ir.assert_structural_equal(After, Before)
+        assert "PH-AT-012" in capfd.readouterr().err
 
 
 if __name__ == "__main__":

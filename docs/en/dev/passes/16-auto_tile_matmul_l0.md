@@ -81,6 +81,27 @@ For each `tile.matmul`, `tile.matmul_acc`, or `tile.matmul_bias` in an InCore-ty
 
 The pass is a `ProgramPass` and walks each function with an `IRMutator`; functions are returned unchanged when no rewrite fires (no `MutableCopy` cost for matmul-free programs).
 
+### The GEMV family
+
+`tile.gemv` / `gemv_acc` / `gemv_bias` share this pass's K-loop emitter with the
+matmul family. GEMV is the `m == 1` specialization of the same cube contract —
+pto-isa's `pto.mad` selects the A-vector operand organization through its
+`disable_gemv` clause when `%m == 1` — so the two differ only in which op names
+the emitter constructs and in how the chooser is driven:
+
+- **`min_m == align_m == 1`.** GEMV pins M at 1 by construction
+  (`BuildGemvResultType` requires a single physical lhs row), so the M axis has
+  no design space to search and the cube minimum does not apply to it.
+  `l0c_align_m` stays at the backend value, so the accumulator is still budgeted
+  as the full 16-row fractal it physically is.
+- **A fresh `tile.gemv` head-peels its first K block** rather than seeding from a
+  `tile.create` placeholder. The placeholder would be `[m, n] == [1, n]`, while
+  `tile.gemv_acc` requires the `[16, n]` accumulator `BuildGemvResultType`
+  declares. Peeling reaches the same one-L0C-buffer chain — the same shape the
+  bias family already used, and for the same underlying reason.
+- **K tiling only.** See `PH-AT-012` / `PH-AT-013` in Diagnostics for the two
+  shapes the pass declines.
+
 ## Cost model & design space (`ChooseL0Tile`)
 
 `ChooseL0Tile` picks the L0 GEMM tile by an **exhaustive roofline search**, not a closed form. For every legal aligned `(m, n, k)` — each a multiple of `GetL0FractalAlignment()`, with `AlignUp(m, l0c_align_m) × n` used for the L0C budget — it estimates wall-clock in core cycles and returns the minimum:
@@ -341,6 +362,10 @@ Adding a new backend therefore only needs to provide these handler hooks — the
 | `tile.matmul_bias` with static Mat matrix operands and a `[1,N]` Mat/Bias source, output fits L0c but K does not | K-tiled; the first block is a head-peeled straight-line `matmul_bias` that initializes each output tile once, and the loop over the remaining blocks uses `matmul_acc` (no `IfStmt`, one L0C buffer) |
 | `tile.matmul_bias` with static Mat matrix operands and a single-use, full rectangular `[1,N]` Mat bias load separated from the call only by sibling loads, output exceeds L0c, with one direct store or only later matmul-operand uses | M/N-tiled after replacing the full load with per-N tensor→Mat window loads; placed through the same direct-GM or Mat-scratch strategies as fresh `tile.matmul` |
 | `tile.matmul_bias` with a Vec left operand, or an already-Bias-resident source requiring N tiling | Skipped; the new biased path requires native Mat operands and cannot emit Bias-to-Bias sub-window extracts |
+| `tile.gemv` over a `[1, K]` Mat left operand + Mat right, output fits L0c but K does not | K-tiled; the first block is a head-peeled straight-line `tile.gemv` that mints the accumulator, and the loop over the remaining blocks uses `tile.gemv_acc` (one L0C buffer, as for `matmul_bias`) |
+| `tile.gemv_acc` / `tile.gemv_bias` under the same conditions | K-tiled exactly as their matmul counterparts — `gemv_acc` threads the caller's accumulator through the loop, `gemv_bias` head-peels |
+| A GEMV needing N tiling (`[16, N]` fp32 exceeds one L0c accumulator) | Skipped with `PerfHint` (`PH-AT-012`) — the M/N grid emitter has no output grid to walk at `m == 1` |
+| A GEMV carrying `acc_phase="partial"` / `"final"` | Skipped with `PerfHint` (`PH-AT-013`) — the phase marks a position in a caller-chunked K reduction |
 | Already L0-sized matmul (`(m, n, k) == (M, N, K)`) | Untouched |
 | Output exceeds L0c but no M/N placement applies — non-canonical standalone `matmul_acc`, Vec left, a non-matmul-operand consumer, or a chained-matmul scratch whose `[M, N]` exceeds Mat/L1 | Skipped with `PerfHint` (`PH-AT-006`) |
 | `K` not a multiple of the cube fractal (16) | Skipped with `PerfHint` (`PH-AT-007`) — no fractal-aligned K-tiling |
@@ -360,6 +385,8 @@ The pass emits `PerfHint` diagnostics rather than failing when it declines to re
 | `PH-AT-008` | `ChooseL0Tile` returned a fallback configuration with a perf hint message |
 | `PH-AT-009` | Backend needs a bf16/f16 on-chip Mat scratch (e.g. Ascend910B) but the oversized chained-matmul intermediate is f32 — cast the matmul result to bf16/f16 before the consumer matmul; left on the deferred path |
 | `PH-AT-010` | A fits-L0c chained-matmul cast cannot fold onto the cube FIXPIPE (which narrows `f32 → bf16/f16` with round-half-to-even only): the source is non-f32, or the round mode is not `rint` (e.g. the default `round`, or `floor`/`ceil`/`trunc`/`odd`/`none`). Kept on the Vector `pto.tcvt` path — a cube→vector→cube round-trip that may overflow the Vec buffer at large `[M, N]`. Cast an f32 result with `mode="rint"` to keep it on the cube. |
+| `PH-AT-012` | A GEMV needs N tiling — `l0c_bytes / (l0c_align_m * bytes_c)` output columns fit one accumulator at `m == 1` (2048 for an FP32 accumulator on 910B), and the M/N grid emitter walks an output grid that does not exist when M is structurally 1. The call is unchanged. |
+| `PH-AT-013` | A GEMV carries `acc_phase="partial"` or `"final"`, which marks its position in a K reduction the *caller* is chunking. Re-chunking K underneath it would change which block is the last one, so the call is left for the user to tile by hand. Drop `acc_phase` to let the pass tile K. |
 | `PH-AT-011` | A biased matmul cannot form a legal Bias window: unsupported Mat→Bias dtype pair, non-Mat matrix operand, partial/dynamic/non-load-backed N window, insufficient Bias capacity, or layout-misaligned M/N/K. The call is unchanged. |
 
 ## See also
