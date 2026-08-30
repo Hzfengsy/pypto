@@ -460,6 +460,23 @@ class BackendHandler {
   [[nodiscard]] virtual int GetMinL0TileDim() const { return 16; }
 
   /**
+   * @brief Row height of one cube NZ fractal box, in elements.
+   *
+   * pto-isa `docs/isa/cube/nz-fractal-layout.md` fixes the inner box height at
+   * `M0 = 16` for every generation, independent of element width, and repeats it
+   * as the `FRACTAL_NZ_ROW` machine constant. A cube operand's *physical* row
+   * count must be a multiple of this. Its *logical* (valid) row count is not
+   * constrained by it at all: `pto.tmatmul` takes M from the operand's valid
+   * region, and hardware addresses a narrower valid region inside a full box
+   * through compact mode.
+   *
+   * Distinct from `GetL0FractalAlignment()`, which collapses m, n and k onto one
+   * number for tile-shape *selection*. This one describes the physical box the
+   * hardware addresses, and applies to the M axis only.
+   */
+  [[nodiscard]] virtual int GetCubeFractalRows() const { return 16; }
+
+  /**
    * @brief Closed-form GEMM cost-model parameters (L1<->L0 / drain bandwidths
    * and MAD constants) consumed by ChooseL0Tile.
    *

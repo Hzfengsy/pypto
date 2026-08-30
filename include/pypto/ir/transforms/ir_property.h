@@ -112,6 +112,14 @@ enum class IRProperty : uint64_t {
                                     ///< from the L0A operand, and only a compact tile makes a reader
                                     ///< recompute that pitch instead of using the physical row count.
                                     ///< Verifiable once InferTileMemorySpace has resolved memory spaces
+  CubeTileFractalValid,             ///< Every cube matmul-family operand (tile.matmul / _acc / _bias,
+                                    ///< tile.gemv family, tile.batch_matmul family) declares a *physical*
+                                    ///< tile extent that is a whole number of NZ fractal boxes: rows a
+                                    ///< multiple of M0=16, cols a multiple of C0/sizeof(dtype). The
+                                    ///< logical (valid) extent is unconstrained -- hardware addresses a
+                                    ///< narrower valid region through compact mode. Decidable on the
+                                    ///< user's own IR, so it is a structural property verified at
+                                    ///< pipeline input
   GraphBoundaryLegalized,           ///< Every FunctionType::Graph function satisfies the
                                     ///< host_build_graph boundary contract: its derived boundary
                                     ///< scalars have been hoisted to the call sites, its signature
@@ -252,7 +260,7 @@ enum class VerificationLevel {
  * AivSplitValid, TileMemoryInferred, HardSyncallOccupancyValid,
  * IterArgCarryClassified, RuntimeScopesMaterialized,
  * DistTensorCtxMaterialized, GraphBoundaryLegalized, AccToGmStoreValid,
- * AccCompactValid, AtomicAddDtypeValid} —
+ * AccCompactValid, AtomicAddDtypeValid, CubeTileFractalValid} —
  * lightweight checks that catch the most common IR errors.
  */
 const IRPropertySet& GetVerifiedProperties();
@@ -264,7 +272,7 @@ const IRPropertySet& GetVerifiedProperties();
  * in per-pass PassProperties. Returns {TypeChecked, BreakContinueValid,
  * NoRedundantBlocks, UseAfterDef, OutParamNotShadowed, NoNestedInCore,
  * InOutUseValid, PipelineLoopValid, ArrayNotEscaped, ManualDepsOnSubmitOnly,
- * AtomicAddDtypeValid}.
+ * AtomicAddDtypeValid, CubeTileFractalValid}.
  */
 const IRPropertySet& GetStructuralProperties();
 

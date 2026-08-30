@@ -138,6 +138,11 @@ void BindPass(nb::module_& m) {
              "Every tile.matmul_acc / tile.matmul_mx_acc accumulates into a CompactMode.normal "
              "buffer when mad's pitch (ceil(lhs validRow/16)*16) differs from the accumulator's "
              "physical row count, and no tile outside Left/Right/Acc carries a compact mode")
+      .value("CubeTileFractalValid", IRProperty::CubeTileFractalValid,
+             "Every cube matmul-family operand (tile.matmul / _acc / _bias, tile.gemv family, "
+             "tile.batch_matmul family) declares a physical tile whose row count is a multiple of "
+             "the NZ fractal box height M0=16. The logical (valid) extent is unconstrained -- "
+             "declare the tile at a fractal multiple and narrow it with valid_shape")
       .value("GraphBoundaryLegalized", IRProperty::GraphBoundaryLegalized,
              "Every FunctionType::Graph function satisfies the host_build_graph boundary contract: "
              "derived boundary scalars hoisted to the call sites, a signature within the runtime's "

@@ -1842,7 +1842,7 @@ class TestFlattenTileNdTo2DBatchMatmul:
         and the middle K dim is partially sliced, so the flattened rows are not
         contiguous (a ``[2*K, N]`` whole load would read across the K gap). It must
         become two per-batch ``[1, 2, 5]`` loads at offsets ``[0,0,0]`` / ``[1,0,0]``;
-        the contiguous ``lhs`` (``[2, 3, 2]``, full) stays a single whole load.
+        the contiguous ``lhs`` (``[2, 16, 2]``, full) stays a single whole load.
         """
 
         @pl.program
@@ -1850,27 +1850,27 @@ class TestFlattenTileNdTo2DBatchMatmul:
             @pl.function(type=pl.FunctionType.InCore)
             def main_incore_0(
                 self,
-                lhs: pl.Tensor[[2, 3, 2], pl.FP16],
+                lhs: pl.Tensor[[2, 16, 2], pl.FP16],
                 rhs_src: pl.Tensor[[2, 4, 5], pl.FP16],
-                out_0: pl.Out[pl.Tensor[[2, 3, 5], pl.FP16]],
-            ) -> pl.Tensor[[2, 3, 5], pl.FP16]:
-                lhs_tile: pl.Tile[[2, 3, 2], pl.FP16] = pl.load(
-                    lhs, [0, 0, 0], [2, 3, 2], target_memory=pl.MemorySpace.Mat
+                out_0: pl.Out[pl.Tensor[[2, 16, 5], pl.FP16]],
+            ) -> pl.Tensor[[2, 16, 5], pl.FP16]:
+                lhs_tile: pl.Tile[[2, 16, 2], pl.FP16] = pl.load(
+                    lhs, [0, 0, 0], [2, 16, 2], target_memory=pl.MemorySpace.Mat
                 )
                 rhs_tile: pl.Tile[[2, 2, 5], pl.FP16] = pl.load(
                     rhs_src, [0, 0, 0], [2, 2, 5], target_memory=pl.MemorySpace.Mat
                 )
-                out_tile: pl.Tile[[2, 3, 5], pl.FP32] = pl.tile.batch_matmul(lhs_tile, rhs_tile)
+                out_tile: pl.Tile[[2, 16, 5], pl.FP32] = pl.tile.batch_matmul(lhs_tile, rhs_tile)
                 out_0 = pl.store(out_tile, [0, 0, 0], out_0)
                 return out_0
 
             @pl.function
             def main(
                 self,
-                lhs: pl.Tensor[[2, 3, 2], pl.FP16],
+                lhs: pl.Tensor[[2, 16, 2], pl.FP16],
                 rhs_src: pl.Tensor[[2, 4, 5], pl.FP16],
-            ) -> pl.Tensor[[2, 3, 5], pl.FP16]:
-                out_0 = pl.create_tensor([2, 3, 5], dtype=pl.FP16)
+            ) -> pl.Tensor[[2, 16, 5], pl.FP16]:
+                out_0 = pl.create_tensor([2, 16, 5], dtype=pl.FP16)
                 y = self.main_incore_0(lhs, rhs_src, out_0)
                 return y
 
@@ -1879,17 +1879,17 @@ class TestFlattenTileNdTo2DBatchMatmul:
             @pl.function(type=pl.FunctionType.InCore)
             def main_incore_0(
                 self,
-                lhs: pl.Tensor[[2, 3, 2], pl.FP16],
+                lhs: pl.Tensor[[2, 16, 2], pl.FP16],
                 rhs_src: pl.Tensor[[2, 4, 5], pl.FP16],
-                out_0: pl.Out[pl.Tensor[[2, 3, 5], pl.FP16]],
-            ) -> pl.Tensor[[2, 3, 5], pl.FP16]:
+                out_0: pl.Out[pl.Tensor[[2, 16, 5], pl.FP16]],
+            ) -> pl.Tensor[[2, 16, 5], pl.FP16]:
                 # lhs (contiguous, [2,3,2] -> [6,2]) kept whole and row-sliced per batch;
                 # rhs (non-contiguous: B=2 + partial K) re-emitted as per-batch [1,2,5] loads.
-                lhs_2d: pl.Tensor[[6, 2], pl.FP16] = pl.tensor.view(lhs, [6, 2])
-                lhs_tile: pl.Tile[[6, 2], pl.FP16, pl.Mem.Mat] = pl.load(
-                    lhs_2d, [0, 0], [6, 2], [6, 2], target_memory=pl.Mem.Mat
+                lhs_2d: pl.Tensor[[32, 2], pl.FP16] = pl.tensor.view(lhs, [32, 2])
+                lhs_tile: pl.Tile[[32, 2], pl.FP16, pl.Mem.Mat] = pl.load(
+                    lhs_2d, [0, 0], [32, 2], [32, 2], target_memory=pl.Mem.Mat
                 )
-                lhs_slice_0: pl.Tile[[3, 2], pl.FP16, pl.Mem.Mat] = pl.tile.slice(lhs_tile, [3, 2], [0, 0])
+                lhs_slice_0: pl.Tile[[16, 2], pl.FP16, pl.Mem.Mat] = pl.tile.slice(lhs_tile, [16, 2], [0, 0])
                 rhs_pbview2d_0: pl.Tensor[
                     [8, 5], pl.FP16, pl.TensorView(stride=[5, 1], layout=pl.TensorLayout.ND)
                 ] = pl.tensor.view(rhs_src, [8, 5])
@@ -1897,9 +1897,9 @@ class TestFlattenTileNdTo2DBatchMatmul:
                     rhs_pbview2d_0, [0, 0], [2, 5], [2, 5], target_memory=pl.Mem.Mat
                 )
                 matmul_0 = pl.tile.matmul(lhs_slice_0, rhs_pbload_0)
-                out_0_0 = pl.store(matmul_0, [0, 0, 0], out_0, shapes=[1, 3, 5])
+                out_0_0 = pl.store(matmul_0, [0, 0, 0], out_0, shapes=[1, 16, 5])
 
-                lhs_slice_1: pl.Tile[[3, 2], pl.FP16, pl.Mem.Mat] = pl.tile.slice(lhs_tile, [3, 2], [3, 0])
+                lhs_slice_1: pl.Tile[[16, 2], pl.FP16, pl.Mem.Mat] = pl.tile.slice(lhs_tile, [16, 2], [16, 0])
                 rhs_pbview2d_1: pl.Tensor[
                     [8, 5], pl.FP16, pl.TensorView(stride=[5, 1], layout=pl.TensorLayout.ND)
                 ] = pl.tensor.view(rhs_src, [8, 5])
@@ -1907,16 +1907,16 @@ class TestFlattenTileNdTo2DBatchMatmul:
                     rhs_pbview2d_1, [4, 0], [2, 5], [2, 5], target_memory=pl.Mem.Mat
                 )
                 matmul_1 = pl.tile.matmul(lhs_slice_1, rhs_pbload_1)
-                out_0_1 = pl.store(matmul_1, [1, 0, 0], out_0_0, shapes=[1, 3, 5])
+                out_0_1 = pl.store(matmul_1, [1, 0, 0], out_0_0, shapes=[1, 16, 5])
                 return out_0_1
 
             @pl.function
             def main(
                 self,
-                lhs: pl.Tensor[[2, 3, 2], pl.FP16],
+                lhs: pl.Tensor[[2, 16, 2], pl.FP16],
                 rhs_src: pl.Tensor[[2, 4, 5], pl.FP16],
-            ) -> pl.Tensor[[2, 3, 5], pl.FP16]:
-                out_0 = pl.create_tensor([2, 3, 5], dtype=pl.FP16)
+            ) -> pl.Tensor[[2, 16, 5], pl.FP16]:
+                out_0 = pl.create_tensor([2, 16, 5], dtype=pl.FP16)
                 y = self.main_incore_0(lhs, rhs_src, out_0)
                 return y
 

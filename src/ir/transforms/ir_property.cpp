@@ -107,6 +107,8 @@ std::string IRPropertyToString(IRProperty prop) {
       return "AtomicAddDtypeValid";
     case IRProperty::AccCompactValid:
       return "AccCompactValid";
+    case IRProperty::CubeTileFractalValid:
+      return "CubeTileFractalValid";
     case IRProperty::GraphBoundaryLegalized:
       return "GraphBoundaryLegalized";
     default:
@@ -163,7 +165,8 @@ const IRPropertySet& GetVerifiedProperties() {
                                    IRProperty::GraphBoundaryLegalized,
                                    IRProperty::AccToGmStoreValid,
                                    IRProperty::AccCompactValid,
-                                   IRProperty::AtomicAddDtypeValid};
+                                   IRProperty::AtomicAddDtypeValid,
+                                   IRProperty::CubeTileFractalValid};
   return props;
 }
 
@@ -192,7 +195,7 @@ const IRPropertySet& GetStructuralProperties() {
                                    IRProperty::OutParamNotShadowed, IRProperty::NoNestedInCore,
                                    IRProperty::InOutUseValid,       IRProperty::PipelineLoopValid,
                                    IRProperty::ArrayNotEscaped,     IRProperty::ManualDepsOnSubmitOnly,
-                                   IRProperty::AtomicAddDtypeValid};
+                                   IRProperty::AtomicAddDtypeValid, IRProperty::CubeTileFractalValid};
   return props;
 }
 

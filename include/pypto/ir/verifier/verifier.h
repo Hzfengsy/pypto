@@ -123,6 +123,21 @@ PropertyVerifierPtr CreateAccCompactValidPropertyVerifier();
 PropertyVerifierPtr CreateAtomicAddDtypeValidPropertyVerifier();
 
 /**
+ * @brief Factory for the cube NZ-fractal tile-shape property verifier
+ *
+ * Checks every cube matmul-family operand (``tile.matmul`` / ``_acc`` /
+ * ``_bias``, the ``tile.gemv`` family, the ``tile.batch_matmul`` family)
+ * against the pto-isa NZ fractal box: physical rows a multiple of ``M0 = 16``,
+ * physical cols a multiple of ``C0 / sizeof(dtype)``
+ * (``BackendHandler::GetCubeFractalRows`` / ``GetCubeFractalCols``). Only the
+ * *physical* extent is constrained -- a narrower logical (valid) extent is
+ * addressed natively by compact mode. Listed in ``GetStructuralProperties()``,
+ * so it is verified at pipeline input on the user's own IR.
+ * @return Shared pointer to CubeTileFractalValid PropertyVerifier
+ */
+PropertyVerifierPtr CreateCubeTileFractalValidPropertyVerifier();
+
+/**
  * @brief Factory for the InParamWritten warning verifier.
  *
  * Reports a parameter declared `In` that its own function body writes, where

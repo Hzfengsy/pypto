@@ -1280,24 +1280,34 @@ def test_singleton_split_axis_transpose_keeps_split():
     """A transpose whose source is singleton on the split axis carries no split
     data (the no-op broadcast case), so the split is preserved. Here a [1, 16]
     source is transposed under UP_DOWN (split dim 0 == 1), so it is NOT rejected
-    and the AIV keeps its split attr with no dual-AIV dispatch."""
+    and the AIV keeps its split attr with no dual-AIV dispatch.
+
+    The singleton tile is a row slice of the cube result rather than the cube
+    result itself: no cube op can yield a physically-singleton dim 0 any more.
+    ``tile.matmul`` takes its result rows from a left operand that
+    CubeTileFractalValid pins at a whole 16-row NZ fractal, and ``tile.gemv`` pads
+    its result to 16 physical rows. The hazard check reads the transpose operand's
+    own type, so a sliced [1, 16] exercises the same exemption the unsliced cube
+    result used to.
+    """
 
     @pl.program
     class Before:
         @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
         def t_singleton(
             self,
-            x: pl.Tensor[[1, 128], pl.BF16],
+            x: pl.Tensor[[16, 128], pl.BF16],
             y: pl.Tensor[[128, 16], pl.BF16],
             out_0: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
         ) -> pl.Tensor[[16, 1], pl.FP32]:
-            x_mat = pl.load(x, [0, 0], [1, 128], target_memory=pl.MemorySpace.Mat)
+            x_mat = pl.load(x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat)
             x_left = pl.move(x_mat, target_memory=pl.MemorySpace.Left)
             y_mat = pl.load(y, [0, 0], [128, 16], target_memory=pl.MemorySpace.Mat)
             y_right = pl.move(y_mat, target_memory=pl.MemorySpace.Right)
-            z = pl.matmul(x_left, y_right)  # [1, 16] (cube result)
+            z = pl.matmul(x_left, y_right)  # [16, 16] (cube result)
             z_vec = pl.move(z, target_memory=pl.MemorySpace.Vec)
-            zt = pl.transpose(z_vec, axis1=0, axis2=1)  # source dim0=1 singleton -> kept split
+            z_row = pl.tile.slice(z_vec, [1, 16], [0, 0])  # [1, 16]
+            zt = pl.transpose(z_row, axis1=0, axis2=1)  # source dim0=1 singleton -> kept split
             out_0 = pl.store(zt, [0, 0], out_0)
             return out_0
 

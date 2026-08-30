@@ -3372,7 +3372,7 @@ class TestSliceMatmulConversion:
         ("name", "lhs_shape", "rhs_shape", "out_shape", "slice_side", "trans_kw"),
         [
             ("no_trans", [16, 128], [128, 64], [16, 64], "rhs", None),
-            ("btrans", [1, 128], [120, 128], [1, 120], "rhs", "b_trans"),
+            ("btrans", [16, 128], [120, 128], [16, 120], "rhs", "b_trans"),
             ("atrans", [128, 16], [128, 64], [16, 64], "lhs", "a_trans"),
         ],
     )

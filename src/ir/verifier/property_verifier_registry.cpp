@@ -75,6 +75,12 @@ PropertyVerifierRegistry::PropertyVerifierRegistry() {
   // it sits in GetStructuralProperties() and fires at pipeline input rather than
   // after a particular pass.
   Register(IRProperty::AtomicAddDtypeValid, CreateAtomicAddDtypeValidPropertyVerifier);
+  // CubeTileFractalValid: a cube operand's physical tile extent must be a whole
+  // NZ fractal box (pto-isa docs/isa/cube/nz-fractal-layout.md). Decidable on
+  // the user's own IR -- the tile shapes are written at the DSL -- so it sits in
+  // GetStructuralProperties() and fires at pipeline input with the author's own
+  // Span, rather than after the pass that would otherwise silently decline it.
+  Register(IRProperty::CubeTileFractalValid, CreateCubeTileFractalValidPropertyVerifier);
 
   Register(IRProperty::InlineFunctionsEliminated, CreateInlineFunctionsEliminatedPropertyVerifier);
   Register(IRProperty::OrchestrationReferencesResolved,

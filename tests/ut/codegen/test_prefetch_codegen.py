@@ -181,20 +181,25 @@ class TestPrefetchPTOCodegen:
 class MixedPrefetchProgram:
     """Prefetch alongside a cube op, so ExpandMixedKernel splits AIC/AIV."""
 
+    # The prefetch source and the matmul left operand are separate tensors: a
+    # prefetch needs a flat contiguous 1D region (dim 0 == 1), while a cube left
+    # operand needs a full 16-row NZ fractal box (CubeTileFractalValid). One
+    # tensor cannot be both.
     @pl.function(type=pl.FunctionType.InCore)
     def main(
         self,
         a: pl.Tensor[[1, 128], pl.FP16],
+        x: pl.Tensor[[16, 128], pl.FP16],
         b: pl.Tensor[[128, 128], pl.FP16],
-        out: pl.Tensor[[1, 128], pl.FP32],
-    ) -> pl.Tensor[[1, 128], pl.FP32]:
+        out: pl.Tensor[[16, 128], pl.FP32],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
         ctx = pl.prefetch.make_context()
         evt = pl.prefetch.async_prefetch(a, ctx)
         session = pl.prefetch.session(ctx)
         pl.prefetch.wait(evt, session)
-        tile_a = pl.load(a, [0, 0], [1, 128])
+        tile_x = pl.load(x, [0, 0], [16, 128])
         tile_b = pl.load(b, [0, 0], [128, 128])
-        return pl.store(pl.tile.matmul(tile_a, tile_b), [0, 0], out)
+        return pl.store(pl.tile.matmul(tile_x, tile_b), [0, 0], out)
 
 
 class TestPrefetchCoreAffinity:

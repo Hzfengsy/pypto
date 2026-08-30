@@ -183,13 +183,13 @@ def test_allocate_memory_addr_reuses_right_buffer_when_moves_sink_to_consumer():
         @pl.function(type=pl.FunctionType.InCore)
         def main(
             self,
-            lhs: pl.Tensor[[4, 128], pl.BF16],
+            lhs: pl.Tensor[[16, 128], pl.BF16],
             rhs0: pl.Tensor[[128, 64], pl.BF16],
             rhs1: pl.Tensor[[128, 64], pl.BF16],
-            out_0: pl.Out[pl.Tensor[[4, 64], pl.FP32]],
-        ) -> pl.Tensor[[4, 64], pl.FP32]:
-            lhs_tile: pl.Tile[[4, 128], pl.BF16] = pl.load(
-                lhs, [0, 0], [4, 128], target_memory=pl.MemorySpace.Mat
+            out_0: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+        ) -> pl.Tensor[[16, 64], pl.FP32]:
+            lhs_tile: pl.Tile[[16, 128], pl.BF16] = pl.load(
+                lhs, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
             )
             rhs0_tile: pl.Tile[[128, 64], pl.BF16] = pl.load(
                 rhs0, [0, 0], [128, 64], target_memory=pl.MemorySpace.Mat
@@ -197,9 +197,9 @@ def test_allocate_memory_addr_reuses_right_buffer_when_moves_sink_to_consumer():
             rhs1_tile: pl.Tile[[128, 64], pl.BF16] = pl.load(
                 rhs1, [0, 0], [128, 64], target_memory=pl.MemorySpace.Mat
             )
-            _acc0: pl.Tile[[4, 64], pl.FP32] = pl.matmul(lhs_tile, rhs0_tile)
-            acc1: pl.Tile[[4, 64], pl.FP32] = pl.matmul(lhs_tile, rhs1_tile)
-            result: pl.Tensor[[4, 64], pl.FP32] = pl.store(acc1, [0, 0], out_0)
+            _acc0: pl.Tile[[16, 64], pl.FP32] = pl.matmul(lhs_tile, rhs0_tile)
+            acc1: pl.Tile[[16, 64], pl.FP32] = pl.matmul(lhs_tile, rhs1_tile)
+            result: pl.Tensor[[16, 64], pl.FP32] = pl.store(acc1, [0, 0], out_0)
             return result
 
     @pl.program
@@ -207,44 +207,43 @@ def test_allocate_memory_addr_reuses_right_buffer_when_moves_sink_to_consumer():
         @pl.function(type=pl.FunctionType.InCore)
         def main(
             self,
-            lhs: pl.Tensor[[4, 128], pl.BF16, pl.MemRef("mem_ddr_0", 0, 1024)],
+            lhs: pl.Tensor[[16, 128], pl.BF16, pl.MemRef("mem_ddr_0", 0, 4096)],
             rhs0: pl.Tensor[[128, 64], pl.BF16, pl.MemRef("mem_ddr_1", 0, 16384)],
             rhs1: pl.Tensor[[128, 64], pl.BF16, pl.MemRef("mem_ddr_2", 0, 16384)],
-            out_0: pl.Out[pl.Tensor[[4, 64], pl.FP32, pl.MemRef("mem_ddr_3", 0, 1024)]],
-        ) -> pl.Tensor[[4, 64], pl.FP32]:
-            mem_mat_4: pl.Ptr = pl.tile.alloc(pl.Mem.Mat, 1024)
+            out_0: pl.Out[pl.Tensor[[16, 64], pl.FP32, pl.MemRef("mem_ddr_3", 0, 4096)]],
+        ) -> pl.Tensor[[16, 64], pl.FP32]:
+            mem_mat_4: pl.Ptr = pl.tile.alloc(pl.Mem.Mat, 4096)
             mem_mat_5: pl.Ptr = pl.tile.alloc(pl.Mem.Mat, 16384)
             mem_mat_6: pl.Ptr = pl.tile.alloc(pl.Mem.Mat, 16384)
-            mem_left_7: pl.Ptr = pl.tile.alloc(pl.Mem.Left, 1024)
+            mem_left_7: pl.Ptr = pl.tile.alloc(pl.Mem.Left, 4096)
             mem_right_8: pl.Ptr = pl.tile.alloc(pl.Mem.Right, 16384)
-            # Logical M=4 still occupies one 16-row physical L0C block.
             mem_acc_9: pl.Ptr = pl.tile.alloc(pl.Mem.Acc, 4096)
-            lhs_tile: pl.Tile[[4, 128], pl.BF16, pl.MemRef(mem_mat_4, 0, 1024), pl.Mem.Mat] = pl.tile.load(
-                lhs, [0, 0], [4, 128], [4, 128], target_memory=pl.Mem.Mat
+            lhs_tile: pl.Tile[[16, 128], pl.BF16, pl.MemRef(mem_mat_4, 0, 4096), pl.Mem.Mat] = pl.tile.load(
+                lhs, [0, 0], [16, 128], [16, 128], target_memory=pl.Mem.Mat
             )
-            rhs0_tile: pl.Tile[[128, 64], pl.BF16, pl.MemRef(mem_mat_5, 1024, 16384), pl.Mem.Mat] = (
+            rhs0_tile: pl.Tile[[128, 64], pl.BF16, pl.MemRef(mem_mat_5, 4096, 16384), pl.Mem.Mat] = (
                 pl.tile.load(rhs0, [0, 0], [128, 64], [128, 64], target_memory=pl.Mem.Mat)
             )
-            rhs1_tile: pl.Tile[[128, 64], pl.BF16, pl.MemRef(mem_mat_6, 17408, 16384), pl.Mem.Mat] = (
+            rhs1_tile: pl.Tile[[128, 64], pl.BF16, pl.MemRef(mem_mat_6, 20480, 16384), pl.Mem.Mat] = (
                 pl.tile.load(rhs1, [0, 0], [128, 64], [128, 64], target_memory=pl.Mem.Mat)
             )
-            lhs_tile_Left: pl.Tile[[4, 128], pl.BF16, pl.MemRef(mem_left_7, 0, 1024), pl.Mem.Left] = (
+            lhs_tile_Left: pl.Tile[[16, 128], pl.BF16, pl.MemRef(mem_left_7, 0, 4096), pl.Mem.Left] = (
                 pl.tile.move(lhs_tile, target_memory=pl.Mem.Left)
             )
             # Both rhs*_tile_Right share mem_right_8 at offset 0 (memory reuse).
             rhs0_tile_Right: pl.Tile[[128, 64], pl.BF16, pl.MemRef(mem_right_8, 0, 16384), pl.Mem.Right] = (
                 pl.tile.move(rhs0_tile, target_memory=pl.Mem.Right)
             )
-            _acc0: pl.Tile[[4, 64], pl.FP32, pl.MemRef(mem_acc_9, 0, 4096), pl.Mem.Acc] = pl.tile.matmul(
+            _acc0: pl.Tile[[16, 64], pl.FP32, pl.MemRef(mem_acc_9, 0, 4096), pl.Mem.Acc] = pl.tile.matmul(
                 lhs_tile_Left, rhs0_tile_Right
             )
             rhs1_tile_Right: pl.Tile[[128, 64], pl.BF16, pl.MemRef(mem_right_8, 0, 16384), pl.Mem.Right] = (
                 pl.tile.move(rhs1_tile, target_memory=pl.Mem.Right)
             )
-            acc1: pl.Tile[[4, 64], pl.FP32, pl.MemRef(mem_acc_9, 0, 4096), pl.Mem.Acc] = pl.tile.matmul(
+            acc1: pl.Tile[[16, 64], pl.FP32, pl.MemRef(mem_acc_9, 0, 4096), pl.Mem.Acc] = pl.tile.matmul(
                 lhs_tile_Left, rhs1_tile_Right
             )
-            result: pl.Tensor[[4, 64], pl.FP32, pl.MemRef("mem_ddr_3", 0, 1024)] = pl.tile.store(
+            result: pl.Tensor[[16, 64], pl.FP32, pl.MemRef("mem_ddr_3", 0, 4096)] = pl.tile.store(
                 acc1, [0, 0], out_0
             )
             return result

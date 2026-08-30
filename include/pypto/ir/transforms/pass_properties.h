@@ -165,11 +165,16 @@ inline const PassProperties kOutlineHierarchyScopesProperties{
 // tile form and attaches the declared boundary memory, which is exactly what
 // check (d) inspects, so it invalidates and re-produces the property to force a
 // second verification at a point where the memory sides are observable.
+// CubeTileFractalValid holds vacuously at pipeline input for a tensor-level
+// program -- no tile.matmul exists yet -- and this pass is what synthesizes the
+// cube operands, choosing their physical tile shapes from the tensor extents.
+// Invalidate and re-produce so the structural check is re-run against the tiles
+// this pass actually created, not against the empty input it already passed.
 inline const PassProperties kConvertTensorToTileOpsProperties{
     .required = {IRProperty::SSAForm, IRProperty::SplitIncoreOrch, IRProperty::NormalizedStmtStructure},
     .produced = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::NormalizedStmtStructure,
-                 IRProperty::AivSplitValid},
-    .invalidated = {IRProperty::AivSplitValid}};
+                 IRProperty::AivSplitValid, IRProperty::CubeTileFractalValid},
+    .invalidated = {IRProperty::AivSplitValid, IRProperty::CubeTileFractalValid}};
 
 // -- Orchestration tensor optimization pass -----------------------------------
 
@@ -220,11 +225,16 @@ inline const PassProperties kLegalizeTileCastProperties{};
 // and memory spaces have not yet been inferred.  No properties are produced
 // or invalidated beyond what the input IR already guarantees.
 
+// The pass rewrites each matmul into a nest of L0-sized ones, so it re-derives
+// every cube operand shape. Invalidate and re-produce CubeTileFractalValid so a
+// tiling that emitted a sub-fractal window fails here rather than on device.
 inline const PassProperties kAutoTileMatmulL0Properties{
     .required = {IRProperty::SSAForm, IRProperty::SplitIncoreOrch, IRProperty::IncoreTileOps,
                  IRProperty::TileOps2D, IRProperty::NormalizedStmtStructure},
     .produced = {IRProperty::SSAForm, IRProperty::SplitIncoreOrch, IRProperty::IncoreTileOps,
-                 IRProperty::TileOps2D, IRProperty::NormalizedStmtStructure}};
+                 IRProperty::TileOps2D, IRProperty::NormalizedStmtStructure,
+                 IRProperty::CubeTileFractalValid},
+    .invalidated = {IRProperty::CubeTileFractalValid}};
 
 // -- Canonicalize Mat-resident tile.slice into tile.extract -------------------
 // Runs right after AutoTileMatmulL0, before InferTileMemorySpace.  A
