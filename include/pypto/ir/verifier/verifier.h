@@ -127,12 +127,15 @@ PropertyVerifierPtr CreateAtomicAddDtypeValidPropertyVerifier();
  *
  * Checks every cube matmul-family operand (``tile.matmul`` / ``_acc`` /
  * ``_bias``, the ``tile.gemv`` family, the ``tile.batch_matmul`` family)
- * against the pto-isa NZ fractal box: physical rows a multiple of ``M0 = 16``,
- * physical cols a multiple of ``C0 / sizeof(dtype)``
- * (``BackendHandler::GetCubeFractalRows`` / ``GetCubeFractalCols``). Only the
- * *physical* extent is constrained -- a narrower logical (valid) extent is
- * addressed natively by compact mode. Listed in ``GetStructuralProperties()``,
- * so it is verified at pipeline input on the user's own IR.
+ * against the pto-isa NZ fractal box: physical rows a multiple of
+ * ``M0 = 16`` (``BackendHandler::GetCubeFractalRows``). Rows only -- the K and N
+ * granularities are ``C0 / sizeof(dtype)`` and so dtype-dependent, and are not
+ * yet enforced. Only the *physical* extent is constrained; a narrower logical
+ * (valid) extent is addressed natively by compact mode. Only a freshly
+ * allocated operand is checked, never a window such as ``tile.slice``, whose
+ * legality as a MAD operand is the windowing op's own contract. Listed in
+ * ``GetStructuralProperties()``, so it is verified at pipeline input on the
+ * user's own IR.
  * @return Shared pointer to CubeTileFractalValid PropertyVerifier
  */
 PropertyVerifierPtr CreateCubeTileFractalValidPropertyVerifier();

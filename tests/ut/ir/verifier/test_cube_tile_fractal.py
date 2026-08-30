@@ -242,5 +242,43 @@ def test_pipeline_accepts_fractal_matmul():
     PassManager.get_strategy(OptimizationStrategy.Default).run_passes(_matmul_program(64, 128, 64))
 
 
+def test_sub_fractal_loop_carried_accumulator_rejected():
+    """A carry is only as legal as the value that seeded it.
+
+    The sub-fractal ``tile.create`` here is never itself a matmul operand -- it
+    is the loop's ``init_values`` -- so the accumulator reaches ``matmul_acc``
+    only through the ``IterArg``. Resolving the carry to its initializer is what
+    keeps that path covered.
+    """
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            a: pl.Tensor[[8, 512], pl.FP16],
+            b: pl.Tensor[[512, 64], pl.FP16],
+            out: pl.Out[pl.Tensor[[8, 64], pl.FP32]],
+        ):
+            acc0: pl.Tile[[8, 64], pl.FP32, pl.Mem.Acc] = pl.tile.create(
+                [8, 64], dtype=pl.FP32, target_memory=pl.Mem.Acc
+            )
+            for k0, (acc,) in pl.range(0, 512, 128, init_values=(acc0,)):
+                am: pl.Tile[[8, 128], pl.FP16, pl.Mem.Mat] = pl.tile.load(
+                    a, [0, k0], [8, 128], target_memory=pl.Mem.Mat
+                )
+                bm: pl.Tile[[128, 64], pl.FP16, pl.Mem.Mat] = pl.tile.load(
+                    b, [k0, 0], [128, 64], target_memory=pl.Mem.Mat
+                )
+                nxt = pl.tile.matmul_acc(acc, am, bm)
+                acc_out = pl.yield_(nxt)
+            out = pl.store(acc_out, [0, 0], out)
+            return out
+
+    diags = _verify(Prog)
+    messages = [d.message for d in diags]
+    assert any("accumulator" in m and "8 physical rows" in m for m in messages), messages
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

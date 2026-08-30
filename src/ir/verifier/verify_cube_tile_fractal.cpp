@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -28,6 +29,7 @@
 #include "pypto/ir/program.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
+#include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/type.h"
@@ -142,8 +144,11 @@ bool MatchCubeCall(const CallPtr& call, CubeCall* out) {
 class CubeTileFractalVisitor : public IRVisitor {
  public:
   CubeTileFractalVisitor(std::vector<Diagnostic>& diagnostics, std::string func_name,
-                         const backend::BackendHandler* handler)
-      : diagnostics_(diagnostics), func_name_(std::move(func_name)), handler_(handler) {}
+                         const backend::BackendHandler* handler, std::set<const Var*> params)
+      : diagnostics_(diagnostics),
+        func_name_(std::move(func_name)),
+        handler_(handler),
+        params_(std::move(params)) {}
 
   /// Record every SSA definition before its uses. The IR is in SSA form and
   /// visited in program order, so a matmul's operands are already in the map by
@@ -185,6 +190,7 @@ class CubeTileFractalVisitor : public IRVisitor {
 
   /// Is `operand` a *freshly allocated* tile, i.e. one whose physical shape the
   /// author wrote down, rather than a window carved out of a larger buffer?
+  /// An `IterArg` resolves to the value that seeded the carry.
   ///
   /// Only an allocation can be sub-fractal in the sense this rule cares about.
   /// A window such as `tile.slice` addresses bytes inside a buffer that is
@@ -198,14 +204,35 @@ class CubeTileFractalVisitor : public IRVisitor {
   /// This is an allowlist, so it fails open: an operand produced by an op not
   /// named here is skipped rather than rejected. A new op therefore cannot make
   /// this verifier refuse a legal program, only miss an illegal one.
-  [[nodiscard]] bool IsFreshAllocation(const ExprPtr& operand) const {
+  [[nodiscard]] bool IsFreshAllocation(const ExprPtr& operand, int depth = 0) const {
+    // A loop-carried operand is only as legal as the value that seeded it, so
+    // resolve the carry to its initial value and apply the same rules there.
+    // Skipping the IterArg outright would miss a sub-fractal `tile.create` that
+    // reaches the cube only through a `tile.matmul_acc` accumulator carry.
+    // The depth bound is a safety net: an init that resolves to another carry
+    // terminates rather than recursing on a malformed cycle.
+    if (auto iter_arg = As<IterArg>(operand)) {
+      constexpr int kMaxCarryDepth = 8;
+      if (depth >= kMaxCarryDepth || !iter_arg->initValue_) return false;
+      return IsFreshAllocation(iter_arg->initValue_, depth + 1);
+    }
     auto var = AsVarLike(operand);
     if (!var) return false;
     auto it = defs_.find(var.get());
-    // No defining call: a parameter or an IterArg. A parameter's physical shape
-    // is written in the signature, so it is checked; an IterArg inherits its
-    // init's type, which was checked at its own definition.
-    if (it == defs_.end()) return As<IterArg>(operand) == nullptr;
+    // No defining call in this function: a parameter, whose physical shape is
+    // written in the signature and is therefore the author's to get right.
+    // Anything else unrecorded fails open, keeping the allowlist's guarantee
+    // that this verifier can only miss an illegal program, never refuse a legal
+    // one.
+    if (it == defs_.end()) return params_.count(var.get()) != 0;
+    // `tile.move` is deliberately absent. It does create a distinct destination
+    // allocation preserving the physical shape, so a sub-fractal moved tile
+    // looks like a genuine sub-fractal L0A/L0C buffer -- but `InferTileMemorySpace`
+    // stages the row-packed batched lowering into Left/Right through exactly such
+    // a move, giving an M-row Left tile per page. Whether that is legal is the
+    // same open question as the narrow-page MAD destination `CanonicalizeTileSlice`
+    // whitelists, so this verifier stays out of it rather than rejecting a
+    // shipped lowering.
     return IsOp(it->second, "tile.load") || IsOp(it->second, "tile.create");
   }
 
@@ -263,6 +290,8 @@ class CubeTileFractalVisitor : public IRVisitor {
   const backend::BackendHandler* handler_;
   /// SSA definitions seen so far in this function, keyed by the defined Var.
   std::map<const Var*, CallPtr> defs_;
+  /// This function's parameters: declared allocations with no defining call.
+  std::set<const Var*> params_;
 };
 
 }  // namespace
@@ -286,7 +315,11 @@ class CubeTileFractalValidPropertyVerifierImpl : public PropertyVerifier {
 
     for (const auto& [global_var, func] : program->functions_) {
       if (!func) continue;
-      CubeTileFractalVisitor visitor(diagnostics, func->name_, handler);
+      std::set<const Var*> params;
+      for (const auto& param : func->params_) {
+        if (param) params.insert(param.get());
+      }
+      CubeTileFractalVisitor visitor(diagnostics, func->name_, handler, std::move(params));
       visitor.VisitFunction(func);
     }
   }
