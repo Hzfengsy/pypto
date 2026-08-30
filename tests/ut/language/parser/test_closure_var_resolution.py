@@ -13,10 +13,13 @@ Verifies that Python globals/closure variables used as positional arguments
 in function calls inside @pl.function bodies are resolved correctly.
 """
 
+import ast
+
 import pypto.language as pl
 import pytest
 from pypto import ir
 from pypto.language.parser.diagnostics import ParserTypeError, UndefinedVariableError
+from pypto.language.parser.expr_evaluator import ExprEvaluator
 
 
 def _first_call(func: ir.Function) -> ir.Call:
@@ -126,19 +129,21 @@ class TestClosureVarAsPositionalArg:
         assert _int_elements(load.args[2]) == [64, 64]
 
     def test_nested_list_closure_var(self):
-        """Nested list closure variable recursively converts to nested MakeTuple."""
-        OFFSETS = [[0, 0], [64, 64]]
+        """Nested list closure variable recursively converts to nested MakeTuple.
 
-        @pl.function
-        def func(
-            t: pl.Tensor[[128, 128], pl.FP32], out: pl.Tensor[[128, 128], pl.FP32]
-        ) -> pl.Tensor[[128, 128], pl.FP32]:
-            a: pl.Tile[[64, 64], pl.FP32] = pl.tile.load(t, OFFSETS, shapes=[64, 64])  # type: ignore[arg-type]
-            result: pl.Tensor[[128, 128], pl.FP32] = pl.tile.store(a, [0, 0], output_tensor=out)
-            return result
+        Asserted on the resolver a positional argument goes through, not through an
+        op call: no operator accepts a nested tuple. Every tuple-valued argument
+        slot in the registry requires integer-scalar elements, so an op used as the
+        vehicle here would (correctly) reject the nested MakeTuple this produces.
+        The op-call path itself is covered by the flat-list case above.
+        """
+        OFFSETS = [[0, 0], [64, 64]]
+        evaluator = ExprEvaluator({"OFFSETS": OFFSETS})
+
+        # The same call parse_name makes for a bare closure-var positional arg.
+        offsets = evaluator.try_eval_as_ir(ast.parse("OFFSETS", mode="eval").body)
 
         # The outer list becomes a MakeTuple whose elements are themselves MakeTuples
-        offsets = _first_call(func).args[1]
         assert isinstance(offsets, ir.MakeTuple)
         rows = list(offsets.elements)
         assert len(rows) == 2

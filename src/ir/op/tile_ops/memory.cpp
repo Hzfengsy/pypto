@@ -61,6 +61,35 @@ T GetKwarg(const std::vector<std::pair<std::string, std::any>>& kwargs, const st
   throw ValueError("Missing kwarg: " + key);
 }
 
+namespace {
+
+/// Validate that every element of an offsets tuple is an integer scalar.
+///
+/// ``tile.load`` / ``tile.store`` declare offsets as "TupleType of ScalarType",
+/// and nothing downstream re-derives that: the window-read proofs in
+/// ``InferWindowReadValidShape`` are defined only over integer scalars, so a
+/// non-scalar element makes every bounds obligation *undecidable* rather than
+/// false — the negative-offset and reads-past-the-end checks then pass silently
+/// and codegen lowers whatever the element happens to reduce to. Reject it here,
+/// at the operator boundary, on the same terms ``tensor.slice`` uses for its own
+/// offsets. ``IsInt()`` (not ``IsIndexLike()``) is the bar because every integer
+/// width is a legitimate offset all the way down: ``EmitCastToIndex`` exists
+/// precisely to widen a non-INDEX integer offset at the partition_view site.
+void ValidateOffsetTupleElements(const MakeTuplePtr& offsets, const std::string& op_name) {
+  for (size_t i = 0; i < offsets->elements_.size(); ++i) {
+    const ExprPtr& elem = offsets->elements_[i];
+    CHECK(elem) << op_name << " offset tuple element " << i << " must not be null";
+    auto scalar_type = As<ScalarType>(elem->GetType());
+    CHECK_SPAN(scalar_type, elem->span_) << op_name << " offset tuple element " << i
+                                         << " must be ScalarType, but got " << elem->GetType()->TypeName();
+    CHECK_SPAN(scalar_type->dtype_.IsInt(), elem->span_)
+        << op_name << " offset tuple element " << i << " must have integer dtype, but got "
+        << scalar_type->dtype_.ToString();
+  }
+}
+
+}  // namespace
+
 TypePtr DeduceTileGetBlockIdxType(const std::vector<ExprPtr>& args,
                                   const std::vector<std::pair<std::string, std::any>>& kwargs,
                                   const std::string& op_name) {
@@ -111,6 +140,7 @@ TypePtr DeduceTileLoadType(const std::vector<ExprPtr>& args,
   CHECK(offsets_tuple) << "The operator " << op_name
                        << " requires second argument to be a tuple (offsets), but got "
                        << args[1]->GetType()->TypeName();
+  ValidateOffsetTupleElements(offsets_tuple, op_name);
 
   // Third argument must be TupleType (shapes)
   auto shapes_tuple = As<MakeTuple>(args[2]);
@@ -305,6 +335,7 @@ TypePtr DeduceTileStoreType(const std::vector<ExprPtr>& args,
   CHECK(offsets_tuple) << "The operator " << op_name
                        << " requires second argument to be a tuple (offsets), but got "
                        << args[1]->GetType()->TypeName();
+  ValidateOffsetTupleElements(offsets_tuple, op_name);
 
   // Third argument must be the output tensor. AsTensorTypeLike accepts both
   // plain TensorType and DistributedTensorType — the latter is needed for the

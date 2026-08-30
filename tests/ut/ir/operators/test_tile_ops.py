@@ -5089,6 +5089,97 @@ class TestTileLoadOp:
         assert Prog is not None
 
 
+class TestTileLoadStoreOffsetElements:
+    """tile.load / tile.store offsets must be integer scalars, as tensor.slice's are.
+
+    A non-scalar element does not merely produce a meaningless op: it makes every
+    window-read bounds obligation undecidable, so the negative-offset and
+    reads-past-the-end checks below stop firing and codegen silently lowers
+    whatever the element reduces to.
+    """
+
+    @staticmethod
+    def _tensor() -> ir.Var:
+        return ir.Var("a", ir.TensorType([128, 128], DataType.FP32), ir.Span.unknown())
+
+    @staticmethod
+    def _nested_offsets() -> list[ir.Expr]:
+        """Offsets one nesting level too deep — ``[[0, 0], [64, 64]]``."""
+        span = ir.Span.unknown()
+
+        def row(value: int) -> ir.MakeTuple:
+            return ir.MakeTuple([ir.ConstInt(value, DataType.INDEX, span)] * 2, span)
+
+        return [row(0), row(64)]
+
+    def test_load_rejects_tuple_offset_element(self):
+        with pytest.raises(ValueError, match="tile.load offset tuple element 0 must be ScalarType"):
+            tile.load(self._tensor(), self._nested_offsets(), [64, 64])
+
+    def test_load_rejects_float_offset_element(self):
+        """A Python ``/`` yields a float; it must not reach codegen as an offset."""
+        span = ir.Span.unknown()
+        offsets = [ir.ConstFloat(64.0, DataType.FP32, span), ir.ConstInt(0, DataType.INDEX, span)]
+
+        with pytest.raises(ValueError, match="tile.load offset tuple element 0 must have integer dtype"):
+            tile.load(self._tensor(), offsets, [64, 64])
+
+    def test_load_accepts_non_index_integer_offset(self):
+        """The bar is IsInt, not IsIndexLike: codegen index_casts a narrower offset."""
+        span = ir.Span.unknown()
+        offsets = [ir.ConstInt(0, DataType.INT32, span), ir.ConstInt(0, DataType.INT32, span)]
+
+        call = tile.load(self._tensor(), offsets, [64, 64])
+
+        assert isinstance(call.type, ir.TileType)
+
+    def test_load_tuple_offset_no_longer_hides_out_of_bounds(self):
+        """The plain-int form is rejected for reading past the end; so is the nested one."""
+        span = ir.Span.unknown()
+        far = [ir.ConstInt(100, DataType.INDEX, span), ir.ConstInt(100, DataType.INDEX, span)]
+        with pytest.raises(ValueError, match="reads past the end of dimension 0"):
+            tile.load(self._tensor(), far, [64, 64])
+
+        nested_far = [ir.MakeTuple([ir.ConstInt(100, DataType.INDEX, span)], span)] * 2
+        with pytest.raises(ValueError, match="tile.load offset tuple element 0 must be ScalarType"):
+            tile.load(self._tensor(), nested_far, [64, 64])
+
+    def _tile_var(self) -> ir.Var:
+        loaded = tile.load(self._tensor(), [0, 0], [64, 64])
+        return ir.Var("t", loaded.type, ir.Span.unknown())
+
+    def test_store_rejects_tuple_offset_element(self):
+        out = ir.Var("out", ir.TensorType([128, 128], DataType.FP32), ir.Span.unknown())
+
+        with pytest.raises(ValueError, match="tile.store offset tuple element 0 must be ScalarType"):
+            tile.store(self._tile_var(), self._nested_offsets(), out)
+
+    def test_store_rejects_float_offset_element(self):
+        span = ir.Span.unknown()
+        out = ir.Var("out", ir.TensorType([128, 128], DataType.FP32), span)
+        offsets = [ir.ConstFloat(0.0, DataType.FP32, span), ir.ConstInt(0, DataType.INDEX, span)]
+
+        with pytest.raises(ValueError, match="tile.store offset tuple element 0 must have integer dtype"):
+            tile.store(self._tile_var(), offsets, out)
+
+    def test_dsl_load_rejects_float_offset(self):
+        """The user-facing path: ``N / 2`` is a float, and the author meant ``N // 2``.
+
+        The closure var is annotated ``Any`` so the offset's dtype is only knowable
+        at parse time — the case a static checker cannot catch for the user.
+        """
+        half: Any = 128 / 2
+
+        with pytest.raises(InvalidOperationError, match="offset tuple element 0 must have integer dtype"):
+
+            @pl.function
+            def func(
+                t: pl.Tensor[[128, 128], pl.FP32], out: pl.Tensor[[128, 128], pl.FP32]
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                a: pl.Tile[[64, 64], pl.FP32] = pl.load(t, [half, 0], [64, 64])
+                return pl.store(a, [0, 0], out)
+
+
 class TestTileCreateOp:
     """Tests for tile.create layout inference."""
 

@@ -400,7 +400,8 @@ def load(
     Args:
         tensor: Source tensor
         offsets: Offsets in each dimension. Always in the source tensor's
-            coordinate system.
+            coordinate system. Each element must be an integer scalar — a float
+            (``n / 2`` rather than ``n // 2``) or a nested sequence is rejected.
         shapes: Shape of the region to load in each dimension. Always in the
             source tensor's coordinate system.
         valid_shape: Valid shape of the tile in each dimension. When provided, sets
@@ -462,7 +463,8 @@ def store(
 
     Args:
         tile: Source tile
-        offsets: Offsets in each dimension
+        offsets: Offsets in each dimension. Each element must be an integer
+            scalar — a float or a nested sequence is rejected.
         output_tensor: Output tensor
         shapes: Optional ND partition shape. Injected by FlattenTileNdTo2D for ND tensors.
         atomic: Combine mode for the global-memory write. ``AtomicType.None_``
