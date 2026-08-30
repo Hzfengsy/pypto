@@ -5113,7 +5113,7 @@ class TestTileLoadStoreOffsetElements:
         return [row(0), row(64)]
 
     def test_load_rejects_tuple_offset_element(self):
-        with pytest.raises(ValueError, match="tile.load offset tuple element 0 must be ScalarType"):
+        with pytest.raises(ValueError, match=r"tile\.load offset tuple element 0 must be ScalarType"):
             tile.load(self._tensor(), self._nested_offsets(), [64, 64])
 
     def test_load_rejects_float_offset_element(self):
@@ -5121,7 +5121,7 @@ class TestTileLoadStoreOffsetElements:
         span = ir.Span.unknown()
         offsets = [ir.ConstFloat(64.0, DataType.FP32, span), ir.ConstInt(0, DataType.INDEX, span)]
 
-        with pytest.raises(ValueError, match="tile.load offset tuple element 0 must have integer dtype"):
+        with pytest.raises(ValueError, match=r"tile\.load offset tuple element 0 must have integer dtype"):
             tile.load(self._tensor(), offsets, [64, 64])
 
     def test_load_accepts_non_index_integer_offset(self):
@@ -5141,7 +5141,7 @@ class TestTileLoadStoreOffsetElements:
             tile.load(self._tensor(), far, [64, 64])
 
         nested_far = [ir.MakeTuple([ir.ConstInt(100, DataType.INDEX, span)], span)] * 2
-        with pytest.raises(ValueError, match="tile.load offset tuple element 0 must be ScalarType"):
+        with pytest.raises(ValueError, match=r"tile\.load offset tuple element 0 must be ScalarType"):
             tile.load(self._tensor(), nested_far, [64, 64])
 
     def _tile_var(self) -> ir.Var:
@@ -5151,7 +5151,7 @@ class TestTileLoadStoreOffsetElements:
     def test_store_rejects_tuple_offset_element(self):
         out = ir.Var("out", ir.TensorType([128, 128], DataType.FP32), ir.Span.unknown())
 
-        with pytest.raises(ValueError, match="tile.store offset tuple element 0 must be ScalarType"):
+        with pytest.raises(ValueError, match=r"tile\.store offset tuple element 0 must be ScalarType"):
             tile.store(self._tile_var(), self._nested_offsets(), out)
 
     def test_store_rejects_float_offset_element(self):
@@ -5159,7 +5159,7 @@ class TestTileLoadStoreOffsetElements:
         out = ir.Var("out", ir.TensorType([128, 128], DataType.FP32), span)
         offsets = [ir.ConstFloat(0.0, DataType.FP32, span), ir.ConstInt(0, DataType.INDEX, span)]
 
-        with pytest.raises(ValueError, match="tile.store offset tuple element 0 must have integer dtype"):
+        with pytest.raises(ValueError, match=r"tile\.store offset tuple element 0 must have integer dtype"):
             tile.store(self._tile_var(), offsets, out)
 
     def test_dsl_load_rejects_float_offset(self):

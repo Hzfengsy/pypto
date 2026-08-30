@@ -65,8 +65,8 @@ namespace {
 
 /// Validate that every element of an offsets tuple is an integer scalar.
 ///
-/// ``tile.load`` / ``tile.store`` declare offsets as "TupleType of ScalarType",
-/// and nothing downstream re-derives that: the window-read proofs in
+/// ``tile.load`` / ``tile.store`` declare offsets as "TupleType of integer
+/// ScalarType", and nothing downstream re-derives that: the window-read proofs in
 /// ``InferWindowReadValidShape`` are defined only over integer scalars, so a
 /// non-scalar element makes every bounds obligation *undecidable* rather than
 /// false — the negative-offset and reads-past-the-end checks then pass silently
@@ -1132,7 +1132,7 @@ REGISTER_OP("tile.load")
     .set_description("Copy data from tensor to unified buffer (tile)")
     .add_argument("tensor", "Source tensor (TensorType)")
     .add_argument("offsets",
-                  "Offsets in each dimension, in source tensor coordinates (TupleType of ScalarType)")
+                  "Offsets in each dimension, in source tensor coordinates (TupleType of integer ScalarType)")
     .add_argument(
         "shapes",
         "Shape of region to load in each dimension, in source tensor coordinates (TupleType of ScalarType)")
@@ -1156,7 +1156,7 @@ REGISTER_OP("tile.store")
     .set_op_category("TileOp")
     .set_description("Copy data from unified buffer (tile) to tensor")
     .add_argument("tile", "Source tile (TileType)")
-    .add_argument("offsets", "Offsets in each dimension (TupleType of ScalarType)")
+    .add_argument("offsets", "Offsets in each dimension (TupleType of integer ScalarType)")
     .add_argument("output_tensor", "Output tensor (TensorType)")
     .add_argument("shapes",
                   "Optional ND partition shape (TupleType). "
