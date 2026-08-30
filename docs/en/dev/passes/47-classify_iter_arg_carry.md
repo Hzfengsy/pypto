@@ -47,12 +47,15 @@ The assemble rule and the output-side rule can never both fire on one assignment
 `tensor.assemble` is a builtin op, and `DeriveCallDirections` stamps
 `arg_directions` on non-builtin calls only.
 
-**Output-side means `OutputExisting` / `InOut` / `Output` / `NoDep`.** `NoDep`
-(from `pl.at(no_dep_args=[t])`) is an *ordering* claim, not an identity one: the
-callee still writes through that same tensor and returns it. Codegen's own alias
-(`CollectOutIndices`) reads the *callee's* `ParamDirection`, which `no_dep_args`
-never touches — so leaving `NoDep` out here made the two disagree, classifying a
-`no_dep` carry as `rebind` while codegen simultaneously aliased that slot.
+**Which arg is written is read off the *callee's* `ParamDirection`, never the
+call-site `ArgDirection`** — the same source codegen's own alias
+(`CollectOutIndices`) uses, so the two agree by construction. The call-site view
+cannot answer the question: `pl.at(no_dep_args=[t])` overwrites whatever
+direction a slot had with `NoDep`, and it accepts *any* tensor the scope
+captures, read or written. Reading it would both miss a genuine write and, if
+`NoDep` were simply admitted, invent one on a read-only slot — which in the
+positional `TupleGetItemExpr` walk shifts every later output's index onto the
+wrong arg.
 
 `ArrayType` iter_args are **excluded** from the nested-loop rule. Unlike a
 `TensorType` (a pointer-to-buffer alias), an `ArrayType` iter_arg owns a *fresh*

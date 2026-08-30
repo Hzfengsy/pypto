@@ -44,11 +44,12 @@ fence 算子，不会改动 Orchestration `ForStmt` 的 iter_arg。
 assemble 规则与输出侧规则不可能在同一条赋值上同时命中：`tensor.assemble` 是
 builtin op，而 `DeriveCallDirections` 只给非 builtin 调用打 `arg_directions`。
 
-**输出侧（output-side）指 `OutputExisting` / `InOut` / `Output` / `NoDep`。**
-`NoDep`（来自 `pl.at(no_dep_args=[t])`）表达的是*顺序*断言，而非身份断言：callee 仍然
-通过同一个张量写入并返回它。代码生成自身的别名（`CollectOutIndices`）读取的是 *callee 的*
-`ParamDirection`，而 `no_dep_args` 从不改动它——因此这里遗漏 `NoDep` 会让两者产生分歧：
-携带值被判定为 `rebind`，而代码生成同时又对该槽位做了别名。
+**哪个实参被写入，一律读取 *callee 的* `ParamDirection`，绝不读调用点的
+`ArgDirection`**——这与代码生成自身的别名（`CollectOutIndices`）取自同一处，因此两者
+天然一致。调用点视角回答不了这个问题：`pl.at(no_dep_args=[t])` 会把槽位原有的方向直接
+覆写为 `NoDep`，而且它接受作用域捕获的*任意*张量，无论只读还是写入。据此判断既会漏掉
+真实的写入，又会在只读槽位上凭空造出一个写入——在下面按位置遍历的 `TupleGetItemExpr`
+路径中，这会把之后每一个输出的下标都错位到别的实参上。
 
 `ArrayType` 的 iter_arg 被**排除**在嵌套循环规则之外。与 `TensorType`（指向缓冲区的
 指针别名）不同，`ArrayType` iter_arg 在每一层都拥有一份*全新的* C 栈数组。把内层

@@ -382,7 +382,7 @@ Rules the carry follows:
 **Codegen is unchanged.** The yielded value is the call's result on a parameter
 the callee returns, so
 [`ClassifyIterArgCarry`](47-classify_iter_arg_carry.md) puts it in the iter_arg's
-alias class (its Out/InOut-call and `TupleGetItemExpr` rules) and marks the carry
+alias class (its written-arg and `TupleGetItemExpr` rules) and marks the carry
 **trivial**: iter_arg and return_var both emit as the init value's name. The carry
 is SSA bookkeeping, not a new buffer. Nothing miscompiled without it either --
 every SSA version of an orchestration tensor denotes the same GM buffer -- but the

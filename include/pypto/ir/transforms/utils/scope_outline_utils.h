@@ -274,16 +274,33 @@ class ScopeOutliner : public IRMutator {
                                              const std::vector<IterArgPtr>& carry_iter_args,
                                              size_t total_carries, const Span& span) const;
 
+  /// Record @p fresh as the current value of store target @p original, keeping
+  /// ``renamed_by_value_`` in step. Every write to ``store_target_renames_``
+  /// goes through here.
+  void SetStoreTargetRename(const VarPtr& original, const VarPtr& fresh);
+
+  /// Undo @p renames, putting each store target back to the value its body was
+  /// entered with. Used between the two arms of an ``if``, which are
+  /// alternatives rather than a sequence.
+  void RewindRenames(const std::vector<BodyStoreRename>& renames);
+
   /// Point every ``store_target_renames_`` entry holding one of @p renames'
   /// body-local values at the matching entry of @p visible_values.
   ///
-  /// The sweep is by *value*, not by key: OutlineScope also registers
+  /// Keyed by *value*, not by store target: OutlineScope also registers
   /// scope-local post-store aliases that name the same store target, and those
   /// entries hold a body-local Var that is equally out of scope afterwards.
+  /// Reached through ``renamed_by_value_`` rather than by scanning the map, so
+  /// the cost is proportional to the entries that actually move.
   void RetargetBodyValues(const std::vector<BodyStoreRename>& renames,
                           const std::vector<VarPtr>& visible_values);
 
-  /// RetargetBodyValues, plus telling the enclosing control-flow frame (if any)
+  /// RetargetBodyValues, plus pointing each store target itself at its
+  /// @p visible_values entry.
+  void RetargetCarries(const std::vector<BodyStoreRename>& renames,
+                       const std::vector<VarPtr>& visible_values);
+
+  /// RetargetCarries, plus telling the enclosing control-flow frame (if any)
   /// about each carry, so a nested loop's carry is threaded on out of the outer
   /// loop too.
   void PublishCarries(const std::vector<BodyStoreRename>& renames, const std::vector<VarPtr>& return_vars);
@@ -421,6 +438,14 @@ class ScopeOutliner : public IRMutator {
   /// inside a control-flow body — go through NoteStoreTargetRename so the
   /// enclosing frame learns the rename and can thread it out.
   std::unordered_map<const Var*, VarPtr> store_target_renames_;
+  /// Reverse index over ``store_target_renames_``: which keys currently resolve
+  /// to a given Var. Lets a control-flow node retarget the entries that name a
+  /// value going out of scope without scanning the whole (ever-growing) map,
+  /// which would make the pass quadratic in the number of control-flow nodes
+  /// (.claude/rules/pass-complexity.md). Buckets may hold stale keys — a key
+  /// retargeted since is skipped on the next visit — so every read re-checks
+  /// the forward map.
+  std::unordered_map<const Var*, std::vector<const Var*>> renamed_by_value_;
   /// Open control-flow frames, innermost last. Empty at the function's top level.
   std::vector<std::vector<BodyStoreRename>> body_rename_stack_;
   ScopeKind target_scope_kind_;

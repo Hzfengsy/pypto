@@ -1054,15 +1054,56 @@ void ScopeOutliner::RetargetBodyValues(const std::vector<BodyStoreRename>& renam
                                        const std::vector<VarPtr>& visible_values) {
   INTERNAL_CHECK(renames.size() == visible_values.size())
       << "Internal error: carry value count does not match the rename count";
-  std::unordered_map<const Var*, VarPtr> visible;
+  // Visit only the entries that actually hold one of this body's values, found
+  // through the reverse index. Sweeping the whole map instead would cost the
+  // pass O(N^2) on a function with N sequential loops writing N distinct
+  // tensors, since the map keeps growing (.claude/rules/pass-complexity.md).
   for (size_t i = 0; i < renames.size(); ++i) {
     for (const auto& body_value : renames[i].body_values) {
-      visible[body_value.get()] = visible_values[i];
+      auto holders = renamed_by_value_.find(body_value.get());
+      if (holders == renamed_by_value_.end()) continue;
+      // Move the bucket out: every key in it is about to point at
+      // `visible_values[i]` instead, and the entry for `body_value` is dead
+      // once they have.
+      auto keys = std::move(holders->second);
+      renamed_by_value_.erase(holders);
+      auto& new_holders = renamed_by_value_[visible_values[i].get()];
+      for (const Var* key : keys) {
+        auto entry = store_target_renames_.find(key);
+        // Stale index entry: the key was retargeted since, so it no longer
+        // holds `body_value` and this bucket no longer speaks for it.
+        if (entry == store_target_renames_.end() || entry->second.get() != body_value.get()) continue;
+        entry->second = visible_values[i];
+        new_holders.push_back(key);
+      }
     }
   }
-  for (auto& [key, value] : store_target_renames_) {
-    auto it = visible.find(value.get());
-    if (it != visible.end()) value = it->second;
+}
+
+void ScopeOutliner::SetStoreTargetRename(const VarPtr& original, const VarPtr& fresh) {
+  auto [entry, inserted] = store_target_renames_.try_emplace(original.get(), fresh);
+  if (!inserted) {
+    if (entry->second.get() == fresh.get()) return;
+    entry->second = fresh;
+  }
+  renamed_by_value_[fresh.get()].push_back(original.get());
+}
+
+void ScopeOutliner::RewindRenames(const std::vector<BodyStoreRename>& renames) {
+  for (const auto& rename : renames) SetStoreTargetRename(rename.original, rename.seed);
+}
+
+void ScopeOutliner::RetargetCarries(const std::vector<BodyStoreRename>& renames,
+                                    const std::vector<VarPtr>& visible_values) {
+  INTERNAL_CHECK(renames.size() == visible_values.size())
+      << "Internal error: carry value count does not match the rename count";
+  // Post-store aliases first — the sweep consumes each body value's bucket.
+  RetargetBodyValues(renames, visible_values);
+  // Then the store target itself, authoritatively. The sweep already moved it
+  // when it still held a body value (the loop path), but not when the body was
+  // an `if` branch that RewindRenames has since rewound to the seed.
+  for (size_t i = 0; i < renames.size(); ++i) {
+    SetStoreTargetRename(renames[i].original, visible_values[i]);
   }
 }
 
@@ -1071,11 +1112,11 @@ void ScopeOutliner::PublishCarries(const std::vector<BodyStoreRename>& renames,
   INTERNAL_CHECK(renames.size() == return_vars.size())
       << "Internal error: carry return_var count does not match the rename count";
   // Tell the enclosing body first: it must be handed the seed *this* body
-  // started from, before the sweep below rewrites the map entry.
+  // started from, before the retarget below rewrites the map entry.
   for (size_t i = 0; i < renames.size(); ++i) {
     NoteStoreTargetRename(renames[i].original, renames[i].seed, return_vars[i]);
   }
-  RetargetBodyValues(renames, return_vars);
+  RetargetCarries(renames, return_vars);
 }
 
 /// Split @p renames into the ones this loop must newly carry and the ones it
@@ -1131,7 +1172,7 @@ StmtPtr ScopeOutliner::VisitStmt_(const ForStmtPtr& op) {
   std::vector<VarPtr> carried_values;
   SplitAlreadyCarried(renames, op->iter_args_, loop->iter_args_, loop->return_vars_, loop->span_, &fresh,
                       &carried, &carried_values);
-  RetargetBodyValues(carried, carried_values);
+  RetargetCarries(carried, carried_values);
   if (fresh.empty()) return visited;
 
   auto carry_iter_args = MakeCarryIterArgs(fresh, loop->span_);
@@ -1161,7 +1202,7 @@ StmtPtr ScopeOutliner::VisitStmt_(const WhileStmtPtr& op) {
   std::vector<VarPtr> carried_values;
   SplitAlreadyCarried(renames, op->iter_args_, loop->iter_args_, loop->return_vars_, loop->span_, &fresh,
                       &carried, &carried_values);
-  RetargetBodyValues(carried, carried_values);
+  RetargetCarries(carried, carried_values);
   if (fresh.empty()) return visited;
 
   auto carry_iter_args = MakeCarryIterArgs(fresh, loop->span_);
@@ -1181,31 +1222,19 @@ StmtPtr ScopeOutliner::VisitStmt_(const IfStmtPtr& op) {
 
   // The branches are alternatives, not a sequence: a rename the then branch made
   // is not visible in the else branch, so the else branch has to start from the
-  // same incoming values.
-  auto incoming = store_target_renames_;
+  // same incoming values. Rewinding the store targets the frame recorded is
+  // enough, and costs O(renames) instead of a copy of the whole map — the
+  // branch-local post-store aliases are keyed on Vars the other branch cannot
+  // name, so they are free to stay, and PublishCarries retargets them below.
   std::vector<BodyStoreRename> then_renames;
   auto new_then_body = VisitControlFlowBody(op->then_body_, &then_renames);
-  auto after_then = store_target_renames_;
+  RewindRenames(then_renames);
 
-  store_target_renames_ = incoming;
   std::vector<BodyStoreRename> else_renames;
   std::optional<StmtPtr> new_else_body;
   if (op->else_body_.has_value()) {
     new_else_body = VisitControlFlowBody(*op->else_body_, &else_renames);
-  }
-  auto after_else = store_target_renames_;
-
-  // Rejoin: keep every entry either branch added or changed. The store targets
-  // among them are retargeted onto the if's return_vars by PublishCarries below;
-  // post-store aliases ride along on that same sweep.
-  store_target_renames_ = std::move(incoming);
-  for (const auto* branch : {&after_then, &after_else}) {
-    for (const auto& [key, value] : *branch) {
-      auto it = store_target_renames_.find(key);
-      if (it == store_target_renames_.end() || it->second.get() != value.get()) {
-        store_target_renames_[key] = value;
-      }
-    }
+    RewindRenames(else_renames);
   }
 
   // One carry per store target either branch wrote; the branch that did not
@@ -1496,6 +1525,7 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
   auto saved_known_names = known_names_;
   auto saved_required_outputs = required_outputs_;
   auto saved_renames = store_target_renames_;
+  auto saved_renamed_by_value = renamed_by_value_;
   func_name_ = outlined_func_name;
   scope_counter_ = 0;
   for (const auto& [ptr, type] : scope_var_collector.var_types) {
@@ -1506,6 +1536,7 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
   }
   known_names_.insert(scope_var_collector.known_names.begin(), scope_var_collector.known_names.end());
   store_target_renames_.clear();
+  renamed_by_value_.clear();
   // Propagate output requirements so nested scopes know what's needed
   required_outputs_.clear();
   for (const auto& var : output_vars) {
@@ -1519,6 +1550,7 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
   known_names_ = saved_known_names;
   required_outputs_ = saved_required_outputs;
   store_target_renames_ = saved_renames;
+  renamed_by_value_ = saved_renamed_by_value;
 
   // Create fresh parameters for the outlined function.
   // Infer param directions from the inner callee when possible (requires program_).
@@ -2144,7 +2176,10 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
   for (const auto& [alias_ptr, target_ptr] : deferred_post_store_aliases) {
     auto rename_it = store_target_renames_.find(target_ptr);
     if (rename_it != store_target_renames_.end()) {
-      store_target_renames_[alias_ptr] = rename_it->second;
+      // var_objects_ holds the identity Var for the alias; the map itself is
+      // keyed by raw pointer, so look it up rather than minting a handle.
+      auto alias_it = var_objects_.find(alias_ptr);
+      if (alias_it != var_objects_.end()) SetStoreTargetRename(alias_it->second, rename_it->second);
     }
   }
   return result;
@@ -2204,7 +2239,7 @@ VarPtr ScopeOutliner::CreateFreshStoreTargetVar(const VarPtr& original_var, cons
   auto current = store_target_renames_.find(original_var.get());
   NoteStoreTargetRename(original_var, current != store_target_renames_.end() ? current->second : original_var,
                         fresh_var);
-  store_target_renames_[original_var.get()] = fresh_var;
+  SetStoreTargetRename(original_var, fresh_var);
   RegisterVar(fresh_var);
   return fresh_var;
 }

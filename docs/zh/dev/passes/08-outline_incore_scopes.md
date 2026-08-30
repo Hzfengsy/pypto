@@ -341,7 +341,7 @@ return out__rv_v1
 
 **代码生成不受影响。** yield 的值是被调函数在其返回的参数上的调用结果，因此
 [`ClassifyIterArgCarry`](47-classify_iter_arg_carry.md) 会把它归入该 iter_arg 的别名类
-（其 Out/InOut 调用规则与 `TupleGetItemExpr` 规则），并将该携带值标记为 **trivial**：
+（其被写实参规则与 `TupleGetItemExpr` 规则），并将该携带值标记为 **trivial**：
 iter_arg 与 return_var 都按初值的名字发射。这个携带值是 SSA 记账，而非新缓冲区。
 没有它同样不会编译错——编排层张量的每个 SSA 版本都指向同一块 GM 缓冲区——但 def-use
 图是错的，`SSAVerify` / `UseAfterDef` 会拒绝这样的 IR。
