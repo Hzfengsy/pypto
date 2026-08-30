@@ -495,6 +495,61 @@ class TestControlFlow:
         after = passes.simplify()(Before)
         ir.assert_structural_equal(after, Expected)
 
+    def test_while_iter_arg_stays_one_node_when_its_init_folds(self):
+        """A WhileStmt IterArg must not split into a header node + orphan uses.
+
+        An ``IterArg`` *use* is the same node as its declaration and carries
+        ``initValue_``, so ``IRMutator::VisitExpr_(IterArgPtr)`` mints a fresh
+        IterArg at the first use whose init the analyzer rewrote. Here
+        ``i = 0`` is a top-level constant, so ``VisitStmt_(AssignStmtPtr)``
+        full-binds it and the init folds ``i -> 0``.
+
+        ``ForStmt`` rebuilds ``iter_args_`` before its body so every reference
+        resolves to the header's new node. ``WhileStmt`` did not: the header
+        kept the stale IterArg while all four body/condition uses pointed at an
+        undefined clone, which ``UseAfterDef`` reported four times.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, out: pl.Tensor[[8], pl.INDEX]):
+                i: pl.Scalar[pl.INDEX] = 0
+                for (i_it,) in pl.while_(init_values=(i,)):
+                    pl.cond(i_it < 4)
+                    y: pl.Scalar[pl.INDEX] = i_it * 2
+                    pl.tensor.write(out, [i_it], y)
+                    nxt: pl.Scalar[pl.INDEX] = i_it + 1
+                    i_end: pl.Scalar[pl.INDEX] = pl.yield_(nxt)
+                # Reading the return_var after the loop keeps the carry live and
+                # exercises the return_vars_ rebuild alongside the iter_args_ one.
+                pl.tensor.write(out, [7], i_end)
+
+        after = passes.simplify()(Before)
+
+        props = passes.IRPropertySet()
+        props.insert(passes.IRProperty.UseAfterDef)
+        diagnostics = passes.PropertyVerifierRegistry.verify(props, after)
+        errors = [d for d in diagnostics if d.severity == passes.DiagnosticSeverity.Error]
+        assert not errors, f"UseAfterDef errors after Simplify: {[d.message for d in errors]}"
+
+        # `i = 0` folds into the iter_arg and is then DCE'd, so the body may be
+        # the bare WhileStmt rather than a SeqStmts.
+        func = next(iter(after.functions.values()))
+        body = func.body
+        stmts = body.stmts if isinstance(body, ir.SeqStmts) else [body]
+        while_stmt = next(s for s in stmts if isinstance(s, ir.WhileStmt))
+        iter_arg = while_stmt.iter_args[0]
+
+        # The fold did happen — otherwise the test would pass vacuously.
+        assert isinstance(iter_arg.initValue, ir.ConstInt)
+        assert iter_arg.initValue.value == 0
+
+        # ... and the condition reads that same node, not a clone of it.
+        condition = while_stmt.condition
+        assert isinstance(condition, ir.Lt)
+        assert condition.left.same_as(iter_arg)
+
     def test_sequential_stmts(self):
         """Multiple statements should all be simplified."""
 

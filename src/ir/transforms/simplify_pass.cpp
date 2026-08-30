@@ -471,13 +471,35 @@ class SimplifyMutator : public arith::IRMutatorWithAnalyzer {
   }
 
   StmtPtr VisitStmt_(const WhileStmtPtr& op) override {
+    // Rebuild iter_args before the condition and body, mirroring ForStmt.
+    // An IterArg *use* is the same node as its declaration, so the base
+    // IRMutator mints a fresh IterArg at the first use whose initValue_ the
+    // analyzer rewrote (e.g. a top-level `i: Scalar[INDEX] = 0` that
+    // VisitStmt_(AssignStmtPtr) full-bound). Rebuilding here seeds var_remap_
+    // so the header and every body reference resolve to one node; without it
+    // the header kept the stale IterArg while all uses pointed at an
+    // undefined clone (UseAfterDef).
+    bool iter_args_changed = false;
+    auto new_iter_args = RebuildVec(
+        op->iter_args_, [this](const auto& ia) { return MaybeRebuildIterArg(ia); }, &iter_args_changed);
+
     auto new_condition = SimplifyExpr(op->condition_);
     auto new_body = VisitScopedBody(op->body_);
-    bool changed = (new_condition.get() != op->condition_.get()) || (new_body.get() != op->body_.get());
+
+    // Rebuild return_vars after the body so folds discovered inside it are
+    // visible in the return types (same ordering rationale as ForStmt).
+    bool return_vars_changed = false;
+    auto new_return_vars = RebuildVec(
+        op->return_vars_, [this](const auto& v) { return MaybeRebuildVar(v); }, &return_vars_changed);
+
+    bool changed = (new_condition.get() != op->condition_.get()) || (new_body.get() != op->body_.get()) ||
+                   iter_args_changed || return_vars_changed;
     if (!changed) return op;
     auto result = MutableCopy(op);
+    result->iter_args_ = std::move(new_iter_args);
     result->condition_ = new_condition;
     result->body_ = new_body;
+    result->return_vars_ = std::move(new_return_vars);
     return result;
   }
 
