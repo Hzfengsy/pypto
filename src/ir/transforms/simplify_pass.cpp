@@ -86,12 +86,13 @@ class MultiAssignCollector : public IRVisitor {
 /// the original Var -- which the fold left with no defining statement, i.e. a
 /// dangling reference UseAfterDef reports.
 ///
-/// The analysis is one pre-order walk that numbers the restoring scopes. A
-/// scope owns the contiguous id range `[id, end)` of its own subtree, so "every
-/// use of v sits inside scope S" reduces to two integer comparisons. A
-/// monotonic `tick` orders uses against the fold site, so a use *preceding* it
-/// inside the same scope (reachable pre-SSA via a loop-carried read) counts as
-/// escaping too.
+/// The analysis is one pre-order walk over the function body that numbers the
+/// restoring scopes. A scope owns the contiguous id range `[id, end)` of its
+/// own subtree, so "every use of v sits inside scope S" reduces to two integer
+/// comparisons. A monotonic `tick` orders uses against the fold site, so a use
+/// *preceding* it inside the same scope (reachable pre-SSA via a loop-carried
+/// read) counts as escaping too. One walk plus O(1) lookups per fold keeps the
+/// pass within its O(N log N) budget.
 ///
 /// Nothing escapes in SSA form: a value defined inside a region is never
 /// referenced outside it, and every use is dominated by its definition. The
@@ -100,16 +101,16 @@ class MultiAssignCollector : public IRVisitor {
 /// run Simplify directly on pre-SSA IR.
 class ReturnVarEscapeIndex : public IRVisitor {
  public:
-  /// Index one self-contained region: a function body, or the body Fold B
-  /// DeepClones (whose fresh Var identities appear in no other region).
+  /// Index a function body. Called once per TransformSimplify run, before the
+  /// mutator walks the same body, which keeps the pass linear in the IR size.
   ///
-  /// The region is pinned for the index's lifetime. Entries are keyed by raw
-  /// Var / Stmt pointers, and a freed clone's address can be recycled by a
-  /// later `make_shared` -- the same hazard the Fold B var_remap_ snapshot
-  /// guards against -- which would alias a stale entry onto an unrelated node.
-  void IndexRegion(const StmtPtr& body) {
+  /// Entries are keyed by raw Var / Stmt pointers, which stay valid because the
+  /// Function owns the indexed body for the whole run. Nodes the mutator mints
+  /// afterwards -- notably the bodies Fold B DeepClones -- are absent from the
+  /// index and so are never confused with an indexed node: a fresh allocation
+  /// cannot land on an address that is still live.
+  void Index(const StmtPtr& body) {
     if (!body) return;
-    pinned_.push_back(body);
     EnterScope();
     VisitStmt(body);
     LeaveScope();
@@ -118,6 +119,16 @@ class ReturnVarEscapeIndex : public IRVisitor {
   /// True when collapsing @p folded would strand a use of @p rv: a use outside
   /// the innermost var_remap_-restoring scope containing @p folded, or one that
   /// precedes @p folded within it.
+  ///
+  /// An unindexed statement answers false, keeping the substitution. That
+  /// covers folds nested inside a Fold B clone, whose Var identities are minted
+  /// after indexing; a clone's own Vars are unreachable from outside it, so the
+  /// only case this leaves unhandled is a restore-scope *within* the clone
+  /// standing between such a fold and a later use of its return var -- possible
+  /// only pre-SSA, and no worse than the behaviour before this index existed.
+  /// Re-indexing each clone would fix it at the cost of an O(N^2) walk over
+  /// nested single-trip loops, which `.claude/rules/pass-complexity.md` rules
+  /// out.
   bool Escapes(const Stmt* folded, const Var* rv) const {
     auto site = sites_.find(folded);
     if (site == sites_.end()) return false;  // never indexed -> keep substituting
@@ -220,7 +231,6 @@ class ReturnVarEscapeIndex : public IRVisitor {
   std::vector<size_t> stack_;
   std::unordered_map<const Stmt*, Site> sites_;
   std::unordered_map<const Var*, Use> uses_;
-  std::vector<StmtPtr> pinned_;
   size_t tick_ = 0;
 };
 
@@ -446,11 +456,6 @@ class SimplifyMutator : public arith::IRMutatorWithAnalyzer {
         // and lets the re-visit below bind the body's scalars on identities
         // distinct from anything in the surrounding scope.
         auto cloned = DeepClone(op->body_, sub_map, /*clone_def_vars=*/true);
-
-        // Index the clone as its own region: its Vars are freshly minted, so a
-        // fold nested inside it would otherwise miss the escape analysis and
-        // fall back to substituting.
-        escapes_->IndexRegion(cloned.cloned_body);
 
         // Snapshot var_remap_ around the cloned-body visit. MaybeRebuildVar
         // inserts entries keyed by the cloned-body's defining-Var raw pointers
@@ -1025,7 +1030,7 @@ FunctionPtr TransformSimplify(const FunctionPtr& func) {
   collector.VisitStmt(func->body_);
 
   ReturnVarEscapeIndex escapes;
-  escapes.IndexRegion(func->body_);
+  escapes.Index(func->body_);
 
   auto analyzer = std::make_shared<arith::Analyzer>();
   SimplifyMutator mutator(analyzer.get(), std::move(collector.multi_assigned), &escapes);
