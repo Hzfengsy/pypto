@@ -145,6 +145,52 @@ InCore、Spmd、Group 函数在本阶段被跳过 —— 它们已在阶段一 /
 
 该需求会**穿过**声明了 `set_output_memory_inherit_input()` 的零拷贝元数据 op 继续向上传播 —— `tensor.slice`、`tensor.view`、`tensor.reshape`、`tensor.reinterpret_view`、`tensor.set_validshape`。因此 `pl.matmul(pl.set_validshape(a[:, :K], rows, K), b)` 这样的操作数仍然直接加载到 Mat。若某个别名输入存储的 op 漏掉该声明，传播链就会断开：操作数被物化到 Vec，再通过 `tile.move` 桥接到 Mat，而这是一个 vector→cube 边界，会把本应是纯 CUBE 的 InCore scope 判定为 `MIXED`，导致 [`ExpandMixedKernel`](22-expand_mixed_kernel.md) 将其拆分为 AIC/AIV 两个函数。
 
+## Cube 操作数的行分形对齐（Row Boxing）
+
+一个 cube 操作数有两个彼此独立的尺寸概念，而只有其中一个受到约束。
+
+- **逻辑（logical）尺寸**基本不受限。`pto.tmatmul` 从操作数的 *valid* 区域推导
+  `M`、`K`、`N`，取值范围 `[1, 4095]`，没有整除要求；`pto.mad` 的 `disable_gemv`
+  子句存在的唯一目的，就是在 `%m == 1` 时选择 L0A 的组织方式。
+- **物理（physical）尺寸**必须是整数个 NZ 分形块。内层块在所有代次和所有 dtype 下
+  都是 16 行（`FRACTAL_NZ_ROW`）。ptoas 直接强制这一点 ——
+  `'pto.alloc_tile' op expects result boxed tile rows to be a multiple of
+  innerRows (16)` —— pto-isa 的 `TExtract` 也对其读取的 Mat 源 tile 用静态断言
+  重复了同一条约束。
+
+因此 2-D `tensor.matmul` 的左操作数在桥接到 Mat 时，行方向的物理尺寸向上对齐到分形块，
+并把张量的真实尺寸声明为 `valid_shape`：
+
+```python
+# 转换前（M = 100）
+y = tensor.matmul(a, b)          # a: Tensor[[100, 256]]
+
+# 转换后
+a_mat = pl.tile.load(a, [0, 0], [112, 256], [100, 256], target_memory=pl.Mem.Mat)
+y_tile = pl.tile.matmul(a_mat, b_mat)   # Tile[[112, 512]]，valid [100, 512]
+```
+
+这份 padding 在代价模型的两个维度上都是免费的：`tile.load` 只搬运 valid 区域，DMA 不变；
+MAD 的代价是 `ceil(M/16)` 个 pass，把 M 向上取整到 16 的倍数不会改变它。硬件通过
+compact 模式寻址整块内部更窄的 valid 区域，`tile.store` 也只写回 valid 行，因此可观测
+结果完全一致。
+
+在这里把 M 变成 16 的倍数，同时也是
+[`AutoTileMatmulL0`](16-auto_tile_matmul_l0.md) 在边界处保持合法的原因：该 pass 选择
+16 对齐的 tile 并剥离余数，而 16 的倍数只能被切分成同样 16 对齐的块（尾块也不例外），
+所以它不需要任何边界特判。
+
+作用范围，以及刻意排除的情况：
+
+| 情况 | 是否对齐 | 原因 |
+| ---- | -------- | ---- |
+| 2-D `tensor.matmul` 左操作数 | 是 | 其行轴即 M，块高在所有 dtype 下都是 16 |
+| 右操作数 | 否 | 其行是 `K`，粒度为 `32 字节 / sizeof(dtype)`，与 dtype 相关，此处不做结论 |
+| `a_trans` 左操作数 | 否 | 自然加载的行轴是 K，零拷贝 `tile.transpose_view` 使 *列*轴才是 M |
+| rank >= 3 的操作数 | 否 | 它下沉为 `tile.batch_matmul`，其行被 [`FlattenTileNdTo2D`](13-flatten_tile_nd_to_2d.md) 打包成单个 `[B*M, N]` tile —— 分形规则约束的是打包后的尺寸，而非该维度 |
+| 行尺寸为动态值 | 否 | 没有编译期常量可供对齐 |
+| `tensor.matmul_acc` 左操作数 | 否 | `tile.matmul_acc` 要求累加器与乘积的*物理* M 一致，而累加器来自本规则无法触及的另一处 `tile.create` |
+
 ## Transpose 下沉
 
 `tensor.transpose` 下沉为一个 3-arg 的 **`tile.transpose(input, axis1, axis2)`**。PTO 后端的 `pto.ttrans` 指令需要一个 scratch 工作 tile（与源 tile 同 shape/同 dtype），但该 scratch 纯属 codegen 细节，并非语义操作数。[`FlattenTileNdTo2D`](13-flatten_tile_nd_to_2d.md) 是 scratch 物化的**唯一归属**：它为 2D 以及逐页 >2D 的 transpose 统一产出 codegen-ready 的 4-arg 形态（`tile.create` + `tile.transpose(..., tmp)`），且仍在内存分配器之前（scratch 仍能拿到真实 UB 地址）。把 scratch 从高层 op 中移除后，`tensor.transpose` 与 DSL `pl.tile.transpose(tile, axis1, axis2)` 都与语义操作保持 1:1。

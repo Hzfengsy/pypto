@@ -967,6 +967,69 @@ def _matmul_acc_calls(node) -> list:
     return calls
 
 
+_CUBE_M_AXIS_TILE = re.compile(r"pl\.Tile\[\[(\d+), \d+\], [^\]]*?pl\.Mem\.(Left|Acc)")
+
+
+def _cube_m_axis_rows(after) -> list[int]:
+    """Static physical row counts of every ``Left`` / ``Acc`` tile in ``after``.
+
+    Both spaces index the matmul's M axis, whose NZ fractal is 16 rows on every
+    Ascend generation, so their physical row count is directly comparable against
+    that one constant. ``Right`` is deliberately excluded: its rows are ``K``,
+    whose granularity is ``32 bytes / sizeof(dtype)`` and therefore dtype-dependent.
+    """
+    return [int(rows) for rows, _ in _CUBE_M_AXIS_TILE.findall(ir.python_print(after))]
+
+
+class TestAutoTileMatmulL0FractalBoundary:
+    """No cube operand leaves the pass with a sub-fractal physical row count.
+
+    Regression for an M that is not a multiple of 16. The chooser picks a
+    16-aligned tile and the pass peels the remainder, so the tail used to carry
+    ``M mod m`` physical rows -- 36 for ``M = 100`` -- straight into ``Left`` and
+    ``Acc``. ptoas rejects such an allocation outright (``'pto.alloc_tile' op
+    expects result boxed tile rows to be a multiple of innerRows (16)``), and at
+    ``M = 1`` it accepts a one-row cube operand that pto-isa's ``TExtract`` cannot
+    address.
+
+    ``ConvertTensorToTileOps`` now loads the left operand into a whole number of
+    boxes with the true extent in ``valid_shape``, so the M reaching this pass is
+    already a multiple of 16 -- and a multiple of 16 can only be tiled into
+    16-aligned pieces, tail included. The invariant therefore holds for every M,
+    with no boundary special case in the pass.
+    """
+
+    @pytest.mark.parametrize("m_dim", [1, 17, 40, 100, 250])
+    def test_no_sub_fractal_cube_rows_at_any_m(self, m_dim):
+        k_dim, n_dim = 256, 512
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[m_dim, k_dim], pl.FP16],
+                b: pl.Tensor[[k_dim, n_dim], pl.FP16],
+                out: pl.Out[pl.Tensor[[m_dim, n_dim], pl.FP32]],
+            ) -> pl.Tensor[[m_dim, n_dim], pl.FP32]:
+                c = pl.matmul(a, b, out_dtype=pl.FP32)
+                out = pl.assemble(out, c, [0, 0])
+                return out
+
+        After = passes.auto_tile_matmul_l0()(_lower_to_tile_ops(Before))
+        rows = _cube_m_axis_rows(After)
+        assert rows, "expected at least one Left/Acc tile in the lowered program"
+        sub_fractal = sorted({r for r in rows if r % 16})
+        assert not sub_fractal, f"sub-fractal cube rows for M={m_dim}: {sub_fractal}"
+
+        # The padding is physical only: the accumulator still names the M the
+        # caller asked for, so the store writes exactly m_dim rows. (An N-tiled
+        # schedule splits the column extent across sub-tiles, so match the row
+        # extent alone.)
+        printed = ir.python_print(After)
+        assert f"valid_shape=[{m_dim}, " in printed, f"the accumulator must carry the true M={m_dim} extent"
+
+
 class TestAutoTileMatmulL0PredicatedAcc:
     """A caller-written ``init_cond`` is threaded through the K-only emitter.
 

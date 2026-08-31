@@ -71,6 +71,14 @@ using ConversionFunc = std::function<ConversionResult(
 struct InputSpaceReq {
   MemorySpace space;                       ///< Required memory space
   std::optional<std::string> trans_kwarg;  ///< Read transpose flag from this kwarg (if any)
+  /// Whether the bridged tile is a *cube* operand, i.e. one the MAD reads out
+  /// of a whole number of NZ fractal boxes.  The logical extent of such an
+  /// operand is essentially free (``pto.mad`` derives ``%m`` from the operand's
+  /// valid rows), but its physical row count must be a multiple of the box
+  /// height, so the bridge load allocates the boxed row count and carries the
+  /// tensor's true extent in ``valid_shape``.  Only the row axis is boxed —
+  /// the column granularity is dtype-dependent and is not settled here.
+  bool cube_row_boxed = false;
 };
 
 /**

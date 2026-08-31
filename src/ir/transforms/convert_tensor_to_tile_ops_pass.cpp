@@ -34,6 +34,7 @@
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
+#include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/op_conversion_registry.h"
@@ -78,6 +79,52 @@ CallPtr MarkCompilerMatBridge(const CallPtr& call, MemorySpace space) {
   auto marked = MutableCopy(call);
   marked->attrs_.emplace_back(kCompilerTensorToTileMatBridgeAttr, true);
   return marked;
+}
+
+/// Physical shape a cube bridge load must allocate for @p tensor_type.
+///
+/// PTO-ISA keeps two independent notions of size for a cube operand, and only
+/// one of them is constrained.  The *logical* extent is essentially free:
+/// ``pto.mad`` derives ``%m`` from the operand's valid rows, bounds it at
+/// ``[1, 4095]``, and documents ``%m == 1`` as a first-class case.  The
+/// *physical* extent must be a whole number of NZ fractal boxes — ptoas
+/// enforces exactly that (``'pto.alloc_tile' op expects result boxed tile rows
+/// to be a multiple of innerRows (16)``), and pto-isa's ``TExtract`` repeats it
+/// as a static assertion on the Mat source it reads.  So the allocation is
+/// rounded up to the box and the tensor's true extent rides in ``valid_shape``,
+/// which the hardware already addresses through compact mode.
+///
+/// The padding is free on both axes of the cost model: a load moves only the
+/// valid extent, so no extra DMA; and the MAD cost is ``ceil(M/16)`` passes,
+/// which rounding M up to a multiple of 16 leaves unchanged.
+///
+/// Returns @p tensor_type's shape unchanged — leaving the emitted load
+/// byte-identical to its historical form — unless every precondition holds:
+///
+///   * rank 2.  A rank >= 3 operand lowers to ``tile.batch_matmul``, whose rows
+///     ``FlattenTileNdTo2D`` row-packs into one ``[B*M, N]`` tile; the box rule
+///     binds that packed extent, not this dimension.
+///   * a static row extent.  A dynamic one has no compile-time box to round to.
+///   * a Mat view whose ``slayout`` is row-major, the orientation whose row axis
+///     really is the matmul's M axis.  The transposed dual boxes 16 on the
+///     *column* axis instead and its row granularity is dtype-dependent; that
+///     rule is deliberately not settled here.
+std::vector<ExprPtr> BoxLoadRows(const TensorType& tensor_type, MemorySpace space, const Span& span) {
+  const auto& shape = tensor_type.shape_;
+  if (shape.size() != 2) return shape;
+  auto rows = As<ConstInt>(shape[0]);
+  if (!rows || rows->value_ <= 0) return shape;
+
+  const auto view = tile_view_semantics::GetImplicitTileView(shape, space);
+  if (view.slayout != TileLayout::row_major) return shape;
+  const auto box = tile_view_semantics::GetBoxedTileAlignment(view, tensor_type.dtype_);
+  if (!box || box->rows <= 1) return shape;
+
+  const int64_t remainder = rows->value_ % box->rows;
+  if (remainder == 0) return shape;
+  auto boxed = shape;
+  boxed[0] = std::make_shared<ConstInt>(rows->value_ + box->rows - remainder, DataType::INDEX, span);
+  return boxed;
 }
 
 bool IsPassthroughTensorOp(const CallPtr& call) {
@@ -868,14 +915,22 @@ class TensorToTileMutator : public TypePropagatingMutator {
     // Emit a `tile.load` of `arg` (TensorType) into `space`, append its AssignStmt,
     // and return the bound load Var. The load is always natural; a transposed
     // operand is realised by a zero-copy tile.transpose_view on the result.
-    auto emit_load = [&](const ExprPtr& arg, const TensorTypePtr& tensor_type, MemorySpace space,
-                         size_t idx) -> VarPtr {
+    //
+    // `row_boxed` marks a cube operand (see InputSpaceReq::cube_row_boxed): the
+    // load then allocates a whole number of NZ fractal boxes on the row axis and
+    // declares the tensor's true extent as valid_shape. `BoxLoadRows` returns the
+    // physical shape; it equals `tensor_type->shape_` whenever no padding applies,
+    // so a fractal-sized operand keeps its historical byte-identical load.
+    auto emit_load = [&](const ExprPtr& arg, const TensorTypePtr& tensor_type, MemorySpace space, size_t idx,
+                         bool row_boxed) -> VarPtr {
       auto offsets = MakeZeroOffsets(tensor_type->shape_.size(), call->span_);
-      auto shapes = MakeShapeTuple(tensor_type->shape_, call->span_);
+      auto valid = MakeShapeTuple(tensor_type->shape_, call->span_);
+      auto shapes =
+          row_boxed ? MakeShapeTuple(BoxLoadRows(*tensor_type, space, call->span_), call->span_) : valid;
       std::vector<std::pair<std::string, std::any>> load_kw = {{"target_memory", space}};
       AppendCachePolicyKwarg(arg, cache_policies_, &load_kw);
       auto load = MarkCompilerMatBridge(
-          op_registry_.Create("tile.load", {arg, offsets, shapes, shapes}, load_kw, call->span_), space);
+          op_registry_.Create("tile.load", {arg, offsets, shapes, valid}, load_kw, call->span_), space);
       std::string var_name;
       if (auto var = As<Var>(arg)) {
         auto space_str = MemorySpaceToString(space);
@@ -927,7 +982,11 @@ class TensorToTileMutator : public TypePropagatingMutator {
       if (tensor_type) {
         // GM operand: load NATURAL (2D and ND alike), then reinterpret as its
         // transpose with a zero-copy view when b_trans/a_trans.
-        auto loaded = emit_load(args[idx], tensor_type, req.space, idx);
+        // A transposed operand keeps its natural (unboxed) load: the
+        // tile.transpose_view below reinterprets the row axis as the matmul's K,
+        // so boxing rows here would pad the wrong axis.
+        const bool row_boxed = req.cube_row_boxed && !use_view;
+        auto loaded = emit_load(args[idx], tensor_type, req.space, idx, row_boxed);
         args[idx] = use_view ? emit_view(loaded) : loaded;
         continue;
       }

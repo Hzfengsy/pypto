@@ -286,6 +286,26 @@ out     = pl.tile.store(d, [0, 0], out)
 
 The `tile.cast` is dropped. When the producer needs a K-loop (`k < K`), the K-loop is emitted as usual and its Acc result feeds the *same* single `tile.assemble` — the fold is independent of K tiling.
 
+## Fractal boundary: why the tail needs no special case
+
+The chooser returns a 16-aligned `(m, n, k)` and this pass peels whatever the
+grid does not cover, so a boundary tile carries `M mod m` physical rows. Those
+rows must still form whole NZ fractal boxes — ptoas rejects anything else with
+`'pto.alloc_tile' op expects result boxed tile rows to be a multiple of
+innerRows (16)`.
+
+The invariant that makes the peel legal is established upstream, not here:
+[`ConvertTensorToTileOps`](10-convert_tensor_to_tile_ops.md) bridges a 2-D
+matmul's left operand into Mat with its rows rounded up to the box and the true
+extent in `valid_shape`. The `M` this pass sees is therefore already a multiple
+of 16, and `M - (M / m) * m` with both `M` and `m` multiples of 16 is a multiple
+of 16 as well. Every emitted tile — interior and tail alike — is a whole number
+of boxes by construction.
+
+Padding the tensor at conversion is what makes this work; padding it *only* at
+the operand would not be enough on its own, because this pass would still
+compute the tail from the unpadded logical `M`.
+
 ## Backend constraints
 
 L0/Mat capacities and fractal alignment come from the active `BackendHandler`. The pass reads from `PassContext::Current()->GetBackendHandler()` when a context is active, and falls back to `pypto::backend::GetBackend()->GetHandler()` for direct callers (e.g. tests that don't wrap in a `PassContext`).

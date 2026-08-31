@@ -269,6 +269,22 @@ out     = pl.tile.store(d, [0, 0], out)
 
 `tile.cast` 被删除。当 producer 需要 K-loop（`k < K`）时，照常发出 K-loop，其 Acc 结果喂给*同一个*单次 `tile.assemble` —— 折叠与 K 切分无关。
 
+## 分形边界：尾块为何不需要特判
+
+chooser 返回 16 对齐的 `(m, n, k)`，本 pass 剥离网格未覆盖的部分，因此边界 tile 的物理
+行数是 `M mod m`。这些行同样必须构成完整的 NZ 分形块 —— 否则 ptoas 会直接拒绝：
+`'pto.alloc_tile' op expects result boxed tile rows to be a multiple of
+innerRows (16)`。
+
+使这次剥离保持合法的不变式由上游建立，而不在本 pass：
+[`ConvertTensorToTileOps`](10-convert_tensor_to_tile_ops.md) 在把 2-D matmul 的左
+操作数桥接到 Mat 时，已把行数向上对齐到分形块，并把真实尺寸放入 `valid_shape`。因此本
+pass 看到的 `M` 已经是 16 的倍数；而当 `M` 与 `m` 均为 16 的倍数时，
+`M - (M / m) * m` 同样是 16 的倍数。于是内部块与尾块都天然是整数个分形块。
+
+关键在于「在转换阶段给张量加 padding」：如果只在操作数处补齐，本 pass 仍会用未补齐的
+逻辑 `M` 计算尾块尺寸，问题依旧存在。
+
 ## Backend 约束
 
 L0/Mat 容量与 fractal 对齐都来自当前 `BackendHandler`。Pass 优先从 `PassContext::Current()->GetBackendHandler()` 读取，若无活动 context 则回退到 `pypto::backend::GetBackend()->GetHandler()`（例如未包 `PassContext` 直接调用的测试场景）。

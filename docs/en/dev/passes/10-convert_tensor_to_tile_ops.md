@@ -160,6 +160,55 @@ When `tensor.slice` feeds into `tensor.matmul` or `tensor.matmul_acc`, the slice
 
 The demand is propagated **through** zero-copy metadata ops that declare `set_output_memory_inherit_input()` — `tensor.slice`, `tensor.view`, `tensor.reshape`, `tensor.reinterpret_view`, `tensor.set_validshape`. So an operand written as `pl.matmul(pl.set_validshape(a[:, :K], rows, K), b)` still loads straight to Mat. An op that aliases its input's storage but omits that declaration breaks the chain: the operand materializes in Vec and needs a `tile.move` to Mat, which is a vector→cube boundary that flips an otherwise pure-CUBE InCore scope to `MIXED` and makes [`ExpandMixedKernel`](22-expand_mixed_kernel.md) split it into an AIC/AIV pair.
 
+## Cube Operand Row Boxing
+
+A cube operand has two independent extents, and only one of them is constrained.
+
+- The **logical** extent is essentially free. `pto.tmatmul` derives `M`, `K`, and
+  `N` from the operands' *valid* region, bounded at `[1, 4095]` with no
+  divisibility rule; `pto.mad` carries a `disable_gemv` clause whose whole
+  purpose is selecting the L0A organization at `%m == 1`.
+- The **physical** extent must be a whole number of NZ fractal boxes. The inner
+  box is 16 rows on every generation and dtype (`FRACTAL_NZ_ROW`). ptoas enforces
+  it directly — `'pto.alloc_tile' op expects result boxed tile rows to be a
+  multiple of innerRows (16)` — and pto-isa's `TExtract` repeats it as a static
+  assertion on the Mat source it reads.
+
+So the left operand of a 2-D `tensor.matmul` bridges into Mat with its row extent
+rounded up to the box, and the tensor's true extent declared as `valid_shape`:
+
+```python
+# Before  (M = 100)
+y = tensor.matmul(a, b)          # a: Tensor[[100, 256]]
+
+# After
+a_mat = pl.tile.load(a, [0, 0], [112, 256], [100, 256], target_memory=pl.Mem.Mat)
+y_tile = pl.tile.matmul(a_mat, b_mat)   # Tile[[112, 512]] valid [100, 512]
+```
+
+The padding is free on both axes of the cost model. A `tile.load` moves only the
+valid extent, so the DMA is unchanged; and the MAD cost is `ceil(M/16)` passes,
+which rounding M up to a multiple of 16 leaves unchanged. The hardware addresses
+the narrower valid region inside the full box through compact mode, and
+`tile.store` writes only the valid rows, so the observable result is identical.
+
+Making M a multiple of 16 here is also what keeps
+[`AutoTileMatmulL0`](16-auto_tile_matmul_l0.md) legal at the boundary: that pass
+picks a 16-aligned tile and peels the remainder, and a multiple of 16 can only be
+split into 16-aligned pieces, tail included. It therefore needs no boundary
+special case.
+
+Scope, and what is deliberately left out:
+
+| Case | Boxed? | Why |
+| ---- | ------ | --- |
+| 2-D `tensor.matmul` left operand | Yes | Its row axis is M, whose box height is 16 for every dtype |
+| Right operand | No | Its rows are `K`, whose granularity is `32 bytes / sizeof(dtype)` — dtype-dependent, and not settled here |
+| `a_trans` left operand | No | The natural load's row axis is K; the zero-copy `tile.transpose_view` makes the *column* axis M |
+| Rank >= 3 operand | No | It lowers to `tile.batch_matmul`, whose rows [`FlattenTileNdTo2D`](13-flatten_tile_nd_to_2d.md) row-packs into one `[B*M, N]` tile — the box rule binds that packed extent, not this dimension |
+| Dynamic row extent | No | No compile-time box to round to |
+| `tensor.matmul_acc` left operand | No | `tile.matmul_acc` requires the accumulator and the product to agree on *physical* M, and the accumulator arrives from a separate `tile.create` this rule cannot reach |
+
 ## Transpose Lowering
 
 `tensor.transpose` lowers to a plain 3-arg **`tile.transpose(input, axis1, axis2)`**. The PTO `pto.ttrans` instruction needs a scratch workspace tile (same shape/dtype as the source), but that scratch is a pure codegen detail — not a semantic operand. [`FlattenTileNdTo2D`](13-flatten_tile_nd_to_2d.md) is the **sole owner** of scratch materialization: it emits the codegen-ready 4-arg form (`tile.create` + `tile.transpose(..., tmp)`) for both 2D and per-page >2D transposes, still before the memory allocator runs (so the scratch gets a real UB address). Keeping scratch out of the high-level op means `tensor.transpose` and the DSL `pl.tile.transpose(tile, axis1, axis2)` stay 1:1 with the semantic operation.
