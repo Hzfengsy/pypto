@@ -348,6 +348,7 @@ pl.system.sync_wait(0, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)    # 
 | **`cube op '...' inside a pl.split_aiv region`** | 区域体是 AIV 的工作 | 把 `pl.matmul` 移出区域 |
 | **`'x' is produced on the CUBE lane ... reads it on the VECTOR lane inside one`** | 未写明的 C->V 跨越（进入区域） | 在区域开头以 `pl.aiv_shard(x)` 读取 |
 | **`'x' is defined inside a pl.split_aiv region but ... reads it on the CUBE lane outside`** | 未写明的 V->C 跨越（离开区域） | 在区域内 gather：`x = pl.aic_gather(x)` |
+| **`'tile.aiv_shard' operand is in Vec, but it transfers a cube-produced value`**（或 `'... operand ... is produced on the VECTOR lane by 'tile.full''`） | 对 AIV lane 自己产出的值（`pl.full` / `pl.load`）做了 `pl.aiv_shard` —— 该值已经在向量 lane 上，没有需要跨越的边界 | 去掉 `pl.aiv_shard`：在区域内按每 lane 的尺寸直接构造该值，或用区域的 `aiv_id` 把 load 本地化到本 lane |
 | **`'pl.aiv_shard' crosses the AIC/AIV boundary under ... but ... earlier in this function crosses it under ...`** | 同一函数的跨越混用了 `mode=NONE` 与切分模式，而它们共用一条跨核 pipe | 让所有跨越在 split / no-split 上一致，或去掉其中一个区域的跨越，或把两个阶段拆进各自的 `pl.at(level=pl.Level.CORE_GROUP)` scope |
 | **cube 随机读到其中一条 lane 的值** | 从 `mode=NONE` 区域向外的 V->C 跨越 —— 两条 lane 都 push、共用一个槽位、无仲裁，**不会有诊断** | 只 gather lane-uniform 的值；若两条 lane 持有不同的半块，请改用数据并行区域 |
 | **对端的信号计数器读到的值是应有值的两倍** | 两条 AIV lane 都执行了同一条 `pld.system.notify` —— **不会有诊断** | 按 `aiv_id` 分片该 notify，或用 `if aiv_id == 0:` 限定 |
