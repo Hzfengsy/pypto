@@ -298,8 +298,8 @@ The invariant that makes the peel legal is established upstream, not here:
 [`ConvertTensorToTileOps`](10-convert_tensor_to_tile_ops.md) bridges a 2-D
 matmul's left operand into Mat with its rows rounded up to the box and the true
 extent in `valid_shape`. The `M` this pass sees is therefore already a multiple
-of 16, and `M - (M / m) * m` with both `M` and `m` multiples of 16 is a multiple
-of 16 as well. Every emitted tile — interior and tail alike — is a whole number
+of 16, and `M % m` with both `M` and `m` multiples of 16 is a multiple of 16 as
+well. Every emitted tile — interior and tail alike — is a whole number
 of boxes by construction.
 
 Padding the tensor at conversion is what makes this work; padding it *only* at

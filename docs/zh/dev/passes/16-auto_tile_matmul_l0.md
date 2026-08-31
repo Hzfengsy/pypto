@@ -280,7 +280,7 @@ innerRows (16)`。
 [`ConvertTensorToTileOps`](10-convert_tensor_to_tile_ops.md) 在把 2-D matmul 的左
 操作数桥接到 Mat 时，已把行数向上对齐到分形块，并把真实尺寸放入 `valid_shape`。因此本
 pass 看到的 `M` 已经是 16 的倍数；而当 `M` 与 `m` 均为 16 的倍数时，
-`M - (M / m) * m` 同样是 16 的倍数。于是内部块与尾块都天然是整数个分形块。
+`M % m` 同样是 16 的倍数。于是内部块与尾块都天然是整数个分形块。
 
 关键在于「在转换阶段给张量加 padding」：如果只在操作数处补齐，本 pass 仍会用未补齐的
 逻辑 `M` 计算尾块尺寸，问题依旧存在。

@@ -2045,7 +2045,7 @@ IncoreTransformResult TransformIncoreFunction(const FunctionPtr& func) {
     // Attribute the entry load to the parameter declaration it loads, not to `def`.
     const auto& load_span = var->span_;
     auto offsets = MakeZeroOffsets(tensor_type->shape_.size(), load_span);
-    auto shapes = MakeShapeTuple(tensor_type->shape_, load_span);
+    auto valid = MakeShapeTuple(tensor_type->shape_, load_span);
 
     // Honour the same consumer demand the mutator honours for the loads it
     // creates (see BridgeInputSpaces): a parameter feeding a matmul goes
@@ -2064,8 +2064,19 @@ IncoreTransformResult TransformIncoreFunction(const FunctionPtr& func) {
       load_kwargs.emplace_back("target_memory", entry_req->space);
     }
     AppendCachePolicyKwarg(var, cache_policies, &load_kwargs);
+    // A parameter that reaches a matmul directly, or through an inherit-input
+    // chain such as tensor.set_validshape, is loaded here rather than by
+    // BridgeInputSpaces / HandleConsumerDrivenLoad -- so the same row boxing has
+    // to apply, or the cube operand keeps its unaligned physical row count.
+    ExprPtr shapes = valid;
+    if (entry_req.has_value() && entry_req->cube_row_boxed) {
+      auto boxed = BoxLoadRows(tensor_type->shape_, tensor_type->dtype_, entry_req->space, load_span);
+      if (!AreExprVectorsEqual(boxed, tensor_type->shape_)) {
+        shapes = MakeShapeTuple(boxed, load_span);
+      }
+    }
     auto load_call = MarkCompilerMatBridge(
-        op_registry.Create("tile.load", {var, offsets, shapes, shapes}, load_kwargs, load_span),
+        op_registry.Create("tile.load", {var, offsets, shapes, valid}, load_kwargs, load_span),
         entry_req.has_value() ? entry_req->space : MemorySpace::Vec);
 
     std::string tile_name = MakeTileValueName(var->name_hint_);

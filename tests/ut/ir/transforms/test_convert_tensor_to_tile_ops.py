@@ -1712,6 +1712,65 @@ class TestConvertTensorToTileOps:
         )
         _assert_convert_equal(before, expected)
 
+    def test_matmul_lhs_reached_through_set_validshape_is_row_boxed(self):
+        """A parameter that reaches the matmul through an inherit-input wrapper.
+
+        ``tensor.set_validshape`` propagates the Mat demand back to the parameter,
+        whose load the pass emits in its Phase-1 entry loop -- neither
+        ``BridgeInputSpaces`` nor ``HandleConsumerDrivenLoad``. That third site
+        needs the same boxing, or a 17-row operand reaches ptoas with 17 physical
+        rows and is rejected.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self, a: pl.Tensor[[17, 128], pl.FP16], b: pl.Tensor[[128, 64], pl.FP16]
+            ) -> pl.Tensor[[17, 64], pl.FP32]:
+                av: pl.Tensor[[17, 128], pl.FP16] = pl.tensor.set_validshape(a, 17, 128)
+                y: pl.Tensor[[17, 64], pl.FP32] = pl.matmul(av, b, out_dtype=pl.FP32)
+                return y
+
+            @pl.function
+            def main(
+                self, a: pl.Tensor[[17, 128], pl.FP16], b: pl.Tensor[[128, 64], pl.FP16]
+            ) -> pl.Tensor[[17, 64], pl.FP32]:
+                y: pl.Tensor[[17, 64], pl.FP32] = self.main_incore_0(a, b)
+                return y
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                a: pl.Tensor[[17, 128], pl.FP16],
+                b: pl.Tensor[[128, 64], pl.FP16],
+                ret0_out: pl.Out[pl.Tensor[[17, 64], pl.FP32]],
+            ) -> pl.Tensor[[17, 64], pl.FP32]:
+                # 17 rows allocated as two whole 16-row NZ boxes; valid_shape keeps
+                # the true extent, so the store still writes exactly 17 rows.
+                a_mat: pl.Tile[[32, 128], pl.FP16, pl.MemorySpace.Mat] = pl.load(
+                    a, [0, 0], [32, 128], [17, 128], target_memory=pl.MemorySpace.Mat
+                )
+                av_tile = pl.tile.set_validshape(a_mat, 17, 128)
+                b_mat: pl.Tile[[128, 64], pl.FP16, pl.MemorySpace.Mat] = pl.load(
+                    b, [0, 0], [128, 64], [128, 64], target_memory=pl.MemorySpace.Mat
+                )
+                y_tile = pl.tile.matmul(av_tile, b_mat)
+                out_store: pl.Tensor[[17, 64], pl.FP32] = pl.store(y_tile, [0, 0], ret0_out)
+                return out_store
+
+            @pl.function
+            def main(
+                self, a: pl.Tensor[[17, 128], pl.FP16], b: pl.Tensor[[128, 64], pl.FP16]
+            ) -> pl.Tensor[[17, 64], pl.FP32]:
+                ret0_out: pl.Tensor[[17, 64], pl.FP32] = pl.create_tensor([17, 64], dtype=pl.FP32)
+                y: pl.Tensor[[17, 64], pl.FP32] = self.main_incore_0(a, b, ret0_out)
+                return y
+
+        _assert_convert_equal(Before, Expected)
+
     def test_matmul_a_trans_lhs_keeps_its_natural_load(self):
         """A transposed left operand is NOT row-boxed.
 
