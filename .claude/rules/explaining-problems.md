@@ -3,9 +3,9 @@
 ## Core Principle
 
 **Explain a defect as a causal chain the reader can follow down the layers —
-written in the concrete syntax of each layer, and grounded at every step in
-output you actually produced. Never in prose, never in a mechanism you inferred
-from reading code.**
+written in the native syntax or artifact of each layer, and grounded at every
+step in output you actually produced. Never in prose where an artifact would do,
+and never in an inference presented as an observation.**
 
 This rule governs *explanations* (root-cause writeups, issue analyses, failure
 reports). `plans-and-proposals.md` governs proposals; `problem-handling.md`
@@ -13,10 +13,11 @@ governs logging an issue to `KNOWN_ISSUES.md`.
 
 ## 1. ALWAYS explain in DSL / IR syntax — never describe it in prose
 
-**Every claim about what the program does must be shown as code, in the syntax
-of the layer it belongs to.** Prose is connective tissue between the artifacts;
-it is never the evidence itself. A sentence describing IR is a claim. The IR is
-a fact.
+**Every claim about what the program does must be shown as an artifact, in the
+native form of the layer it belongs to.** Prose is connective tissue between the
+artifacts; it is never the evidence itself. A sentence describing IR is a claim.
+The IR is a fact. (The bottom layers are error text and stack frames rather than
+code — paste those verbatim too; §5.)
 
 ```text
 ❌ "The constant's buffer allocation is left behind in the cube half, and the
@@ -27,11 +28,10 @@ a fact.
    pl.tile.tpush_to_aiv(bias_full__tile__FREE_VAR, ...)   # pushes an UNDEFINED var
 ```
 
-Each layer has its own syntax, and the explanation switches vocabulary as it
-descends — user DSL (`pl.aiv_shard`), printed IR (`pl.tile.tpush_to_aiv`),
-PTOAS/MLIR (`pto.tpush_to_aiv ... !pto.tile_buf<loc=acc, ...>`), then the C++
-assertion. Use the layer's real spelling; do not paraphrase one layer in
-another's terms.
+The explanation switches vocabulary as it descends — user DSL (`pl.aiv_shard`),
+printed IR (`pl.tile.tpush_to_aiv`), PTOAS/MLIR (`pto.tpush_to_aiv ...
+!pto.tile_buf<loc=acc, ...>`), then the C++ assertion. Use each layer's real
+spelling; never paraphrase one layer in another's terms.
 
 **Trim and annotate.** Paste the offending lines, not the dump. Comment them
 inline, and state the evidence that makes the point provable:
@@ -109,20 +109,22 @@ Not an area — a function, a file:line, and the specific decision it gets wrong
 Quote the few lines and say what they should have consulted instead.
 
 ```text
-❌ "The bug is in ExpandMixedKernel's statement partitioning."
-✅ "`SplitReshapeDirection` (expand_mixed_kernel_pass.cpp:169) derives the
-    transfer direction from the operator's NAME and never from where the operand
-    lives. Its sibling `ClassifyMoveDirection` (core_affinity.cpp:44) does the
-    same job by reading `memory_space_`, and returns NONE for a same-side move."
+❌ "The bug is in the pass's statement partitioning."
+✅ "`<Fn>` (<file>:<line>) picks the transfer direction from the operator NAME,
+    while the filter deciding which lane keeps the producer reads the operand's
+    MEMORY SPACE. They agree for a cube-produced operand and diverge for a
+    vector-produced one, which is the reported input."
 ```
 
 When two decisions disagree, name both sources of truth and the exact input on
-which they diverge.
+which they diverge. Cite live code only where you verified it at that commit —
+a stale claim in an always-on rule misleads every later session.
 
 ## 8. Report reachability honestly
 
-A defect blocked by a guard is **unreachable, not fixed**. Say which. State what
-still carries the defect, and never let a diagnostic's existence imply a repair.
+A guard can make a trigger unreachable. **Say which it did: mitigated the
+observed failure, or removed the root cause.** Name any path that still reaches
+the unsafe state, and never let a diagnostic's existence imply a repair.
 
 Report faithfully in both directions: if the issue text you were handed
 mis-describes the mechanism, correct it and show the evidence — do not restate a
@@ -144,18 +146,17 @@ End with actions, not a summary of what you just said:
 - **Tables for two things differing along one axis** (auto vs explicit, before vs
   after, trigger vs symptom).
 - **Present the finished causal chain, not your investigation.** No "first I
-  looked at...". Dead ends belong in the writeup only when the reader would
-  otherwise try them (§9).
+  looked at..."; dead ends belong in it only per §9.
 
 ## Anti-Patterns
 
 | Don't | Do |
 | ----- | -- |
-| Describe behaviour in prose | Show it in DSL / IR / PTOAS syntax (§1) |
+| Describe behaviour in prose | Show the layer's own artifact (§1) |
 | Paraphrase one layer in another's terms | Use each layer's real spelling |
 | Paste the whole IR / log dump | Paste the offending lines, annotated |
 | Lead with the stack trace | Lead with what the author wrote |
 | Explain in pass names to a non-expert | Enter at the DSL, introduce names as needed |
-| Assert a mechanism you only read | Run it; mark anything unverified |
+| Assert a mechanism you only read | Run it; label inference as inference |
 | Stop at the error message's own noun | Trace trigger vs symptom |
-| Call a guarded defect "fixed" | Say "unreachable; root cause open" |
+| Say "guarded" and leave "fixed?" open | Say mitigated or root-caused, and why |
