@@ -2003,6 +2003,66 @@ class TestConvertTensorToTileOps:
         # agreement holds -- which is what the pass would otherwise break.
         assert "[32, 128], [17, 128]" in printed, printed
 
+    @pytest.mark.parametrize("acc_trans_first", [False, True])
+    def test_conflicting_cube_m_demands_leave_the_seed_unboxed(self, acc_trans_first):
+        """Two consumers wanting different M alignments must not race.
+
+        One buffer cannot carry two physical M extents, so this program cannot
+        compile either way -- the point is *which* extent it is reported against.
+        INT8 is the only dtype where the two demands differ (a plain operand's M
+        box is 16, an ``a_trans`` operand's column box is 32) while both share the
+        INT32 accumulator dtype, and routing one use through
+        ``tensor.set_validshape`` makes that demand arrive on the seed through the
+        backward propagation sweep rather than as a direct use.
+
+        The sweep used to keep whichever demand it reached first, so the seed was
+        boxed to 112 or 128 depending on statement order and the mismatch was
+        reported against a shape the author never wrote. ``MergeConsumerReq`` now
+        applies the same reconciliation on both paths: the disputed padding is
+        dropped, and the accumulator is reported at its declared extent either way.
+        """
+        rows, k_dim, n_dim = 100, 128, 64
+
+        if acc_trans_first:
+
+            @pl.program
+            class Before:
+                @pl.function(type=pl.FunctionType.InCore)
+                def main_incore_0(
+                    self,
+                    a: pl.Tensor[[rows, k_dim], pl.INT8],
+                    at: pl.Tensor[[k_dim, rows], pl.INT8],
+                    b: pl.Tensor[[k_dim, n_dim], pl.INT8],
+                ) -> pl.Tensor[[rows, n_dim], pl.INT32]:
+                    acc: pl.Tensor[[rows, n_dim], pl.INT32] = pl.create_tensor([rows, n_dim], dtype=pl.INT32)
+                    accv: pl.Tensor[[rows, n_dim], pl.INT32] = pl.tensor.set_validshape(acc, rows, n_dim)
+                    y: pl.Tensor[[rows, n_dim], pl.INT32] = pl.matmul_acc(acc, at, b, a_trans=True)
+                    x: pl.Tensor[[rows, n_dim], pl.INT32] = pl.matmul_acc(accv, a, b)
+                    return pl.tensor.add(x, y)
+        else:
+
+            @pl.program
+            class Before:
+                @pl.function(type=pl.FunctionType.InCore)
+                def main_incore_0(
+                    self,
+                    a: pl.Tensor[[rows, k_dim], pl.INT8],
+                    at: pl.Tensor[[k_dim, rows], pl.INT8],
+                    b: pl.Tensor[[k_dim, n_dim], pl.INT8],
+                ) -> pl.Tensor[[rows, n_dim], pl.INT32]:
+                    acc: pl.Tensor[[rows, n_dim], pl.INT32] = pl.create_tensor([rows, n_dim], dtype=pl.INT32)
+                    accv: pl.Tensor[[rows, n_dim], pl.INT32] = pl.tensor.set_validshape(acc, rows, n_dim)
+                    x: pl.Tensor[[rows, n_dim], pl.INT32] = pl.matmul_acc(accv, a, b)
+                    y: pl.Tensor[[rows, n_dim], pl.INT32] = pl.matmul_acc(acc, at, b, a_trans=True)
+                    return pl.tensor.add(x, y)
+
+        with pytest.raises(ValueError) as excinfo:
+            passes.convert_tensor_to_tile_ops()(Before)
+        message = str(excinfo.value)
+        # The seed keeps its declared extent in both orders; only the operand it
+        # is measured against differs, and each call names its own.
+        assert f"acc M={rows}" in message, message
+
     def test_mixed_kernel_vec_btrans_moves_to_mat_then_views(self):
         """A Vec compute result (add) feeding a b_trans=True 2D matmul is bridged to Mat
         via a NATURAL tile.move, then transposed by a zero-copy tile.transpose_view — NOT

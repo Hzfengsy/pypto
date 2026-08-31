@@ -462,6 +462,32 @@ struct ConsumerSpaceReq {
   size_t cube_m_axis = 0;
 };
 
+/// Fold @p incoming into @p existing, the requirement already recorded for a
+/// shared producer.
+///
+/// Two rules, and both paths that record a demand -- a direct operand use and
+/// the backward sweep over inherit-input / alias / loop-carry edges -- have to
+/// apply them identically, or which demand a producer sees depends on the order
+/// its consumers happen to be visited in.
+///
+///   * A specialized space (Mat/Left/Right/Acc/Bias) beats the default Vec, so
+///     a load-like producer can emit that space directly.
+///   * The M boxing survives only where every consumer agrees on it. A differing
+///     axis or alignment means one of them reads the tile at its declared
+///     physical shape, and one buffer cannot carry two physical extents; the
+///     padding is dropped so the mismatch is reported against the shape the
+///     author actually wrote, the same way whichever consumer is visited first.
+void MergeConsumerReq(ConsumerSpaceReq* existing, const ConsumerSpaceReq& incoming) {
+  if (existing->space == MemorySpace::Vec && incoming.space != MemorySpace::Vec) {
+    *existing = incoming;
+    return;
+  }
+  if (existing->space != incoming.space) return;
+  if (existing->cube_m_axis != incoming.cube_m_axis || existing->cube_m_align != incoming.cube_m_align) {
+    existing->cube_m_align = 0;
+  }
+}
+
 /**
  * @brief Visitor that collects consumer memory space requirements for variables.
  *
@@ -497,9 +523,10 @@ class ConsumerSpaceCollector : public IRVisitor {
       if (out_it == consumer_reqs_.end()) continue;
       const auto& req = out_it->second;
       auto [ins_it, inserted] = consumer_reqs_.try_emplace(src, req);
-      if (!inserted && ins_it->second.space == MemorySpace::Vec && req.space != MemorySpace::Vec) {
-        ins_it->second = req;
-      }
+      // Same reconciliation as a direct use: a source reached both directly and
+      // through an alias must not keep whichever demand this sweep happened to
+      // reach first (see MergeConsumerReq).
+      if (!inserted) MergeConsumerReq(&ins_it->second, req);
     }
   }
 
@@ -574,26 +601,11 @@ class ConsumerSpaceCollector : public IRVisitor {
                                                                       req.m_align_from_arg.value_or(idx))
                                               : 0;
         const ConsumerSpaceReq resolved{req.space, align, CubeMAxis(call, req)};
-        // Prioritize non-Vec spaces: if an existing requirement is the default Vec but this
-        // consumer needs a specialized space (Mat/Left/Right/Acc/Bias), override it so the
-        // load-like producer can emit the specialized space directly.
+        // Several consumers can share one producer (a sliced KV feeding two
+        // matmuls, an accumulator seed read by two accumulations); MergeConsumerReq
+        // is the single rule for reconciling them.
         auto [it, inserted] = consumer_reqs_.try_emplace(var.get(), resolved);
-        if (inserted) continue;
-        if (it->second.space == MemorySpace::Vec && req.space != MemorySpace::Vec) {
-          it->second = resolved;
-        } else if (it->second.space == resolved.space) {
-          // Several consumers share one producer (e.g. a sliced KV feeding two
-          // matmuls). Box only when every one of them wants it, so a consumer
-          // that reads the tile at its declared physical shape is never handed a
-          // padded one.
-          // Box only to an extent every consumer agrees on: a differing axis
-          // or alignment means one of them reads the tile at its declared
-          // physical shape, which must never be handed a padded one.
-          if (it->second.cube_m_axis != resolved.cube_m_axis ||
-              it->second.cube_m_align != resolved.cube_m_align) {
-            it->second.cube_m_align = 0;
-          }
-        }
+        if (!inserted) MergeConsumerReq(&it->second, resolved);
       }
     }
     IRVisitor::VisitStmt_(op);
