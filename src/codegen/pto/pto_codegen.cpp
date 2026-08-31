@@ -1489,8 +1489,8 @@ PTOCodegen::AllocTileFields PTOCodegen::ComputeAllocTileFields(
   // place a physically illegal box grid can be caught with the IR location and
   // an actionable remedy -- rather than by PTOAS, whose message names its own
   // internals and points at whichever line the location happened to carry.
-  CheckBoxedTileExtents(ExtractTileTypeInfo(*tile_type, GetTypeString(tile_type->dtype_)), tile_type->dtype_,
-                        tile_type->GetMemorySpace(), current_span_);
+  CheckBoxedTileExtents(*tile_type, ExtractTileTypeInfo(*tile_type, GetTypeString(tile_type->dtype_)),
+                        current_span_);
 
   // Cast a non-index integer SSA to `index` (PTOAS expects index typed
   // valid_row / valid_col operands). Floating-point operands are rejected.

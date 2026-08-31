@@ -22,9 +22,12 @@
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
+#include "pypto/ir/memory_space.h"
 #include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/span.h"
 #include "pypto/ir/storage_size.h"
 #include "pypto/ir/tile_view_semantics.h"
+#include "pypto/ir/transforms/printer.h"
 #include "pypto/ir/type.h"
 
 namespace pypto {
@@ -185,17 +188,35 @@ std::optional<std::pair<int64_t, int64_t>> BoxGranularity(uint64_t fractal, ir::
 
 }  // namespace
 
-void CheckBoxedTileExtents(const TileTypeComponents& components, const DataType& dtype,
-                           const std::optional<ir::MemorySpace>& space, const ir::Span* span) {
+void CheckBoxedTileExtents(const ir::TileType& tile_type, const TileTypeComponents& components,
+                           const ir::Span* span) {
   // A non-boxed tile is addressed as a flat run of bytes; the box rule is not
   // about it. (PTOAS checks a byte-size alignment there instead.)
   if (components.slayout == ir::TileLayout::none_box) return;
+
+  const DataType& dtype = tile_type.dtype_;
+  const auto space = tile_type.GetMemorySpace();
+
+  // `ExtractTileTypeInfo` falls back to its struct default for a dimension that
+  // is not a `ConstInt`, so a dynamic physical extent would be checked -- and
+  // emitted -- as that placeholder instead of as itself. `InitMemRef` (pass 32)
+  // already refuses a dynamic `TileType::shape_`, so reaching codegen with one
+  // is a pass bug, not user input.
+  for (const auto& dim : tile_type.shape_) {
+    INTERNAL_CHECK(As<ir::ConstInt>(dim))
+        << "Internal error: a boxed tile reached codegen with a dynamic physical extent ("
+        << ir::PythonPrint(dim)
+        << "); InitMemRef requires a static TileType::shape_, with any runtime extent in TileView";
+  }
 
   const int64_t bits = static_cast<int64_t>(ir::storage_size::GetStorageBitWidth(dtype));
   if (bits <= 0 || bits % 8 != 0) return;  // sub-byte carrier: not this rule
   auto box = BoxGranularity(components.fractal, components.slayout, bits / 8);
   if (!box) return;
-  const auto [inner_rows, inner_cols] = *box;
+  // Plain locals rather than a structured binding: the lambda below captures
+  // them, which C++17 does not allow for binding names.
+  const int64_t inner_rows = box->first;
+  const int64_t inner_cols = box->second;
 
   const std::string where = space.has_value() ? ir::MemorySpaceToString(*space) : std::string("unresolved");
   auto report = [&](const char* axis, int64_t extent, int64_t inner) {

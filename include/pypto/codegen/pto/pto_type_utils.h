@@ -13,7 +13,6 @@
 #define PYPTO_CODEGEN_PTO_PTO_TYPE_UTILS_H_
 
 #include <cstdint>
-#include <optional>
 #include <string>
 
 #include "pypto/core/dtype.h"
@@ -107,14 +106,22 @@ struct TileTypeComponents {
 /// sub-byte carrier, a single-row tile, and Vec's row axis are all exempt —
 /// the same exemptions PTOAS applies.
 ///
+/// A boxed tile's physical extents must be static by the time it is emitted —
+/// ``InitMemRef`` refuses a dynamic ``TileType::shape_`` outright, telling the
+/// author to put the runtime extent in ``TileView`` instead. That matters here
+/// because ``ExtractTileTypeInfo`` substitutes its struct default for a
+/// non-``ConstInt`` dimension, so a dynamic extent would be checked (and
+/// rendered) as a placeholder rather than as itself. The assumption is asserted
+/// rather than assumed silently.
+///
+/// @param tile_type  Tile being allocated; supplies the dtype, the memory space
+///                   (Vec relaxes the row rule) and the physical shape.
 /// @param components Rendered tile geometry, as it will appear in the emitted
 ///                   ``!pto.tile_buf<...>`` type string.
-/// @param dtype      Element type the box granularity is derived from.
-/// @param space      Resolved memory space (Vec relaxes the row rule).
 /// @param span       IR location reported on failure; may be null when the
 ///                   emitter has no statement in scope.
-void CheckBoxedTileExtents(const TileTypeComponents& components, const DataType& dtype,
-                           const std::optional<ir::MemorySpace>& space, const ir::Span* span);
+void CheckBoxedTileExtents(const ir::TileType& tile_type, const TileTypeComponents& components,
+                           const ir::Span* span);
 
 TileTypeComponents ExtractTileTypeInfo(const ir::TileType& tile_type,
                                        const std::string& dtype_str_override = "");
