@@ -533,7 +533,7 @@ allocate 112 on that axis and declare 100 as the tile's valid_shape ...
 
 `ComputeAllocTileFields` 是所有分配的唯一收口——逐变量声明、被提升出来的
 `extra_alloc_tiles`、以及控制流路径都经过它——因此校验看到的正是最终发射的内容，不会与之
-漂移。张量层的 `pl.matmul` / `pl.matmul_acc` 永远不会触发它：M 轴已由
+漂移。张量层的 `pl.matmul` / `pl.matmul_acc` 不会因 *M 轴*触发它：M 轴已由
 [`ConvertTensorToTileOps`](../passes/10-convert_tensor_to_tile_ops.md#cube-operand-m-axis-boxing)
 自动对齐；仍需用户自行保证的是 `K` 与 `N`。
 

@@ -201,7 +201,7 @@ dtype 下都是 16 行，而转置操作数的列块是 `32 / sizeof(dtype)`。�
 累加器 16 行的最小公倍数（所涉粒度均为 2 的幂，故最小公倍数即最大值）。
 
 这条规则挂在「需求」上，而不是挂在某一条代码路径上。有四处可以满足 matmul 操作数的需求，
-四处都会做行对齐：操作数在调用点仍是张量时由 `BridgeInputSpaces` 处理；`tensor.slice`
+四处都会按 M 所在的轴对齐：操作数在调用点仍是张量时由 `BridgeInputSpaces` 处理；`tensor.slice`
 （以及任何 `set_output_memory_inherit_input()` 传播链）在生产者处满足需求时由
 `HandleConsumerDrivenLoad` 处理；生产者是函数参数时由 Phase-1 入口循环处理 ——
 `pl.matmul(pl.set_validshape(a, ...), b)` 走的正是这一条；累加器不是被加载而是被分配的，
@@ -225,7 +225,7 @@ acc = pl.create_tensor([100, 64], pl.FP32)
 c = pl.matmul_acc(acc, a, b)
 
 # 转换后
-acc_storage = pl.tile.create([112, 64], dtype=pl.FP32, target_memory=pl.Mem.Acc)
+acc_storage = pl.tile.create([112, 64], dtype=pl.FP32, target_memory=pl.Mem.Acc, compact=True)
 acc_tile = pl.tile.set_validshape(acc_storage, 100, 64)   # Tile[[112, 64]]，valid [100, 64]
 a_mat = pl.tile.load(a, [0, 0], [112, 128], [100, 128], target_memory=pl.Mem.Mat)
 c_tile = pl.tile.matmul_acc(acc_tile, a_mat, b_mat)

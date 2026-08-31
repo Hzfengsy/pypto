@@ -277,9 +277,11 @@ chooser 返回 16 对齐的 `(m, n, k)`，本 pass 剥离网格未覆盖的部�
 innerRows (16)`。
 
 使这次剥离保持合法的不变式由上游建立，而不在本 pass：
-[`ConvertTensorToTileOps`](10-convert_tensor_to_tile_ops.md) 会把所有行轴即 M 的 2-D
-cube tile —— 左操作数，以及 `tensor.matmul_acc` 场景下与之配对的累加器 —— 的行数向上
-对齐到分形块，并把真实尺寸放入 `valid_shape`。因此本
+[`ConvertTensorToTileOps`](10-convert_tensor_to_tile_ops.md) 会把所有 M 轴穿过的 2-D
+cube tile —— 左操作数，以及 `tensor.matmul_acc` 场景下与之配对的累加器 —— *承载 M 的
+那条轴*向上对齐到分形块，并把真实尺寸放入 `valid_shape`。对自然操作数而言该轴是行，对
+`a_trans` 操作数而言是列（其自然加载在 `tile.transpose_view` 把 M 换到乘积行轴之前就已
+对齐）；两种情形下 `tensor.matmul_acc` 都让累加器采用同一个 M 对齐值。因此本
 pass 看到的 `M` 已经是 16 的倍数；而当 `M` 与 `m` 均为 16 的倍数时，
 `M % m` 同样是 16 的倍数。于是内部块与尾块都天然是整数个分形块 —— 累加写法与普通写法
 一视同仁。

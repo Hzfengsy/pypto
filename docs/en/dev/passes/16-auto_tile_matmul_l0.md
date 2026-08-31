@@ -297,8 +297,11 @@ innerRows (16)`.
 The invariant that makes the peel legal is established upstream, not here:
 [`ConvertTensorToTileOps`](10-convert_tensor_to_tile_ops.md) allocates every 2-D
 cube tile the M axis runs through — the left operand, and for `tensor.matmul_acc` the
-accumulator with it — with its rows rounded up to the box and the true extent in
-`valid_shape`. The `M` this pass sees is therefore already a multiple of 16, and
+accumulator with it — with *the axis carrying M* rounded up to the box and the
+true extent in `valid_shape`. That axis is the rows for a natural operand, and
+the columns for an `a_trans` one, whose natural load is boxed before
+`tile.transpose_view` swaps M onto the product's row axis; `tensor.matmul_acc`
+gives its accumulator the same M alignment either way. The `M` this pass sees is therefore already a multiple of 16, and
 `M % m` with both `M` and `m` multiples of 16 is a multiple of 16 as well. Every
 emitted tile — interior and tail alike — is a whole number of boxes by
 construction, for the accumulating spelling as much as the plain one.

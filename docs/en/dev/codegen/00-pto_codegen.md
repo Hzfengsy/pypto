@@ -573,8 +573,8 @@ pl.matmul_acc does this for its M axis automatically.
 `ComputeAllocTileFields` is the single choke point every allocation passes
 through — the per-variable declaration, the hoisted `extra_alloc_tiles`, and the
 control-flow paths alike — so the check sees exactly what is emitted and cannot
-drift from it. A tensor-level `pl.matmul` / `pl.matmul_acc` never trips it: the
-M axis is boxed for the user in
+drift from it. A tensor-level `pl.matmul` / `pl.matmul_acc` never trips it *on
+its M axis*, which is boxed for the user in
 [`ConvertTensorToTileOps`](../passes/10-convert_tensor_to_tile_ops.md#cube-operand-m-axis-boxing).
 The axes that remain the user's responsibility are `K` and `N`.
 
