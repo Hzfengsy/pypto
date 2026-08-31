@@ -198,6 +198,14 @@ picks a 16-aligned tile and peels the remainder, and a multiple of 16 can only b
 split into 16-aligned pieces, tail included. It therefore needs no boundary
 special case.
 
+The rule rides on the *demand*, not on one code path. A `tensor.slice` (or any
+`set_output_memory_inherit_input()` chain) feeding a matmul answers the Mat
+requirement at the slice itself rather than through `BridgeInputSpaces`, so
+`ConsumerSpaceReq` carries the box flag alongside the memory space and that
+consumer-driven load boxes the same rows. When several consumers share one
+producer, the rows are boxed only if every one of them asks for it, so a consumer
+that reads the tile at its declared physical shape is never handed a padded one.
+
 Scope, and what is deliberately left out:
 
 | Case | Boxed? | Why |

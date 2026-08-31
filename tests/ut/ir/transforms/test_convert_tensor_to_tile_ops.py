@@ -1673,6 +1673,45 @@ class TestConvertTensorToTileOps:
         )
         _assert_convert_equal(before, expected)
 
+    def test_sliced_matmul_lhs_is_row_boxed_by_the_consumer_driven_load(self):
+        """A sliced left operand is boxed too, not just a bare parameter.
+
+        A ``tensor.slice`` feeding a matmul answers the Mat demand at the slice
+        itself (``HandleConsumerDrivenLoad``) rather than through
+        ``BridgeInputSpaces``, so the box rule has to ride on ``ConsumerSpaceReq``
+        as well. Without that the sliced operand keeps its unaligned physical row
+        count all the way to ptoas. ``valid_shape`` still names the slice window,
+        so only the allocation grows.
+        """
+        param_shape = [32, 128]
+        slice_shape: list[int | ir.Expr] = [17, 128]
+        rhs_shape = [128, 64]
+        out_shape = [17, 64]
+        dtype = DataType.FP16
+        in_specs: list[InSpec] = [("a", param_shape, dtype), ("b", rhs_shape, dtype)]
+
+        def before_body(ib, ins):
+            sliced = ib.let("a_slice", tensor_ops.slice(ins[0], slice_shape, [0, 0]))
+            return ib.let("y", tensor_ops.matmul(sliced, ins[1]))
+
+        def expected_body(ib, params):
+            a_p, b_p = params
+            lhs_mat = ib.let(
+                "a_slice_tile",
+                tile_ops.load(a_p, [0, 0], [32, 128], slice_shape, target_memory=MemorySpace.Mat),
+            )
+            rhs_mat = ib.let(
+                "rhs_mat",
+                tile_ops.load(b_p, [0, 0], rhs_shape, rhs_shape, target_memory=MemorySpace.Mat),
+            )
+            return ib.let("y_tile", tile_ops.matmul(lhs_mat, rhs_mat))
+
+        before = _make_before(in_specs=in_specs, out_shape=out_shape, out_dtype=dtype, body=before_body)
+        expected = _make_expected(
+            in_specs=in_specs, out_shape=out_shape, out_dtype=dtype, body=expected_body, preload=False
+        )
+        _assert_convert_equal(before, expected)
+
     def test_matmul_a_trans_lhs_keeps_its_natural_load(self):
         """A transposed left operand is NOT row-boxed.
 

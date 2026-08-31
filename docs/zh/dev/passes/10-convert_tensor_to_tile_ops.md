@@ -180,6 +180,12 @@ compact 模式寻址整块内部更窄的 valid 区域，`tile.store` 也只写�
 16 对齐的 tile 并剥离余数，而 16 的倍数只能被切分成同样 16 对齐的块（尾块也不例外），
 所以它不需要任何边界特判。
 
+这条规则挂在「需求」上，而不是挂在某一条代码路径上。被 matmul 使用的 `tensor.slice`
+（以及任何 `set_output_memory_inherit_input()` 传播链）会在 slice 自身处直接满足 Mat 需求，
+而不经过 `BridgeInputSpaces`，因此 `ConsumerSpaceReq` 在携带内存空间的同时也携带对齐标记，
+该 consumer-driven 加载会做同样的行对齐。当多个消费者共享同一个生产者时，只有它们全部提出
+该需求时才会对齐，从而保证按声明物理尺寸读取该 tile 的消费者不会拿到被 padding 过的 tile。
+
 作用范围，以及刻意排除的情况：
 
 | 情况 | 是否对齐 | 原因 |
