@@ -413,11 +413,14 @@ def load(
             coordinate system. Each element must be an integer scalar — a float
             (``n / 2`` rather than ``n // 2``) or a nested sequence is rejected.
         shapes: Shape of the region to load in each dimension. Always in the
-            source tensor's coordinate system.
+            source tensor's coordinate system. Each element must be an integer
+            scalar, on the same terms as ``offsets``.
         valid_shape: Valid shape of the tile in each dimension. When provided, sets
             TileView.valid_shape in the output TileType. When omitted, shapes is used
             as valid_shape. Uses the same coordinate convention as shapes. Narrows
-            the tile; cannot widen it past what the source has.
+            the tile; cannot widen it past what the source has. Each element must
+            be an integer scalar — one extent per dimension, not a nested
+            ``[start, extent]`` pair.
         target_memory: Target memory space (MemorySpace.Vec or MemorySpace.Mat).
             ``None`` (the default) leaves the space unset for the compiler to place.
             MX-layout tensors require an explicit MemorySpace.Mat.
@@ -477,6 +480,7 @@ def store(
             scalar — a float or a nested sequence is rejected.
         output_tensor: Output tensor
         shapes: Optional ND partition shape. Injected by FlattenTileNdTo2D for ND tensors.
+            Each element must be an integer scalar, on the same terms as ``offsets``.
         atomic: Combine mode for the global-memory write. ``AtomicType.None_``
             (default) overwrites; ``AtomicType.Add`` atomically adds the tile
             into existing GM contents — used for split-K accumulation, where

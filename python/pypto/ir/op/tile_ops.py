@@ -217,13 +217,16 @@ def load(
         offsets: Offsets in each dimension (sequence of scalars), or a MakeTuple.
             Always in the source tensor's coordinate system.
         shapes: Shape of the region to load in each dimension (sequence of scalars),
-            or a MakeTuple. Always in the source tensor's coordinate system.
+            or a MakeTuple. Always in the source tensor's coordinate system. Every
+            element must be an integer scalar, as for ``offsets``.
         valid_shape: Valid shape of the tile in each dimension (sequence of scalars), or a
             MakeTuple. When provided, sets TileView.valid_shape in the output TileType.
             When omitted, shapes is used as valid_shape. Useful for dynamic shapes where
             the actual valid data region differs from the allocated tile size.
             Uses the same coordinate convention as shapes. This is a *request*: it
-            narrows the tile, but cannot widen it past what the source has.
+            narrows the tile, but cannot widen it past what the source has. Every
+            element must be an integer scalar — one extent per dimension, never a
+            nested tuple.
         target_memory: Target memory space (MemorySpace.Vec or MemorySpace.Mat).
             ``None`` (the default) leaves the space unset so InferTileMemorySpace
             places the tile from consumer demand; the kwarg is then omitted from
@@ -315,7 +318,8 @@ def store(
         offsets: Offsets in each dimension (sequence of scalars), or a MakeTuple
         output_tensor: Output tensor (TensorType)
         shapes: ND partition shape (sequence of ints), or None for 2D tiles. Normally
-            injected automatically by FlattenTileNdTo2D for ND tensors.
+            injected automatically by FlattenTileNdTo2D for ND tensors. Every element
+            must be an integer scalar, as for ``offsets``.
         span: Optional source span for debugging (auto-captured if not provided)
         atomic: ``AtomicType`` underlying int — 0 (``kNone``, plain overwrite) or
             1 (``kAdd``, atomic-add into global memory). The kwarg is omitted

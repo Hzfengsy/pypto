@@ -5210,6 +5210,122 @@ class TestTileLoadStoreOffsetElements:
                 return pl.store(a, [0, 0], out)
 
 
+class TestTileLoadStoreShapeElements:
+    """tile.load / tile.store shapes and valid_shape must be integer scalars too.
+
+    Same family as the offsets check above, and the same stakes: a non-scalar
+    element makes ``InferWindowReadValidShape``'s obligations undecidable, so the
+    "valid region fits the window" and "reads past the end" checks stop firing
+    and codegen lowers the tuple's last leaf. A nested ``valid_shape`` compiled to
+    a ``tload`` reading 200 rows of a 128-row tensor into a 64-row tile.
+    """
+
+    @staticmethod
+    def _tensor() -> ir.Var:
+        return ir.Var("a", ir.TensorType([128, 128], DataType.FP32), ir.Span.unknown())
+
+    @staticmethod
+    def _nested(first: int, second: int) -> list[ir.Expr]:
+        """A rank-2 tuple one nesting level too deep — ``[[f, s], [f, s]]``."""
+        span = ir.Span.unknown()
+        row = ir.MakeTuple(
+            [ir.ConstInt(first, DataType.INDEX, span), ir.ConstInt(second, DataType.INDEX, span)], span
+        )
+        return [row, row]
+
+    def test_load_rejects_tuple_shapes_element(self):
+        with pytest.raises(ValueError, match=r"tile\.load shapes tuple element 0 must be ScalarType"):
+            tile.load(self._tensor(), [0, 0], self._nested(0, 64))
+
+    def test_load_rejects_float_shapes_element(self):
+        span = ir.Span.unknown()
+        shapes = [ir.ConstFloat(64.0, DataType.FP32, span), ir.ConstInt(64, DataType.INDEX, span)]
+
+        with pytest.raises(ValueError, match=r"tile\.load shapes tuple element 0 must have integer dtype"):
+            tile.load(self._tensor(), [0, 0], shapes)
+
+    def test_load_rejects_tuple_valid_shape_element(self):
+        with pytest.raises(ValueError, match=r"tile\.load valid_shape tuple element 0 must be ScalarType"):
+            tile.load(self._tensor(), [0, 0], [64, 64], self._nested(0, 40))
+
+    def test_load_rejects_float_valid_shape_element(self):
+        span = ir.Span.unknown()
+        valid = [ir.ConstFloat(40.0, DataType.FP32, span), ir.ConstInt(64, DataType.INDEX, span)]
+
+        with pytest.raises(
+            ValueError, match=r"tile\.load valid_shape tuple element 0 must have integer dtype"
+        ):
+            tile.load(self._tensor(), [0, 0], [64, 64], valid)
+
+    def test_load_accepts_non_index_integer_extents(self):
+        """The bar is IsInt, not IsIndexLike — an INT32 extent is legitimate."""
+        span = ir.Span.unknown()
+        shapes = [ir.ConstInt(64, DataType.INT32, span), ir.ConstInt(64, DataType.INT32, span)]
+
+        call = tile.load(self._tensor(), [0, 0], shapes)
+
+        assert isinstance(call.type, ir.TileType)
+
+    def test_load_accepts_symbolic_extents(self):
+        """Dynamic shapes stay legal: a symbolic integer scalar is a valid extent."""
+        span = ir.Span.unknown()
+        rows = ir.Var("rows", ir.ScalarType(DataType.INDEX), span)
+
+        call = tile.load(self._tensor(), [0, 0], [64, 64], [rows, ir.ConstInt(64, DataType.INDEX, span)])
+
+        assert isinstance(call.type, ir.TileType)
+
+    def test_tuple_valid_shape_no_longer_hides_oversized_request(self):
+        """The plain-int form is rejected for exceeding the window; so is the nested one."""
+        with pytest.raises(ValueError, match="which exceeds the window extent"):
+            tile.load(self._tensor(), [0, 0], [64, 64], [200, 64])
+
+        with pytest.raises(ValueError, match=r"tile\.load valid_shape tuple element 0 must be ScalarType"):
+            tile.load(self._tensor(), [0, 0], [64, 64], self._nested(200, 200))
+
+    def test_store_rejects_tuple_shapes_element(self):
+        """tile.store's optional 4th operand carries the ND partition shape."""
+        loaded = tile.load(self._tensor(), [0, 0], [64, 64])
+        tile_var = ir.Var("t", loaded.type, ir.Span.unknown())
+        out = ir.Var("out", ir.TensorType([128, 128], DataType.FP32), ir.Span.unknown())
+
+        with pytest.raises(ValueError, match=r"tile\.store shapes tuple element 0 must be ScalarType"):
+            tile.store(tile_var, [0, 0], out, self._nested(0, 64))
+
+    def test_dsl_load_rejects_nested_valid_shape_positional(self):
+        """The user-facing path: an author who reads valid_shape as [start, extent] pairs.
+
+        Positionally, the parser resolves the closure var into a tuple of tuples,
+        so the deducer is what has to reject it — this spelling used to compile to
+        an out-of-bounds ``tload`` with no diagnostic at any layer. The var is
+        annotated ``Any``, as in the offsets case above, so the shape of the value
+        is only knowable at parse time: exactly what a static checker cannot catch.
+        """
+        pairs: Any = [[0, 40], [0, 56]]
+
+        with pytest.raises(InvalidOperationError, match="valid_shape tuple element 0 must be ScalarType"):
+
+            @pl.function
+            def func(
+                t: pl.Tensor[[128, 128], pl.FP32], out: pl.Tensor[[128, 128], pl.FP32]
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                a = pl.load(t, [0, 0], [64, 64], pairs)
+                return pl.store(a, [0, 0], out)
+
+    def test_dsl_load_rejects_nested_valid_shape_keyword(self):
+        """Spelled as a kwarg the list never becomes IR, so the builder reports it."""
+        pairs: Any = [[0, 40], [0, 56]]
+
+        with pytest.raises(InvalidOperationError, match="one bracket level, not nested pairs"):
+
+            @pl.function
+            def func(
+                t: pl.Tensor[[128, 128], pl.FP32], out: pl.Tensor[[128, 128], pl.FP32]
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                a = pl.load(t, [0, 0], [64, 64], valid_shape=pairs)
+                return pl.store(a, [0, 0], out)
+
+
 class TestTileCreateOp:
     """Tests for tile.create layout inference."""
 

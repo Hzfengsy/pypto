@@ -64,27 +64,34 @@ T GetKwarg(const std::vector<std::pair<std::string, std::any>>& kwargs, const st
 
 namespace {
 
-/// Validate that every element of an offsets tuple is an integer scalar.
+/// Validate that every element of a window-geometry tuple is an integer scalar.
 ///
-/// ``tile.load`` / ``tile.store`` declare offsets as "TupleType of integer
-/// ScalarType", and nothing downstream re-derives that: the window-read proofs in
-/// ``InferWindowReadValidShape`` are defined only over integer scalars, so a
-/// non-scalar element makes every bounds obligation *undecidable* rather than
-/// false — the negative-offset and reads-past-the-end checks then pass silently
-/// and codegen lowers whatever the element happens to reduce to. Reject it here,
-/// at the operator boundary, on the same terms ``tensor.slice`` uses for its own
-/// offsets. ``IsInt()`` (not ``IsIndexLike()``) is the bar because every integer
-/// width is a legitimate offset all the way down: ``EmitCastToIndex`` exists
-/// precisely to widen a non-INDEX integer offset at the partition_view site.
-void ValidateOffsetTupleElements(const MakeTuplePtr& offsets, const std::string& op_name) {
-  for (size_t i = 0; i < offsets->elements_.size(); ++i) {
-    const ExprPtr& elem = offsets->elements_[i];
-    CHECK(elem) << op_name << " offset tuple element " << i << " must not be null";
+/// ``tile.load`` / ``tile.store`` declare each of offsets, shapes and valid_shape
+/// as "TupleType of integer ScalarType", and nothing downstream re-derives that:
+/// the window-read proofs in ``InferWindowReadValidShape`` are defined only over
+/// integer scalars, so a non-scalar element makes every bounds obligation
+/// *undecidable* rather than false — the negative-offset, valid-region-fits and
+/// reads-past-the-end checks then pass silently and codegen lowers whatever the
+/// element happens to reduce to (its last leaf, for a nested tuple). Reject it
+/// here, at the operator boundary, on the same terms ``tensor.slice`` uses for
+/// its own shape and offset tuples.
+///
+/// ``IsInt()`` (not ``IsIndexLike()``) is the bar because every integer width is
+/// legitimate all the way down: ``EmitCastToIndex`` exists precisely to widen a
+/// non-INDEX integer offset at the partition_view site.
+///
+/// ``role`` names the operand in the diagnostic using the spelling the DSL
+/// exposes (``offset`` / ``shapes`` / ``valid_shape``), so the message points at
+/// the argument the author actually wrote.
+void ValidateIntScalarTupleElements(const MakeTuplePtr& tuple, const std::string& op_name, const char* role) {
+  for (size_t i = 0; i < tuple->elements_.size(); ++i) {
+    const ExprPtr& elem = tuple->elements_[i];
+    CHECK(elem) << op_name << " " << role << " tuple element " << i << " must not be null";
     auto scalar_type = As<ScalarType>(elem->GetType());
-    CHECK_SPAN(scalar_type, elem->span_) << op_name << " offset tuple element " << i
+    CHECK_SPAN(scalar_type, elem->span_) << op_name << " " << role << " tuple element " << i
                                          << " must be ScalarType, but got " << elem->GetType()->TypeName();
     CHECK_SPAN(scalar_type->dtype_.IsInt(), elem->span_)
-        << op_name << " offset tuple element " << i << " must have integer dtype, but got "
+        << op_name << " " << role << " tuple element " << i << " must have integer dtype, but got "
         << scalar_type->dtype_.ToString();
   }
 }
@@ -141,19 +148,21 @@ TypePtr DeduceTileLoadType(const std::vector<ExprPtr>& args,
   CHECK(offsets_tuple) << "The operator " << op_name
                        << " requires second argument to be a tuple (offsets), but got "
                        << args[1]->GetType()->TypeName();
-  ValidateOffsetTupleElements(offsets_tuple, op_name);
+  ValidateIntScalarTupleElements(offsets_tuple, op_name, "offset");
 
   // Third argument must be TupleType (shapes)
   auto shapes_tuple = As<MakeTuple>(args[2]);
   CHECK(shapes_tuple) << "The operator " << op_name
                       << " requires third argument to be a tuple (shapes), but got "
                       << args[2]->GetType()->TypeName();
+  ValidateIntScalarTupleElements(shapes_tuple, op_name, "shapes");
 
   // Fourth argument must be TupleType (valid_shape)
   auto valid_shape_tuple = As<MakeTuple>(args[3]);
   CHECK(valid_shape_tuple) << "The operator " << op_name
                            << " requires fourth argument to be a tuple (valid shape), but got "
                            << args[3]->GetType()->TypeName();
+  ValidateIntScalarTupleElements(valid_shape_tuple, op_name, "valid_shape");
 
   // Verify offsets, shapes and valid_shape have same number of dimensions
   CHECK(offsets_tuple->elements_.size() == shapes_tuple->elements_.size())
@@ -361,7 +370,7 @@ TypePtr DeduceTileStoreType(const std::vector<ExprPtr>& args,
   CHECK(offsets_tuple) << "The operator " << op_name
                        << " requires second argument to be a tuple (offsets), but got "
                        << args[1]->GetType()->TypeName();
-  ValidateOffsetTupleElements(offsets_tuple, op_name);
+  ValidateIntScalarTupleElements(offsets_tuple, op_name, "offset");
 
   // Third argument must be the output tensor. AsTensorTypeLike accepts both
   // plain TensorType and DistributedTensorType — the latter is needed for the
@@ -383,6 +392,7 @@ TypePtr DeduceTileStoreType(const std::vector<ExprPtr>& args,
                         << " requires optional 4th argument to be a shapes tuple (MakeTuple)";
     CHECK(!shapes_tuple->elements_.empty())
         << "The operator " << op_name << " requires non-empty shapes tuple when provided";
+    ValidateIntScalarTupleElements(shapes_tuple, op_name, "shapes");
     CHECK(shapes_tuple->elements_.size() == offsets_tuple->elements_.size())
         << "The operator " << op_name
         << " requires shapes and offsets to have the same number of dimensions, but got "

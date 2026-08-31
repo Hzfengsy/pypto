@@ -103,6 +103,17 @@ def _normalize_expr(
         return _ir.ConstInt(value, int_dtype, actual_span)
     elif isinstance(value, float):
         return _ir.ConstFloat(value, float_dtype, actual_span)
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        # A nested sequence where a scalar belongs — almost always one bracket
+        # level too many in an offsets / shapes / valid_shape argument. No
+        # operator accepts a nested tuple, so name the mistake here rather than
+        # letting the generic "cannot convert" message stand.
+        raise TypeError(
+            f"Cannot convert {type(value)} to IR expression: expected a scalar, but got the "
+            f"sequence {value!r}. Each element of an offsets / shapes / valid_shape argument is "
+            f"one dimension's extent, so the argument takes a flat sequence of integer scalars "
+            f"-- one bracket level, not nested pairs."
+        )
     else:
         raise TypeError(f"Cannot convert {type(value)} to IR expression")
 
