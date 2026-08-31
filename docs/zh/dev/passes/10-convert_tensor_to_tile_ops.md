@@ -145,20 +145,20 @@ InCore、Spmd、Group 函数在本阶段被跳过 —— 它们已在阶段一 /
 
 该需求会**穿过**声明了 `set_output_memory_inherit_input()` 的零拷贝元数据 op 继续向上传播 —— `tensor.slice`、`tensor.view`、`tensor.reshape`、`tensor.reinterpret_view`、`tensor.set_validshape`。因此 `pl.matmul(pl.set_validshape(a[:, :K], rows, K), b)` 这样的操作数仍然直接加载到 Mat。若某个别名输入存储的 op 漏掉该声明，传播链就会断开：操作数被物化到 Vec，再通过 `tile.move` 桥接到 Mat，而这是一个 vector→cube 边界，会把本应是纯 CUBE 的 InCore scope 判定为 `MIXED`，导致 [`ExpandMixedKernel`](22-expand_mixed_kernel.md) 将其拆分为 AIC/AIV 两个函数。
 
-## Cube 操作数的行分形对齐（Row Boxing）
+## Cube 操作数的 M 轴分形对齐（M-Axis Boxing）
 
 一个 cube 操作数有两个彼此独立的尺寸概念，而只有其中一个受到约束。
 
 - **逻辑（logical）尺寸**基本不受限。`pto.tmatmul` 从操作数的 *valid* 区域推导
   `M`、`K`、`N`，取值范围 `[1, 4095]`，没有整除要求；`pto.mad` 的 `disable_gemv`
   子句存在的唯一目的，就是在 `%m == 1` 时选择 L0A 的组织方式。
-- **物理（physical）尺寸**必须是整数个 NZ 分形块。内层块在所有代次和所有 dtype 下
-  都是 16 行（`FRACTAL_NZ_ROW`）。ptoas 直接强制这一点 ——
-  `'pto.alloc_tile' op expects result boxed tile rows to be a multiple of
+- **物理（physical）尺寸**必须是整数个 NZ 分形块。块高在所有代次和所有 dtype 下都是
+  16 行；块宽是 `32 字节 / sizeof(dtype)`（FP16 为 16，INT8 为 32）。ptoas 直接强制
+  这一点 —— `'pto.alloc_tile' op expects result boxed tile rows to be a multiple of
   innerRows (16)` —— pto-isa 的 `TExtract` 也对其读取的 Mat 源 tile 用静态断言
   重复了同一条约束。
 
-因此 2-D `tensor.matmul` 的左操作数在桥接到 Mat 时，行方向的物理尺寸向上对齐到分形块，
+因此凡是 matmul M 轴穿过的 cube tile，该轴的物理尺寸都向上对齐到分形块，
 并把张量的真实尺寸声明为 `valid_shape`：
 
 ```python
@@ -180,24 +180,88 @@ compact 模式寻址整块内部更窄的 valid 区域，`tile.store` 也只写�
 16 对齐的 tile 并剥离余数，而 16 的倍数只能被切分成同样 16 对齐的块（尾块也不例外），
 所以它不需要任何边界特判。
 
-这条规则挂在「需求」上，而不是挂在某一条代码路径上。有三处可以满足 matmul 的 Mat 需求，
-三处都会做行对齐：操作数在调用点仍是张量时由 `BridgeInputSpaces` 处理；`tensor.slice`
+### M 落在哪条轴上
+
+M 并不总是落在行轴。`a_trans` 操作数按*自然*方式加载、再由零拷贝的
+`tile.transpose_view` 重解释，因此其加载 tile 的行轴是 `K`、**列**轴才是 `M` ——
+分形规则会跟随 M 到它实际所在的那条轴（`InputSpaceReq::cube_m_axis` 由该操作数自身的
+转置标志解析出轴号）：
+
+```python
+# a: Tensor[[128, 100]]，a_trans=True —— M 是本次加载的列尺寸
+a_mat = pl.tile.load(a, [0, 0], [128, 112], [128, 100], target_memory=pl.Mem.Mat)
+a_t   = pl.tile.transpose_view(a_mat)   # Tile[[112, 128]]，valid [100, 128]
+```
+
+这也意味着：虽然对齐后的尺寸必须一致，各 tile 自身的*粒度*却不同 —— Acc 块在所有
+dtype 下都是 16 行，而转置操作数的列块是 `32 / sizeof(dtype)`。因此转置的 INT8
+操作数需要 32，与之配对的累加器也必须采用同一个 32；各取各的粒度会得到 128 行的乘积
+与 112 行的累加器，而 `tile.matmul_acc` 会拒绝这一组合。
+`InputSpaceReq::m_align_from_arg` 指定左操作数为唯一决定者，最终对齐值取它的块尺寸与
+累加器 16 行的最小公倍数（所涉粒度均为 2 的幂，故最小公倍数即最大值）。
+
+这条规则挂在「需求」上，而不是挂在某一条代码路径上。有四处可以满足 matmul 操作数的需求，
+四处都会做行对齐：操作数在调用点仍是张量时由 `BridgeInputSpaces` 处理；`tensor.slice`
 （以及任何 `set_output_memory_inherit_input()` 传播链）在生产者处满足需求时由
 `HandleConsumerDrivenLoad` 处理；生产者是函数参数时由 Phase-1 入口循环处理 ——
-`pl.matmul(pl.set_validshape(a, ...), b)` 走的正是这一条。因此 `ConsumerSpaceReq`
+`pl.matmul(pl.set_validshape(a, ...), b)` 走的正是这一条；累加器不是被加载而是被分配的，
+由 `HandleBoxedAccCreate` 处理。因此 `ConsumerSpaceReq`
 在携带内存空间的同时也携带对齐标记。当多个消费者共享同一个生产者时，只有它们全部提出
 该需求时才会对齐，从而保证按声明物理尺寸读取该 tile 的消费者不会拿到被 padding 过的 tile。
+
+### `tensor.matmul_acc` 的累加器与其操作数一同对齐
+
+`tensor.matmul_acc` 与 `tensor.matmul` 的 M 约束完全相同，因为 M 轴穿过的两个 cube tile
+必须**同时**对齐：`tile.matmul_acc` 要求累加器与乘积的物理 M 一致，只对左操作数做对齐
+只会把 ptoas 的拒绝换成一个操作数不匹配的报错。
+
+累加器从不被加载 —— 除矩阵单元外没有任何部件写 L0C —— 因此满足该需求的位置是它的分配点。
+`HandleBoxedAccCreate` 改写为它做种子的 `tensor.create`；由于 `tile.create` 不接受 valid
+尺寸，收窄由一条独立的 `tile.set_validshape` 承担：
+
+```python
+# 转换前（M = 100）
+acc = pl.create_tensor([100, 64], pl.FP32)
+c = pl.matmul_acc(acc, a, b)
+
+# 转换后
+acc_storage = pl.tile.create([112, 64], dtype=pl.FP32, target_memory=pl.Mem.Acc)
+acc_tile = pl.tile.set_validshape(acc_storage, 100, 64)   # Tile[[112, 64]]，valid [100, 64]
+a_mat = pl.tile.load(a, [0, 0], [112, 128], [100, 128], target_memory=pl.Mem.Mat)
+c_tile = pl.tile.matmul_acc(acc_tile, a_mat, b_mat)
+```
+
+这条路径需要额外确定两件操作数路径上没有的事：
+
+- **内存空间在此显式声明，而不是留给 [`InferTileMemorySpace`](18-infer_tile_memory_space.md)。**
+  普通的 `tensor.create` 转换刻意不写 `target_memory`，因为它没有消费者上下文可供推导；
+  而这里有，且正是提出对齐需求的那一个。显式声明还关乎正确性：Acc tile 的隐式 view 是
+  分块 NZ，若种子的空间未定，它会带着原始 row-major view，与跨 split-K 循环与之做循环
+  携带的 `tile.matmul_acc` 结果不一致。
+- **需求需要跨越循环携带。** split-K 累加器在循环外分配，以 `IterArg` 的身份到达
+  `tile.matmul_acc`，因此 `ConsumerSpaceCollector` 用 `AsVarLike` 匹配操作数
+  （`IterArg` 有自己的 `ObjectKind`），并为每个 `IterArg` 记录一条指向其种子值的传播边。
+
+对齐后的累加器会声明为 **compact**。`mad` 以 `ceil(validRow/16)*16` 的 pitch 写出乘积
+（100 行的乘积即 112），而非 compact 的读取方是按物理行数推导 stride 的 —— 而分形对齐
+已把它取整为 112，或在 32 行对齐时取整为 128。compact 让所有读取方重新计算 `mad` 实际
+使用的 pitch；不声明它则会被 `AccCompactValid` 直接拒绝（issue #2470）。
 
 作用范围，以及刻意排除的情况：
 
 | 情况 | 是否对齐 | 原因 |
 | ---- | -------- | ---- |
-| 2-D `tensor.matmul` 左操作数 | 是 | 其行轴即 M，块高在所有 dtype 下都是 16 |
-| 右操作数 | 否 | 其行是 `K`，粒度为 `32 字节 / sizeof(dtype)`，与 dtype 相关，此处不做结论 |
-| `a_trans` 左操作数 | 否 | 自然加载的行轴是 K，零拷贝 `tile.transpose_view` 使 *列*轴才是 M |
+| 2-D `tensor.matmul` 左操作数 | 是，按行 | 其行轴即 M，块高在所有 dtype 下都是 16 |
+| 2-D `tensor.matmul_acc` 的左操作数与累加器 | 是，按行 | 同一条轴、同一条规则 —— 且该 op 要求二者物理 M 一致，因此必须一同对齐 |
+| `a_trans` 左操作数，以及与之配对的累加器 | 是，按列 | 自然加载的行轴是 K，M 是列尺寸；累加器经 `m_align_from_arg` 采用该操作数的列粒度 |
+| 右操作数 | 否 | 其行是 `K`，即归约轴 —— 除非硬件按 valid col 做掩码（尚未验证），补齐会把未初始化的 L1 数据带入求和 |
+| 输出的 `N` | 否 | 与 `K` 同属尚未解决的问题；[`AutoTileMatmulL0`](16-auto_tile_matmul_l0.md) 的 `PH-AT-007` 出于同样原因不予处理 |
 | rank >= 3 的操作数 | 否 | 它下沉为 `tile.batch_matmul`，其行被 [`FlattenTileNdTo2D`](13-flatten_tile_nd_to_2d.md) 打包成单个 `[B*M, N]` tile —— 分形规则约束的是打包后的尺寸，而非该维度 |
-| 行尺寸为动态值 | 否 | 没有编译期常量可供对齐 |
-| `tensor.matmul_acc` 左操作数 | 否 | `tile.matmul_acc` 要求累加器与乘积的*物理* M 一致，而累加器来自本规则无法触及的另一处 `tile.create` |
+| M 尺寸为动态值 | 否 | 没有编译期常量可供对齐 |
+
+本 pass 不处理的每一种情况，最终仍由 PyPTO 而非 ptoas 报错：
+[PTO codegen](../codegen/00-pto_codegen.md) 会校验它发射的每一条 `pto.alloc_tile`
+的分块网格。
 
 ## Transpose 下沉
 

@@ -295,12 +295,13 @@ rows must still form whole NZ fractal boxes — ptoas rejects anything else with
 innerRows (16)`.
 
 The invariant that makes the peel legal is established upstream, not here:
-[`ConvertTensorToTileOps`](10-convert_tensor_to_tile_ops.md) bridges a 2-D
-matmul's left operand into Mat with its rows rounded up to the box and the true
-extent in `valid_shape`. The `M` this pass sees is therefore already a multiple
-of 16, and `M % m` with both `M` and `m` multiples of 16 is a multiple of 16 as
-well. Every emitted tile — interior and tail alike — is a whole number
-of boxes by construction.
+[`ConvertTensorToTileOps`](10-convert_tensor_to_tile_ops.md) allocates every 2-D
+cube tile the M axis runs through — the left operand, and for `tensor.matmul_acc` the
+accumulator with it — with its rows rounded up to the box and the true extent in
+`valid_shape`. The `M` this pass sees is therefore already a multiple of 16, and
+`M % m` with both `M` and `m` multiples of 16 is a multiple of 16 as well. Every
+emitted tile — interior and tail alike — is a whole number of boxes by
+construction, for the accumulating spelling as much as the plain one.
 
 Padding the tensor at conversion is what makes this work; padding it *only* at
 the operand would not be enough on its own, because this pass would still

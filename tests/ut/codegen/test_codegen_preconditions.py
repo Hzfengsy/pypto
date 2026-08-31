@@ -89,6 +89,111 @@ def test_device_kernel_rejects_descending_loop():
         codegen.PTOCodegen().generate(optimized)
 
 
+@pytest.mark.parametrize(
+    ("name", "rows", "cols", "dtype", "axis", "inner", "padded"),
+    [
+        # M on the row axis: the box is 16 rows for every dtype.
+        ("row_axis", 100, 128, pl.FP16, "row", 16, 112),
+        # K on the column axis: the box holds 32 bytes' worth of elements, so
+        # 16 for FP16 -- the axis this compiler does not pad for the user.
+        ("col_axis", 128, 24, pl.FP16, "column", 16, 32),
+        # An 8-bit column box is 32 elements wide, not 16.
+        ("col_axis_int8", 128, 24, pl.INT8, "column", 32, 32),
+    ],
+)
+def test_sub_fractal_cube_tile_is_rejected_by_pypto(name, rows, cols, dtype, axis, inner, padded):
+    """A partial fractal box is refused here, not left for PTOAS to refuse.
+
+    PTO addresses a boxed tile one box at a time, so a tile whose physical
+    extent is not a whole number of boxes has no address. PTOAS enforces that on
+    the ``pto.alloc_tile`` it receives, but its message names PTOAS internals
+    (``expects result boxed tile rows to be a multiple of innerRows (16)``) and
+    offers no remedy. Checking it where PyPTO emits the allocation reports the
+    tile, the axis, the extent to reach, and how to reach it.
+
+    Both axes and both granularities are covered: the row box is 16 for every
+    dtype, while the column box holds 32 bytes' worth of elements.
+    """
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kern(
+            self,
+            a: pl.Tensor[[rows, cols], dtype],
+            b: pl.Tensor[[cols, 64], dtype],
+            out: pl.Out[pl.Tensor[[rows, 64], pl.FP32]],
+        ) -> pl.Tensor[[rows, 64], pl.FP32]:
+            # Written at the tile level so the shape reaches codegen verbatim:
+            # a tensor-level pl.matmul would box its M axis automatically.
+            am = pl.tile.load(a, [0, 0], [rows, cols], target_memory=pl.MemorySpace.Mat)
+            bm = pl.tile.load(b, [0, 0], [cols, 64], target_memory=pl.MemorySpace.Mat)
+            acc = pl.tile.matmul(am, bm)
+            return pl.tile.store(acc, [0, 0], out)
+
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend910B)
+    optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+
+    with pytest.raises(ValueError) as excinfo:
+        codegen.PTOCodegen().generate(optimized)
+    message = str(excinfo.value)
+    assert f"its {axis} extent" in message, message
+    assert f"not a multiple of {inner}" in message, message
+    # The remedy has to name the extent to reach and where to declare the real one.
+    assert f"allocate {padded} on that axis" in message, message
+    assert "valid_shape" in message, message
+
+
+def test_fractal_sized_cube_tile_still_lowers():
+    """The guard above does not over-reach: a whole-box tile is untouched."""
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kern(
+            self,
+            a: pl.Tensor[[112, 128], pl.FP16],
+            b: pl.Tensor[[128, 64], pl.FP16],
+            out: pl.Out[pl.Tensor[[112, 64], pl.FP32]],
+        ) -> pl.Tensor[[112, 64], pl.FP32]:
+            am = pl.tile.load(a, [0, 0], [112, 128], target_memory=pl.MemorySpace.Mat)
+            bm = pl.tile.load(b, [0, 0], [128, 64], target_memory=pl.MemorySpace.Mat)
+            acc = pl.tile.matmul(am, bm)
+            return pl.tile.store(acc, [0, 0], out)
+
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend910B)
+    optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+    assert codegen.PTOCodegen().generate(optimized)
+
+
+def test_sub_fractal_rows_are_accepted_where_pto_exempts_them():
+    """Vec is exempt from the row rule, so an unaligned Vec tile still lowers.
+
+    PTO only boxes the matrix spaces; a Vec tile's rows are unconstrained. The
+    guard mirrors that exemption rather than imposing a stricter rule than the
+    hardware's.
+    """
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.AIV)
+        def kern(
+            self,
+            x: pl.Tensor[[100, 64], pl.FP32],
+            out: pl.Out[pl.Tensor[[100, 64], pl.FP32]],
+        ) -> pl.Tensor[[100, 64], pl.FP32]:
+            t: pl.Tile[[100, 64], pl.FP32] = pl.load(x, [0, 0], [100, 64])
+            t = pl.add(t, t)
+            return pl.store(t, [0, 0], out)
+
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend910B)
+    optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+    assert codegen.PTOCodegen().generate(optimized)
+
+
 def test_device_kernel_accepts_ascending_loop():
     """The ascending counterpart of the descending-loop rejection still lowers.
 

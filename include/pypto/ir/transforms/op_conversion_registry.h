@@ -71,14 +71,27 @@ using ConversionFunc = std::function<ConversionResult(
 struct InputSpaceReq {
   MemorySpace space;                       ///< Required memory space
   std::optional<std::string> trans_kwarg;  ///< Read transpose flag from this kwarg (if any)
-  /// Whether the bridged tile is a *cube* operand, i.e. one the MAD reads out
-  /// of a whole number of NZ fractal boxes.  The logical extent of such an
-  /// operand is essentially free (``pto.mad`` derives ``%m`` from the operand's
-  /// valid rows), but its physical row count must be a multiple of the box
-  /// height, so the bridge load allocates the boxed row count and carries the
-  /// tensor's true extent in ``valid_shape``.  Only the row axis is boxed —
-  /// the column granularity is dtype-dependent and is not settled here.
-  bool cube_row_boxed = false;
+  /// Whether this operand carries the matmul's **M** axis, i.e. an axis the MAD
+  /// reads out of a whole number of NZ fractal boxes.  The logical extent of a
+  /// cube operand is essentially free (``pto.mad`` derives ``%m`` from the
+  /// operand's valid extent), but its *physical* extent on that axis must be a
+  /// multiple of the box, so the bridged tile allocates the boxed extent and
+  /// carries the tensor's true extent in ``valid_shape``.
+  ///
+  /// Which axis M lands on depends on this operand's own ``trans_kwarg``: an
+  /// untransposed operand has M on rows, while a transposed one is loaded
+  /// naturally with K on rows, so its M is the *column* axis.  The reduction
+  /// axis (K) and the output axis (N) are never boxed here — padding K would
+  /// feed uninitialised L1 into the sum.
+  bool cube_m_axis = false;
+  /// Index of the operand whose layout fixes the M alignment for the *whole*
+  /// call, when that is not this operand itself.  Every cube tile M runs
+  /// through has to agree on one padded extent — ``tile.matmul_acc`` requires
+  /// the accumulator and the product to have the same physical M — but the
+  /// granularity differs per tile: an Acc box is 16 rows for every dtype, while
+  /// a transposed left operand's column box is ``32 / sizeof(dtype)`` (32 for
+  /// INT8).  Naming one decider makes them share a single alignment.
+  std::optional<size_t> m_align_from_arg;
 };
 
 /**

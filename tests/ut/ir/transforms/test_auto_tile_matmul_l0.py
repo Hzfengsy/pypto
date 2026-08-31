@@ -1029,6 +1029,42 @@ class TestAutoTileMatmulL0FractalBoundary:
         printed = ir.python_print(After)
         assert f"valid_shape=[{m_dim}, " in printed, f"the accumulator must carry the true M={m_dim} extent"
 
+    @pytest.mark.parametrize("m_dim", [1, 17, 40, 100, 250])
+    def test_no_sub_fractal_cube_rows_for_the_accumulating_spelling(self, m_dim):
+        """``pl.matmul_acc`` holds the same invariant at the same set of M.
+
+        The accumulating spelling has a second cube tile the rule has to reach:
+        the accumulator, which is allocated rather than loaded. Since
+        ``tile.matmul_acc`` requires it and the product to agree on physical M,
+        an accumulator left at the declared extent would either reach ptoas
+        sub-fractal or be rejected outright against a boxed operand -- so the
+        two are boxed together, and this pass sees a 16-aligned M either way.
+        """
+        k_dim, n_dim = 256, 512
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[m_dim, k_dim], pl.FP16],
+                b: pl.Tensor[[k_dim, n_dim], pl.FP16],
+                out: pl.Out[pl.Tensor[[m_dim, n_dim], pl.FP32]],
+            ) -> pl.Tensor[[m_dim, n_dim], pl.FP32]:
+                acc = pl.create_tensor([m_dim, n_dim], pl.FP32)
+                c = pl.matmul_acc(acc, a, b)
+                out = pl.assemble(out, c, [0, 0])
+                return out
+
+        After = passes.auto_tile_matmul_l0()(_lower_to_tile_ops(Before))
+        rows = _cube_m_axis_rows(After)
+        assert rows, "expected at least one Left/Acc tile in the lowered program"
+        sub_fractal = sorted({r for r in rows if r % 16})
+        assert not sub_fractal, f"sub-fractal cube rows for M={m_dim}: {sub_fractal}"
+
+        printed = ir.python_print(After)
+        assert f"valid_shape=[{m_dim}, " in printed, f"the accumulator must carry the true M={m_dim} extent"
+
 
 class TestAutoTileMatmulL0PredicatedAcc:
     """A caller-written ``init_cond`` is threaded through the K-only emitter.

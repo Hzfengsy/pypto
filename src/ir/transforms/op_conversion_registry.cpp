@@ -1152,7 +1152,7 @@ void OpConversionRegistry::RegisterMatmulOps() {
         const std::string out_op = nd ? "tile.batch_matmul" : "tile.matmul";
         return ConversionResult{OpRegistry::GetInstance().Create(out_op, {args[0], args[1]}, span)};
       },
-      {{0, {MemorySpace::Mat, "a_trans", /*cube_row_boxed=*/true}}, {1, {MemorySpace::Mat, "b_trans"}}});
+      {{0, {MemorySpace::Mat, "a_trans", /*cube_m_axis=*/true}}, {1, {MemorySpace::Mat, "b_trans"}}});
 
   // tensor.matmul_acc: 2D × 2D × 2D → tile.matmul_acc; any operand ≥3D →
   // tile.batch_matmul_acc. Same a_trans/b_trans handling as tensor.matmul.
@@ -1175,14 +1175,18 @@ void OpConversionRegistry::RegisterMatmulOps() {
         if (args.size() == 4) out_args.push_back(args[3]);
         return ConversionResult{OpRegistry::GetInstance().Create(out_op, out_args, span)};
       },
-      // The left operand is deliberately NOT row-boxed here, unlike
-      // tensor.matmul's. tile.matmul_acc requires the accumulator and the
-      // product to agree on *physical* M, and the accumulator arrives from a
-      // separate tile.create whose allocation this rule cannot reach — boxing
-      // only the operand would turn an unaligned M from a ptoas rejection into
-      // an operand-mismatch one. Boxing an accumulator needs consumer-driven
-      // information about the create site and is left as follow-up work.
-      {{1, {MemorySpace::Mat, "a_trans"}}, {2, {MemorySpace::Mat, "b_trans"}}});
+      // Same M boxing as tensor.matmul, on *both* cube tiles the M axis runs
+      // through. tile.matmul_acc requires the accumulator and the product to
+      // agree on physical M, so boxing the left operand alone would trade a
+      // ptoas rejection for an operand-mismatch one — the two have to move
+      // together, which is what `m_align_from_arg` states: the accumulator's own
+      // Acc box is 16 rows, but it adopts whatever extent the left operand's
+      // layout requires. The accumulator's req carries no bridge load (there is
+      // no data path into Acc); it exists so ConsumerSpaceCollector can hand the
+      // demand back to the allocation site, where HandleBoxedAccCreate answers it.
+      {{0, {MemorySpace::Acc, std::nullopt, /*cube_m_axis=*/true, /*m_align_from_arg=*/1}},
+       {1, {MemorySpace::Mat, "a_trans", /*cube_m_axis=*/true}},
+       {2, {MemorySpace::Mat, "b_trans"}}});
 }
 
 // ============================================================================

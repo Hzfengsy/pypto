@@ -1771,19 +1771,27 @@ class TestConvertTensorToTileOps:
 
         _assert_convert_equal(Before, Expected)
 
-    def test_matmul_a_trans_lhs_keeps_its_natural_load(self):
-        """A transposed left operand is NOT row-boxed.
+    @pytest.mark.parametrize(
+        ("name", "dtype", "acc_dtype", "cols", "boxed_cols"),
+        [
+            # The column box holds 32 bytes' worth of elements: 16 for FP16, 32 for INT8.
+            ("fp16", DataType.FP16, DataType.FP32, 17, 32),
+            ("int8", DataType.INT8, DataType.INT32, 100, 128),
+        ],
+    )
+    def test_matmul_a_trans_lhs_is_boxed_on_its_column_axis(self, name, dtype, acc_dtype, cols, boxed_cols):
+        """A transposed left operand is boxed on its COLUMN axis, not its rows.
 
         ``a_trans`` loads the operand naturally and reinterprets it with a
         zero-copy ``tile.transpose_view``, so the loaded tile's row axis is the
-        matmul's ``K``, not its ``M``. Boxing rows there would pad the wrong axis;
-        the transposed dual's own granularity is dtype-dependent and is not
-        settled by this rule.
+        matmul's ``K`` and its *column* axis is ``M``. The box rule follows M to
+        whichever axis carries it. The granularity there is the fractal-512
+        column box, ``32 / sizeof(dtype)`` -- which is why the INT8 case pads to
+        128 rather than to the 112 a row-axis box would give.
         """
-        lhs_shape = [128, 17]
+        lhs_shape = [128, cols]
         rhs_shape = [128, 64]
-        out_shape = [17, 64]
-        dtype = DataType.FP16
+        out_shape = [cols, 64]
         in_specs: list[InSpec] = [("lhs", lhs_shape, dtype), ("rhs", rhs_shape, dtype)]
 
         def before_body(ib, ins):
@@ -1793,7 +1801,7 @@ class TestConvertTensorToTileOps:
             lhs_p, rhs_p = params
             lhs_mat = ib.let(
                 "lhs_mat",
-                tile_ops.load(lhs_p, [0, 0], lhs_shape, lhs_shape, target_memory=MemorySpace.Mat),
+                tile_ops.load(lhs_p, [0, 0], [128, boxed_cols], lhs_shape, target_memory=MemorySpace.Mat),
             )
             lhs_operand = ib.let("lhs_mat_t", tile_ops.transpose_view(lhs_mat))
             rhs_mat = ib.let(
@@ -1802,11 +1810,198 @@ class TestConvertTensorToTileOps:
             )
             return ib.let("y_tile", tile_ops.matmul(lhs_operand, rhs_mat))
 
-        before = _make_before(in_specs=in_specs, out_shape=out_shape, out_dtype=dtype, body=before_body)
+        before = _make_before(in_specs=in_specs, out_shape=out_shape, out_dtype=acc_dtype, body=before_body)
         expected = _make_expected(
-            in_specs=in_specs, out_shape=out_shape, out_dtype=dtype, body=expected_body, preload=False
+            in_specs=in_specs, out_shape=out_shape, out_dtype=acc_dtype, body=expected_body, preload=False
         )
         _assert_convert_equal(before, expected)
+
+    @pytest.mark.parametrize(
+        ("name", "rows", "boxed_rows"),
+        [
+            ("single_row", 1, 16),
+            ("just_over_one_box", 17, 32),
+            ("mid_box", 100, 112),
+        ],
+    )
+    def test_matmul_acc_boxes_its_accumulator_with_its_lhs(self, name, rows, boxed_rows):
+        """``tensor.matmul_acc`` takes exactly ``tensor.matmul``'s M constraint.
+
+        The same box rule binds both cube operands the M axis runs through, and
+        it has to bind them *together*: ``tile.matmul_acc`` requires the
+        accumulator and the product to agree on physical M, so boxing the left
+        operand alone would trade one hard error for another. The accumulator is
+        never loaded -- nothing but the matrix unit writes L0C -- so its
+        allocation is where the demand is answered, and the narrowing rides on a
+        ``tile.set_validshape`` because ``tile.create`` takes no valid extent.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self, a: pl.Tensor[[rows, 128], pl.FP16], b: pl.Tensor[[128, 64], pl.FP16]
+            ) -> pl.Tensor[[rows, 64], pl.FP32]:
+                acc: pl.Tensor[[rows, 64], pl.FP32] = pl.create_tensor([rows, 64], dtype=pl.FP32)
+                y: pl.Tensor[[rows, 64], pl.FP32] = pl.matmul_acc(acc, a, b)
+                return y
+
+            @pl.function
+            def main(
+                self, a: pl.Tensor[[rows, 128], pl.FP16], b: pl.Tensor[[128, 64], pl.FP16]
+            ) -> pl.Tensor[[rows, 64], pl.FP32]:
+                y: pl.Tensor[[rows, 64], pl.FP32] = self.main_incore_0(a, b)
+                return y
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                a: pl.Tensor[[rows, 128], pl.FP16],
+                b: pl.Tensor[[128, 64], pl.FP16],
+                ret0_out: pl.Out[pl.Tensor[[rows, 64], pl.FP32]],
+            ) -> pl.Tensor[[rows, 64], pl.FP32]:
+                # compact: the box rounds the allocation past the pitch `mad`
+                # writes at (ceil(valid/16)*16), so every reader has to recompute
+                # that pitch rather than derive it from the physical rows.
+                acc_storage = pl.tile.create(
+                    [boxed_rows, 64], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc, compact=True
+                )
+                acc_tile = pl.tile.set_validshape(acc_storage, rows, 64)
+                a_mat: pl.Tile[[boxed_rows, 128], pl.FP16, pl.MemorySpace.Mat] = pl.load(
+                    a, [0, 0], [boxed_rows, 128], [rows, 128], target_memory=pl.MemorySpace.Mat
+                )
+                b_mat: pl.Tile[[128, 64], pl.FP16, pl.MemorySpace.Mat] = pl.load(
+                    b, [0, 0], [128, 64], [128, 64], target_memory=pl.MemorySpace.Mat
+                )
+                y_tile = pl.tile.matmul_acc(acc_tile, a_mat, b_mat)
+                out_store: pl.Tensor[[rows, 64], pl.FP32] = pl.store(y_tile, [0, 0], ret0_out)
+                return out_store
+
+            @pl.function
+            def main(
+                self, a: pl.Tensor[[rows, 128], pl.FP16], b: pl.Tensor[[128, 64], pl.FP16]
+            ) -> pl.Tensor[[rows, 64], pl.FP32]:
+                ret0_out: pl.Tensor[[rows, 64], pl.FP32] = pl.create_tensor([rows, 64], dtype=pl.FP32)
+                y: pl.Tensor[[rows, 64], pl.FP32] = self.main_incore_0(a, b, ret0_out)
+                return y
+
+        _assert_convert_equal(Before, Expected)
+
+    @pytest.mark.parametrize(
+        ("name", "dtype", "acc_dtype", "cols", "boxed"),
+        [
+            # FP16's column box is 16, so M lands on the same 16 the accumulator
+            # wants. INT8's is 32, which is the case that proves the two share
+            # one alignment rather than each taking its own.
+            ("fp16", DataType.FP16, DataType.FP32, 17, 32),
+            ("int8", DataType.INT8, DataType.INT32, 100, 128),
+        ],
+    )
+    def test_matmul_acc_a_trans_shares_the_operand_column_alignment(
+        self, name, dtype, acc_dtype, cols, boxed
+    ):
+        """An ``a_trans`` accumulator adopts the operand's column granularity.
+
+        The op requires the accumulator and the product to agree on physical M,
+        but the two tiles' own box granularities differ: an Acc box is 16 rows
+        for every dtype, while a transposed operand's column box is
+        ``32 / sizeof(dtype)`` -- 32 for INT8. Each taking its own would give a
+        128-row product and a 112-row accumulator. ``m_align_from_arg`` makes the
+        accumulator adopt the left operand's, so both land on 128.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self, a: pl.Tensor[[128, cols], dtype], b: pl.Tensor[[128, 64], dtype]
+            ) -> pl.Tensor[[cols, 64], acc_dtype]:
+                acc: pl.Tensor[[cols, 64], acc_dtype] = pl.create_tensor([cols, 64], dtype=acc_dtype)
+                y: pl.Tensor[[cols, 64], acc_dtype] = pl.matmul_acc(acc, a, b, a_trans=True)
+                return y
+
+            @pl.function
+            def main(
+                self, a: pl.Tensor[[128, cols], dtype], b: pl.Tensor[[128, 64], dtype]
+            ) -> pl.Tensor[[cols, 64], acc_dtype]:
+                y: pl.Tensor[[cols, 64], acc_dtype] = self.main_incore_0(a, b)
+                return y
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                a: pl.Tensor[[128, cols], dtype],
+                b: pl.Tensor[[128, 64], dtype],
+                ret0_out: pl.Out[pl.Tensor[[cols, 64], acc_dtype]],
+            ) -> pl.Tensor[[cols, 64], acc_dtype]:
+                acc_storage = pl.tile.create(
+                    [boxed, 64], dtype=acc_dtype, target_memory=pl.MemorySpace.Acc, compact=True
+                )
+                acc_tile = pl.tile.set_validshape(acc_storage, cols, 64)
+                # M is the operand's column axis: the natural load pads there and
+                # transpose_view swaps it onto the product's row axis.
+                a_mat: pl.Tile[[128, boxed], dtype, pl.MemorySpace.Mat] = pl.load(
+                    a, [0, 0], [128, boxed], [128, cols], target_memory=pl.MemorySpace.Mat
+                )
+                a_mat_t = pl.tile.transpose_view(a_mat)
+                b_mat: pl.Tile[[128, 64], dtype, pl.MemorySpace.Mat] = pl.load(
+                    b, [0, 0], [128, 64], [128, 64], target_memory=pl.MemorySpace.Mat
+                )
+                y_tile = pl.tile.matmul_acc(acc_tile, a_mat_t, b_mat)
+                out_store: pl.Tensor[[cols, 64], acc_dtype] = pl.store(y_tile, [0, 0], ret0_out)
+                return out_store
+
+            @pl.function
+            def main(
+                self, a: pl.Tensor[[128, cols], dtype], b: pl.Tensor[[128, 64], dtype]
+            ) -> pl.Tensor[[cols, 64], acc_dtype]:
+                ret0_out: pl.Tensor[[cols, 64], acc_dtype] = pl.create_tensor([cols, 64], dtype=acc_dtype)
+                y: pl.Tensor[[cols, 64], acc_dtype] = self.main_incore_0(a, b, ret0_out)
+                return y
+
+        _assert_convert_equal(Before, Expected)
+
+    def test_loop_carried_accumulator_seed_is_row_boxed(self):
+        """A split-K accumulator reaches its matmul_acc as an ``IterArg``.
+
+        The seed is allocated before the loop and the body accumulates into the
+        carry, so the demand has to cross two hops the collector used to drop:
+        an ``IterArg`` is not matched by ``As<Var>`` at the use site, and its
+        link back to the seed is not an inherit-input edge. Without both, the
+        seed keeps its unaligned physical rows while the boxed operand gives a
+        wider product, and the op rejects the pair on physical M.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self, a: pl.Tensor[[17, 128], pl.FP16], b: pl.Tensor[[128, 64], pl.FP16]
+            ) -> pl.Tensor[[17, 64], pl.FP32]:
+                seed: pl.Tensor[[17, 64], pl.FP32] = pl.create_tensor([17, 64], dtype=pl.FP32)
+                for _k, (carry,) in pl.range(2, init_values=(seed,)):
+                    step: pl.Tensor[[17, 64], pl.FP32] = pl.matmul_acc(carry, a, b)
+                    acc: pl.Tensor[[17, 64], pl.FP32] = pl.yield_(step)
+                return acc
+
+            @pl.function
+            def main(
+                self, a: pl.Tensor[[17, 128], pl.FP16], b: pl.Tensor[[128, 64], pl.FP16]
+            ) -> pl.Tensor[[17, 64], pl.FP32]:
+                y: pl.Tensor[[17, 64], pl.FP32] = self.main_incore_0(a, b)
+                return y
+
+        After = passes.convert_tensor_to_tile_ops()(Before)
+        printed = ir.python_print(After)
+        assert "pl.tile.create([32, 64]" in printed, printed
+        assert "pl.tile.set_validshape(" in printed, printed
+        # The operand is boxed to the same physical M, so the op's physical-M
+        # agreement holds -- which is what the pass would otherwise break.
+        assert "[32, 128], [17, 128]" in printed, printed
 
     def test_mixed_kernel_vec_btrans_moves_to_mat_then_views(self):
         """A Vec compute result (add) feeding a b_trans=True 2D matmul is bridged to Mat

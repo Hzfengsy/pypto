@@ -1485,6 +1485,13 @@ PTOCodegen::AllocTileFields PTOCodegen::ComputeAllocTileFields(
   // extent is conveyed via valid_row / valid_col operands below.
   fields.type_str = GetTileBufTypeStringFromTileType(tile_type);
 
+  // Every `pto.alloc_tile` PyPTO emits passes through here, so this is the one
+  // place a physically illegal box grid can be caught with the IR location and
+  // an actionable remedy -- rather than by PTOAS, whose message names its own
+  // internals and points at whichever line the location happened to carry.
+  CheckBoxedTileExtents(ExtractTileTypeInfo(*tile_type, GetTypeString(tile_type->dtype_)), tile_type->dtype_,
+                        tile_type->GetMemorySpace(), current_span_);
+
   // Cast a non-index integer SSA to `index` (PTOAS expects index typed
   // valid_row / valid_col operands). Floating-point operands are rejected.
   auto cast_to_index = [&](const std::string& ssa, const ir::ExprPtr& expr) -> std::string {

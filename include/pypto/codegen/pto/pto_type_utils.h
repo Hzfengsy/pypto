@@ -13,10 +13,12 @@
 #define PYPTO_CODEGEN_PTO_PTO_TYPE_UTILS_H_
 
 #include <cstdint>
+#include <optional>
 #include <string>
 
 #include "pypto/core/dtype.h"
 #include "pypto/ir/memory_space.h"
+#include "pypto/ir/span.h"
 #include "pypto/ir/type.h"
 
 namespace pypto {
@@ -87,6 +89,33 @@ struct TileTypeComponents {
 /// @param dtype_str_override Optional override for the dtype string (e.g.,
 ///                           PTOCodegen::GetTypeString); empty falls back to
 ///                           DataTypeToMLIR(tile_type.dtype_).
+/// Reject a boxed tile whose physical extent is not a whole number of fractal
+/// boxes, before the `pto.alloc_tile` that declares it reaches PTOAS.
+///
+/// PTO addresses a boxed tile one box at a time, so a partial box has no
+/// address at all. PTOAS enforces that on the op it receives, but its message
+/// (``'pto.alloc_tile' op expects result boxed tile rows to be a multiple of
+/// innerRows (16)``) names PTOAS internals, points at whichever line the
+/// location happened to carry, and offers no remedy. Checking the same rule
+/// where PyPTO emits the allocation reports the tile, the axis, the extent to
+/// reach, and how to reach it.
+///
+/// The rule mirrors PTOAS' ``verifyBoxedTileLayout`` exactly: the box is 16x16
+/// for the fractal-1024 accumulator, and ``16 x (32 / sizeof(dtype))`` for a
+/// fractal-512 Mat/Left/Right tile (transposed on a ``col_major`` scatter
+/// layout). A non-boxed (``none_box``) layout, the MX-scale fractal, a
+/// sub-byte carrier, a single-row tile, and Vec's row axis are all exempt —
+/// the same exemptions PTOAS applies.
+///
+/// @param components Rendered tile geometry, as it will appear in the emitted
+///                   ``!pto.tile_buf<...>`` type string.
+/// @param dtype      Element type the box granularity is derived from.
+/// @param space      Resolved memory space (Vec relaxes the row rule).
+/// @param span       IR location reported on failure; may be null when the
+///                   emitter has no statement in scope.
+void CheckBoxedTileExtents(const TileTypeComponents& components, const DataType& dtype,
+                           const std::optional<ir::MemorySpace>& space, const ir::Span* span);
+
 TileTypeComponents ExtractTileTypeInfo(const ir::TileType& tile_type,
                                        const std::string& dtype_str_override = "");
 

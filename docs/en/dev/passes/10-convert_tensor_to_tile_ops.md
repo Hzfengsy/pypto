@@ -160,7 +160,7 @@ When `tensor.slice` feeds into `tensor.matmul` or `tensor.matmul_acc`, the slice
 
 The demand is propagated **through** zero-copy metadata ops that declare `set_output_memory_inherit_input()` — `tensor.slice`, `tensor.view`, `tensor.reshape`, `tensor.reinterpret_view`, `tensor.set_validshape`. So an operand written as `pl.matmul(pl.set_validshape(a[:, :K], rows, K), b)` still loads straight to Mat. An op that aliases its input's storage but omits that declaration breaks the chain: the operand materializes in Vec and needs a `tile.move` to Mat, which is a vector→cube boundary that flips an otherwise pure-CUBE InCore scope to `MIXED` and makes [`ExpandMixedKernel`](22-expand_mixed_kernel.md) split it into an AIC/AIV pair.
 
-## Cube Operand Row Boxing
+## Cube Operand M-Axis Boxing
 
 A cube operand has two independent extents, and only one of them is constrained.
 
@@ -168,13 +168,14 @@ A cube operand has two independent extents, and only one of them is constrained.
   `N` from the operands' *valid* region, bounded at `[1, 4095]` with no
   divisibility rule; `pto.mad` carries a `disable_gemv` clause whose whole
   purpose is selecting the L0A organization at `%m == 1`.
-- The **physical** extent must be a whole number of NZ fractal boxes. The inner
-  box is 16 rows on every generation and dtype (`FRACTAL_NZ_ROW`). ptoas enforces
-  it directly — `'pto.alloc_tile' op expects result boxed tile rows to be a
+- The **physical** extent must be a whole number of NZ fractal boxes. A box is
+  16 rows tall on every generation and dtype; it is
+  `32 bytes / sizeof(dtype)` wide (16 for FP16, 32 for INT8). ptoas enforces it
+  directly — `'pto.alloc_tile' op expects result boxed tile rows to be a
   multiple of innerRows (16)` — and pto-isa's `TExtract` repeats it as a static
   assertion on the Mat source it reads.
 
-So the left operand of a 2-D `tensor.matmul` bridges into Mat with its row extent
+So every cube tile the matmul's M axis runs through is allocated with that extent
 rounded up to the box, and the tensor's true extent declared as `valid_shape`:
 
 ```python
@@ -198,26 +199,103 @@ picks a 16-aligned tile and peels the remainder, and a multiple of 16 can only b
 split into 16-aligned pieces, tail included. It therefore needs no boundary
 special case.
 
-The rule rides on the *demand*, not on one code path. Three sites can answer a
-matmul's Mat requirement, and all three box: `BridgeInputSpaces` for an operand
+### Which axis carries M
+
+M does not always land on the row axis. An `a_trans` operand is loaded
+*naturally* and reinterpreted by a zero-copy `tile.transpose_view`, so its
+loaded tile has `K` on rows and `M` on **columns** — the box rule follows M to
+whichever axis holds it (`InputSpaceReq::cube_m_axis` resolves the axis from the
+operand's own transpose flag):
+
+```python
+# a: Tensor[[128, 100]], a_trans=True — M is the load's column extent
+a_mat = pl.tile.load(a, [0, 0], [128, 112], [128, 100], target_memory=pl.Mem.Mat)
+a_t   = pl.tile.transpose_view(a_mat)   # Tile[[112, 128]] valid [100, 128]
+```
+
+That also means the *granularity* differs per tile even though the padded extent
+must not: an Acc box is 16 rows for every dtype, while a transposed operand's
+column box is `32 / sizeof(dtype)`. A transposed INT8 operand therefore needs 32,
+and the accumulator paired with it has to adopt that same 32 — each taking its
+own would give a 128-row product against a 112-row accumulator, which
+`tile.matmul_acc` rejects. `InputSpaceReq::m_align_from_arg` names the left
+operand as the single decider, and the alignment is the lcm of its box and the
+accumulator's 16 rows (every granularity involved is a power of two, so the lcm
+is the max).
+
+The rule rides on the *demand*, not on one code path. Four sites can answer a
+matmul's operand requirement, and all four box: `BridgeInputSpaces` for an operand
 that is still a tensor at the call; `HandleConsumerDrivenLoad` when a
 `tensor.slice` (or any `set_output_memory_inherit_input()` chain) answers it at
-the producer; and the Phase-1 entry loop when the producer is a parameter, which
-is what a `pl.matmul(pl.set_validshape(a, ...), b)` reaches. `ConsumerSpaceReq`
-therefore carries the box flag alongside the memory space. When several consumers share one
-producer, the rows are boxed only if every one of them asks for it, so a consumer
-that reads the tile at its declared physical shape is never handed a padded one.
+the producer; the Phase-1 entry loop when the producer is a parameter, which
+is what a `pl.matmul(pl.set_validshape(a, ...), b)` reaches; and
+`HandleBoxedAccCreate` for an accumulator, which is allocated rather than loaded.
+`ConsumerSpaceReq` therefore carries the box flag alongside the memory space. When
+several consumers share one producer, the rows are boxed only if every one of them
+asks for it, so a consumer that reads the tile at its declared physical shape is
+never handed a padded one.
+
+### `tensor.matmul_acc` boxes its accumulator with its operand
+
+`tensor.matmul_acc` takes exactly `tensor.matmul`'s M constraint, because the two
+cube tiles the M axis runs through must be boxed *together*: `tile.matmul_acc`
+requires the accumulator and the matrix product to agree on physical M, so boxing
+the left operand alone would trade a ptoas rejection for an operand-mismatch one.
+
+The accumulator is never loaded — nothing but the matrix unit writes L0C — so its
+allocation is the site that answers the demand. `HandleBoxedAccCreate` rewrites
+the `tensor.create` that seeds it, and the narrowing rides on a separate
+`tile.set_validshape` because `tile.create` takes no valid extent:
+
+```python
+# Before  (M = 100)
+acc = pl.create_tensor([100, 64], pl.FP32)
+c = pl.matmul_acc(acc, a, b)
+
+# After
+acc_storage = pl.tile.create([112, 64], dtype=pl.FP32, target_memory=pl.Mem.Acc)
+acc_tile = pl.tile.set_validshape(acc_storage, 100, 64)   # Tile[[112, 64]] valid [100, 64]
+a_mat = pl.tile.load(a, [0, 0], [112, 128], [100, 128], target_memory=pl.Mem.Mat)
+c_tile = pl.tile.matmul_acc(acc_tile, a_mat, b_mat)
+```
+
+Two details this path settles that the operand path does not:
+
+- **The space is stated, not left to [`InferTileMemorySpace`](18-infer_tile_memory_space.md).**
+  The plain `tensor.create` conversion deliberately leaves `target_memory` unset,
+  having no consumer context to derive it from; here there is one, and it is the
+  same demand that asked for the boxing. Stating it also matters for correctness:
+  an Acc tile's implicit view is boxed NZ, so a seed left unresolved would carry
+  the raw row-major view and disagree with the `tile.matmul_acc` result it is
+  carried against across a split-K loop.
+- **The demand crosses the loop carry.** A split-K accumulator is allocated before
+  the loop and reaches its `tile.matmul_acc` as an `IterArg`, so
+  `ConsumerSpaceCollector` matches operands with `AsVarLike` (an `IterArg` carries
+  its own `ObjectKind`) and records a propagation edge from each `IterArg` to the
+  value that seeds it.
+
+The boxed accumulator is declared **compact**. `mad` lays the product out at a
+pitch of `ceil(validRow/16)*16` — 112 for a 100-row product — while a
+non-compact reader derives its stride from the physical row count, which the box
+rounded to 112 or, at a 32-row alignment, to 128. Compact makes every reader
+recompute the pitch `mad` actually used; without it `AccCompactValid` rejects the
+program (issue #2470).
 
 Scope, and what is deliberately left out:
 
 | Case | Boxed? | Why |
 | ---- | ------ | --- |
-| 2-D `tensor.matmul` left operand | Yes | Its row axis is M, whose box height is 16 for every dtype |
-| Right operand | No | Its rows are `K`, whose granularity is `32 bytes / sizeof(dtype)` — dtype-dependent, and not settled here |
-| `a_trans` left operand | No | The natural load's row axis is K; the zero-copy `tile.transpose_view` makes the *column* axis M |
+| 2-D `tensor.matmul` left operand | Yes, on rows | Its row axis is M, whose box height is 16 for every dtype |
+| 2-D `tensor.matmul_acc` left operand and accumulator | Yes, on rows | Same axis, same rule — and the op requires the two to agree on physical M, so they move together |
+| `a_trans` left operand, and the accumulator paired with it | Yes, on columns | The natural load's row axis is K, so M is the column extent; the accumulator adopts that operand's column granularity via `m_align_from_arg` |
+| Right operand | No | Its rows are `K`, the reduction axis — padding it would feed uninitialised L1 into the sum unless the hardware masks by valid col, which is unverified |
+| Output `N` | No | Same open question as `K`; [`AutoTileMatmulL0`](16-auto_tile_matmul_l0.md)'s `PH-AT-007` declines it for the same reason |
 | Rank >= 3 operand | No | It lowers to `tile.batch_matmul`, whose rows [`FlattenTileNdTo2D`](13-flatten_tile_nd_to_2d.md) row-packs into one `[B*M, N]` tile — the box rule binds that packed extent, not this dimension |
-| Dynamic row extent | No | No compile-time box to round to |
-| `tensor.matmul_acc` left operand | No | `tile.matmul_acc` requires the accumulator and the product to agree on *physical* M, and the accumulator arrives from a separate `tile.create` this rule cannot reach |
+| Dynamic M extent | No | No compile-time box to round to |
+
+Every case this pass declines still reaches a PyPTO-level error rather than a
+ptoas one: [PTO codegen](../codegen/00-pto_codegen.md#boxed-tile-extents)
+validates the box grid of every `pto.alloc_tile` it emits.
 
 ## Transpose Lowering
 

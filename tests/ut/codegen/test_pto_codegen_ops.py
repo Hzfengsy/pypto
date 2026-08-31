@@ -4854,24 +4854,28 @@ class TestB03TriAndGatherCodegen:
             def kernel(
                 self,
                 mem: pl.Tensor[[64, 32], dtype],
-                idx: pl.Tensor[[1, 16], pl.INT32],
-                eye: pl.Tensor[[16, 16], dtype],
-                out: pl.Tensor[[16, 32], pl.FP32],
-            ) -> pl.Tensor[[16, 32], pl.FP32]:
-                gathered: pl.Tile[[16, 32], dtype] = pl.tile.mgather(
+                idx: pl.Tensor[[1, 32], pl.INT32],
+                # K = 32, not 16: an 8-bit Mat tile's column box holds
+                # 32 bytes / 1 byte = 32 elements, so a 16-column operand is a
+                # partial box with no address. This operand is scaffolding for
+                # the mgather under test, so it takes the legal K.
+                eye: pl.Tensor[[32, 32], dtype],
+                out: pl.Tensor[[32, 32], pl.FP32],
+            ) -> pl.Tensor[[32, 32], pl.FP32]:
+                gathered: pl.Tile[[32, 32], dtype] = pl.tile.mgather(
                     mem,
                     idx,
                     target_memory=pl.MemorySpace.Mat,
                 )
-                eye_tile: pl.Tile[[16, 16], dtype] = pl.load(
-                    eye, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat
+                eye_tile: pl.Tile[[32, 32], dtype] = pl.load(
+                    eye, [0, 0], [32, 32], target_memory=pl.MemorySpace.Mat
                 )
-                product: pl.Tile[[16, 32], pl.FP32] = pl.matmul(eye_tile, gathered)
+                product: pl.Tile[[32, 32], pl.FP32] = pl.matmul(eye_tile, gathered)
                 return pl.store(product, [0, 0], out)
 
         mlir = self._generate_mlir(Prog, BackendType.Ascend950)
         mem_type = f"!pto.partition_tensor_view<64x32x{dtype_text}>"
-        idx_type = "!pto.partition_tensor_view<1x16xi32>"
+        idx_type = "!pto.partition_tensor_view<1x32xi32>"
         self._assert_partition_view(mlir, result="%mem_pview", source="%mem_view", result_type=mem_type)
         self._assert_partition_view(mlir, result="%idx_pview", source="%idx_view", result_type=idx_type)
         gathered_type = self._alloc_tile_type(mlir, "%gathered")
