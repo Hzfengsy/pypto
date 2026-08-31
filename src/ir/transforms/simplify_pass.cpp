@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <unordered_map>
@@ -73,6 +74,156 @@ class MultiAssignCollector : public IRVisitor {
   std::unordered_set<const Var*> seen_;
 };
 
+/// Answers, for each control-flow statement Fold A / Fold B may collapse,
+/// whether any use of its return_vars would outlive the substitution the fold
+/// records in place of a definition.
+///
+/// Both folds lift a kept branch / unrolled body by writing
+/// `return_var -> yielded_value` into `var_remap_` instead of emitting an
+/// AssignStmt, and ForStmt, WhileStmt and IfStmt each restore `var_remap_` to a
+/// pre-body baseline on the way out so a body-internal remap cannot rewrite
+/// siblings or post-loop code. A use that outlives that restore therefore keeps
+/// the original Var -- which the fold left with no defining statement, i.e. a
+/// dangling reference UseAfterDef reports.
+///
+/// The analysis is one pre-order walk that numbers the restoring scopes. A
+/// scope owns the contiguous id range `[id, end)` of its own subtree, so "every
+/// use of v sits inside scope S" reduces to two integer comparisons. A
+/// monotonic `tick` orders uses against the fold site, so a use *preceding* it
+/// inside the same scope (reachable pre-SSA via a loop-carried read) counts as
+/// escaping too.
+///
+/// Nothing escapes in SSA form: a value defined inside a region is never
+/// referenced outside it, and every use is dominated by its definition. The
+/// pipeline runs Simplify only after ConvertToSSA (positions 5 and 46), so the
+/// materializing path this index unlocks is reachable only from callers that
+/// run Simplify directly on pre-SSA IR.
+class ReturnVarEscapeIndex : public IRVisitor {
+ public:
+  /// Index one self-contained region: a function body, or the body Fold B
+  /// DeepClones (whose fresh Var identities appear in no other region).
+  ///
+  /// The region is pinned for the index's lifetime. Entries are keyed by raw
+  /// Var / Stmt pointers, and a freed clone's address can be recycled by a
+  /// later `make_shared` -- the same hazard the Fold B var_remap_ snapshot
+  /// guards against -- which would alias a stale entry onto an unrelated node.
+  void IndexRegion(const StmtPtr& body) {
+    if (!body) return;
+    pinned_.push_back(body);
+    EnterScope();
+    VisitStmt(body);
+    LeaveScope();
+  }
+
+  /// True when collapsing @p folded would strand a use of @p rv: a use outside
+  /// the innermost var_remap_-restoring scope containing @p folded, or one that
+  /// precedes @p folded within it.
+  bool Escapes(const Stmt* folded, const Var* rv) const {
+    auto site = sites_.find(folded);
+    if (site == sites_.end()) return false;  // never indexed -> keep substituting
+    auto use = uses_.find(rv);
+    if (use == uses_.end()) return false;  // unused -> nothing to strand
+    const size_t scope = site->second.scope;
+    return use->second.min_scope < scope || use->second.max_scope >= scopes_[scope].end ||
+           use->second.min_tick < site->second.tick;
+  }
+
+  void VisitVarLike_(const VarPtr& op) override {
+    auto& use = uses_[op.get()];
+    use.min_scope = std::min(use.min_scope, stack_.back());
+    use.max_scope = std::max(use.max_scope, stack_.back());
+    use.min_tick = std::min(use.min_tick, tick_);
+    ++tick_;
+    IRVisitor::VisitVarLike_(op);
+  }
+
+  // The three statements whose visitors restore var_remap_ around their bodies.
+  // Their traversal order mirrors the IRVisitor base; it is spelled out here
+  // only so the body is walked inside its own scope.
+
+  void VisitStmt_(const ForStmtPtr& op) override {
+    RecordSite(op.get());
+    VisitExpr(op->loop_var_);
+    VisitExpr(op->start_);
+    VisitExpr(op->stop_);
+    VisitExpr(op->step_);
+    for (const auto& iter_arg : op->iter_args_) VisitExpr(iter_arg);
+    EnterScope();
+    VisitStmt(op->body_);
+    LeaveScope();
+    for (const auto& return_var : op->return_vars_) VisitExpr(return_var);
+  }
+
+  void VisitStmt_(const IfStmtPtr& op) override {
+    RecordSite(op.get());
+    VisitExpr(op->condition_);
+    // Each branch is its own scope: the IfStmt visitor rebases var_remap_
+    // between them, and keeps a branch's additions only when Fold A fires.
+    // Treating a kept branch as restoring is conservative -- it materializes
+    // where substitution would also have worked.
+    EnterScope();
+    VisitStmt(op->then_body_);
+    LeaveScope();
+    if (op->else_body_.has_value()) {
+      EnterScope();
+      VisitStmt(*op->else_body_);
+      LeaveScope();
+    }
+    for (const auto& return_var : op->return_vars_) VisitExpr(return_var);
+  }
+
+  void VisitStmt_(const WhileStmtPtr& op) override {
+    // No RecordSite: Simplify never folds a WhileStmt away, it only restores
+    // var_remap_ around the body -- which is what makes this a scope.
+    VisitExpr(op->condition_);
+    for (const auto& iter_arg : op->iter_args_) VisitExpr(iter_arg);
+    EnterScope();
+    VisitStmt(op->body_);
+    LeaveScope();
+    for (const auto& return_var : op->return_vars_) VisitExpr(return_var);
+  }
+
+ private:
+  /// A var_remap_-restoring region. Pre-order ids make a scope's subtree the
+  /// half-open range [own id, end).
+  struct Scope {
+    size_t end = 0;
+  };
+
+  /// Where a foldable control-flow statement sits: its enclosing scope, and the
+  /// tick it was reached at.
+  struct Site {
+    size_t scope = 0;
+    size_t tick = 0;
+  };
+
+  /// The scope range and earliest tick over all uses of one Var.
+  struct Use {
+    size_t min_scope = std::numeric_limits<size_t>::max();
+    size_t max_scope = 0;
+    size_t min_tick = std::numeric_limits<size_t>::max();
+  };
+
+  void EnterScope() {
+    stack_.push_back(scopes_.size());
+    scopes_.push_back({});
+  }
+
+  void LeaveScope() {
+    scopes_[stack_.back()].end = scopes_.size();
+    stack_.pop_back();
+  }
+
+  void RecordSite(const Stmt* op) { sites_[op] = Site{stack_.back(), tick_}; }
+
+  std::vector<Scope> scopes_;
+  std::vector<size_t> stack_;
+  std::unordered_map<const Stmt*, Site> sites_;
+  std::unordered_map<const Var*, Use> uses_;
+  std::vector<StmtPtr> pinned_;
+  size_t tick_ = 0;
+};
+
 /// Strip the trailing YieldStmt from @p body and return both the stripped
 /// body and the yielded values that the caller should bind into its
 /// var_remap_ as `return_vars[i] → yielded_values[i]`. Used by control-flow
@@ -125,8 +276,9 @@ StrippedYield StripTrailingYield(const StmtPtr& body, size_t return_var_count) {
 
 class SimplifyMutator : public arith::IRMutatorWithAnalyzer {
  public:
-  SimplifyMutator(arith::Analyzer* analyzer, std::unordered_set<const Var*> multi_assigned)
-      : IRMutatorWithAnalyzer(analyzer), multi_assigned_(std::move(multi_assigned)) {}
+  SimplifyMutator(arith::Analyzer* analyzer, std::unordered_set<const Var*> multi_assigned,
+                  ReturnVarEscapeIndex* escapes)
+      : IRMutatorWithAnalyzer(analyzer), multi_assigned_(std::move(multi_assigned)), escapes_(escapes) {}
 
   /// Fold scalar constant bindings at every Var leaf. Reached via the base
   /// IRMutator's qualified ExprFunctor::VisitExpr dispatch when walking Call
@@ -295,6 +447,11 @@ class SimplifyMutator : public arith::IRMutatorWithAnalyzer {
         // distinct from anything in the surrounding scope.
         auto cloned = DeepClone(op->body_, sub_map, /*clone_def_vars=*/true);
 
+        // Index the clone as its own region: its Vars are freshly minted, so a
+        // fold nested inside it would otherwise miss the escape analysis and
+        // fall back to substituting.
+        escapes_->IndexRegion(cloned.cloned_body);
+
         // Snapshot var_remap_ around the cloned-body visit. MaybeRebuildVar
         // inserts entries keyed by the cloned-body's defining-Var raw pointers
         // (the freshly-allocated clones); after this Fold returns, those clones
@@ -317,7 +474,7 @@ class SimplifyMutator : public arith::IRMutatorWithAnalyzer {
         auto unrolled_body = VisitStmt(cloned.cloned_body);
 
         var_remap_ = std::move(baseline_remap);
-        return LiftBodyToReturnVars(unrolled_body, op->return_vars_);
+        return LiftBodyToReturnVars(unrolled_body, op->return_vars_, op.get());
       }
     }
 
@@ -455,7 +612,7 @@ class SimplifyMutator : public arith::IRMutatorWithAnalyzer {
             << "Internal error: IfStmt with no else branch must have empty return_vars_";
         return loop_repair::MakeBody({}, op->span_);
       }
-      return LiftBodyToReturnVars(kept, op->return_vars_);
+      return LiftBodyToReturnVars(kept, op->return_vars_, op.get());
     }
 
     bool changed = (new_condition.get() != op->condition_.get()) ||
@@ -803,26 +960,55 @@ class SimplifyMutator : public arith::IRMutatorWithAnalyzer {
   }
 
   /// Lift @p kept_body into the parent scope when a control-flow fold has
-  /// chosen it as the surviving branch. Strips the trailing YieldStmt and
-  /// records `return_vars[i] → yielded_value[i]` in `var_remap_` so any
-  /// downstream uses (subsequent siblings, ReturnStmt) read the yielded
-  /// value directly. Shared by Fold A (IfStmt) and the one-trip case of
-  /// Fold B (ForStmt).
+  /// chosen it as the surviving branch, @p folded being the statement being
+  /// collapsed. Strips the trailing YieldStmt and records
+  /// `return_vars[i] → yielded_value[i]` in `var_remap_` so any downstream
+  /// uses (subsequent siblings, ReturnStmt) read the yielded value directly.
+  /// Shared by Fold A (IfStmt) and the one-trip case of Fold B (ForStmt).
   ///
   /// Substituting via var_remap_ (rather than emitting `AssignStmt(rv, val)`)
   /// avoids alias assignments that the orchestration codegen lowers
   /// incorrectly when both sides derive from a role-tagged parameter name
   /// (e.g. both vars have base name "out", producing `auto out = out;`).
-  StmtPtr LiftBodyToReturnVars(const StmtPtr& kept_body, const std::vector<VarPtr>& return_vars) {
+  ///
+  /// The substitution only reaches uses visited while the entry is live: the
+  /// enclosing ForStmt / WhileStmt / IfStmt rebases `var_remap_` on the way
+  /// out. A return var whose uses outlive that restore is materialized as a
+  /// real `AssignStmt` instead, since the fold is otherwise removing its only
+  /// definition. That assignment stays *at the fold site*: the yielded value
+  /// may name Vars local to the body, so it cannot be hoisted past the loop.
+  /// ReturnVarEscapeIndex proves no return var escapes in SSA form, so this
+  /// only fires for callers running Simplify on pre-SSA IR.
+  StmtPtr LiftBodyToReturnVars(const StmtPtr& kept_body, const std::vector<VarPtr>& return_vars,
+                               const Stmt* folded) {
     if (return_vars.empty()) return kept_body;
     auto stripped = StripTrailingYield(kept_body, return_vars.size());
+
+    std::vector<StmtPtr> materialized;
     for (size_t i = 0; i < return_vars.size(); ++i) {
-      var_remap_[return_vars[i].get()] = stripped.yielded_values[i];
+      const auto& value = stripped.yielded_values[i];
+      if (escapes_->Escapes(folded, return_vars[i].get())) {
+        materialized.push_back(
+            std::make_shared<AssignStmt>(MaybeRebuildVar(return_vars[i]), value, value->span_));
+        continue;
+      }
+      var_remap_[return_vars[i].get()] = value;
     }
-    return stripped.body ? stripped.body : loop_repair::MakeBody({}, kept_body->span_);
+
+    if (materialized.empty()) {
+      return stripped.body ? stripped.body : loop_repair::MakeBody({}, kept_body->span_);
+    }
+    std::vector<StmtPtr> out;
+    if (stripped.body) out = transform_utils::FlattenToStmts(stripped.body);
+    out.insert(out.end(), materialized.begin(), materialized.end());
+    return loop_repair::MakeBody(out, kept_body->span_);
   }
 
   std::unordered_set<const Var*> multi_assigned_;
+
+  /// Escape analysis for the return vars of foldable control-flow statements.
+  /// Owned by TransformSimplify, valid for this mutator's lifetime.
+  ReturnVarEscapeIndex* escapes_;
 
   /// Scalar Vars bound via BindScalar / BindScalarBound, in bind order. Used
   /// by UnbindScalarsSince to scope bindings to the region they were made in.
@@ -838,8 +1024,11 @@ FunctionPtr TransformSimplify(const FunctionPtr& func) {
   MultiAssignCollector collector;
   collector.VisitStmt(func->body_);
 
+  ReturnVarEscapeIndex escapes;
+  escapes.IndexRegion(func->body_);
+
   auto analyzer = std::make_shared<arith::Analyzer>();
-  SimplifyMutator mutator(analyzer.get(), std::move(collector.multi_assigned));
+  SimplifyMutator mutator(analyzer.get(), std::move(collector.multi_assigned), &escapes);
   auto new_body = mutator.VisitStmt(func->body_);
 
   // Final step: drop dead IfStmt phi return_vars + matching yield slots, with

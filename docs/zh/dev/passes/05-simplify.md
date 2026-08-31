@@ -79,6 +79,16 @@ program_simplified = simplify_pass(program)
 
 `return_vars` 通过 `var_remap_` 代换而非直接产出 `AssignStmt(rv, yielded)`，这是有意为之：编排（orchestration）代码生成器的角色感知命名消歧（`role == "out"` 等）会把多个 role 标签的 SSA 版本折叠到同一个 C++ 标识符，于是 `out__rv_v2 = out__co_l0_rv_v3` 这样的别名赋值会下沉为不合法的 `auto out = out;`。在使用点代换可以完全绕开消歧。
 
+#### 逃逸的 return var
+
+代换只能作用于「`var_remap_` 条目仍然有效时被访问到」的使用点，而 `ForStmt`、`WhileStmt`、`IfStmt` 在离开各自的体时都会把 `var_remap_` 恢复到进入前的基线，以免体内的 remap 改写兄弟语句或循环之后的代码。活过这次恢复的使用点会继续指向原始 `Var` —— 而折叠恰好删除了它唯一的定义，形成 `UseAfterDefCheck` 会报告的悬空引用。
+
+`ReturnVarEscapeIndex`（位于 `simplify_pass.cpp` 的前置分析）按折叠点逐一判定。它对函数做一次遍历，用前序编号标记所有会恢复 `var_remap_` 的作用域，使每个作用域拥有其子树的连续 id 区间 `[id, end)`；于是「`v` 的所有使用点都在作用域 `S` 内」只需两次整数比较。单调递增的 tick 则把使用点与折叠点排序，因此同一作用域内*位于折叠点之前*的读取同样计为逃逸。Fold B 还会把每个 `DeepClone` 出来的循环体当作独立区域单独建索引（克隆体的 `Var` 标识不存在于任何其他区域），并固定持有这些循环体，避免已释放克隆的地址被复用后错误命中陈旧条目。
+
+对逃逸的 `return_vars[i]`，`LiftBodyToReturnVars` 不再记录 remap，而是在折叠点产出 `AssignStmt(return_vars[i], yielded_value[i])`。该赋值必须留在被提升的区域*内部*：yielded 值可能引用循环体内的局部 `Var`，无法外提到循环之后；而在 leak 语义下「最后一次迭代最后写入」恰好就是循环后读取所期望的值。
+
+SSA 形式下不存在逃逸：区域内定义的值不会在区域外被引用，且每个使用点都被其定义支配。由于流水线只在 `ConvertToSSA` 之后运行 Simplify（第 5 和第 46 位），该物化路径在流水线中不会触发 —— 它服务于直接对 pre-SSA IR 运行 Simplify 的调用方，而在那里上述别名赋值的顾虑并不成立，因为 SSA 转换仍会在其后运行。
+
 两种折叠在同一次 Pass 中可以叠加：当 Fold B 把 `loop_var → 0` 代入循环体后，类似 `if loop_var == 0` 的谓词会变成 `if 0 == 0` → `ConstBool(true)`，紧接着就被 Fold A 折掉，无需再跑一次 Simplify。
 
 ## 示例

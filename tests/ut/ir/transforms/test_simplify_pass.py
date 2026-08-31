@@ -572,12 +572,11 @@ class TestControlFlow:
         Pre-SSA on purpose — leak-mode bodies only exist before SSA conversion,
         and this pass runs at pipeline position 5 and again at 46.
 
-        Verification is disabled for the two pass runs: Fold B lifts the inner body
-        by *substitution* rather than by emitting ``AssignStmt(rv, yielded)``, so in
-        leak mode the surviving post-loop reference has no defining statement and
-        trips ``UseAfterDef``. That is a pre-existing Fold B limitation which the
-        ``for`` half of this test shows is identical for both loop kinds; it is not
-        what this test pins.
+        Verification stays on: ``LiftBodyToReturnVars`` materialises
+        ``AssignStmt(acc_next, ...)`` inside the loop body for a return var whose
+        uses outlive the enclosing ``var_remap_`` restore, so the post-loop
+        reference keeps a definition. See
+        ``test_fold_materializes_escaping_return_var``.
         """
 
         @pl.program
@@ -603,8 +602,7 @@ class TestControlFlow:
                 pl.tensor.write(out, [0], acc_next)
 
         def post_loop_operand(program):
-            with passes.PassContext([]):
-                after = passes.simplify()(program)
+            after = passes.simplify()(program)
             func = next(iter(after.functions.values()))
             body = func.body
             stmts = body.stmts if isinstance(body, ir.SeqStmts) else [body]
@@ -620,6 +618,51 @@ class TestControlFlow:
                 f"{label}: post-loop use was rewritten to {operand.as_python()}"
             )
             assert operand.name_hint.startswith("acc_next"), label
+
+    def test_fold_materializes_escaping_return_var(self):
+        """A folded loop's return var read after the loop gets a real definition.
+
+        Fold B lifts a single-trip body by recording ``return_var -> yielded``
+        in ``var_remap_``; the enclosing loop then rebases that map, so a
+        leak-mode read *after* the loop would keep a Var the fold just stripped
+        the only definition of — ``UseAfterDef``. ``ReturnVarEscapeIndex`` spots
+        the escaping use, and the lift emits ``AssignStmt`` instead.
+
+        The assignment must land inside the loop body: its RHS names the loop
+        variable, so it cannot be hoisted past the loop — and the last iteration
+        writing last is exactly the value a leak-mode post-loop read expects.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, out: pl.Tensor[[8], pl.INDEX]):
+                acc_next: pl.Scalar[pl.INDEX] = 0
+                for k in pl.range(4):
+                    for j, (acc,) in pl.range(0, 1, init_values=(k,)):
+                        acc_next = pl.yield_(acc + 1)
+                pl.tensor.write(out, [0], acc_next)
+
+        # Verification is on by default — the point of the test is that the
+        # folded IR passes UseAfterDef.
+        after = passes.simplify()(Before)
+        func = next(iter(after.functions.values()))
+        assert isinstance(func.body, ir.SeqStmts)
+        stmts = func.body.stmts
+
+        for_stmt = next(s for s in stmts if isinstance(s, ir.ForStmt))
+        body = for_stmt.body
+        body_stmts = body.stmts if isinstance(body, ir.SeqStmts) else [body]
+        assign = next(s for s in body_stmts if isinstance(s, ir.AssignStmt))
+        assert assign.var.name_hint.startswith("acc_next")
+        # RHS is the yielded `acc + 1` with `acc` substituted by its init `k`.
+        assert assign.value.as_python() == "k + 1", assign.value.as_python()
+
+        # The post-loop read still names that same Var — not a substituted copy
+        # of a loop-private expression.
+        call = next(s.expr for s in stmts if isinstance(s, ir.EvalStmt) and isinstance(s.expr, ir.Call))
+        assert isinstance(call.args[-1], ir.Var)
+        assert call.args[-1].name_hint == assign.var.name_hint
 
     def test_sequential_stmts(self):
         """Multiple statements should all be simplified."""
