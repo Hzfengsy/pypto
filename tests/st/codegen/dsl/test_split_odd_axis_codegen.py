@@ -22,8 +22,12 @@ The two ways an odd axis reaches the boundary:
 * an odd VALID extent inside an even physical box (``15`` of ``16`` rows: lanes
   hold 8 and 7) -- the shape a real kernel's ragged tail has, since an Acc box is
   fractal-aligned and therefore even;
-* an odd physical BOX (``17`` rows: lanes hold 9 and 8), for tiles whose box is
-  not fractal-bound.
+* an odd physical BOX (``17`` rows: lanes would hold 9 and 8) -- which a
+  Cube->Vector boundary cannot actually carry, because ``tile.aiv_shard``'s cube
+  side is an ``Acc`` and an ``Acc`` box IS fractal-bound. A ``pl.matmul`` reaching
+  that boundary now loads its left operand into whole NZ fractal boxes, so a
+  17-row source arrives as a 32-row box with a 17-row valid extent, whose lanes
+  are 16 and 1 -- unplaceable, and refused with the authoring routes that work.
 
 A deeper tail (``13`` of ``16``) would leave the box partition's lanes 8 and 5 --
 further than one cell apart, so pto-isa could place neither. The compiler
@@ -47,7 +51,7 @@ ROWS, COLS, K = 16, 128, 128
 HALF = ROWS // 2
 ODD_VALID_M = 15  # lanes hold 8 and 7 -> TILE_UP_DOWN_ODD
 DEEP_TAIL_VALID_M = 13  # box lanes 8 and 5 -> rebalanced to 7 and 6
-ODD_BOX_ROWS = 17  # a fully-valid ODD box: lanes hold 9 and 8
+ODD_BOX_ROWS = 17  # an odd source extent; its Acc box is 32, so lanes hold 16 and 1
 ODD_BOX_HALF = (ODD_BOX_ROWS + 1) // 2
 
 
@@ -119,7 +123,12 @@ def explicit_region_odd_box(
     w: pl.Tensor[[COLS, K], pl.BF16],
     out: pl.Out[pl.Tensor[[ODD_BOX_ROWS, COLS], pl.FP32]],
 ) -> pl.Tensor[[ODD_BOX_ROWS, COLS], pl.FP32]:
-    """An explicit ``pl.split_aiv`` region over a fully-valid ODD box (17 rows)."""
+    """An explicit ``pl.split_aiv`` region over an odd (17-row) source extent.
+
+    The 17 rows reach the cube as a 32-row NZ-fractal box carrying a 17-row valid
+    extent, so the region's box partition leaves the lanes 16 and 1 -- further
+    than one cell apart, which pto-isa cannot place.
+    """
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="region_odd"):
         acc = pl.matmul(a[0:ODD_BOX_ROWS, 0:K], w[0:COLS, 0:K], b_trans=True, out_dtype=pl.FP32)
         for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
@@ -308,22 +317,28 @@ def test_rebalance_is_declined_when_a_value_is_split_independently():
     assert "16 / 15" in message
 
 
-def test_explicit_region_odd_box_localizes_the_per_lane_extent():
-    """A fully-valid ODD box is per-lane in an explicit region too.
+def test_explicit_region_odd_box_is_refused_with_unplaceable_lanes():
+    """An odd physical box cannot reach a Cube -> Vector boundary at all.
 
-    ``ReshapeSplitAxis`` gives both lanes the ceil half (9), which is right for
-    the physical box and wrong for the extents pto-isa reads off the popped tile:
-    17 rows split 9 / 8. The region path used to take the "fully valid needs no
-    repair" shortcut here, leaving both lanes at 9 while the transport picked the
-    odd code — lane 1 would then have been placed one row too far.
+    ``tile.aiv_shard``'s cube side is an ``Acc``, and ptoas rejects an ``Acc``
+    allocation whose rows are not a multiple of 16, so the 17-row box this used to
+    assert on was never a shape the backend would accept -- it only survived
+    because ``--codegen-only`` skips assembly. The 17 rows now arrive as a 32-row
+    fractal box carrying a 17-row valid extent, and the region's box partition
+    leaves lane 0 with 16 cells and lane 1 with 1: further than one cell apart, so
+    neither ``TILE_UP_DOWN`` nor its ``_ODD`` sibling can place lane 1's band.
+    The compiler says so, and names the two authoring routes that do work.
+
+    The reachable odd axis -- an odd VALID extent inside an even box -- keeps its
+    positive coverage in ``test_odd_valid_extent_takes_the_odd_split_code`` and
+    ``test_odd_pop_carries_a_per_lane_row_extent_and_the_full_column_box``.
     """
-    printed = str(explicit_region_odd_box.lower(config=RunConfig(platform="a2a3")))
-    aiv = _lowered_half(printed, "aiv")
+    with pytest.raises(ValueError) as exc:
+        explicit_region_odd_box.lower(config=RunConfig(platform="a2a3"))
 
-    assert "pl.tile.tpop_from_aic(split=3)" in aiv, aiv
-    # clamp(17 - aiv_id * 9, 0, 9) -> 9 and 8, on a 9-row box.
-    assert re.search(r"pl\.const\(17, pl\.INDEX\)[^]]*?pl\.const\(9, pl\.INDEX\)", aiv), aiv
-    assert re.search(r"pl\.tile\.store\([^)]*\* 9", aiv), aiv
+    message = str(exc.value)
+    assert "leaves the two AIV lanes 16 and 1 cells" in message, message
+    assert "pl.tile.set_validshape" in message, message
 
 
 @pytest.fixture(scope="session")
