@@ -491,13 +491,13 @@ def test_shard_of_a_vector_produced_value_is_rejected():
     already produced has no crossing to name. Reject it with the boundary op's
     span rather than lowering it into a tpush the cube lane cannot satisfy.
     """
-    with pytest.raises(ValueError, match="is produced on the VECTOR lane by 'tile.full'"):
+    with pytest.raises(ValueError, match=r"is produced on the VECTOR lane by 'tile\.full'"):
         _expand(_build_vector_produced_shard_program())
 
 
 def test_gather_of_a_cube_produced_value_is_rejected():
     """The V->C mirror: a cube-produced gather operand is rejected the same way."""
-    with pytest.raises(ValueError, match="is produced on the CUBE lane by 'tile.matmul'"):
+    with pytest.raises(ValueError, match=r"is produced on the CUBE lane by 'tile\.matmul'"):
         _expand(_build_cube_produced_gather_program())
 
 
@@ -511,6 +511,118 @@ def test_shard_of_a_parameter_still_folds():
     """
     printed = ir.python_print(_expand(_build_shard_program(128, 128)))
     assert "pl.tile.tpush_to_aiv(qk, split=1)" in printed
+    assert "__FREE_VAR" not in printed
+
+
+def _build_chained_shard_program():
+    """``half2 = pl.aiv_shard(pl.aiv_shard(acc))`` — two crossings, same direction.
+
+    The first shard binds `half1` on its CONSUMING (AIV) lane only, so the second
+    shard's cube-lane tpush references a value the cube half never defines. The
+    operand's affinity is MIXED, which says "this value IS a crossing" and not
+    which lane holds it — resolving MIXED through the producer's direction is
+    what catches this.
+    """
+    span = ir.Span.unknown()
+    acc = ir.Var("acc", _tile([128, 128], mem=MS.Acc), span)
+    out_0 = ir.Var("out_0", ir.TensorType([32, 128], FP32), span)
+
+    first = T.aiv_shard(acc, split=1, span=span)
+    assert isinstance(first.type, ir.TileType)
+    half1 = ir.Var("half1", _tile(first.type.shape, first.type.tile_view, MS.Vec), span)
+    second = T.aiv_shard(half1, split=1, span=span)
+    assert isinstance(second.type, ir.TileType)
+    half2 = ir.Var("half2", _tile(second.type.shape, second.type.tile_view, MS.Vec), span)
+    store = T.store(half2, [0, 0], out_0, span=span)
+    out_store = ir.Var("out_store", store.type, span)
+
+    body = ir.SeqStmts(
+        [
+            ir.AssignStmt(half1, first, span),
+            ir.AssignStmt(half2, second, span),
+            ir.AssignStmt(out_store, store, span),
+            ir.ReturnStmt([out_store], span),
+        ],
+        span,
+    )
+    func = ir.Function(
+        "split_aiv",
+        [(acc, _IN), (out_0, _OUT)],
+        [out_0.type],
+        body,
+        span,
+        ir.FunctionType.InCore,
+        attrs={"split": pl.SplitMode.UP_DOWN, "split_aiv": True},
+    )
+    return ir.Program([func], "test_chained_shard", span)
+
+
+def _build_inline_operand_shard_program():
+    """``pl.aiv_shard(pl.full(...))`` — the operand is a Call, not a bound Var.
+
+    Nothing is filtered out of a lane here, so no Var dangles; instead the vector
+    op is emitted INSIDE the cube lane's tpush, asking a core with no UB to run a
+    UB write. Same defect, different shape.
+    """
+    span = ir.Span.unknown()
+    out_0 = ir.Var("out_0", ir.TensorType([64, 128], FP32), span)
+
+    fill = T.full([128, 128], FP32, 0.0, span)
+    shard = T.aiv_shard(fill, split=1, span=span)
+    assert isinstance(shard.type, ir.TileType)
+    half = ir.Var("half", _tile(shard.type.shape, shard.type.tile_view, MS.Vec), span)
+    store = T.store(half, [0, 0], out_0, span=span)
+    out_store = ir.Var("out_store", store.type, span)
+
+    body = ir.SeqStmts(
+        [
+            ir.AssignStmt(half, shard, span),
+            ir.AssignStmt(out_store, store, span),
+            ir.ReturnStmt([out_store], span),
+        ],
+        span,
+    )
+    func = ir.Function(
+        "split_aiv",
+        [(out_0, _OUT)],
+        [out_0.type],
+        body,
+        span,
+        ir.FunctionType.InCore,
+        attrs={"split": pl.SplitMode.UP_DOWN, "split_aiv": True},
+    )
+    return ir.Program([func], "test_inline_operand_shard", span)
+
+
+def test_chained_same_direction_shard_is_rejected():
+    """A boundary result cannot cross again in the same direction.
+
+    Before the MIXED case was resolved through the producer's direction, the cube
+    half emitted ``pl.tile.tpush_to_aiv(half1__FREE_VAR, split=1)``.
+    """
+    with pytest.raises(ValueError, match=r"is produced on the VECTOR lane by 'tile\.aiv_shard'"):
+        _expand(_build_chained_shard_program())
+
+
+def test_inline_vector_call_operand_is_rejected():
+    """An unbound vector Call operand is caught too, not skipped for lack of a Var.
+
+    Before this, the cube half emitted the ``tile.full`` inline inside its tpush.
+    """
+    with pytest.raises(ValueError, match=r"operand \(inline\) is produced on the VECTOR lane"):
+        _expand(_build_inline_operand_shard_program())
+
+
+def test_shard_then_gather_still_folds():
+    """The INVERSE chain is legal and must keep folding.
+
+    ``aic_gather(aiv_shard(acc))`` crosses C->V then V->C: the shard binds its
+    result on AIV, which is exactly the lane the gather pushes from. Guard against
+    the MIXED resolution above over-rejecting.
+    """
+    program, _ = _build_aic_gather_program()
+    printed = ir.python_print(_expand(program))
+    assert "pl.tile.tpush_to_aic(" in printed
     assert "__FREE_VAR" not in printed
 
 
