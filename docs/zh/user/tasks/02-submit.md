@@ -73,7 +73,7 @@ with pl.spmd(4, name_hint="stage2", deps=[first]) as second:
 
 它接受 `deps=`、`predicate=` 与 `allow_early_resolve=`，这使它成为唯一带派发谓词的内联写法。
 
-**`deps=` 只有 `as` 形式接受。** 用 `as` 绑定才拿得到 TaskId；裸 `with pl.spmd(4):` 与 `for i in pl.spmd(4):` 照样执行同样的工作但不给它命名，向这两种形式传 `deps=` 会被拒绝并报 `pl.spmd() does not accept 'deps=' here`。
+**三种形式都接受 `deps=`。** 用 `as` 绑定拿到的是*本次*派发的 TaskId，只有当后续任务需要等待它时才需要；裸 `with pl.spmd(4, deps=[...]):` 与 `for i in pl.spmd(4, deps=[...]):` 同样可以声明依赖边，只是不给自己命名。
 
 ### `pl.submit`
 
@@ -129,7 +129,7 @@ out, _ = pl.submit(self.consumer, data, out, deps=[tids])
 | **`pl.submit is a DSL parser construct and cannot be called directly`** | 在被装饰函数体外使用 | 移进被装饰的函数体内 |
 | **`unpacks 1 result value(s) but kernel returns 0`** | kernel 写的是 `Out` 参数且没声明返回类型 | 只解包 kernel 真正返回的东西，或给它加上返回类型 |
 | **`deps= entries must be a TaskId variable`** | TaskId 是对扁平 submit 结果做下标得到的 | 把 TaskId 绑定到独立的名字再传 |
-| **`pl.spmd() does not accept 'deps=' here`** | 向裸 `with` 或 `for` 形式传了 `deps=` | 用 `as tid:` 绑定该区域 —— 只有这种形式接受 `deps=` |
+| **`pl.spmd(..., deps=[...]) cannot be nested inside pl.cluster()`** | 嵌套在 cluster 内的 `pl.spmd` 会被展开进 Group 函数，不会产生可挂依赖边的任务 | 把 `deps=` 放到 `pl.cluster()` 区域上，或改用独立的 `pl.spmd` |
 | **`core_num` 缺失** | 它是 `pl.spmd_submit` 的必需关键字 | 传 `core_num=N`；位置槽是 kernel 的实参 |
 | **消费者只等到了循环的最后一个生产者** | 复用了一个 TaskId 而没有收集 | 收进 `pl.TASK_ID` 的 `pl.array` 并把数组传入 |
 | **auto 作用域里显式边似乎被忽略** | 并没有 —— 等待集合是并集 | 去别处找**缺失**的边，而不是被丢弃的边 |

@@ -171,6 +171,56 @@ class TestSpmdScopeTaskIdCodegen:
             f"expected set_dependencies({deps_arr}, ...) tying the dep to {alias!r}\n{code}"
         )
 
+    def test_deps_without_as_tid_emit_set_dependencies(self):
+        """``deps=`` needs no ``as tid``: the Spmd outliner synthesises the producer
+        TaskId Var, so the dispatch still lowers to a Submit and emits
+        ``set_dependencies(...)``.
+
+        Only the *consumer* omits the capture here — the producer keeps ``as tid``
+        because naming it is exactly what ``deps=`` needs. The synthesised TaskId
+        is unconsumed, so codegen must not require it to be bound to anything.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class P:
+            @pl.function(type=pl.FunctionType.InCore)
+            def vkernel(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                t = pl.load(a, [0, 0], [512, 128])
+                out = pl.store(pl.add(t, t), [0, 0], out)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out1: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+                out2: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                with pl.spmd(4, name_hint="stage1") as tid0:
+                    out1 = self.vkernel(a, out1)
+                # No ``as tid`` — the edge is declared, the TaskId is not needed.
+                with pl.spmd(4, name_hint="stage2", deps=[tid0]):
+                    out2 = self.vkernel(a, out2)
+                return out2
+
+        transformed = self._mixed_spmd_pipeline(P)
+        code = self._codegen(transformed)
+        m = re.search(r"TaskId (\w+) = task_0_outs\.task_id\(\);", code)
+        assert m is not None, f"first dispatch's producer TaskId not captured\n{code}"
+        alias = m.group(1)
+        m2 = re.search(rf"(\w+)\[[^\]]*\] = {re.escape(alias)};", code)
+        assert m2 is not None, f"captured TaskId {alias!r} not wired into a deps array\n{code}"
+        deps_arr = m2.group(1)
+        assert re.search(rf"\.set_dependencies\({re.escape(deps_arr)},", code) is not None, (
+            f"expected set_dependencies({deps_arr}, ...) on the uncaptured consumer\n{code}"
+        )
+
     def test_mixed_spmd_in_equals_out_aliases_shared_buffer(self):
         """A MIXED (split=) ``pl.spmd`` dispatch passing one buffer as both an
         input AND the output must codegen — and both lanes of the aliased buffer

@@ -1434,37 +1434,129 @@ class TestSpmdScopeTaskId:
         Reparsed = pl.parse_program(printed)
         ir.assert_structural_equal(Original, Reparsed)
 
+    def test_deps_without_tid_round_trip(self):
+        """``deps=`` needs no ``as tid``: capturing the TaskId and declaring edges
+        are orthogonal, and the uncaptured form round-trips.
+
+        The Spmd outliner synthesises the (unused) producer TaskId Var such a scope
+        needs to lower to a ``Submit``, exactly as ``pl.at(..., deps=[...])``
+        already works without an ``as`` clause. An inline body prints back as the
+        ``for``-form (its first statement is the block-index read), so this pins
+        the for-form's ``deps=`` printing too.
+        """
+
+        @pl.program
+        class Original:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                with pl.spmd(4, name_hint="s1") as tid0:
+                    i = pl.tile.get_block_idx()
+                    out = pl.store(pl.load(a, [i * 128, 0], [128, 128]), [i * 128, 0], out)
+                with pl.spmd(4, name_hint="s2", deps=[tid0]):  # deps without `as tid`
+                    j = pl.tile.get_block_idx()
+                    out = pl.store(pl.load(out, [j * 128, 0], [128, 128]), [j * 128, 0], out)
+                return out
+
+        printed = Original.as_python()
+        assert "deps=[tid0]" in printed
+        assert "s2_spmd" in printed and " as " not in printed.split("s2_spmd")[1].split("\n")[0]
+        Reparsed = pl.parse_program(printed)
+        ir.assert_structural_equal(Original, Reparsed)
+
+    def test_dispatch_body_deps_without_tid_round_trip(self):
+        """A direct-dispatch body (no InCore wrapper, so the plain with-form is
+        what prints back) carries ``deps=`` without ``as tid`` and round-trips."""
+
+        @pl.program
+        class Original:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                out = pl.store(pl.load(a, [0, 0], [512, 128]), [0, 0], out)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out1: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+                out2: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                with pl.spmd(4, name_hint="s1") as tid0:
+                    out1 = self.kernel(a, out1)
+                with pl.spmd(4, name_hint="s2", deps=[tid0]):
+                    out2 = self.kernel(a, out2)
+                return out2
+
+        printed = Original.as_python()
+        assert "deps=[tid0]" in printed
+        Reparsed = pl.parse_program(printed)
+        ir.assert_structural_equal(Original, Reparsed)
+
+    def test_for_spmd_deps_round_trip(self):
+        """The ``for``-form takes ``deps=`` on the same terms as the with-forms."""
+
+        @pl.program
+        class Original:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                with pl.spmd(4, name_hint="s1") as tid0:
+                    i = pl.tile.get_block_idx()
+                    out = pl.store(pl.load(a, [i * 128, 0], [128, 128]), [i * 128, 0], out)
+                for j in pl.spmd(4, name_hint="s2", deps=[tid0]):
+                    out = pl.store(pl.load(out, [j * 128, 0], [128, 128]), [j * 128, 0], out)
+                return out
+
+        printed = Original.as_python()
+        assert "deps=[tid0]" in printed
+        Reparsed = pl.parse_program(printed)
+        ir.assert_structural_equal(Original, Reparsed)
+
+    def test_empty_deps_without_tid_is_a_no_op(self):
+        """``deps=[]`` normalizes to no edges — accepted, and leaves no attr behind."""
+
+        @pl.program
+        class Original:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                out = pl.store(pl.load(a, [0, 0], [512, 128]), [0, 0], out)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                with pl.spmd(4, deps=[]):
+                    out = self.kernel(a, out)
+                return out
+
+        printed = Original.as_python()
+        assert "deps=" not in printed
+        ir.assert_structural_equal(Original, pl.parse_program(printed))
+
     # ── Rejections ──────────────────────────────────────────────────────────
 
-    def test_deps_without_tid_rejected(self):
-        """``deps=`` on the plain ``with pl.spmd(n):`` form (no ``as tid``) is rejected."""
-        with pytest.raises(ParserSyntaxError, match="does not accept 'deps='"):
-
-            @pl.program
-            class Bad:
-                @pl.function(type=pl.FunctionType.Orchestration)
-                def main(
-                    self,
-                    a: pl.Tensor[[512, 128], pl.FP32],
-                    out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
-                ) -> pl.Tensor[[512, 128], pl.FP32]:
-                    with pl.spmd(4, name_hint="s1") as tid0:
-                        i = pl.tile.get_block_idx()
-                        out = pl.store(pl.load(a, [i * 128, 0], [128, 128]), [i * 128, 0], out)
-                    with pl.spmd(4, deps=[tid0]):  # type: ignore[call-arg]  # deps without `as tid`
-                        j = pl.tile.get_block_idx()
-                        out = pl.store(pl.load(out, [j * 128, 0], [128, 128]), [j * 128, 0], out)
-                    return out
-
-    def test_empty_deps_without_tid_rejected(self):
-        """``deps=[]`` (empty / normalized to []) without ``as tid`` is rejected too.
-
-        Gating is by keyword *presence* (allow_deps=optional_vars is not None), not by
-        the resolved dep list being non-empty — so even an empty/None-only ``deps=``
-        on the non-capturing with-form surfaces a clear error rather than silently
-        passing.
-        """
-        with pytest.raises(ParserSyntaxError, match="does not accept 'deps='"):
+    def test_deps_nested_in_cluster_rejected(self):
+        """``deps=`` on a cluster-nested pl.spmd is rejected: the scope is unwrapped
+        into the Group function and never produces a Submit to carry the edges."""
+        with pytest.raises(ParserSyntaxError, match=r"`pl.spmd\(\.\.\., deps=\[\.\.\.\]\)` cannot be nested"):
 
             @pl.program
             class Bad:
@@ -1481,21 +1573,15 @@ class TestSpmdScopeTaskId:
                 def main(
                     self,
                     a: pl.Tensor[[512, 128], pl.FP32],
-                    out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+                    out1: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+                    out2: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
                 ) -> pl.Tensor[[512, 128], pl.FP32]:
-                    with pl.spmd(4, deps=[]):  # type: ignore[call-arg]  # empty deps, no `as tid`
-                        out = self.kernel(a, out)
-                    return out
-
-    def test_for_spmd_deps_rejected(self):
-        """The for-form does not accept ``deps=`` — steer to the ``as tid`` with-form."""
-        with pytest.raises(ParserSyntaxError, match="does not accept 'deps='"):
-
-            @pl.function
-            def bad(a: pl.Tensor[[512, 128], pl.FP32]) -> pl.Tensor[[512, 128], pl.FP32]:
-                for i in pl.spmd(4, deps=[]):  # type: ignore[call-arg]
-                    _ = i
-                return a
+                    with pl.spmd(4, name_hint="s1") as tid0:
+                        out1 = self.kernel(a, out1)
+                    with pl.cluster():
+                        with pl.spmd(4, deps=[tid0]):
+                            out2 = self.kernel(a, out2)
+                    return out2
 
     def test_as_tid_tuple_target_rejected(self):
         """The ``as`` target must be a plain name, not a tuple."""

@@ -770,7 +770,10 @@ def spmd(
     | --- | --- |
     | `with pl.spmd(n):` | Dispatch or inline block (no captured TaskId). |
     | `for i in pl.spmd(n):` | Loop-style; `i` = per-block index, body is auto-outlined to InCore. |
-    | `with pl.spmd(n) as tid:` | Same body as form 1, plus TaskId in `tid` (optionally pass `deps=[...]`). |
+    | `with pl.spmd(n) as tid:` | Same body as form 1, plus the dispatch TaskId in `tid`. |
+
+    ``deps=[...]`` works on all three: capturing the TaskId is only needed when a
+    *later* task must wait on this one.
 
     Usage forms:
 
@@ -786,7 +789,8 @@ def spmd(
        sole body statement *is* the InCore carrier and is not wrapped again; with
        such a body ``optimizations=`` must go on that ``pl.at(...)`` rather than on
        the ``pl.spmd(...)`` line. Captures no producer TaskId (use form 3 for
-       that). Can stand alone (implicit cluster) or nest inside ``pl.cluster()``.
+       that), but still accepts ``deps=``. Can stand alone (implicit cluster) or
+       nest inside ``pl.cluster()``.
 
     2. ``for i in pl.spmd(n):`` — loop-style. The iteration variable binds
        the per-block index (equivalent to ``pl.tile.get_block_idx()``); the
@@ -799,7 +803,7 @@ def spmd(
        ``tid`` (mirroring ``with pl.at(...) as tid:``), usable as a ``deps=`` edge
        on later tasks, stored into a ``pl.array.create(N, pl.TASK_ID)``, or
        crossing into ``pl.manual_scope``. TaskId capture is the only thing this
-       adds over form 1 — it is orthogonal to the inline body.
+       adds over form 1 — it is orthogonal to both the inline body and ``deps=``.
 
     Optional ``optimizations=[pl.split(mode)]`` applies to the inner InCore scope
     (auto-generated for the for-form and the ``as tid`` form, wrapped around the
@@ -824,9 +828,14 @@ def spmd(
         optimizations: Optional list literal containing only ``pl.split(mode)``
             entries (the parser inspects the AST).
         deps: Optional explicit producer-edge list (TaskId Vars and/or ``None``
-            sentinels), accepted only with the ``as tid`` form. Lowered to the
-            outlined Submit's ``manual_dep_edges``; codegen packs it into a
+            sentinels), accepted on all three forms. Lowered to the outlined
+            Submit's ``manual_dep_edges``; codegen packs it into a
             ``set_dependencies(...)`` invocation (union'd with auto-deps).
+            Like ``allow_early_resolve`` it forces the dispatch to lower to an
+            ``ir.Submit`` even without ``as tid`` — the Spmd outliner synthesises
+            the (unused) producer TaskId Var that shape needs. Rejected on a
+            ``pl.cluster()``-nested ``pl.spmd``, which is unwrapped into the Group
+            function and never produces a Submit.
         allow_early_resolve: Opt the grid dispatch in as a speculative
             early-dispatch producer (simpler#1065). Same hint as
             ``pl.submit(..., allow_early_resolve=True)`` / ``pl.at(...,
@@ -852,9 +861,7 @@ def spmd(
             ``pl.cluster()``-nested ``pl.spmd``.
 
             **Contract:** the operand tensor's producing task must be one of
-            ``deps=`` — otherwise the predicate may read a stale value. ``deps=``
-            is only available on the ``as tid`` form, so a predicate over a
-            tensor produced in the same function needs that form. The parser
+            ``deps=`` — otherwise the predicate may read a stale value. The parser
             makes a best-effort check (see ``pl.spmd_submit``); getting ``deps=``
             right remains the author's responsibility.
 

@@ -87,9 +87,9 @@ with pl.spmd(4, name_hint="stage2", deps=[first]) as second:
 It accepts `deps=`, `predicate=` and `allow_early_resolve=`, which makes it the one inline
 form that carries a dispatch predicate.
 
-**`deps=` requires the `as` form.** Binding with `as` is what gives you the TaskId; the bare
-`with pl.spmd(4):` and `for i in pl.spmd(4):` forms run the same work without naming it, and
-passing `deps=` to either is rejected with `pl.spmd() does not accept 'deps=' here`.
+All three forms take `deps=`. Binding with `as` is what gives you *this* dispatch's TaskId,
+so you only need it when a later task must wait on this one — `with pl.spmd(4, deps=[...]):`
+and `for i in pl.spmd(4, deps=[...]):` declare edges just as well without naming themselves.
 
 ### `pl.submit`
 
@@ -158,7 +158,7 @@ like any other. See [Control Flow](../language/02-control-flow.md).
 | **`pl.submit is a DSL parser construct and cannot be called directly`** | Used outside a decorated function body | Move it inside the decorated body |
 | **`unpacks 1 result value(s) but kernel returns 0`** | The kernel writes an `Out` parameter and declares no return type | Unpack only what the kernel returns, or give it a return type |
 | **`deps= entries must be a TaskId variable`** | A TaskId reached by indexing a flat submit result | Bind the TaskId to its own name and pass that |
-| **`pl.spmd() does not accept 'deps=' here`** | `deps=` was passed to the bare `with` or the `for` form | Bind the region with `as tid:` — only that form takes `deps=` |
+| **`pl.spmd(..., deps=[...]) cannot be nested inside pl.cluster()`** | A cluster-nested `pl.spmd` is unwrapped into the Group and never produces a task to hang edges on | Put the `deps=` on the `pl.cluster()` region, or use a standalone `pl.spmd` |
 | **`core_num` missing** | It is a required keyword on `pl.spmd_submit` | Pass `core_num=N`; positional slots are the kernel's arguments |
 | **A consumer only waits on the last producer of a loop** | One TaskId was reused instead of collected | Collect into a `pl.array` of `pl.TASK_ID` and pass the array |
 | **Explicit edge seems ignored in auto scope** | It is not — the wait set is the union | Look for a *missing* edge elsewhere, not a discarded one |

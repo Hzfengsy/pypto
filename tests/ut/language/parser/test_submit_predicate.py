@@ -620,20 +620,18 @@ def test_scope_producer_tracking_survives_tid_rebinding():
 
 
 def test_scope_predicate_deps_hint_matches_the_form():
-    """The remediation hint must be reachable from the form the author wrote.
+    """The remediation hint is the same on every spmd form: add the producer.
 
-    Scope-producer tracking made this case reachable: on the plain / for-forms
-    ``deps=`` is rejected outright, so a hint saying "add deps=[tid]" would send
-    the author into a second, different error. Those forms are told to switch to
-    the ``as tid`` capture form instead.
+    ``deps=`` is accepted on all three spellings (capturing the TaskId is
+    orthogonal to declaring edges), so "add deps=[g_tid]" is actionable whichever
+    form the author wrote — no form has to be steered to a different one first.
     """
-    # as-tid form: deps= is available, so "add it" is the right advice.
+    # as-tid form.
     with pytest.raises(ParserSyntaxError) as as_tid:
         _scope_program("rc[0, 0] > 0", deps_src="")
     assert "deps=[g_tid]" in as_tid.value.hint, as_tid.value.hint
 
-    # plain with-form: deps= is not accepted; the hint must say so and point at
-    # the capture form rather than at a kwarg that would itself be rejected.
+    # plain with-form: same advice, and following it now parses.
     plain_src = (
         _SCOPE_HEAD
         + f"""
@@ -650,9 +648,10 @@ def test_scope_predicate_deps_hint_matches_the_form():
     )
     with pytest.raises(ParserSyntaxError) as plain:
         pl.parse_program(plain_src)
-    hint = plain.value.hint
-    assert "does not accept deps=" in hint, hint
-    assert "as tid" in hint, hint
+    assert "deps=[g_tid]" in plain.value.hint, plain.value.hint
+
+    # Taking the hint's advice on the plain form resolves the error.
+    pl.parse_program(plain_src.replace("pl.spmd(1, predicate=", "pl.spmd(1, deps=[g_tid], predicate="))
 
 
 if __name__ == "__main__":

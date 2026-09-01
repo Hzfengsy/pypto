@@ -2318,6 +2318,10 @@ void IRPythonPrinter::VisitStmt_(const SpmdScopeStmtPtr& op) {
     if (incore) {
       PrintScopeOptimizations(incore->split_, incore);
     }
+    // ``deps=`` needs no ``as tid``: the Spmd outliner synthesises the TaskId Var
+    // it needs to emit a Submit, so the for-form carries edges too and must print
+    // them or the round-trip drops the dependency.
+    PrintScopeDepsAttr(op);
     PrintScopeAllowEarlyResolveAttr(op);
     PrintScopePredicateAttr(op);
     stream_ << "):\n";
@@ -2355,6 +2359,9 @@ void IRPythonPrinter::VisitStmt_(const SpmdScopeStmtPtr& op) {
   if (!op->name_hint_.empty()) {
     stream_ << ", name_hint=\"" << op->name_hint_ << "\"";
   }
+  // Same as the for-form above: a plain ``with pl.spmd(...):`` may carry
+  // ``manual_dep_edges`` without a captured TaskId.
+  PrintScopeDepsAttr(op);
   PrintScopeAllowEarlyResolveAttr(op);
   PrintScopePredicateAttr(op);
   stream_ << "):\n";

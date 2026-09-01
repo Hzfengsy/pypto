@@ -129,8 +129,8 @@ class After:
 
 | Dispatch shape | Carrier |
 | -------------- | ------- |
-| plain `Call` (`with pl.spmd(...)`) | `attrs["core_num"]` (`ExprPtr`) and `attrs["sync_start"]` (`bool`, only when true) |
-| `Submit` (`with pl.spmd(...) as tid`) | the first-class `Submit::core_num_` / `sync_start_` fields |
+| plain `Call` (`with pl.spmd(...)` carrying no Submit-only metadata) | `attrs["core_num"]` (`ExprPtr`) and `attrs["sync_start"]` (`bool`, only when true) |
+| `Submit` (`as tid`, or any of `deps=` / `allow_early_resolve=` / `predicate=`, for which the outliner synthesizes the TaskId Var) | the first-class `Submit::core_num_` / `sync_start_` fields |
 | `Group` from `pl.cluster(): with pl.spmd(...)` | the dispatch, same as above; the Group keeps only the `spmd_unwrapped` marker |
 
 `core_num` is an expression evaluated in the *dispatching* function's scope — it
