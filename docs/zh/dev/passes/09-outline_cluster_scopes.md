@@ -126,8 +126,8 @@ class After:
 
 | 调度形态 | 载体 |
 | -------- | ---- |
-| 普通 `Call`（`with pl.spmd(...)`，且不带任何 Submit 专属元数据） | `attrs["core_num"]`（`ExprPtr`）与 `attrs["sync_start"]`（`bool`，仅为真时发出） |
-| `Submit`（`as tid`，或带 `deps=` / `allow_early_resolve=` / `predicate=` 之一——此时 outliner 会合成 TaskId Var） | 一等字段 `Submit::core_num_` / `sync_start_` |
+| 普通 `Call`——独立的 `with pl.spmd(...)` / `for i in pl.spmd(...)`，且不带任何 Submit 专属元数据 | `attrs["core_num"]`（`ExprPtr`）与 `attrs["sync_start"]`（`bool`，仅为真时发出） |
+| `Submit`——独立的 `with pl.spmd(...)` / `for i in pl.spmd(...)`，带 `as tid`，或带 `deps=` / `allow_early_resolve=` / `predicate=` 之一（此时 outliner 会合成 TaskId Var） | 一等字段 `Submit::core_num_` / `sync_start_` |
 | `pl.cluster(): with pl.spmd(...)` 产生的 `Group` | 同上，挂在调度点；Group 上只保留 `spmd_unwrapped` 标记 |
 
 `core_num` 是在*调度方*函数作用域中求值的表达式，可能引用调用者的局部标量（例如

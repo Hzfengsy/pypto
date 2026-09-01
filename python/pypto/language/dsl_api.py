@@ -790,7 +790,10 @@ def spmd(
        such a body ``optimizations=`` must go on that ``pl.at(...)`` rather than on
        the ``pl.spmd(...)`` line. Captures no producer TaskId (use form 3 for
        that), but still accepts ``deps=``. Can stand alone (implicit cluster) or
-       nest inside ``pl.cluster()``.
+       nest inside ``pl.cluster()`` — but only a scope carrying no Submit-only
+       metadata may nest: ``deps=`` / ``allow_early_resolve=`` / ``predicate=``
+       require the standalone form (a cluster-nested pl.spmd is unwrapped into
+       the Group function and never produces the ``Submit`` that carries them).
 
     2. ``for i in pl.spmd(n):`` — loop-style. The iteration variable binds
        the per-block index (equivalent to ``pl.tile.get_block_idx()``); the

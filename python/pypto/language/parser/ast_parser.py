@@ -4590,6 +4590,42 @@ class ASTParser:
             hint=f"Use a standalone `with pl.spmd(..., {kwarg}):` (implicit cluster) to keep it.",
         )
 
+    @staticmethod
+    def _build_spmd_scope_attrs(
+        dep_vars: "list[ir.Var]",
+        allow_early_resolve: bool,
+        predicate: "ir.Expr | None",
+        task_id_var: "ir.Var | None" = None,
+    ) -> "list[tuple[str, Any]]":
+        """Build a ``SpmdScopeStmt``'s attr list in canonical order.
+
+        The single source of the ordering shared by all three ``pl.spmd`` forms:
+        ``manual_dep_edges``, ``task_id_var`` (``as tid`` only), then
+        ``allow_early_resolve``, then ``predicate`` — mirroring
+        :meth:`_parse_at_meta` for ``pl.at`` scopes.
+
+        **The order is load-bearing.** ``structural_equal`` compares scope attrs
+        positionally, so a print -> reparse cycle only round-trips while this
+        matches the printer's emission order (``PrintScopeDepsAttr`` ->
+        ``PrintScopeTaskIdVarSuffix`` -> ``PrintScopeAllowEarlyResolveAttr`` ->
+        ``PrintScopePredicateAttr`` in ``python_printer.cpp``). Keeping it in one
+        place is what makes adding a kwarg a two-file change instead of a
+        four-site one.
+
+        Each entry is omitted when unset, so a plain ``with pl.spmd(n):`` yields
+        an empty list (the caller passes ``attrs=... or None``).
+        """
+        attrs: list[tuple[str, Any]] = []
+        if dep_vars:
+            attrs.append(("manual_dep_edges", dep_vars))
+        if task_id_var is not None:
+            attrs.append(("task_id_var", task_id_var))
+        if allow_early_resolve:
+            attrs.append(("allow_early_resolve", True))
+        if predicate is not None:
+            attrs.append(("predicate", predicate))
+        return attrs
+
     def _reject_submit_dispatch_metadata_in_cluster(
         self,
         *,
@@ -4958,17 +4994,9 @@ class ASTParser:
         # of them would be silently dropped — reject them here (mirrors the
         # ``as tid`` cluster rejection in _parse_spmd_scope_with_tid).
         self._reject_spmd_submit_only_kwargs_in_cluster(dep_vars, allow_early_resolve, predicate, span)
-        # Canonical attr order: manual_dep_edges, then allow_early_resolve, then
-        # predicate (the ``as tid`` form inserts task_id_var between the first two)
-        # so a print -> reparse compares equal under structural_equal's positional
-        # attr check.
-        spmd_attrs: list[tuple[str, Any]] = []
-        if dep_vars:
-            spmd_attrs.append(("manual_dep_edges", dep_vars))
-        if allow_early_resolve:
-            spmd_attrs.append(("allow_early_resolve", True))
-        if predicate is not None:
-            spmd_attrs.append(("predicate", predicate))
+        # No task_id_var — this form captures none; the rest of the canonical
+        # order is shared with the other two forms.
+        spmd_attrs = self._build_spmd_scope_attrs(dep_vars, allow_early_resolve, predicate)
 
         # No ``as tid``: the plain with-form. Any ``deps=`` rides on the scope as
         # ``manual_dep_edges`` and the Spmd outliner synthesises the TaskId Var it
@@ -5039,26 +5067,13 @@ class ASTParser:
                 hint="Use `with pl.spmd(...) as tid:` (single name; nested tuples are not allowed).",
             )
 
-        # Canonical attr order (deps, task_id_var, allow_early_resolve,
-        # predicate) mirrors _parse_at_meta so a print -> reparse cycle compares
-        # equal under structural_equal's positional attr check.
-        scope_attrs: list[tuple[str, Any]] = []
-        if dep_vars:
-            scope_attrs.append(("manual_dep_edges", dep_vars))
+        # ``task_id_var`` is the only attr unique to this form. The Spmd outliner
+        # reads each one off the scope and threads it onto the synthesised Submit;
+        # ``predicate`` in particular carries live SSA Vars (the operand tensor and
+        # its indices), which ConvertToSSA versions via SubstScopeAttrs.
         tid_var = self.builder.var(optional_vars.id, ir.ScalarType(DataType.TASK_ID), span=span)
         self.scope_manager.define_var(optional_vars.id, tid_var, span=span)
-        scope_attrs.append(("task_id_var", tid_var))
-        # ``allow_early_resolve`` last (canonical order) — the Spmd outliner reads
-        # it off the scope and threads it onto the synthesised Submit, exactly as
-        # _parse_at_meta does for pl.at scopes.
-        if allow_early_resolve:
-            scope_attrs.append(("allow_early_resolve", True))
-        # ``predicate`` after it — an Expr (not a flag), read off the scope by the
-        # Spmd outliner and moved onto ``Submit.predicate``. It carries live SSA
-        # Vars (the operand tensor and its indices), which ConvertToSSA versions
-        # via SubstScopeAttrs.
-        if predicate is not None:
-            scope_attrs.append(("predicate", predicate))
+        scope_attrs = self._build_spmd_scope_attrs(dep_vars, allow_early_resolve, predicate, tid_var)
 
         # Emit the transient ``AssignStmt(tid, system.task_invalid())`` placeholder
         # one stmt BEFORE the scope so ConvertToSSA has a def for the tid Var; the
@@ -5184,14 +5199,8 @@ class ASTParser:
         # A cluster-nested pl.spmd is unwrapped into the Group and never produces
         # a Submit, so reject them there (mirrors the with-form / as-tid guards).
         self._reject_spmd_submit_only_kwargs_in_cluster(dep_vars, allow_early_resolve, predicate, span)
-        # Canonical attr order — see the with-form.
-        spmd_attrs: list[tuple[str, Any]] = []
-        if dep_vars:
-            spmd_attrs.append(("manual_dep_edges", dep_vars))
-        if allow_early_resolve:
-            spmd_attrs.append(("allow_early_resolve", True))
-        if predicate is not None:
-            spmd_attrs.append(("predicate", predicate))
+        # No task_id_var — the for-form captures none (see the with-form).
+        spmd_attrs = self._build_spmd_scope_attrs(dep_vars, allow_early_resolve, predicate)
         # Merge forward-sticky pl.dump_tag tensors onto the auto-outlined InCore
         # scope — the kernel the loop body lowers to. The with-form (pl.at /
         # pl.spmd / pl.cluster) routes through _parse_scope_body for this; the
