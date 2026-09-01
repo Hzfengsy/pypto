@@ -129,7 +129,7 @@ out, _ = pl.submit(self.consumer, data, out, deps=[tids])
 | **`pl.submit is a DSL parser construct and cannot be called directly`** | 在被装饰函数体外使用 | 移进被装饰的函数体内 |
 | **`unpacks 1 result value(s) but kernel returns 0`** | kernel 写的是 `Out` 参数且没声明返回类型 | 只解包 kernel 真正返回的东西，或给它加上返回类型 |
 | **`deps= entries must be a TaskId variable`** | TaskId 是对扁平 submit 结果做下标得到的 | 把 TaskId 绑定到独立的名字再传 |
-| **`pl.spmd(..., deps=[...]) cannot be nested inside pl.cluster()`** | 嵌套在 cluster 内的 `pl.spmd` 会被展开进 Group 函数，不会产生可挂依赖边的任务 | 把 `deps=` 放到 `pl.cluster()` 区域上，或改用独立的 `pl.spmd` |
+| **`pl.spmd(..., deps=[...]) cannot be nested inside pl.cluster()`** | 嵌套在 cluster 内的 `pl.spmd` 会被展开进 Group 函数，不会产生可挂依赖边的任务 | 去掉 `pl.cluster()` 包装 —— 独立的 `pl.spmd` 自带隐式 cluster，且接受 `deps=` |
 | **`core_num` 缺失** | 它是 `pl.spmd_submit` 的必需关键字 | 传 `core_num=N`；位置槽是 kernel 的实参 |
 | **消费者只等到了循环的最后一个生产者** | 复用了一个 TaskId 而没有收集 | 收进 `pl.TASK_ID` 的 `pl.array` 并把数组传入 |
 | **auto 作用域里显式边似乎被忽略** | 并没有 —— 等待集合是并集 | 去别处找**缺失**的边，而不是被丢弃的边 |
