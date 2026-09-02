@@ -140,6 +140,8 @@ SIMPLER_SCOPE() {
 
 External tensors borrow chip-resident descriptors passed through `ChipTaskArgs`. Internal tensors are pre-allocated at scope entry via `alloc_tensors()` — all `tensor.create` calls within the same scope (function body, for body, if body) are batched into a single `alloc_tensors` invocation. Pre-allocated tensors are then passed to kernels via `add_output(const ChipTensor&)` (OUTPUT_EXISTING overload).
 
+A create is only hoisted to scope entry when its size is *entry-valid*. A size that reads a value the body itself defines — a plain local, or an `if` / `for` / `while` return_var, whose C++ declaration is emitted where that statement sits — keeps the create in body order instead, so the emitted C++ never uses a name before its declaration. The same rule covers the `__gm_pipe_buffer` placeholder, whose real size is `slot_bytes * core_num` rather than its IR shape.
+
 ### Parameter Direction
 
 The `ParamDirection` of each function parameter determines how it appears in task submission:

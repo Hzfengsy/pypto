@@ -139,6 +139,8 @@ SIMPLER_SCOPE() {
 
 外部张量借用通过 `ChipTaskArgs` 传入的设备侧描述符。内部张量在 scope 入口处通过 `alloc_tensors()` 预分配——同一 scope（函数体、for 循环体、if 分支体）中的所有 `tensor.create` 被批量合并为一条 `alloc_tensors` 调用。预分配的张量随后通过 `add_output(const ChipTensor&)`（OUTPUT_EXISTING 重载）传递给核函数。
 
+只有尺寸在 scope 入口处已经可见（entry-valid）的 create 才会被提升到入口。若尺寸读取了函数体自身定义的值——普通局部变量，或 `if` / `for` / `while` 的 return_var（其 C++ 声明在对应语句处才emit）——该 create 会保留在语句顺序上，从而保证生成的 C++ 不会在声明之前使用某个名字。`__gm_pipe_buffer` 占位符同样适用此规则：它的真实尺寸是 `slot_bytes * core_num`，而非其 IR shape。
+
 ### 参数方向
 
 每个函数参数的 `ParamDirection` 决定其在任务提交中的表现：

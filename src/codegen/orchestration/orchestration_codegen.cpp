@@ -3273,12 +3273,15 @@ class OrchestrationStmtCodegen : public CodegenBase {
     for (size_t stmt_idx = 0; stmt_idx < stmts.size(); ++stmt_idx) {
       const auto& stmt = stmts[stmt_idx];
       auto assign = As<AssignStmt>(stmt);
-      if (!assign) {
-        continue;
-      }
-      auto call = As<Call>(assign->value_);
+      auto call = assign ? As<Call>(assign->value_) : nullptr;
       if (!call || !IsOp(call, "tensor.create")) {
-        locally_defined.insert(assign->var_.get());
+        // Track every name this level defines, not just AssignStmt targets: an
+        // IfStmt / ForStmt / WhileStmt return_var is a phi whose C++ declaration
+        // is emitted where the statement sits, so a create sized from one is
+        // hoist-ineligible exactly like a create sized from a plain local.
+        for (const auto* def : var_collectors::CollectStmtDefinedVars(stmt)) {
+          locally_defined.insert(def);
+        }
         continue;
       }
       if (declared_var_ptrs_.count(assign->var_.get()) || param_name_set_.count(GetVarName(assign->var_))) {
