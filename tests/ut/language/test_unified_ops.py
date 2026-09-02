@@ -1605,6 +1605,49 @@ class TestUnifiedOpsCrossPathKwargs:
 
         ir.assert_structural_equal(unified.unwrap(), explicit.unwrap())
 
+    def test_matmul_tensor_rejects_float_out_dtype_on_int_operands(self):
+        """INT8 operands accumulate in INT32; FP32 out is a dequant with no scale.
+
+        Dropping the request instead lowers to a `pto.tstore` of an int32 L0C
+        accumulator into an f32 tensor, which the Cube writeback has no quant
+        mode for — it dies in ccec, or returns wrong numbers.
+        """
+        lhs, rhs = _tensor("lhs", [32, 128], DataType.INT8), _tensor("rhs", [128, 64], DataType.INT8)
+        with pytest.raises(ValueError) as exc_info:
+            unified_ops.matmul(lhs, rhs, out_dtype=DataType.FP32)
+
+        msg = str(exc_info.value)
+        assert "out_dtype=fp32" in msg
+        assert "int32" in msg  # names the accumulator it actually gets
+        assert "pl.cast" in msg
+
+    def test_matmul_tensor_accepts_int32_out_dtype_on_int_operands(self):
+        """INT32 is the one dtype an integer accumulator leaves L0C in unscaled."""
+        lhs, rhs = _tensor("lhs", [32, 128], DataType.INT8), _tensor("rhs", [128, 64], DataType.INT8)
+
+        result_type = unified_ops.matmul(lhs, rhs, out_dtype=DataType.INT32).unwrap().type
+        assert isinstance(result_type, ir.TensorType)
+        assert result_type.dtype == DataType.INT32
+
+    @pytest.mark.parametrize("out_dtype", [DataType.FP32, DataType.FP16, DataType.BF16])
+    def test_matmul_tensor_accepts_fixpipe_narrowings_on_float_operands(self, out_dtype):
+        """The FP32 accumulator narrows to FP16/BF16 in the FIXPIPE writeback."""
+        lhs, rhs = _tensor("lhs", [32, 128], DataType.FP16), _tensor("rhs", [128, 64], DataType.FP16)
+
+        result_type = unified_ops.matmul(lhs, rhs, out_dtype=out_dtype).unwrap().type
+        assert isinstance(result_type, ir.TensorType)
+        assert result_type.dtype == out_dtype
+
+    def test_matmul_tensor_rejects_int_out_dtype_on_float_operands(self):
+        """The float accumulator has no unscaled path to an integer dtype either."""
+        lhs, rhs = _tensor("lhs", [32, 128], DataType.FP16), _tensor("rhs", [128, 64], DataType.FP16)
+        with pytest.raises(ValueError) as exc_info:
+            unified_ops.matmul(lhs, rhs, out_dtype=DataType.INT8)
+
+        msg = str(exc_info.value)
+        assert "out_dtype=int8" in msg
+        assert "fp16 or bf16" in msg
+
     @pytest.mark.parametrize("kwarg", ["a_trans", "b_trans"])
     def test_matmul_acc_tile_rejects_transpose_flags(self, kwarg):
         acc = _tile("acc", [32, 128], DataType.FP32)

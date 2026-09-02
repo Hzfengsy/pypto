@@ -32,6 +32,7 @@
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/span.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/type_inference.h"
 
@@ -66,6 +67,35 @@ void CheckContractionExtents(const ExprPtr& k_lhs, const ExprPtr& k_rhs, const s
   }
 }
 
+/// Reject an ``out_dtype`` the Cube cannot produce for these operands.
+///
+/// ``out_dtype`` names the element type the matmul's result tensor carries, and
+/// that result leaves L0C through the FIXPIPE. The accumulator is fixed by the
+/// operand domain (``MatmulAccumulatorDataType``) and the plain writeback offers
+/// exactly one conversion, ``f32 -> f16`` / ``f32 -> bf16``. An INT8 x INT8
+/// matmul therefore cannot hand back FP32: that is a dequant, and it needs a
+/// scale ``tensor.matmul`` has nowhere to carry.
+///
+/// Without this check the request is simply dropped -- ``ConvertTensorToTileOps``
+/// builds ``tile.matmul`` from the operands alone -- and the mismatch surfaces
+/// far away, as a ccec type error on the generated ``TStore`` ("the 2nd parameter
+/// maybe need a type '__cc__ float *'") or, where that store happens to compile,
+/// as silently wrong numbers.
+void CheckTensorMatmulOutDataType(DataType out_dtype, DataType lhs_dtype, DataType rhs_dtype,
+                                  const Span& span) {
+  const DataType accumulator = MatmulAccumulatorDataType(lhs_dtype, rhs_dtype);
+  if (CubeWritebackSupportsDataType(accumulator, out_dtype)) return;
+  const bool needs_scale = accumulator == DataType::INT32;
+  CHECK_SPAN(false, span)
+      << "tensor.matmul: out_dtype=" << out_dtype.ToString() << " is not supported for "
+      << lhs_dtype.ToString() << " x " << rhs_dtype.ToString() << " operands -- the Cube accumulates them in "
+      << accumulator.ToString()
+      << (needs_scale ? ", and reaching any other dtype from an integer accumulator is a dequantization "
+                        "that needs a scale out_dtype cannot carry. Pass out_dtype="
+                      : ", and the writeback can only narrow that to fp16 or bf16. Pass out_dtype=")
+      << accumulator.ToString() << " and convert the result explicitly with pl.cast(result, <dtype>).";
+}
+
 }  // namespace
 
 TypePtr DeduceTensorMatMulType(const std::vector<ExprPtr>& args,
@@ -91,14 +121,21 @@ TypePtr DeduceTensorMatMulType(const std::vector<ExprPtr>& args,
 
   // Read kwargs (with defaults)
   DataType out_dtype;
+  bool out_dtype_requested = false;
   try {
     out_dtype = GetKwarg<DataType>(kwargs, "out_dtype");
+    out_dtype_requested = true;
   } catch (const ValueError& e) {
     auto promoted = PromoteDataTypes(lhs_type->dtype_, rhs_type->dtype_);
     CHECK(promoted) << "Cannot promote data types for tensor.matmul";
     out_dtype = *promoted;
   } catch (const TypeError& e) {
     throw TypeError("Invalid kwarg type for out_dtype: " + std::string(e.what()));
+  }
+  // Outside the try: this check reports a user error as a ValueError of its own,
+  // which the "out_dtype omitted" handler above must not swallow.
+  if (out_dtype_requested) {
+    CheckTensorMatmulOutDataType(out_dtype, lhs_type->dtype_, rhs_type->dtype_, args[0]->span_);
   }
 
   bool a_trans = GetKwarg<bool>(kwargs, "a_trans", false);

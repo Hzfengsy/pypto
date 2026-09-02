@@ -303,6 +303,12 @@ class BackendHandler {
    * dtypes: the identical DSL program is legal when its matmul result routes
    * through Vec and illegal when it stays in Acc.
    *
+   * This is a set of *destinations*, not of conversions, so passing it is
+   * necessary and not sufficient: it says nothing about which accumulator each
+   * destination can come from. `ir::CubeWritebackSupportsDataType` carries that
+   * second, arch-uniform half (the unscaled writeback converts only
+   * `FP32 -> FP16/BF16`), and `AccToGmStoreValid` checks both.
+   *
    * The two sets above mirror ptoas exactly; keep them in step when the pinned
    * assembler moves (`toolchain/versions.env`, `runtime/pto_isa.pin`). As of
    * ptoas v0.57 / pto-isa 83d01313 both arches are `i32/f32/f16/bf16`

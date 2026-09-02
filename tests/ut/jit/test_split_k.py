@@ -495,6 +495,43 @@ def test_acc_to_gm_narrow_int_dest_rejected(prog_name, out_dtype_name):
         )
 
 
+def _mm_int_acc_to_float_program():
+    """An int32 accumulator stored straight into an fp32 GM tensor.
+
+    The destination passes the backend whitelist (``fp32`` is in it), so only
+    the source-aware half of ``AccToGmStoreValid`` rejects this: the unscaled
+    fix-pipe writeback narrows ``f32 -> f16/bf16`` and has no ``int32 -> f32``
+    mode at all — that is a dequantization, and its scale has nowhere to live.
+    """
+
+    @jit
+    def mm_int_acc_to_f32(a: pl.Tensor, b: pl.Tensor, c: pl.Out[pl.Tensor]):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm_i32_f32"):
+            partial = pl.matmul(a, b, out_dtype=pl.INT32)
+            c = pl.assemble(c, partial, [0, 0])
+        return c
+
+    return mm_int_acc_to_f32
+
+
+def test_acc_to_gm_int_source_float_dest_rejected():
+    """A whitelisted destination is still illegal from an integer accumulator.
+
+    ptoas accepts the resulting ``pto.tstore`` — ``f32`` is in its dst set — and
+    the failure lands in ccec inside pto-isa's ``TStoreAcc`` ("the 2nd parameter
+    maybe need a type '__cc__ float *'"), or, where the shape lets it compile,
+    in the numbers: the kernel writes raw int32 accumulator bits reinterpreted
+    as float.
+    """
+    torch = pytest.importorskip("torch")
+    with pytest.raises(pypto.Error, match="AccToGmStoreValid"):
+        _mm_int_acc_to_float_program().lower(
+            torch.randint(-4, 4, (_M, _K), dtype=torch.int8),
+            torch.randint(-4, 4, (_K, _N), dtype=torch.int8),
+            torch.zeros(_M, _N, dtype=torch.float32),
+        )
+
+
 def _mm_via_vec_to_int8_program():
     """The same narrow-int GM destination, reached legally through Vec.
 

@@ -525,6 +525,17 @@ void CheckMatmulInitCond(const std::vector<ExprPtr>& args, size_t index, const s
       << ". Write a comparison such as `k == 0` rather than passing the index itself.";
 }
 
+DataType MatmulAccumulatorDataType(DataType lhs, DataType rhs) {
+  return (lhs.IsFloat() && rhs.IsFloat()) ? DataType::FP32 : DataType::INT32;
+}
+
+bool CubeWritebackSupportsDataType(DataType accumulator, DataType out) {
+  if (out == accumulator) return true;
+  // The one no-scale FIXPIPE conversion: the f32 accumulator narrowed on the way
+  // out. An INT32 accumulator has no unscaled target but INT32 itself.
+  return accumulator == DataType::FP32 && (out == DataType::FP16 || out == DataType::BF16);
+}
+
 void CheckReductionInputNonEmpty(const std::vector<ExprPtr>& valid, const std::string& op_name,
                                  const Span& span) {
   for (size_t i = 0; i < valid.size(); ++i) {

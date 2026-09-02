@@ -90,18 +90,21 @@ def test_device_kernel_rejects_descending_loop():
 
 
 @pytest.mark.parametrize(
-    ("name", "rows", "cols", "dtype", "axis", "inner", "padded"),
+    ("name", "rows", "cols", "dtype", "acc_dtype", "axis", "inner", "padded"),
     [
         # M on the row axis: the box is 16 rows for every dtype.
-        ("row_axis", 100, 128, pl.FP16, "row", 16, 112),
+        ("row_axis", 100, 128, pl.FP16, pl.FP32, "row", 16, 112),
         # K on the column axis: the box holds 32 bytes' worth of elements, so
         # 16 for FP16 -- the axis this compiler does not pad for the user.
-        ("col_axis", 128, 24, pl.FP16, "column", 16, 32),
-        # An 8-bit column box is 32 elements wide, not 16.
-        ("col_axis_int8", 128, 24, pl.INT8, "column", 32, 32),
+        ("col_axis", 128, 24, pl.FP16, pl.FP32, "column", 16, 32),
+        # An 8-bit column box is 32 elements wide, not 16. Integer operands
+        # accumulate in INT32, and the fix-pipe has no unscaled path out of an
+        # integer accumulator, so this case must take an INT32 destination --
+        # an FP32 one is rejected by AccToGmStoreValid before codegen runs.
+        ("col_axis_int8", 128, 24, pl.INT8, pl.INT32, "column", 32, 32),
     ],
 )
-def test_sub_fractal_cube_tile_is_rejected_by_pypto(name, rows, cols, dtype, axis, inner, padded):
+def test_sub_fractal_cube_tile_is_rejected_by_pypto(name, rows, cols, dtype, acc_dtype, axis, inner, padded):
     """A partial fractal box is refused here, not left for PTOAS to refuse.
 
     PTO addresses a boxed tile one box at a time, so a tile whose physical
@@ -122,8 +125,8 @@ def test_sub_fractal_cube_tile_is_rejected_by_pypto(name, rows, cols, dtype, axi
             self,
             a: pl.Tensor[[rows, cols], dtype],
             b: pl.Tensor[[cols, 64], dtype],
-            out: pl.Out[pl.Tensor[[rows, 64], pl.FP32]],
-        ) -> pl.Tensor[[rows, 64], pl.FP32]:
+            out: pl.Out[pl.Tensor[[rows, 64], acc_dtype]],
+        ) -> pl.Tensor[[rows, 64], acc_dtype]:
             # Written at the tile level so the shape reaches codegen verbatim:
             # a tensor-level pl.matmul would box its M axis automatically.
             am = pl.tile.load(a, [0, 0], [rows, cols], target_memory=pl.MemorySpace.Mat)

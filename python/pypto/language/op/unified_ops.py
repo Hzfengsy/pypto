@@ -1024,6 +1024,15 @@ def matmul(
     the Tile path accepts ``out_dtype`` only when it already agrees with that
     deduction and raises otherwise.
 
+    The Tensor path allows one conversion on top of that deduction, because the
+    result drains L0C through the FIXPIPE, whose unscaled writeback narrows
+    ``FP32 -> FP16`` / ``FP32 -> BF16``. So float operands accept ``FP32``,
+    ``FP16`` or ``BF16``, and int operands accept only ``INT32`` — reaching any
+    other dtype from an integer accumulator is a dequantization, and its scale
+    has nowhere to live in this call. Requesting an unsupported pair (notably
+    ``out_dtype=FP32`` on INT8 operands) raises here rather than lowering to a
+    backend type error. Convert explicitly with ``pl.cast`` instead.
+
     For Tensor inputs with rank > 2 on either operand, the call is lowered to
     ``tile.batch_matmul`` (with batch broadcasting) by ``ConvertTensorToTileOps``
     and then unrolled to per-batch ``tile.matmul`` by ``FlattenTileNdTo2D``.

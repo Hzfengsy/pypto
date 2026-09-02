@@ -128,6 +128,7 @@ parallelism is worth more than reproducibility.
 | **Results drift between identical runs** | Split-K's atomic accumulation order is not fixed | Expected — use K-blocking if you need determinism |
 | **Split-K output is too large by roughly a factor** | The output was not zeroed before the atomic loop | Zero-init in its own scope first |
 | **Accumulator dtype rejected** | `matmul_acc` requires the accumulator's dtype | Create it with `pl.matmul(..., out_dtype=pl.FP32)` |
+| **`out_dtype=pl.FP32` rejected on INT8 inputs** | Integer operands accumulate in INT32, and the cube writeback narrows only FP32 -> FP16/BF16 — an integer accumulator reaching a float dtype is a dequantization, and its scale has nowhere to live in the call | Ask for `out_dtype=pl.INT32`, then `pl.cast(result, pl.FP32)` in the vector unit |
 
 ## Before and after this page
 

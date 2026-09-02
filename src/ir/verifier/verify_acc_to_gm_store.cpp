@@ -28,6 +28,7 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/type.h"
+#include "pypto/ir/type_inference.h"
 #include "pypto/ir/verifier/verifier.h"
 
 namespace pypto {
@@ -36,16 +37,28 @@ namespace ir {
 namespace {
 
 /// Flags every `tile.store` that drains an Acc-resident tile into a GM tensor
-/// whose dtype the cube fix-pipe cannot narrow into.
+/// the cube fix-pipe cannot produce. Two independent conditions must hold.
 ///
-/// The cube fix-pipe writes an accumulator to global memory through a fixed
-/// destination set (INT32/FP32/FP16[/BF16], see
-/// `BackendHandler::SupportsAccToGmDtype`). An INT8/INT16 destination is not in
-/// it, and ptoas rejects the resulting `pto.tstore` -- but only after codegen,
-/// pointing at a line in a generated `.pto` the user never wrote. One such
-/// program also tends to trip a *second*, unrelated-looking op downstream (an
-/// int8 zero-init lowers to a `pto.texpands` with the same illegal dtype), so
-/// the late diagnostic names two symptoms and never the cause.
+/// **The destination must be in the backend's whitelist.** The fix-pipe writes
+/// an accumulator to global memory through a fixed destination set
+/// (INT32/FP32/FP16[/BF16], see `BackendHandler::SupportsAccToGmDtype`). An
+/// INT8/INT16 destination is not in it, and ptoas rejects the resulting
+/// `pto.tstore` -- but only after codegen, pointing at a line in a generated
+/// `.pto` the user never wrote. One such program also tends to trip a *second*,
+/// unrelated-looking op downstream (an int8 zero-init lowers to a
+/// `pto.texpands` with the same illegal dtype), so the late diagnostic names
+/// two symptoms and never the cause.
+///
+/// **The fix-pipe must be able to reach that destination from *this* source.**
+/// The whitelist is a set of destinations, not of conversions: it says nothing
+/// about which accumulator each one can come from. The unscaled writeback
+/// performs exactly one conversion, `f32 -> f16` / `f32 -> bf16`
+/// (`CubeWritebackSupportsDataType`), so an INT32 accumulator can only leave as
+/// INT32 -- an int8 x int8 matmul stored straight into an FP32 tensor passes the
+/// whitelist and is still a dequantization with no scale. ptoas accepts it; ccec
+/// then fails inside pto-isa's `TStoreAcc` ("the 2nd parameter maybe need a type
+/// '__cc__ float *'"), and where the shape lets it compile the kernel returns
+/// the raw accumulator bits reinterpreted as the destination type.
 ///
 /// Checking here -- the first point at which memory spaces are resolved -- lets
 /// the error carry the original `Span` and name the one decision behind both.
@@ -95,17 +108,36 @@ class AccToGmStoreVisitor : public IRVisitor {
     if (!tensor_type) return;
 
     const auto& dtype = tensor_type->dtype_;
-    if (handler_->SupportsAccToGmDtype(dtype)) return;
+    if (!handler_->SupportsAccToGmDtype(dtype)) {
+      diagnostics_.emplace_back(
+          DiagnosticSeverity::Error, "AccToGmStoreValid", /*error_code=*/1,
+          "cube accumulator cannot be stored directly into a '" + dtype.ToString() +
+              "' global tensor on the '" + handler_->GetPtoTargetArch() + "' backend (function '" +
+              func_name_ + "'). The fix-pipe narrows an Acc tile only into INT32/FP32/FP16" +
+              (handler_->SupportsAccToGmDtype(DataType::BF16) ? "/BF16" : "") +
+              ". Narrow through the vector unit first -- cast the matmul result to '" + dtype.ToString() +
+              "' (e.g. pl.cast(result, ...)) and store that -- or accumulate "
+              "into an INT32/FP32 tensor and convert afterwards.",
+          call->span_);
+      return;
+    }
+
+    // Whitelisted destination, but not one the fix-pipe can reach from this
+    // accumulator: the unscaled writeback only narrows f32 -> f16/bf16, so an
+    // INT32 accumulator leaves as INT32 or not at all.
+    const auto& src_dtype = tile_type->dtype_;
+    if (CubeWritebackSupportsDataType(src_dtype, dtype)) return;
 
     diagnostics_.emplace_back(
         DiagnosticSeverity::Error, "AccToGmStoreValid", /*error_code=*/1,
-        "cube accumulator cannot be stored directly into a '" + dtype.ToString() +
-            "' global tensor on the '" + handler_->GetPtoTargetArch() + "' backend (function '" + func_name_ +
-            "'). The fix-pipe narrows an Acc tile only into INT32/FP32/FP16" +
-            (handler_->SupportsAccToGmDtype(DataType::BF16) ? "/BF16" : "") +
-            ". Narrow through the vector unit first -- cast the matmul result to '" + dtype.ToString() +
-            "' (e.g. pl.cast(result, ...)) and store that -- or accumulate "
-            "into an INT32/FP32 tensor and convert afterwards.",
+        "a '" + src_dtype.ToString() + "' cube accumulator cannot be stored into a '" + dtype.ToString() +
+            "' global tensor (function '" + func_name_ +
+            "'): the fix-pipe writeback converts only FP32 -> FP16/BF16, so reaching '" + dtype.ToString() +
+            "' from '" + src_dtype.ToString() +
+            "' is a dequantization and needs a scale this store cannot carry. An integer accumulator "
+            "comes from integer operands, so if you asked for it with out_dtype, ask for '" +
+            src_dtype.ToString() + "' instead and convert in the vector unit -- pl.cast(result, " +
+            dtype.ToString() + ") -- or store into a '" + src_dtype.ToString() + "' tensor.",
         call->span_);
   }
 

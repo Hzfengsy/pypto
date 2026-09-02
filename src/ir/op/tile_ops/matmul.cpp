@@ -83,8 +83,7 @@ MatmulProductInfo DeduceMatmulProductInfo(const TileTypePtr& lhs_type, const Til
   CHECK(lhs_type->dtype_ == rhs_type->dtype_)
       << "The operator " << op_name << " requires identical lhs and rhs data types, but got "
       << lhs_type->dtype_.ToString() << " and " << rhs_type->dtype_.ToString();
-  const auto accumulator_dtype =
-      (lhs_type->dtype_.IsFloat() && rhs_type->dtype_.IsFloat()) ? DataType::FP32 : DataType::INT32;
+  const auto accumulator_dtype = MatmulAccumulatorDataType(lhs_type->dtype_, rhs_type->dtype_);
 
   return MatmulProductInfo{{lhs_shape[0], rhs_shape[1]}, {lhs_valid[0], rhs_valid[1]}, accumulator_dtype};
 }

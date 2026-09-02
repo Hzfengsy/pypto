@@ -106,6 +106,7 @@ for ks in pl.parallel(SPLITS):
 | **相同输入多次运行结果漂移** | split-K 的原子累加顺序不固定 | 属预期 —— 需要确定性就用 K 分块 |
 | **split-K 输出大了约一个倍数** | 原子循环前没清零输出 | 先在独立作用域里零初始化 |
 | **累加器 dtype 被拒** | `matmul_acc` 要求累加器的 dtype | 用 `pl.matmul(..., out_dtype=pl.FP32)` 创建它 |
+| **INT8 输入上 `out_dtype=pl.FP32` 被拒** | 整数操作数在 INT32 中累加，而 cube 写回只做 FP32 -> FP16/BF16 的收窄——整数累加器转到浮点 dtype 属于反量化，其 scale 在这次调用里无处安放 | 改用 `out_dtype=pl.INT32`，再在向量单元里 `pl.cast(result, pl.FP32)` |
 
 ## 本页前后的例子
 
