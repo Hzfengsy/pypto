@@ -130,7 +130,13 @@ class SpecializeContext:
         tensor_meta: TensorMeta per tensor param name.
         scalar_values: Concrete value per scalar param name.
         scalar_dtypes: DataType annotation per scalar param name.
-        dep_names: Names of dep functions called from this function.
+        dep_names: Names this function's source calls its deps by. Under an
+            aliased import (``from mod import kernel as kern``) that is the
+            alias, not the callee's ``__name__`` — see ``dep_func_names``.
+        dep_func_names: ``call name -> generated function name``, for every
+            call name that differs from the function it resolves to. The body
+            transformer consults it when rewriting ``kern(...)`` into
+            ``self.kernel(...)``; an absent entry means the two agree.
         py_globals: Every name visible to the originating function — its
             ``__globals__`` merged with its closure free vars, as built by
             :func:`func_name_lookup`. The specializer uses this to resolve
@@ -181,6 +187,9 @@ class SpecializeContext:
     external_aiv_source: str | None = None
     external_dual_aiv_dispatch: bool = False
     external_include_dirs: tuple[str, ...] = ()
+    # Also appended at the tail (see above): ``call name -> generated function
+    # name`` for the deps this function reaches under a different name.
+    dep_func_names: dict[str, str] = field(default_factory=dict)
 
     @property
     def dynamic_dims(self) -> set[tuple[str, int]]:
@@ -552,11 +561,17 @@ class _BodyTransformer(ast.NodeTransformer):
         initial_used_names: set[str] | None = None,
         py_globals: dict[str, Any] | None = None,
         dep_param_names: dict[str, list[str]] | None = None,
+        dep_func_names: dict[str, str] | None = None,
     ) -> None:
         super().__init__()
         self._meta = tensor_meta
         self._scalars = scalar_values
         self._dep_names = dep_names
+        # Call name → generated function name, for deps this body reaches
+        # under a different name (an aliased import). ``visit_Call`` resolves
+        # through it so ``kern(...)`` becomes ``self.kernel(...)``; a name
+        # absent from the map is its own generated name.
+        self._dep_func_names = dep_func_names or {}
         # DynVar name → (anchor_param, anchor_dim_idx). ``visit_Name`` uses
         # this to rewrite runtime references like ``pl.create_tensor([M, ...])``
         # via ``_dyn_dim_expr`` so the annotation-only DynVar doesn't leak past
@@ -915,13 +930,17 @@ class _BodyTransformer(ast.NodeTransformer):
     def visit_Call(self, node: ast.Call) -> ast.expr:
         """Rewrite dep_func(args) → self.dep_func(args) for multi-function JIT.
 
+        The attribute is the dep's *generated* function name, which differs
+        from the name at the call site when the body reaches the dep through
+        an aliased import (``kern(...)`` → ``self.kernel(...)``).
+
         Keyword args are normalised to positional based on the dep's
         parameter order (so ``dep(a, out=out)`` becomes ``self.dep(a, out)``).
         Inter-function calls inside ``@pl.program`` only accept positional
         args — preserving keyword form would make the parser reject the call.
         """
         if isinstance(node.func, ast.Name) and node.func.id in self._dep_names:
-            dep_name = node.func.id
+            dep_name = self._dep_func_names.get(node.func.id, node.func.id)
             new_func = ast.Attribute(
                 value=ast.Name(id="self", ctx=ast.Load()),
                 attr=dep_name,
@@ -1812,6 +1831,7 @@ class Specializer:
             initial_used_names=all_defined,
             py_globals=ctx.py_globals,
             dep_param_names=self._dep_param_names,
+            dep_func_names=ctx.dep_func_names,
         )
         new_body = [transformer.visit(stmt) for stmt in func_def.body]
         # Accumulate alias→original renames for error message rewriting.
@@ -2031,11 +2051,13 @@ class Specializer:
                 meta = ctx.tensor_meta.get(name)
                 if meta is None:
                     raise ValueError(
-                        f"@pl.jit: missing inferred tensor metadata for parameter '{name}'. "
-                        "This usually means the tensor's shape/dtype could not be statically "
-                        "determined. Pass the tensor directly as a function argument, or "
-                        "ensure any intermediate pl.create_tensor() used for this parameter "
-                        "has a statically inferable shape and dtype."
+                        f"@pl.jit: missing inferred tensor metadata for parameter '{name}' "
+                        f"of '{ctx.func_name}'. This usually means the tensor's shape/dtype "
+                        "could not be statically determined, or that the call site passing it "
+                        f"was not resolved (no call to '{ctx.func_name}' found in its caller). "
+                        "Pass the tensor directly as a function argument, or ensure any "
+                        "intermediate pl.create_tensor() used for this parameter has a "
+                        "statically inferable shape and dtype."
                     )
                 ann = _build_tensor_annotation(
                     meta, is_out=is_out, is_distributed=is_distributed, is_inout=is_inout
@@ -2090,6 +2112,7 @@ def build_specialize_context(  # noqa: PLR0913 — pass-through assembler; each 
     external_aiv_source: str | None = None,
     external_dual_aiv_dispatch: bool = False,
     external_include_dirs: tuple[str, ...] = (),
+    dep_func_names: dict[str, str] | None = None,
 ) -> SpecializeContext:
     """Build a SpecializeContext from a Python function and call-site data.
 
@@ -2101,11 +2124,15 @@ def build_specialize_context(  # noqa: PLR0913 — pass-through assembler; each 
         tensor_meta: TensorMeta per tensor param name.
         scalar_values: Concrete scalar values from the call site.
         scalar_dtypes: DataType per scalar param name.
-        dep_names: Names of @pl.jit.incore functions called from this function.
+        dep_names: Names this function's source calls its @pl.jit deps by
+            (the alias, under an aliased import).
         auto_scope: Whether the compiler auto-inserts AUTO runtime scopes.
             Forwarded to the generated ``@pl.function`` decorator; the
             Orchestration entry, HOST orchestrator, and inline sub-functions
             honor ``False``.
+        dep_func_names: ``call name -> generated function name`` for the deps
+            this function reaches under a different name; names that agree may
+            be omitted.
 
     Dynamic dims live inside ``tensor_meta`` as :class:`DynDim` entries —
     no separate set is passed in.
@@ -2144,6 +2171,7 @@ def build_specialize_context(  # noqa: PLR0913 — pass-through assembler; each 
         scalar_values=scalar_values,
         scalar_dtypes=scalar_dtypes,
         dep_names=dep_names,
+        dep_func_names=dep_func_names or {},
         auto_scope=auto_scope,
         # Closure-aware: a factory-defined kernel captures its constants as free
         # vars, which never appear in __globals__. Folding must see them or they

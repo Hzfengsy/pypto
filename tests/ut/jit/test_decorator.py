@@ -26,6 +26,7 @@ from pypto.jit.decorator import (
     _arg_ref,
     _build_param_mapping,
     _compute_per_func_dyndim_maps,
+    _discover_dep_bindings,
     _discover_deps,
     _extract_call_args_for_dep,
     _extract_local_tensor_metas,
@@ -646,6 +647,211 @@ class TestMultiFuncDepDiscovery:
 
         deps = _discover_deps(entry._func)
         assert len(deps) == 0
+
+
+class TestAliasedDepCallName:
+    """A dep reached under a name other than its own.
+
+    ``from mod import kernel as kern`` (and the equivalent ``kern = kernel``
+    rebinding) leaves the caller's AST calling ``kern``, while the callee's
+    ``__name__`` stays ``kernel``. Every call-site lookup must key on the
+    former; only the generated ``@pl.function`` keeps the latter.
+    """
+
+    @staticmethod
+    def _aliased_entry():
+        """Return ``(entry, dep)`` where ``entry`` calls ``dep`` via an alias.
+
+        The dep's parameters are deliberately named differently from the
+        caller's variables, so nothing resolves by coincidence of names.
+        """
+
+        @jit.incore
+        def copy_incore(src: pl.Tensor, dst: pl.Out[pl.Tensor]) -> pl.Tensor:
+            tile = pl.load(src, [0, 0], [64, 64])
+            pl.store(tile, [0, 0], dst)
+            return dst
+
+        kern = copy_incore  # the alias an ``import ... as`` would bind
+
+        @jit
+        def entry(a: pl.Tensor, c: pl.Out[pl.Tensor]):
+            kern(a, c)
+            return c
+
+        return entry, copy_incore
+
+    def test_discovery_reports_call_name_and_func_name(self):
+        entry, dep = self._aliased_entry()
+        bindings = _discover_dep_bindings(entry._func)
+        assert [(b.call_name, b.dep.__name__) for b in bindings] == [("kern", "copy_incore")]
+        assert bindings[0].dep is dep
+
+    def test_discover_deps_view_drops_call_names(self):
+        entry, dep = self._aliased_entry()
+        assert _discover_deps(entry._func) == [dep]
+
+    def test_scan_dep_io_keyed_by_call_name(self):
+        """``_dep_out_metas`` looks the entry up by the AST's ``ast.Name``."""
+        entry, _ = self._aliased_entry()
+        io = _scan_dep_io(entry._func)
+        assert "kern" in io
+        assert "copy_incore" not in io
+        param_names, output_params = io["kern"]
+        assert param_names == ["src", "dst"]
+        assert output_params == ["dst"]
+
+    def test_dep_metadata_resolves_through_alias(self):
+        """The reported failure: metadata came back empty, blaming the shapes."""
+        entry, dep = self._aliased_entry()
+        caller_meta = {
+            "a": TensorMeta(shape=(64, 64), dtype=DataType.FP32),
+            "c": TensorMeta(shape=(64, 64), dtype=DataType.FP32),
+        }
+        dep_meta, _, _ = _resolve_dep_call_metadata(
+            dep, entry._func, caller_meta, {}, {}, {}, dep_call_name="kern"
+        )
+        # Positional call-site mapping, not the name-based fallback: the dep's
+        # own parameter names appear nowhere in the caller.
+        assert dep_meta["src"].shape == (64, 64)
+        assert dep_meta["dst"].shape == (64, 64)
+
+    def test_context_carries_call_name_and_generated_name(self):
+        torch = pytest.importorskip("torch")
+        entry, _ = self._aliased_entry()
+        a = torch.empty(64, 64)
+        c = torch.empty(64, 64)
+        _pn, _, tmeta, sv, sd, pfd = entry._bind_args((a, c), {})
+        contexts = entry._build_contexts(tmeta, sv, sd, pfd)
+
+        dep_ctx = next(ctx for ctx in contexts if ctx.func_name == "copy_incore")
+        assert dep_ctx.tensor_meta["src"].shape == (64, 64)
+
+        entry_ctx = next(ctx for ctx in contexts if ctx.func_name == "entry")
+        assert entry_ctx.dep_names == ["kern"]
+        assert entry_ctx.dep_func_names == {"kern": "copy_incore"}
+
+    def test_generated_source_calls_the_generated_name(self):
+        """The body rewrite must target ``self.copy_incore``, not ``self.kern``."""
+        torch = pytest.importorskip("torch")
+        entry, _ = self._aliased_entry()
+        a = torch.empty(64, 64)
+        c = torch.empty(64, 64)
+        _pn, _, tmeta, sv, sd, pfd = entry._bind_args((a, c), {})
+        contexts = entry._build_contexts(tmeta, sv, sd, pfd)
+        source = Specializer("_jit_entry", contexts).specialize()
+
+        assert "self.copy_incore(a, c)" in source
+        assert "kern" not in source
+        # And it still parses — an unrewritten bare call does not.
+        assert isinstance(pl.parse(source), ir.Program)
+
+    def test_two_aliases_for_one_dep_both_rewrite(self):
+        """Both call names map onto the single generated function."""
+        torch = pytest.importorskip("torch")
+
+        @jit.incore
+        def copy_incore(src: pl.Tensor, dst: pl.Out[pl.Tensor]) -> pl.Tensor:
+            tile = pl.load(src, [0, 0], [64, 64])
+            pl.store(tile, [0, 0], dst)
+            return dst
+
+        first = copy_incore
+        second = copy_incore
+
+        @jit
+        def entry(a: pl.Tensor, c: pl.Out[pl.Tensor]):
+            first(a, c)
+            second(a, c)
+            return c
+
+        a = torch.empty(64, 64)
+        c = torch.empty(64, 64)
+        _pn, _, tmeta, sv, sd, pfd = entry._bind_args((a, c), {})
+        contexts = entry._build_contexts(tmeta, sv, sd, pfd)
+        entry_ctx = next(ctx for ctx in contexts if ctx.func_name == "entry")
+        assert entry_ctx.dep_func_names == {"first": "copy_incore", "second": "copy_incore"}
+
+        source = Specializer("_jit_entry", contexts).specialize()
+        assert source.count("self.copy_incore(a, c)") == 2
+        # One generated function, called twice.
+        assert source.count("def copy_incore(self") == 1
+
+    def test_module_global_alias_from_import(self):
+        """The reported shape: ``from mod import kernel as kern`` at module scope.
+
+        Discovery reads the entry's ``__globals__``, so the alias must resolve
+        there too — not only through the closure path the other cases use.
+        """
+        import importlib.util  # noqa: PLC0415
+        import types  # noqa: PLC0415
+        from pathlib import Path  # noqa: PLC0415
+
+        torch = pytest.importorskip("torch")
+
+        fixture_path = Path(__file__).parent / "_alias_dep_fixture.py"
+        spec = importlib.util.spec_from_file_location("_alias_dep_fixture", fixture_path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        def _entry_raw(a: pl.Tensor, c: pl.Out[pl.Tensor]):
+            # Bound below, as ``import ... as kern`` would, via the rebuilt globals.
+            kern(a, c)  # noqa: F821  # pyright: ignore[reportUndefinedVariable]
+            return c
+
+        # ``from _alias_dep_fixture import copy_incore as kern`` binds the dep
+        # under ``kern`` in the importing module's globals.
+        new_globals = {**_entry_raw.__globals__, "kern": module.copy_incore}
+        entry = JITFunction(
+            types.FunctionType(
+                _entry_raw.__code__,
+                new_globals,
+                _entry_raw.__name__,
+                _entry_raw.__defaults__,
+                _entry_raw.__closure__,
+            ),
+            func_type="orchestration",
+        )
+
+        a = torch.empty(64, 64)
+        c = torch.empty(64, 64)
+        _pn, _, tmeta, sv, sd, pfd = entry._bind_args((a, c), {})
+        contexts = entry._build_contexts(tmeta, sv, sd, pfd)
+
+        dep_ctx = next(ctx for ctx in contexts if ctx.func_name == "copy_incore")
+        assert dep_ctx.tensor_meta["src"].shape == (64, 64)
+        source = Specializer("_jit_entry_raw", contexts).specialize()
+        assert "self.copy_incore(a, c)" in source
+        assert isinstance(pl.parse(source), ir.Program)
+
+    def test_aliased_dep_out_metadata_propagates_to_capture(self):
+        """``out = kern(a, buf)`` inherits the meta of the arg bound to ``dst``."""
+
+        @jit.incore
+        def copy_incore(src: pl.Tensor, dst: pl.Out[pl.Tensor]) -> pl.Tensor:
+            tile = pl.load(src, [0, 0], [64, 64])
+            pl.store(tile, [0, 0], dst)
+            return dst
+
+        kern = copy_incore
+
+        @jit
+        def entry(a: pl.Tensor, c: pl.Out[pl.Tensor]):
+            buf = pl.create_tensor([32, 16], dtype=pl.FP32)
+            out = kern(a, buf)
+            return out
+
+        metas = _extract_local_tensor_metas(
+            entry._func,
+            seed_meta={
+                "a": TensorMeta(shape=(64, 64), dtype=DataType.FP32),
+                "c": TensorMeta(shape=(64, 64), dtype=DataType.FP32),
+            },
+        )
+        # ``out`` captures the dep's Out param, which the call site bound to
+        # ``buf`` — resolvable only if _scan_dep_io keyed the dep by "kern".
+        assert metas["out"].shape == (32, 16)
 
 
 class TestMultiFuncIntegration:
@@ -1649,7 +1855,7 @@ class TestSlicedDispatchMetadata:
             entry_func=_per_rank_dispatch_body,
             entry_param_names=["inputs", "outputs"],
             deps=[_dyn_sliced_chip],
-            callers_by_dep_id={id(_dyn_sliced_chip._func): [_per_rank_dispatch_body]},
+            callers_by_dep_id={id(_dyn_sliced_chip._func): [(_per_rank_dispatch_body, "_dyn_sliced_chip")]},
             call_args_cache=call_args_cache,
         )
         host_map = maps[id(_per_rank_dispatch_body)]
@@ -1785,8 +1991,9 @@ class TestInlineFuncIntegration:
 
         deps_topo, callers_by_id, callees_by_id, _ = entry._get_dep_graph()
         assert [d.__name__ for d in deps_topo] == ["leaf", "mid"]
-        assert callers_by_id[id(leaf._func)] == [mid._func]
-        assert callers_by_id[id(mid._func)] == [entry._func]
+        # Callers are recorded with the name their source calls the dep by.
+        assert callers_by_id[id(leaf._func)] == [(mid._func, "leaf")]
+        assert callers_by_id[id(mid._func)] == [(entry._func, "mid")]
         assert callees_by_id[id(entry._func)] == ["mid"]
         assert callees_by_id[id(mid._func)] == ["leaf"]
         assert callees_by_id[id(leaf._func)] == []
@@ -1861,9 +2068,10 @@ class TestInlineFuncIntegration:
         # shared leaf, so dyn-dim / dynvar propagation visits every branch
         # rather than just the first DFS path.
         shared_callers = callers_by_id[id(shared._func)]
-        assert {c.__name__ for c in shared_callers} == {"a_helper", "b_helper"}
-        assert callers_by_id[id(a_helper._func)] == [entry_diamond._func]
-        assert callers_by_id[id(b_helper._func)] == [entry_diamond._func]
+        assert {c.__name__ for c, _ in shared_callers} == {"a_helper", "b_helper"}
+        assert {name for _, name in shared_callers} == {"shared"}
+        assert callers_by_id[id(a_helper._func)] == [(entry_diamond._func, "a_helper")]
+        assert callers_by_id[id(b_helper._func)] == [(entry_diamond._func, "b_helper")]
 
         a = torch.randn(32, 32)
         out = torch.empty(32, 32)

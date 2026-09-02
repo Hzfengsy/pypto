@@ -601,7 +601,7 @@ def _compute_per_func_dyndim_maps(
     entry_func: Any,
     entry_param_names: list[str],
     deps: list[Any],
-    callers_by_dep_id: dict[int, list[Any]],
+    callers_by_dep_id: dict[int, list[tuple[Any, str]]],
     call_args_cache: dict[tuple[int, str], list[tuple[str | None, str | _SlicedArg | None]] | None],
 ) -> dict[int, dict[str, dict[int, DynDim]]]:
     """Per JIT function in the dep graph, return ``param → dim_idx → DynDim``.
@@ -634,8 +634,8 @@ def _compute_per_func_dyndim_maps(
         dep_map = out[id(dep._func)]
         if not dep_map:
             continue
-        for caller_func in callers_by_dep_id.get(id(dep._func), ()):
-            call_args = call_args_cache.get((id(caller_func), dep.__name__))
+        for caller_func, call_name in callers_by_dep_id.get(id(dep._func), ()):
+            call_args = call_args_cache.get((id(caller_func), call_name))
             if call_args is None:
                 continue
             param_mapping = _build_param_mapping(dep._param_names(), call_args)
@@ -687,11 +687,30 @@ def _build_dynvar_anchor_index(
     return anchors
 
 
+class _DepBinding(NamedTuple):
+    """A JIT dep together with the name its caller's source calls it by.
+
+    The two differ whenever the caller reaches the dep through a rebinding —
+    ``from mod import kernel as kern``, or a module-level ``kern = kernel``.
+    Anything that has to *find the call site* (argument extraction, ``Out``
+    param propagation, the ``self.<dep>(...)`` rewrite) must key on
+    ``call_name``; anything that names the *function* (the generated
+    ``@pl.function``, diagnostics, the source hash) keys on ``dep.__name__``.
+    """
+
+    call_name: str
+    dep: JITFunction
+
+
 def _scan_dep_io(
     func: Any, caller_func_type: str = "orchestration"
 ) -> dict[str, tuple[list[str], list[str]]]:
-    """Return ``dep_name → (param_names, output_param_names)`` for every @pl.jit
+    """Return ``call_name → (param_names, output_param_names)`` for every @pl.jit
     dep called from ``func``'s body.
+
+    Keyed by the name the body *calls* the dep by, so an aliased import
+    (``from mod import kernel as kern``) still matches the ``ast.Name`` at the
+    call site.
 
     Used by ``_extract_local_tensor_metas`` to propagate metas through
     ``v1, ..., vk = dep(args)`` assignments (each ``vi`` inherits the meta of
@@ -706,7 +725,7 @@ def _scan_dep_io(
     orchestrator also admits ``orchestration`` deps (its chip orchestrators).
     """
     out: dict[str, tuple[list[str], list[str]]] = {}
-    for dep in _discover_deps(func, caller_func_type):
+    for call_name, dep in _discover_dep_bindings(func, caller_func_type):
         try:
             out_params, inout_params, _, _, _ = _classify_params(_get_func_def(dep._func))
         except OSError:
@@ -714,7 +733,7 @@ def _scan_dep_io(
         param_names = dep._param_names()
         output_set = set(out_params) | set(inout_params)
         output_params = [p for p in param_names if p in output_set]
-        out[dep.__name__] = (param_names, output_params)
+        out[call_name] = (param_names, output_params)
     return out
 
 
@@ -1347,6 +1366,7 @@ def _resolve_dep_call_metadata(
     caller_scalar_dtypes: dict[str, DataType],
     dep_dyn_map: dict[str, dict[int, DynDim]],
     caller_func_type: str = "orchestration",
+    dep_call_name: str | None = None,
 ) -> tuple[
     dict[str, TensorMeta],
     dict[str, int | float | bool],
@@ -1366,15 +1386,21 @@ def _resolve_dep_call_metadata(
     ``caller_func_type`` is forwarded to ``_extract_local_tensor_metas``
     so a host orchestrator's body can also recognise chip-orchestrator deps
     when walking ``v = chip_orch(...)`` return-capture assignments.
+
+    ``dep_call_name`` is the name ``caller_func``'s source calls the dep by;
+    it differs from ``dep.__name__`` under an aliased import or any other
+    rebinding. Defaults to ``dep.__name__`` for callers that resolve a dep
+    reached under its own name.
     """
     dep_param_names = dep._param_names()
-    call_args = _extract_call_args_for_dep(caller_func, dep.__name__)
+    call_name = dep_call_name or dep.__name__
+    call_args = _extract_call_args_for_dep(caller_func, call_name)
     intermediate_metas = _extract_local_tensor_metas(
         caller_func,
         seed_meta=caller_tensor_meta,
         seed_scalars=caller_scalar_values,
         caller_func_type=caller_func_type,
-        stop_at_dep=dep.__name__ if call_args is not None else None,
+        stop_at_dep=call_name if call_args is not None else None,
     )
     # The extractor starts from caller_tensor_meta, then applies source-ordered
     # rebindings. Its result is therefore the authoritative state at the call.
@@ -1768,7 +1794,7 @@ class JITFunction:
         self,
     ) -> tuple[
         list[JITFunction],
-        dict[int, list[Any]],
+        dict[int, list[tuple[Any, str]]],
         dict[int, list[str]],
         dict[tuple[int, str], list[tuple[str | None, str | _SlicedArg | None]] | None],
     ]:
@@ -1780,10 +1806,12 @@ class JITFunction:
         - ``deps_topo``: every reachable dep in leaf-first topological order
           (deduplicated by underlying Python function identity). The entry
           function is NOT included.
-        - ``callers_by_dep_id``: for each dep, the list of Python functions
-          whose bodies contain a call site to it. Recorded in DFS-discovery
-          order; deduplicated within each list. The entry has no caller and
-          does not appear as a key.
+        - ``callers_by_dep_id``: for each dep, the list of
+          ``(caller_func, call_name)`` pairs whose bodies contain a call site
+          to it — ``call_name`` being the name that caller's source calls it
+          by, which differs from ``dep.__name__`` under an aliased import.
+          Recorded in DFS-discovery order; deduplicated within each list. The
+          entry has no caller and does not appear as a key.
 
           Tensor / scalar metadata for a shared dep is still resolved
           through the first-recorded caller — call sites in other branches
@@ -1791,11 +1819,11 @@ class JITFunction:
           have to differ from another, which the one-context-per-function
           design doesn't support).
         - ``callees_by_func_id``: for each function (entry + every reached
-          dep), the names of JIT deps it directly calls. Used to set each
-          context's ``dep_names`` so the body transformer rewrites nested
-          dep calls into the ``self.<dep>(...)`` form required by
+          dep), the *call names* of the JIT deps it directly calls. Used to
+          set each context's ``dep_names`` so the body transformer rewrites
+          nested dep calls into the ``self.<dep>(...)`` form required by
           multi-function ``@pl.program``.
-        - ``call_args_cache``: ``(id(caller_func), dep_name)`` → unified
+        - ``call_args_cache``: ``(id(caller_func), call_name)`` → unified
           call-site arg list (see ``_extract_call_args_for_dep``) or
           ``None`` if the call site isn't found. Cached so metadata
           resolution doesn't re-walk caller ASTs on every JIT call.
@@ -1810,20 +1838,23 @@ class JITFunction:
             ] = {}
 
             def visit(func: Any, caller_func_type: str) -> None:
-                direct = _discover_deps(func, caller_func_type)
-                callees_by_func_id[id(func)] = [d.__name__ for d in direct]
-                for dep in direct:
+                direct = _discover_dep_bindings(func, caller_func_type)
+                # Call names, not ``__name__``: these become ``ctx.dep_names``,
+                # which the body transformer matches against the ``ast.Name``
+                # the source actually calls.
+                callees_by_func_id[id(func)] = [b.call_name for b in direct]
+                for call_name, dep in direct:
                     # Key everything off ``id(dep._func)`` (the underlying
                     # Python function) — same key the downstream helpers
                     # use, and stable across multiple wrapper objects for
                     # the same source function.
                     callers = callers_by_dep_id.setdefault(id(dep._func), [])
-                    if func not in callers:
-                        callers.append(func)
-                    # Memoise per-(caller, dep) call-site args once.
-                    cache_key = (id(func), dep.__name__)
+                    if (func, call_name) not in callers:
+                        callers.append((func, call_name))
+                    # Memoise per-(caller, call name) call-site args once.
+                    cache_key = (id(func), call_name)
                     if cache_key not in call_args_cache:
-                        call_args_cache[cache_key] = _extract_call_args_for_dep(func, dep.__name__)
+                        call_args_cache[cache_key] = _extract_call_args_for_dep(func, call_name)
                     if id(dep._func) in seen:
                         continue
                     # Mark before recursing — this also serves as a cycle
@@ -2526,9 +2557,12 @@ class JITFunction:
           entry. DynDim entries inside the metas propagate naturally as
           metas are forwarded into deps via ``_resolve_dep_call_metadata``.
         - Each context's ``dep_names`` is the set of JIT deps that the
-          context's function *directly* calls. The body transformer uses
-          this to rewrite nested ``dep(args)`` calls into the
-          ``self.dep(args)`` form required by multi-function ``@pl.program``.
+          context's function *directly* calls, named as its source calls
+          them. The body transformer uses this — plus ``dep_func_names``,
+          which maps those call names onto the generated function names they
+          differ from under an aliased import — to rewrite nested
+          ``dep(args)`` calls into the ``self.dep(args)`` form required by
+          multi-function ``@pl.program``.
 
         The returned list is in leaf-first order (deps before their
         callers) so the generated source defines callees before callers.
@@ -2558,13 +2592,21 @@ class JITFunction:
         # caller metadata is already resolved when we get to it; collect
         # contexts caller-first, then reverse to restore leaf-first emit
         # order.
+        # Per caller, ``call name → generated function name``. They differ
+        # under an aliased import: the body calls ``kern(...)`` while the
+        # generated ``@pl.function`` is named after ``dep.__name__``.
+        dep_func_names_by_caller: dict[int, dict[str, str]] = {}
+        for dep in deps_topo:
+            for caller_func, call_name in callers_by_id.get(id(dep._func), ()):
+                dep_func_names_by_caller.setdefault(id(caller_func), {})[call_name] = dep.__name__
+
         dep_contexts: list[SpecializeContext] = []
         for dep in reversed(deps_topo):
             # For metadata resolution we use the first-recorded caller. In a
             # diamond ``entry -> {A, B} -> shared`` only one specialization
             # of ``shared`` is emitted, so the call sites in other branches
             # must agree on shapes/dtypes anyway.
-            caller_func = callers_by_id[id(dep._func)][0]
+            caller_func, dep_call_name = callers_by_id[id(dep._func)][0]
             c_meta, c_sv, c_sd = resolved[id(caller_func)]
             caller_ftype = func_type_by_id.get(id(caller_func), "orchestration")
             dep_meta, dep_sv, dep_sd = _resolve_dep_call_metadata(
@@ -2575,6 +2617,7 @@ class JITFunction:
                 c_sd,
                 per_func_dyn.get(id(dep._func), empty_dyn),
                 caller_func_type=caller_ftype,
+                dep_call_name=dep_call_name,
             )
             resolved[id(dep._func)] = (dep_meta, dep_sv, dep_sd)
             dep_contexts.append(
@@ -2587,6 +2630,7 @@ class JITFunction:
                     scalar_values=dep_sv,
                     scalar_dtypes=dep_sd,
                     dep_names=callees_by_id[id(dep._func)],
+                    dep_func_names=dep_func_names_by_caller.get(id(dep._func), {}),
                     auto_scope=dep._auto_scope,
                     external_core_type=dep._external_core_type,
                     external_aic_source=dep._external_aic_source,
@@ -2606,6 +2650,7 @@ class JITFunction:
             scalar_values=scalar_values,
             scalar_dtypes=scalar_dtypes,
             dep_names=callees_by_id[id(self._func)],
+            dep_func_names=dep_func_names_by_caller.get(id(self._func), {}),
             auto_scope=self._auto_scope,
         )
         return dep_contexts + [entry_ctx]
@@ -2619,8 +2664,8 @@ class JITFunction:
 # ---------------------------------------------------------------------------
 
 
-def _discover_deps(func: Any, caller_func_type: str = "orchestration") -> list[JITFunction]:
-    """Discover JIT dep functions called by ``func``.
+def _discover_dep_bindings(func: Any, caller_func_type: str = "orchestration") -> list[_DepBinding]:
+    """Discover JIT dep functions called by ``func``, with their call names.
 
     Scans the function's AST for bare function calls, then resolves each name
     against both module globals and closure variables (for deps defined in an
@@ -2663,14 +2708,24 @@ def _discover_deps(func: Any, caller_func_type: str = "orchestration") -> list[J
     if caller_func_type == "host":
         allowed_dep_types.add("orchestration")
 
-    deps: list[JITFunction] = []
+    deps: list[_DepBinding] = []
     seen: set[str] = set()
     for name in called_names:
         obj = all_vars.get(name)
         if isinstance(obj, JITFunction) and obj._func_type in allowed_dep_types and name not in seen:
-            deps.append(obj)
+            deps.append(_DepBinding(call_name=name, dep=obj))
             seen.add(name)
     return deps
+
+
+def _discover_deps(func: Any, caller_func_type: str = "orchestration") -> list[JITFunction]:
+    """Discover JIT dep functions called by ``func``, dropping their call names.
+
+    Thin view over :func:`_discover_dep_bindings` for callers that only need
+    the functions themselves. Anything that has to find the call site in the
+    caller's source must use the bindings instead — see ``_DepBinding``.
+    """
+    return [binding.dep for binding in _discover_dep_bindings(func, caller_func_type)]
 
 
 # ---------------------------------------------------------------------------
