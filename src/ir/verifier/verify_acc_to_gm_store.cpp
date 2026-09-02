@@ -55,7 +55,11 @@ namespace {
 /// performs exactly one conversion, `f32 -> f16` / `f32 -> bf16`
 /// (`CubeWritebackSupportsDataType`), so an INT32 accumulator can only leave as
 /// INT32 -- an int8 x int8 matmul stored straight into an FP32 tensor passes the
-/// whitelist and is still a dequantization with no scale. ptoas accepts it; ccec
+/// whitelist and is still a dequantization with no scale. (The rejected pairs are
+/// not all dequantizations: a float accumulator reaching an integer destination
+/// is a quantization, and integer to narrower integer a requantization. All three
+/// carry a scale, and `DescribeCubeWritebackScaledConversion` names the right one
+/// so the diagnostic does not mislabel two cases out of three.) ptoas accepts it; ccec
 /// then fails inside pto-isa's `TStoreAcc` ("the 2nd parameter maybe need a type
 /// '__cc__ float *'"), and where the shape lets it compile the kernel returns
 /// the raw accumulator bits reinterpreted as the destination type.
@@ -133,11 +137,12 @@ class AccToGmStoreVisitor : public IRVisitor {
         "a '" + src_dtype.ToString() + "' cube accumulator cannot be stored into a '" + dtype.ToString() +
             "' global tensor (function '" + func_name_ +
             "'): the fix-pipe writeback converts only FP32 -> FP16/BF16, so reaching '" + dtype.ToString() +
-            "' from '" + src_dtype.ToString() +
-            "' is a dequantization and needs a scale this store cannot carry. An integer accumulator "
-            "comes from integer operands, so if you asked for it with out_dtype, ask for '" +
-            src_dtype.ToString() + "' instead and convert in the vector unit -- pl.cast(result, " +
-            dtype.ToString() + ") -- or store into a '" + src_dtype.ToString() + "' tensor.",
+            "' from '" + src_dtype.ToString() + "' is " +
+            DescribeCubeWritebackScaledConversion(src_dtype, dtype) +
+            " and needs a scale this store cannot carry. Convert in the vector unit instead -- "
+            "pl.cast(result, " +
+            dtype.ToString() + ") and store that -- or store into a '" + src_dtype.ToString() +
+            "' tensor (for a matmul, that is out_dtype=" + src_dtype.ToString() + ").",
         call->span_);
   }
 

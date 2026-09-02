@@ -337,6 +337,24 @@ DataType MatmulAccumulatorDataType(DataType lhs, DataType rhs);
 bool CubeWritebackSupportsDataType(DataType accumulator, DataType out);
 
 /**
+ * @brief Name the scaled conversion a rejected Acc writeback pair would need
+ *
+ * The pairs `CubeWritebackSupportsDataType` rejects are not all the same kind of
+ * conversion, and FIXPIPE's scaled modes are directional: an integer accumulator
+ * reaching a float destination is a *dequantization* (`DEQF16`), a float
+ * accumulator reaching an integer one is a *quantization* (`QF322B8_PRE`), and
+ * integer to a narrower integer is a *requantization* (`REQ8`). All three carry
+ * a scale, which is what a plain matmul or store has nowhere to put -- but a
+ * diagnostic that calls every one of them a dequantization is wrong for two of
+ * the three. Call this only for a pair `CubeWritebackSupportsDataType` rejects.
+ *
+ * @param accumulator Accumulator element type (FP32 or INT32)
+ * @param out Requested destination element type
+ * @return "a dequantization", "a quantization", or "a requantization"
+ */
+const char* DescribeCubeWritebackScaledConversion(DataType accumulator, DataType out);
+
+/**
  * @brief Read the elements of a tuple-typed operand
  *
  * A ``MakeTuple`` operand yields its elements directly, which preserves the

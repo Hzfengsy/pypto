@@ -1647,6 +1647,18 @@ class TestUnifiedOpsCrossPathKwargs:
         msg = str(exc_info.value)
         assert "out_dtype=int8" in msg
         assert "fp16 or bf16" in msg
+        # A float accumulator reaching an integer dtype is a *quantization*;
+        # only the reverse direction is a dequantization.
+        assert "is a quantization" in msg
+
+    def test_matmul_tensor_names_the_conversion_direction_it_rejects(self):
+        """The three rejected directions are different conversions, named as such."""
+        i8 = (_tensor("lhs", [32, 128], DataType.INT8), _tensor("rhs", [128, 64], DataType.INT8))
+
+        with pytest.raises(ValueError, match="is a dequantization"):
+            unified_ops.matmul(*i8, out_dtype=DataType.FP32)
+        with pytest.raises(ValueError, match="is a requantization"):
+            unified_ops.matmul(*i8, out_dtype=DataType.INT8)
 
     @pytest.mark.parametrize("kwarg", ["a_trans", "b_trans"])
     def test_matmul_acc_tile_rejects_transpose_flags(self, kwarg):

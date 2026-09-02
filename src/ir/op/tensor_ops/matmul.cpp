@@ -74,7 +74,9 @@ void CheckContractionExtents(const ExprPtr& k_lhs, const ExprPtr& k_rhs, const s
 /// operand domain (``MatmulAccumulatorDataType``) and the plain writeback offers
 /// exactly one conversion, ``f32 -> f16`` / ``f32 -> bf16``. An INT8 x INT8
 /// matmul therefore cannot hand back FP32: that is a dequant, and it needs a
-/// scale ``tensor.matmul`` has nowhere to carry.
+/// scale ``tensor.matmul`` has nowhere to carry. The other rejected directions
+/// need a scale too but are not dequantizations, so the message names the one it
+/// actually has (``DescribeCubeWritebackScaledConversion``).
 ///
 /// Without this check the request is simply dropped -- ``ConvertTensorToTileOps``
 /// builds ``tile.matmul`` from the operands alone -- and the mismatch surfaces
@@ -85,15 +87,15 @@ void CheckTensorMatmulOutDataType(DataType out_dtype, DataType lhs_dtype, DataTy
                                   const Span& span) {
   const DataType accumulator = MatmulAccumulatorDataType(lhs_dtype, rhs_dtype);
   if (CubeWritebackSupportsDataType(accumulator, out_dtype)) return;
-  const bool needs_scale = accumulator == DataType::INT32;
-  CHECK_SPAN(false, span)
-      << "tensor.matmul: out_dtype=" << out_dtype.ToString() << " is not supported for "
-      << lhs_dtype.ToString() << " x " << rhs_dtype.ToString() << " operands -- the Cube accumulates them in "
-      << accumulator.ToString()
-      << (needs_scale ? ", and reaching any other dtype from an integer accumulator is a dequantization "
-                        "that needs a scale out_dtype cannot carry. Pass out_dtype="
-                      : ", and the writeback can only narrow that to fp16 or bf16. Pass out_dtype=")
-      << accumulator.ToString() << " and convert the result explicitly with pl.cast(result, <dtype>).";
+  CHECK_SPAN(false, span) << "tensor.matmul: out_dtype=" << out_dtype.ToString() << " is not supported for "
+                          << lhs_dtype.ToString() << " x " << rhs_dtype.ToString()
+                          << " operands -- the Cube accumulates them in " << accumulator.ToString()
+                          << ", and the unscaled writeback out of L0C converts only fp32 to fp16 or "
+                          << "bf16. Reaching " << out_dtype.ToString() << " from " << accumulator.ToString()
+                          << " is " << DescribeCubeWritebackScaledConversion(accumulator, out_dtype)
+                          << ", which needs a scale out_dtype cannot carry. Pass out_dtype="
+                          << accumulator.ToString()
+                          << " and convert the result explicitly with pl.cast(result, <dtype>).";
 }
 
 }  // namespace

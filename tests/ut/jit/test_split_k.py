@@ -514,7 +514,31 @@ def _mm_int_acc_to_float_program():
     return mm_int_acc_to_f32
 
 
-def test_acc_to_gm_int_source_float_dest_rejected():
+def _mm_int_acc_to_float_no_out_dtype_program():
+    """The same store, reached without naming ``out_dtype`` at all.
+
+    ``pl.matmul``'s own guard only sees a request the caller spells out, so this
+    spelling reaches the store untouched — the accumulator is int32 either way,
+    because the operands decide it. It is what makes the verifier the load-bearing
+    half of the check rather than a second opinion.
+    """
+
+    @jit
+    def mm_int_acc_to_f32_default(a: pl.Tensor, b: pl.Tensor, c: pl.Out[pl.Tensor]):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm_i32_f32_def"):
+            partial = pl.matmul(a, b)
+            c = pl.assemble(c, partial, [0, 0])
+        return c
+
+    return mm_int_acc_to_f32_default
+
+
+@pytest.mark.parametrize(
+    "program_factory",
+    [_mm_int_acc_to_float_program, _mm_int_acc_to_float_no_out_dtype_program],
+    ids=["explicit_out_dtype", "default_out_dtype"],
+)
+def test_acc_to_gm_int_source_float_dest_rejected(program_factory):
     """A whitelisted destination is still illegal from an integer accumulator.
 
     ptoas accepts the resulting ``pto.tstore`` — ``f32`` is in its dst set — and
@@ -522,10 +546,15 @@ def test_acc_to_gm_int_source_float_dest_rejected():
     maybe need a type '__cc__ float *'"), or, where the shape lets it compile,
     in the numbers: the kernel writes raw int32 accumulator bits reinterpreted
     as float.
+
+    Both spellings are covered because ``out_dtype`` is not the trigger, only
+    what makes the assignment *look* type-correct: omitting it produces the same
+    illegal store, so rejecting the bad ``out_dtype`` alone would leave the hole
+    open.
     """
     torch = pytest.importorskip("torch")
     with pytest.raises(pypto.Error, match="AccToGmStoreValid"):
-        _mm_int_acc_to_float_program().lower(
+        program_factory().lower(
             torch.randint(-4, 4, (_M, _K), dtype=torch.int8),
             torch.randint(-4, 4, (_K, _N), dtype=torch.int8),
             torch.zeros(_M, _N, dtype=torch.float32),

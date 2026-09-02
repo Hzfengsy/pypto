@@ -536,6 +536,11 @@ bool CubeWritebackSupportsDataType(DataType accumulator, DataType out) {
   return accumulator == DataType::FP32 && (out == DataType::FP16 || out == DataType::BF16);
 }
 
+const char* DescribeCubeWritebackScaledConversion(DataType accumulator, DataType out) {
+  if (accumulator.IsFloat()) return "a quantization";
+  return out.IsFloat() ? "a dequantization" : "a requantization";
+}
+
 void CheckReductionInputNonEmpty(const std::vector<ExprPtr>& valid, const std::string& op_name,
                                  const Span& span) {
   for (size_t i = 0; i < valid.size(); ++i) {

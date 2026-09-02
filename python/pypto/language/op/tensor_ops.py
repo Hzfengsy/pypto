@@ -723,9 +723,9 @@ def matmul(
         lhs: Left-hand side tensor
         rhs: Right-hand side tensor
         out_dtype: Output data type. Optional; inferred from the operands when
-            omitted. When given it must be one the Cube writeback can produce:
-            FP32/FP16/BF16 for float operands, INT32 for int operands (see
-            ``pl.matmul``)
+            omitted. When given it must be one of the dtypes the Cube writeback
+            can produce: FP32/FP16/BF16 for float operands, INT32 for int
+            operands (see ``pl.matmul``)
         a_trans: Whether to transpose lhs (requires a 2D+ lhs)
         b_trans: Whether to transpose rhs (requires a 2D+ rhs)
         c_matrix_nz: C matrix non-zero flag
