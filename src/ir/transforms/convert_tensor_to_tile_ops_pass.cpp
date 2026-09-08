@@ -414,11 +414,15 @@ class TensorArgsInConvertedOpsCollector : public IRVisitor {
    *
    * When an IterArg is in used_ (consumed by a converted op), its initValue_ may be a
    * function parameter eligible for a shared entry load. Follow each newly
-   * discovered seed once, including chains of nested IterArgs, in O(N).
+   * discovered seed once, including chains of nested IterArgs, in O(N). Only
+   * tile-valued carries consume such a preload; GM carries load their current
+   * value at the computation, which may differ from their initializer.
    */
-  void TraceIterArgInitValues() {
+  template <typename IsTileValue>
+  void TraceIterArgInitValues(IsTileValue is_tile_value) {
     std::vector<const Var*> worklist(used_.begin(), used_.end());
     for (size_t i = 0; i < worklist.size(); ++i) {
+      if (!is_tile_value(worklist[i])) continue;
       auto it = iter_arg_to_init_.find(worklist[i]);
       if (it == iter_arg_to_init_.end()) continue;
       if (auto var = AsVarLike(it->second);
@@ -713,19 +717,29 @@ class TensorConversionAnalysis : public IRVisitor {
   explicit TensorConversionAnalysis(const OpConversionRegistry& registry) : registry_(registry) {}
 
   void Propagate() {
-    for (size_t i = 0; i < worklist_.size(); ++i) {
-      auto it = users_.find(worklist_[i]);
+    // Yield edges can precede the tuple definitions in their branch/body.
+    // Resolve projections only after the complete definition index exists.
+    for (const auto& [source, target] : projection_flows_) {
+      if (auto var = AsVarLike(ResolveFlowSource(source))) AddFlow(var, target);
+    }
+    while (!worklist_.empty()) {
+      const auto* value = worklist_.back();
+      worklist_.pop_back();
+      auto it = users_.find(value);
       if (it == users_.end()) continue;
       for (const auto* user : it->second) MarkTile(user);
     }
-    for (size_t i = 0; i < write_worklist_.size(); ++i) {
-      auto it = sources_.find(write_worklist_[i]);
+    while (!write_worklist_.empty()) {
+      const auto* value = write_worklist_.back();
+      write_worklist_.pop_back();
+      auto it = sources_.find(value);
       if (it == sources_.end()) continue;
       for (const auto* source : it->second) MarkWritten(source);
     }
   }
 
-  [[nodiscard]] bool IsTile(const VarPtr& var) const { return tiles_.count(var.get()) != 0; }
+  [[nodiscard]] bool IsTile(const Var* var) const { return tiles_.count(var) != 0; }
+  [[nodiscard]] bool IsTile(const VarPtr& var) const { return IsTile(var.get()); }
   [[nodiscard]] bool HasOpaqueCalls() const { return has_opaque_calls_; }
   [[nodiscard]] bool MayWriteSource(const VarPtr& var) const {
     return written_sources_.count(var.get()) != 0;
@@ -757,11 +771,12 @@ class TensorConversionAnalysis : public IRVisitor {
     var_collectors::VarDefUseCollector refs;
     refs.VisitExpr(op->value_);
     sources_[op->var_.get()] = std::move(refs.var_uses_ordered);
+    if (As<TupleType>(op->var_->GetType())) tuple_definitions_[op->var_.get()] = op->value_;
     if (As<TileType>(op->var_->GetType())) {
       MarkTile(op->var_.get());
     } else if (AsTensorTypeLike(op->var_->GetType())) {
-      if (auto source = AsVarLike(op->value_)) {
-        AddFlow(source, op->var_);
+      if (AsVarLike(op->value_) || As<TupleGetItemExpr>(op->value_)) {
+        AddFlow(op->value_, op->var_);
       } else if (auto call = As<Call>(op->value_); call && registry_.Lookup(call->op_->name_)) {
         if (IsOp(call, "tensor.write") || IsOp(call, "tensor.assemble")) {
           AddFlow(call->args_[0], op->var_);
@@ -800,7 +815,38 @@ class TensorConversionAnalysis : public IRVisitor {
     if (written_sources_.insert(var).second) write_worklist_.push_back(var);
   }
 
+  /// Reuse immutable MakeTuple nodes as shared descriptors. Aliases select
+  /// the same descriptor, and projections select only their indexed element.
+  /// Memoization visits each alias/projection once without copying wide tuples.
+  /// Tensor leaves remain Var/IterArg nodes so their phi cycles use the worklist.
+  ExprPtr ResolveFlowSource(const ExprPtr& source) {
+    auto cached = resolved_flow_sources_.find(source.get());
+    if (cached != resolved_flow_sources_.end()) return cached->second;
+
+    ExprPtr resolved;
+    if (auto var = AsVarLike(source)) {
+      if (!As<TupleType>(var->GetType())) {
+        resolved = var;
+      } else if (auto definition = tuple_definitions_.find(var.get());
+                 definition != tuple_definitions_.end()) {
+        resolved = ResolveFlowSource(definition->second);
+      }
+    } else if (As<MakeTuple>(source)) {
+      resolved = source;
+    } else if (auto projection = As<TupleGetItemExpr>(source)) {
+      if (auto tuple = As<MakeTuple>(ResolveFlowSource(projection->tuple_))) {
+        resolved = ResolveFlowSource(tuple->elements_[projection->index_]);
+      }
+    }
+    resolved_flow_sources_.emplace(source.get(), resolved);
+    return resolved;
+  }
+
   void AddFlow(const ExprPtr& source, const VarPtr& target) {
+    if (As<TupleGetItemExpr>(source)) {
+      projection_flows_.emplace_back(source, target);
+      return;
+    }
     auto var = AsVarLike(source);
     if (!var) return;
     users_[var.get()].push_back(target.get());
@@ -829,6 +875,9 @@ class TensorConversionAnalysis : public IRVisitor {
   }
 
   const OpConversionRegistry& registry_;
+  std::unordered_map<const Var*, ExprPtr> tuple_definitions_;
+  std::unordered_map<const Expr*, ExprPtr> resolved_flow_sources_;
+  std::vector<std::pair<ExprPtr, VarPtr>> projection_flows_;
   std::unordered_map<const Var*, std::vector<const Var*>> users_;
   std::unordered_set<const Var*> tiles_;
   std::vector<const Var*> worklist_;
@@ -2555,7 +2604,7 @@ IncoreTransformResult TransformIncoreFunction(const FunctionPtr& func) {
   // tiles are kept in a separate cache, never installed in the SSA var map.
   TensorArgsInConvertedOpsCollector collector(conv_registry);
   collector.VisitStmt(canonical_body);
-  collector.TraceIterArgInitValues();
+  collector.TraceIterArgInitValues([&tile_values](const Var* var) { return tile_values.IsTile(var); });
   const auto& params_used_by_converted_ops = collector.GetUsed();
   for (const auto& var : func->params_) {
     if (!AsTensorTypeLike(var->GetType()) || tile_values.MayWriteSource(var) ||

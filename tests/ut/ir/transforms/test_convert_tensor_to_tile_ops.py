@@ -3225,6 +3225,86 @@ class TestNestedControlFlow:
         with pytest.raises(pypto.InternalError, match="has no registered tile conversion"):
             passes.convert_tensor_to_tile_ops()(prog)
 
+    def test_gm_for_carry_loads_current_value_without_unused_seed_load(self):
+        """A GM carry may switch tensors, so its initializer cache cannot serve its uses."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 32], pl.FP32],
+                y: pl.Tensor[[16, 32], pl.FP32],
+                out: pl.Out[pl.Tensor[[2], pl.FP32]],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                for i, (carried,) in pl.range(2, init_values=(x,)):
+                    r = pl.row_max(carried)
+                    scalar = pl.tensor.read(r, [0, 0])
+                    pl.tensor.write(out, [i], scalar)
+                    result = pl.yield_(y)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 32], pl.FP32],
+                y: pl.Tensor[[16, 32], pl.FP32],
+                out: pl.Out[pl.Tensor[[2], pl.FP32]],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                for i, (carried,) in pl.range(2, init_values=(x,)):
+                    current = pl.load(carried, [0, 0], [16, 32])
+                    tmp = pl.tile.create([16, 128], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+                    r = pl.tile.row_max(current, tmp)
+                    scalar = pl.tile.read(r, [0, 0])
+                    pl.tensor.write(out, [i], scalar)
+                    result = pl.yield_(y)
+                return result
+
+        _assert_convert_equal(Before, Expected)
+
+    def test_gm_while_carry_loads_current_value_without_unused_seed_load(self):
+        """While carries retain GM identity without allocating an unused entry tile."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 32], pl.FP32],
+                y: pl.Tensor[[16, 32], pl.FP32],
+                out: pl.Out[pl.Tensor[[2], pl.FP32]],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                for i, carried in pl.while_(init_values=(0, x)):
+                    pl.cond(i < 2)
+                    r = pl.row_max(carried)
+                    scalar = pl.tensor.read(r, [0, 0])
+                    pl.tensor.write(out, [i], scalar)
+                    _last_i, result = pl.yield_(i + 1, y)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 32], pl.FP32],
+                y: pl.Tensor[[16, 32], pl.FP32],
+                out: pl.Out[pl.Tensor[[2], pl.FP32]],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                for i, carried in pl.while_(init_values=(0, x)):
+                    pl.cond(i < 2)
+                    current = pl.load(carried, [0, 0], [16, 32])
+                    tmp = pl.tile.create([16, 128], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+                    r = pl.tile.row_max(current, tmp)
+                    scalar = pl.tile.read(r, [0, 0])
+                    pl.tensor.write(out, [i], scalar)
+                    _last_i, result = pl.yield_(i + 1, y)
+                return result
+
+        _assert_convert_equal(Before, Expected)
+
     def test_iter_arg_init_from_tensor_param_gets_preloaded(self):
         """Tensor parameter used only as ForStmt iter_arg initValue must be pre-loaded.
 
@@ -3951,6 +4031,183 @@ class TestGmLocalTensorConversion:
                 r = pl.tile.row_max(second, tmp)
                 stored = pl.store(r, [0, 0], out)
                 return stored
+
+        _assert_convert_equal(Before, Expected)
+
+    def test_tuple_alias_chain_projection_loads_the_gm_branch_yield(self):
+        """A projected computed tensor makes its branch result tile-valued."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 32], pl.FP32],
+                y: pl.Tensor[[16, 32], pl.FP32],
+                flag: pl.Scalar[pl.BOOL],
+                out: pl.Out[pl.Tensor[[16, 32], pl.FP32]],
+            ):
+                local = pl.add(x, 1.0)
+                pair = (local, y)
+                alias = pair
+                inner = alias
+                projected = inner[0]
+                if flag:
+                    value = pl.yield_(projected)
+                else:
+                    value = pl.yield_(y)
+                out[0:16, 0:32] = value
+                return  # noqa: PLR1711 (DSL return terminator)
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 32], pl.FP32],
+                y: pl.Tensor[[16, 32], pl.FP32],
+                flag: pl.Scalar[pl.BOOL],
+                out: pl.Out[pl.Tensor[[16, 32], pl.FP32]],
+            ):
+                xt = pl.load(x, [0, 0], [16, 32])
+                local = pl.tile.adds(xt, 1.0)
+                pair = (local, y)
+                alias = pair
+                inner = alias
+                projected = inner[0]
+                if flag:
+                    value = pl.yield_(projected)
+                else:
+                    yt = pl.load(y, [0, 0], [16, 32])
+                    value = pl.yield_(yt)
+                _stored = pl.store(value, [0, 0], out)
+                return  # noqa: PLR1711 (DSL return terminator)
+
+        _assert_convert_equal(Before, Expected)
+
+    def test_tuple_alias_chain_gm_projection_keeps_branch_yields_gm(self):
+        """A computed sibling must not turn the selected GM element into a tile."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 32], pl.FP32],
+                y: pl.InOut[pl.Tensor[[16, 32], pl.FP32]],
+                flag: pl.Scalar[pl.BOOL],
+            ):
+                local = pl.add(x, 1.0)
+                pair = (local, y)
+                alias = pair
+                inner = alias
+                projected = inner[1]
+                if flag:
+                    value = pl.yield_(projected)
+                else:
+                    value = pl.yield_(y)
+                pl.tensor.write(value, [0, 0], pl.const(2.0, pl.FP32))
+                return  # noqa: PLR1711 (DSL return terminator)
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 32], pl.FP32],
+                y: pl.InOut[pl.Tensor[[16, 32], pl.FP32]],
+                flag: pl.Scalar[pl.BOOL],
+            ):
+                xt = pl.load(x, [0, 0], [16, 32])
+                local = pl.tile.adds(xt, 1.0)
+                pair = (local, y)
+                alias = pair
+                inner = alias
+                projected = inner[1]
+                if flag:
+                    value = pl.yield_(projected)
+                else:
+                    value = pl.yield_(y)
+                pl.tensor.write(value, [0, 0], pl.const(2.0, pl.FP32))
+                return  # noqa: PLR1711 (DSL return terminator)
+
+        _assert_convert_equal(Before, Expected)
+
+    def test_tuple_projection_yield_converts_for_carry_to_tile(self):
+        """Resolve a direct projection after indexing its loop-local tuple."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 32], pl.FP32],
+                y: pl.Tensor[[16, 32], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 32], pl.FP32]],
+            ):
+                for _i, (carried,) in pl.range(2, init_values=(x,)):
+                    local = pl.add(carried, 1.0)
+                    pair = (local, y)
+                    result = pl.yield_(pair[0])
+                out[0:16, 0:32] = result
+                return  # noqa: PLR1711 (DSL return terminator)
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 32], pl.FP32],
+                y: pl.Tensor[[16, 32], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 32], pl.FP32]],
+            ):
+                xt = pl.load(x, [0, 0], [16, 32])
+                for _i, (carried,) in pl.range(2, init_values=(xt,)):
+                    local = pl.tile.adds(carried, 1.0)
+                    pair = (local, y)
+                    result = pl.yield_(pair[0])
+                _stored = pl.store(result, [0, 0], out)
+                return  # noqa: PLR1711 (DSL return terminator)
+
+        _assert_convert_equal(Before, Expected)
+
+    def test_tuple_projection_yield_converts_while_carry_to_tile(self):
+        """A projected tensor leaf propagates through a while carry and result."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 32], pl.FP32],
+                y: pl.Tensor[[16, 32], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 32], pl.FP32]],
+            ):
+                for i, carried in pl.while_(init_values=(0, x)):
+                    pl.cond(i < 2)
+                    local = pl.add(carried, 1.0)
+                    pair = (local, y)
+                    _last_i, result = pl.yield_(i + 1, pair[0])
+                out[0:16, 0:32] = result
+                return  # noqa: PLR1711 (DSL return terminator)
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 32], pl.FP32],
+                y: pl.Tensor[[16, 32], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 32], pl.FP32]],
+            ):
+                xt = pl.load(x, [0, 0], [16, 32])
+                for i, carried in pl.while_(init_values=(0, xt)):
+                    pl.cond(i < 2)
+                    local = pl.tile.adds(carried, 1.0)
+                    pair = (local, y)
+                    _last_i, result = pl.yield_(i + 1, pair[0])
+                _stored = pl.store(result, [0, 0], out)
+                return  # noqa: PLR1711 (DSL return terminator)
 
         _assert_convert_equal(Before, Expected)
 
