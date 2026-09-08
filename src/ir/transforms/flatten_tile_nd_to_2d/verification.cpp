@@ -58,8 +58,17 @@ class TileOps2DVerifier : public IRVisitor {
     const auto& name = call->op_->name_;
     if (name.substr(0, 5) != "tile.") return;
 
-    if (IsOp(call, "tile.load") || IsOp(call, "tile.store") || IsOp(call, "tile.reshape") ||
-        IsOp(call, "tile.reinterpret_view")) {
+    // `tile.load` / `tile.store` bridge the tensor and tile worlds: the rewrite
+    // gives them a 2D tile while their tensor-side window operands legitimately
+    // keep the source's ND rank, so neither the result nor the argument scan
+    // below applies to them.
+    //
+    // `tile.reshape` / `tile.reinterpret_view` are NOT exempt. Their rank comes
+    // from a literal shape operand rather than from an operand's type, so they
+    // are the one place the rewrite has to rewrite the shape itself -- and the
+    // one place a >2D tile used to survive the pass unnoticed, only to be typed
+    // from its first two dimensions by `ExtractTileTypeInfo` in PTO codegen.
+    if (IsOp(call, "tile.load") || IsOp(call, "tile.store")) {
       return;
     }
 

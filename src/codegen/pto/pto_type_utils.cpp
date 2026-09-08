@@ -30,6 +30,7 @@
 #include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/printer.h"
 #include "pypto/ir/type.h"
+#include "pypto/ir/type_inference.h"
 
 namespace pypto {
 namespace codegen {
@@ -319,6 +320,19 @@ TileTypeComponents ExtractTileTypeInfo(const ir::TileType& tile_type, const std:
   ir::TileView view = ir::tile_view_semantics::GetEffectiveTileView(tile_type);
   const bool packed_fp4_vec =
       tile_type.dtype_ == DataType::FP4 && tile_type.GetMemorySpace() == ir::MemorySpace::Vec;
+
+  // PTO tiles are 2D. A rank>2 tile has no `rows`/`cols` to read: taking the
+  // first two dimensions and dropping the rest silently shrinks the tile
+  // ([2, 8, 128] would render as rows=2, cols=8 -- 16 elements instead of
+  // 2048), which either mis-sizes an allocation or makes ptoas reject a
+  // `pto.treshape` for a total-byte-size mismatch. `FlattenTileNdTo2D` (pass
+  // 14) collapses every InCore tile to `[product(leading), last]` and its
+  // `TileOps2D` verifier enforces that, so reaching here with rank>2 is a pass
+  // bug rather than user input.
+  INTERNAL_CHECK(tile_type.shape_.size() <= 2)
+      << "Internal error: a rank-" << tile_type.shape_.size() << " tile " << ir::FormatShape(tile_type.shape_)
+      << " reached PTO codegen; PTO tile_buf is 2D, so FlattenTileNdTo2D must have collapsed it to "
+         "[product(leading dims), last dim] first";
 
   if (tile_type.shape_.size() >= 2) {
     if (auto c0 = As<ir::ConstInt>(tile_type.shape_[0])) c.rows = c0->value_;

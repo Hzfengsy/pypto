@@ -3364,20 +3364,38 @@ def test_pto_codegen_tensor_view_aliases_input_base_ptr():
 
 
 def test_pto_codegen_rank3_tensor_view_mat_load_uses_input_base_ptr():
-    """A rank-3 tensor.view remains rooted at the input's raw GM pointer."""
+    """A rank-3 tensor.view remains rooted at the input's raw GM pointer.
+
+    The source *window* keeps its ND rank while the destination *tile* is 2D --
+    exactly the shape ``FlattenTileNdTo2D`` leaves behind for a rank>2 load whose
+    window it does not collapse. Building the load with its deduced rank-3 tile
+    type instead would model IR no pipeline can produce: PTO's ``tile_buf`` is
+    2D, and ``ExtractTileTypeInfo`` types one from ``shape_[0]`` / ``shape_[1]``
+    alone, so a rank-3 tile would be emitted as a ``[2, 16]`` buffer.
+    """
     span = ir.Span.unknown()
     src_type = ir.TensorType([2, 16, 32], DataType.FP32)
     src = ir.Var("src", src_type, span)
 
     view_call = ir.op.tensor.view(src, [2, 16, 32])
     view_var = ir.Var("src_view", view_call.type, span)
-    load_call = ir.op.tile.load(
+    deduced_load = ir.op.tile.load(
         view_var,
         [0, 0, 0],
         [2, 16, 32],
         target_memory=pl.MemorySpace.Mat,
     )
-    tile_var = ir.Var("tile", load_call.type, span)
+    nd_tile_type = deduced_load.type
+    assert isinstance(nd_tile_type, ir.TileType)
+    flat_tile_type = ir.TileType(
+        [2 * 16, 32],
+        nd_tile_type.dtype,
+        None,
+        nd_tile_type.tile_view,
+        nd_tile_type.memory_space,
+    )
+    load_call = ir.Call(deduced_load.op, deduced_load.args, deduced_load.kwargs, flat_tile_type, span)
+    tile_var = ir.Var("tile", flat_tile_type, span)
 
     body = ir.SeqStmts(
         [

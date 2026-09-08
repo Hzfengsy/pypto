@@ -267,7 +267,7 @@ enum class VerificationLevel {
  * Returns {SSAForm, TypeChecked, MixedKernelExpanded, AllocatedMemoryAddr,
  * BreakContinueValid, NoRedundantBlocks, InOutUseValid,
  * CallDirectionsResolved, ManualDepsOnSubmitOnly, ReturnParamsExplicit,
- * AivSplitValid, TileMemoryInferred, HardSyncallOccupancyValid,
+ * AivSplitValid, TileMemoryInferred, TileOps2D, HardSyncallOccupancyValid,
  * IterArgCarryClassified, RuntimeScopesMaterialized,
  * DistTensorCtxMaterialized, GraphBoundaryLegalized, AccToGmStoreValid,
  * AccCompactValid, AtomicAddDtypeValid, AccStorePhaseValid} —

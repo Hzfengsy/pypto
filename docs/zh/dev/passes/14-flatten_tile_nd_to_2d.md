@@ -43,20 +43,21 @@ program_2d = flatten_pass(program)
 
 1. **验证前置条件**：检查静态物理形状、最后轴归约、不允许对 >2D 使用 `tile.read`/`tile.write`/`tile.slice`，以及不允许写入区域无法连续折叠的 >2D `tile.assemble`
 2. **变换语句**：遍历函数体，将 >2D Tile 操作转换为 2D，并保留动态的 `valid_shape`（见[动态 valid_shape](#动态-tile-维度issue-1578)）
-3. **验证后置条件**：由独立的 `TileOps2D` 属性验证器 (property verifier) 检查改写后的 InCore IR 仅包含受支持的 Tile rank、2D `tile.assemble` 偏移与 codegen-ready transpose 形态
+3. **验证后置条件**：由独立的 `TileOps2D` 属性验证器 (property verifier) 检查改写后的 InCore IR 仅包含受支持的 Tile rank、2D `tile.assemble` 偏移与 codegen-ready transpose 形态。`TileOps2D` 已列入 `GetVerifiedProperties()`，因此只要 `VerificationLevel` 高于 `None`，`PassPipeline` 就会在该 Pass 之后自动运行这个验证器
 
 按语句类型处理：
 
 | Tile 操作 | 变换方式 |
 | --------- | -------- |
 | `tile.load`（>2D） | 将结果 tile 重建为 2D。对于 natural NZ Mat load，还会在源张量上插入 shape-only 的 2D `tensor.view`，把 leading offsets/shapes/valid_shape 折叠到 2D 源窗口，并要求该窗口按 row-major 连续可折叠。Vec load 和 transposed Mat load 保留原始 rank>2 源窗口，只展平结果 tile |
-| `tile.store`（rank>2 张量） | 在转换后 IR 中注入原始张量 rank 对应的分区 `shapes` 作为额外的第 4 个操作数，供后端 codegen 重建 `partition_view`；DSL 源码不变。若 tile 操作数本身仍是 rank>2(例如用户显式 `tile.reshape` 升到 3D 后再喂给 `pl.assemble` 写入 N-D 张量视图),pass 会先插入一个 `tile.reshape` 把 tile 操作数压回 2D —— codegen 要求 tile 必须是 2D,而原始 tile shape 仍由 `shapes` 分区操作数携带 |
+| `tile.store`（rank>2 张量） | 在转换后 IR 中注入原始张量 rank 对应的分区 `shapes` 作为额外的第 4 个操作数，供后端 codegen 重建 `partition_view`；DSL 源码不变。若 tile 操作数本身仍是 rank>2，pass 会先插入一个 `tile.reshape` 把 tile 操作数压回 2D —— 这是给手工构造 IR 的兜底，因为 `tile.load` 与 `tile.reshape` 分支现在已经展平了 DSL 能写出的每一种生产者 —— codegen 要求 tile 必须是 2D,而原始 tile shape 仍由 `shapes` 分区操作数携带 |
 | `tile.store`（2D 张量） | 直接透传 |
 | `tile.create`/`tile.full`（>2D） | 直接使用展平的 2D 形状重建 |
 | `tile.assemble`（>2D 目标） | 用与 `tile.load` 折叠 tensor-rank 偏移相同的行主序折叠，把 ND 偏移折进展平后的 `(row, col)` 空间（`row = ((o0*d1 + o1)*d2 + o2)*… + o[k-2]`，`col = o[k-1]`）；Tile 操作数本身由其定义处的算子展平。要求 source、target 与 offset 具有相同 rank，且写入区域能折叠为连续的行区间（`IsRowMajorCollapseContiguous`），否则在前置条件阶段报错。若不折叠，偏移会以 ND rank 残留在 2D Tile 上，而 codegen 只按位置读取 `elements[0]`/`elements[1]` 并忽略其余元素，从而静默地写到错误地址 |
 | `tile.transpose` | `pto.ttrans` scratch 物化的唯一归属。进入时为 3-arg（input, axis1, axis2）。**2D**：创建一块 scratch tile（shape = 源页，位于输入所在 memory），产出 codegen-ready 的 4-arg `tile.transpose(in, a1, a2, scratch)`。**>2D**（末两轴交换）：展开为逐 batch 的 2D transpose，每个都是 4-arg 形态，scratch 从扁平 `[batch*A, B]` 池中切片，再 assemble 进合并后的 2D 输出。交换 batch 轴属用户错误 |
 | `tile.batch_matmul` | 展开为逐 batch 的 2D `tile.matmul`，处理 batch broadcast。b_trans/a_trans 操作数以一个零拷贝 `tile.transpose_view`（覆盖在自然 load 之上）出现（不再 transpose-at-load、不搬数据）；tile 级算子本身无 transpose 语义。每个操作数处理方式一致（见下方操作数处理）。**当结果本身就是批量累加器**（下游 `tile.batch_matmul_acc` 会继续写它）时，各页改为通过 `tile.matmul_acc(window, lhs_b, rhs_b, init_cond=True)` 写入同一块按列打包的 `Acc` tile —— 见[批量累加器按列打包](#批量累加器按列打包) |
 | `tile.batch_matmul_acc` | 展开为逐 batch 的 2D `tile.matmul_acc`，按 batch 索引取（已展平的）累加器的一个窗口：链按列打包时取 `[M, B*N]` tile 的**列**窗口 `[0, b*N]`，否则取 `[B*M, N]` tile 的旧**行**窗口 `[b*M, 0]` —— 见[批量累加器按列打包](#批量累加器按列打包)。本 pass 未直接确定的内存空间决策（行打包累加器上的 Vec/Acc 来回搬运、上游 `tile.create` 的可重定向生产者改写、TileView 刷新）交由 `InferTileMemorySpace`（pass 20）负责 —— 本 pass 不发射任何 `tile.move` |
+| `tile.reshape` / `tile.reinterpret_view`（>2D 结果） | 将字面量目标 shape 操作数改写为合并后的 2D `[product(leading), last]` 并重新推导类型。这两个是仅有的结果 rank 来自 shape 操作数而非某个操作数类型的 tile 算子，因此下面的通用路径无法下降它们——通用路径会用**同一个** ND 元组重建调用，rank>2 的结果就此存活到 PTO codegen，被 `ExtractTileTypeInfo` 按前两维定型。此处的折叠严格保持语义：tile 是一段连续的行主序数据，`[2, 8, 128]` 与 `[16, 128]` 指向同一批元素、同一顺序。由此得到的 2D reshape 往往是恒等变换，随后由 `FoldNoOpReshape`（pass 38）消除。喂给 `tile.batch_matmul` 的安全 batch-only reshape 由该 lowering 剥离（见上），不会走到这个分支 |
 | 其他 Tile 操作（>2D） | 替换变量，使用 2D 类型重新创建 |
 | 1D/2D Tile 操作 | 不变 |
 

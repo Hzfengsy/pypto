@@ -162,6 +162,7 @@ const IRPropertySet& GetVerifiedProperties() {
                                    IRProperty::ReturnParamsExplicit,
                                    IRProperty::AivSplitValid,
                                    IRProperty::TileMemoryInferred,
+                                   IRProperty::TileOps2D,
                                    IRProperty::HardSyncallOccupancyValid,
                                    IRProperty::IterArgCarryClassified,
                                    IRProperty::RuntimeScopesMaterialized,

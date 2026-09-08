@@ -963,6 +963,154 @@ class TestFlattenTileNdTo2DMultiOutput:
 
 
 # ----------------------------------------------------------------------------
+# Rank-raising tile.reshape / tile.reinterpret_view: the shape operand is the
+# only place a >2D tile can be introduced independently of any operand's type
+# ----------------------------------------------------------------------------
+
+
+class TestFlattenTileNdTo2DRankRaisingViews:
+    """A `pl.reshape` / `pl.reinterpret_view` onto a >2D shape collapses to 2D.
+
+    Every other tile op derives its result rank from an operand, so the pass's
+    generic substitute-and-re-deduce path lowers it for free. These two read the
+    rank off a literal shape tuple that no substitution touches, so the pass has
+    to rewrite the tuple itself. Left alone, the >2D result reached PTO codegen,
+    where ``ExtractTileTypeInfo`` types a ``tile_buf`` from ``shape_[0]`` and
+    ``shape_[1]`` only: a ``[2, 8, 128]`` tile was emitted as ``rows=2, cols=8``
+    -- 16 elements instead of 2048 -- and ptoas rejected the ``pto.treshape``
+    that carried it for a total-byte-size mismatch.
+
+    The collapse is the pass's own ``[product(leading), last]`` rule, which is
+    exactly semantics-preserving for a reshape: a tile is one contiguous
+    row-major run, so ``[2, 8, 128]`` and ``[16, 128]`` name the same elements
+    in the same order.
+    """
+
+    @pytest.mark.parametrize(
+        ("nd_shape", "flat_shape"),
+        [
+            ([2, 8, 128], [16, 128]),
+            ([16, 1, 128], [16, 128]),
+            ([4, 4, 128], [16, 128]),
+            # A genuine 2D shape change, not an identity: [16, 128] -> [128, 16].
+            ([16, 8, 16], [128, 16]),
+            ([2, 2, 4, 128], [16, 128]),
+        ],
+    )
+    def test_rank_raising_reshape_collapses_to_2d(self, nd_shape, flat_shape):
+        """`pl.reshape` onto a >2D shape becomes the merged 2D reshape."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                t = pl.load(x, [0, 0], [16, 128])
+                r = pl.tile.reshape(t, nd_shape)
+                s = pl.tile.mul(r, 2.0)
+                b = pl.tile.reshape(s, [16, 128])
+                out_0 = pl.store(b, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[16, 128], pl.FP32]) -> pl.Tensor[[16, 128], pl.FP32]:
+                out_0 = pl.create_tensor([16, 128], dtype=pl.FP32)
+                return self.main_incore_0(x, out_0)
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                t = pl.tile.load(x, [0, 0], [16, 128], [16, 128])
+                r = pl.tile.reshape(t, flat_shape)
+                s = pl.tile.muls(r, 2.0)
+                b = pl.tile.reshape(s, [16, 128])
+                out_0_1 = pl.tile.store(b, [0, 0], out_0)
+                return out_0_1
+
+            @pl.function
+            def main(self, x: pl.Tensor[[16, 128], pl.FP32]) -> pl.Tensor[[16, 128], pl.FP32]:
+                out_0 = pl.create_tensor([16, 128], dtype=pl.FP32)
+                return self.main_incore_0(x, out_0)
+
+        After = passes.flatten_tile_nd_to_2d()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_rank_raising_reshape_leaves_no_nd_tile_for_the_verifier(self):
+        """The `TileOps2D` postcondition holds after the pass, not just by exemption."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                t = pl.load(x, [0, 0], [16, 128])
+                r = pl.tile.reshape(t, [2, 8, 128])
+                s = pl.tile.mul(r, 2.0)
+                b = pl.tile.reshape(s, [16, 128])
+                out_0 = pl.store(b, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[16, 128], pl.FP32]) -> pl.Tensor[[16, 128], pl.FP32]:
+                out_0 = pl.create_tensor([16, 128], dtype=pl.FP32)
+                return self.main_incore_0(x, out_0)
+
+        # The unflattened input violates the property the pass promises...
+        props = passes.IRPropertySet()
+        props.insert(passes.IRProperty.TileOps2D)
+        with pytest.raises(pypto.Error, match="TileOps2D"):
+            passes.verify_properties(props, Before, "before_flatten")
+
+        # ...and satisfies it afterwards.
+        After = passes.flatten_tile_nd_to_2d()(Before)
+        passes.verify_properties(props, After, "after_flatten")
+
+    def test_rank_raising_reinterpret_view_collapses_to_2d(self):
+        """`tile.reinterpret_view(..., shape=[4, 1, 16])` becomes `[4, 16]`."""
+        span = ir.Span.unknown()
+        source = ir.Var("source", ir.TileType([4, 8], DataType.FP32), span)
+        view_call = tile_ops.reinterpret_view(source, DataType.INT16, shape=[4, 1, 16], span=span)
+        view = ir.Var("view", view_call.type, span)
+        body = ir.SeqStmts(
+            [ir.AssignStmt(view, view_call, span), ir.ReturnStmt([view], span)],
+            span,
+        )
+        func = ir.Function(
+            "rank_raising_view",
+            [(source, ir.ParamDirection.In)],
+            [view_call.type],
+            body,
+            span,
+            ir.FunctionType.InCore,
+        )
+        program = ir.Program([func], "rank_raising_view", span)
+
+        after = passes.flatten_tile_nd_to_2d()(program)
+        after_func = after.get_function("rank_raising_view")
+        assert after_func is not None
+        views = [
+            c for c in _tile_calls(after_func.body) if c.op.name == ir.get_op("tile.reinterpret_view").name
+        ]
+        assert len(views) == 1
+        assert _const_int_values(cast(ir.TileType, views[0].type).shape) == [4, 16]
+
+        props = passes.IRPropertySet()
+        props.insert(passes.IRProperty.TileOps2D)
+        passes.verify_properties(props, after, "after_flatten")
+
+
+# ----------------------------------------------------------------------------
 # User-introduced rank-raising tile.reshape feeding tile.store (#1400)
 # ----------------------------------------------------------------------------
 
@@ -1011,13 +1159,17 @@ class TestFlattenTileNdTo2DReshapedStore:
             ) -> pl.Tensor[[B, S, D], pl.FP32]:
                 # 2D tile.load is unchanged by the pass.
                 x_tile = pl.tile.load(x, [0, 0], [B, D], [B, D])
-                # The user's explicit rank-raising reshape is preserved.
-                r3 = pl.tile.reshape(x_tile, [B, 1, D])
-                # The pass-inserted ``tile.reshape`` flattens the >2D tile operand of
-                # ``tile.store`` back to 2D; codegen requires a 2D tile while the
-                # original 3D shape flows through as the ``shapes`` partition operand.
-                flat_tile = pl.tile.reshape(r3, [B, D])
-                out_0_1 = pl.tile.store(flat_tile, [0, 0, 0], out_0, [B, 1, D])
+                # The user's rank-raising reshape is collapsed to its 2D form: a tile
+                # is one contiguous row-major run, so [B, 1, D] and [B, D] name the
+                # same elements. Left at rank 3 it would reach PTO codegen, where
+                # ``ExtractTileTypeInfo`` types the tile_buf from ``shape_[0]`` and
+                # ``shape_[1]`` alone and drops the trailing D.
+                r3 = pl.tile.reshape(x_tile, [B, D])
+                # The 3D shape the user wrote still flows through as the ``shapes``
+                # partition operand, which is what selects the [B, 1, D] window of the
+                # [B, S, D] output tensor. No pass-inserted flattening reshape is
+                # needed any more: the operand arrives 2D.
+                out_0_1 = pl.tile.store(r3, [0, 0, 0], out_0, [B, 1, D])
                 return out_0_1
 
             @pl.function
@@ -1342,8 +1494,17 @@ class TestFlattenTileNdTo2DPassProperties:
         with pytest.raises(pypto.Error, match="TileOps2D"):
             passes.verify_properties(props, program, "test_non_literal_offset_assemble")
 
-    def test_verifier_allows_rank_raising_reinterpret_view(self):
-        """An explicit rank-raising metadata view is exempt, like tile.reshape."""
+    def test_verifier_rejects_rank_raising_reinterpret_view(self):
+        """A rank-raising metadata view is a >2D tile like any other.
+
+        `tile.reinterpret_view` and `tile.reshape` used to be exempt from the
+        result-rank check, on the reading that an explicit rank-raising view is
+        the author's intent. It is not something PTO can hold: `tile_buf` is 2D,
+        and `ExtractTileTypeInfo` types one from `shape_[0]` / `shape_[1]` alone,
+        so the exemption only meant the wrong-sized tile was found later (or, on
+        the `memory_planner=PYPTO` path, never). The pass collapses these two ops
+        like every other; the verifier holds them to it.
+        """
         span = ir.Span.unknown()
         source = ir.Var("source", ir.TileType([4, 8], DataType.FP32), span)
         view_call = tile_ops.reinterpret_view(source, DataType.INT16, shape=[4, 1, 16], span=span)
@@ -1364,7 +1525,8 @@ class TestFlattenTileNdTo2DPassProperties:
         props = passes.IRPropertySet()
         props.insert(passes.IRProperty.TileOps2D)
 
-        passes.verify_properties(props, program, "test_rank_raising_reinterpret_view")
+        with pytest.raises(pypto.Error, match="TileOps2D"):
+            passes.verify_properties(props, program, "test_rank_raising_reinterpret_view")
 
 
 # ----------------------------------------------------------------------------
