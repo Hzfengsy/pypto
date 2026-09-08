@@ -1204,13 +1204,19 @@ jobs:
           # compile + golden card-free, device run BATCHED via task-submit. The
           # `not device_batch` (direct @pl.jit / config=test_config) tests for
           # ALL dirs run in the `system-tests-direct` job.
-          python -m pytest tests/st -v -m device_batch \
+          #
+          # `not swimlane` because those assert on a chip-swimlane record and
+          # skip without `--enable-chip-swimlane`, which this step does not pass.
+          # They ran here only to skip, and 35 silent skips buried the real ones;
+          # the flagged steps in `system-tests-direct` run them for real.
+          python -m pytest tests/st -v -m "device_batch and not swimlane and not multi_card" \
             --ignore=tests/st/distributed \
             --ignore=tests/st/codegen \
             --ignore=tests/st/runtime/ops \
             --ignore=tests/st/runtime/cross_core \
             --ignore=tests/st/runtime/framework_and_models/test_dump_tag.py \
-            --precompile-workers=32 --execute-via-task-submit --execute-batch-size=64 \
+            --precompile-workers=32 --strict-case-discovery \
+            --execute-via-task-submit --execute-batch-size=64 \
             --task-queue-timeout=1800 --task-max-time=600 --task-submit-device="$DEVICE_ID"
 
       - name: Kill orphaned task-submit tasks
@@ -1225,7 +1231,7 @@ jobs:
     #      runtime/ops + runtime/cross_core. These have many tests but cheap
     #      compiles (~80s measured vs ~404s for the heavy dirs in `system-tests`),
     #      so they are paired here with the direct + DFX tail.
-    #   2. Direct-device (mechanism B): `-m 'not device_batch'` over ALL of
+    #   2. Direct-device (mechanism B): `-m 'not device_batch and not multi_card'` over ALL of
     #      tests/st (the in-process @pl.jit / config=test_config tests, including
     #      the direct tests under the heavy dirs that `system-tests` skips).
     #   3. DFX steps: paged-attention / multi-orch L2 / swimlane / dump-args.
@@ -1318,12 +1324,13 @@ jobs:
           test -n "$DEVICE_ID" || { echo "DEVICE_ID is empty in the runner env"; exit 1; }
           python -m pytest tests/st/runtime/ops tests/st/runtime/cross_core \
             -v -m device_batch \
-            --precompile-workers=32 --execute-via-task-submit --execute-batch-size=64 \
+            --precompile-workers=32 --strict-case-discovery \
+            --execute-via-task-submit --execute-batch-size=64 \
             --task-queue-timeout=1800 --task-max-time=600 --task-submit-device="$DEVICE_ID"
 
       - name: Test direct-device (mechanism B — one card, in-process)
         timeout-minutes: 30
-        # ALL `-m 'not device_batch'` tests across tests/st (both shards' dirs):
+        # ALL `-m 'not device_batch and not multi_card'` tests across tests/st (both shards' dirs):
         # direct @pl.jit kernel calls / config=test_config (and no-fixture device
         # tests), which execute the device synchronously in-process and cannot be
         # batched. Wrap them whole in ONE task-submit card session and run
@@ -1345,7 +1352,7 @@ jobs:
           test -n "$DEVICE_ID" || { echo "DEVICE_ID is empty in the runner env"; exit 1; }
           task-submit --device "$DEVICE_ID" --timeout 3600 --max-time 1800 \
             --run "cd $GITHUB_WORKSPACE/st-direct-checkout && source activate.sh && python -m pytest \
-              tests/st -v -m 'not device_batch' \
+              tests/st -v -m 'not device_batch and not multi_card' \
               --ignore=tests/st/distributed \
               --ignore=tests/st/codegen \
               --ignore=tests/st/runtime/framework_and_models/test_perf_swimlane.py \
@@ -1376,10 +1383,44 @@ jobs:
             --run "cd $GITHUB_WORKSPACE/st-direct-checkout && source activate.sh && python -m pytest tests/st/distributed/test_l2_multi_orch.py -v --device=\$TASK_DEVICE"
 
       - name: Test swimlane output
+        # --precompile-workers is what gives these tests an artifact directory at
+        # all: they read the record through `case_run.dfx(...)`, which resolves
+        # inside the case's own work_dir, and conftest returns early -- no pool,
+        # no work_dir -- when the flag is absent.
+        #
+        # No --forked, which it used to pass: a forked child cannot resolve the
+        # parent's compile futures, and the step hung until the 900s task cap
+        # when the two were combined. Unforked it is 4 passed in 11s.
         run: |
           source activate.sh
           task-submit --device "$DEVICE_ID" --timeout 3600 --max-time 600 \
-            --run "cd $GITHUB_WORKSPACE/st-direct-checkout && source activate.sh && python -m pytest tests/st/runtime/framework_and_models/test_perf_swimlane.py -v --device=\$TASK_DEVICE --platform=a2a3 --enable-chip-swimlane --forked"
+            --run "cd $GITHUB_WORKSPACE/st-direct-checkout && source activate.sh && python -m pytest tests/st/runtime/framework_and_models/test_perf_swimlane.py -v --device=\$TASK_DEVICE --platform=a2a3 --enable-chip-swimlane --precompile-workers=8"
+
+      - name: Test scheduling swimlane assertions
+        # The 35 swimlane assertions under runtime/scheduling had never run: they
+        # gate on `--enable-chip-swimlane`, which CI passed only to
+        # test_perf_swimlane.py, so every one of them skipped in the batched
+        # shard. Selected by the `swimlane` marker rather than by path, so the
+        # correctness cases sharing these files are not re-run here.
+        #
+        # --precompile-workers, and no --forked, for the reasons on the two steps
+        # above: each test reads its record through `case_run.dfx(...)`, which
+        # needs the pool to have published a work_dir, and several tests sharing
+        # one declared case then share its single device run.
+        #
+        # --device-num 2 because the device-pool path runs one case per card in
+        # --device. Measured on a2a3 over these 19 cases: 122s on one card, 66s
+        # on two, 35s on four. Two is the setting, not four: the extra 31s does
+        # not justify holding four of a shared pool's cards for the length of
+        # this step. Concurrency here was unreachable until the pre-submitter,
+        # and unsafe until the device-init lock in pypto.runtime.worker.
+        run: |
+          source activate.sh
+          task-submit --device "$DEVICE_ID" --device-num 2 --timeout 3600 --max-time 1200 \
+            --run "cd $GITHUB_WORKSPACE/st-direct-checkout && source activate.sh && python -m pytest \
+              tests/st/runtime/scheduling -v -m swimlane \
+              --device=\$TASK_DEVICE --platform=a2a3 --enable-chip-swimlane \
+              --precompile-workers=8 --strict-case-discovery"
 
       - name: Test Graph record-and-replay (one process per test)
         # --forked because a ChipWorker binds one (platform, device_id, runtime):
@@ -1391,6 +1432,10 @@ jobs:
             --run "cd $GITHUB_WORKSPACE/st-direct-checkout && source activate.sh && python -m pytest tests/st/runtime/framework_and_models/test_graph_execution.py -v --device=\$TASK_DEVICE --platform=a2a3 --forked"
 
       - name: Test dump-args output
+        # No pool and --forked, unlike the swimlane steps: this file's cases stay
+        # fixture-driven (see TestSubmitDumpsManifest's inline_case marker), and
+        # --forked is what keeps TestDumpTagManifest's module fixture in a
+        # process of its own.
         run: |
           source activate.sh
           task-submit --device "$DEVICE_ID" --timeout 3600 --max-time 600 \
@@ -1520,6 +1565,19 @@ jobs:
           source activate.sh
           task-submit --device "$DEVICE_ID" --device-num 2 --timeout 3600 --max-time 1800 \
             --run "cd $GITHUB_WORKSPACE/dist-checkout && source activate.sh && python -m pytest tests/st/distributed -v --device=\$TASK_DEVICE --ignore=tests/st/distributed/test_l2_multi_orch.py"
+
+      - name: Test multi-card cases outside tests/st/distributed
+        # Multi-card used to be selected by directory, so a test needing two
+        # cards anywhere else was collected by a single-card step and skipped
+        # itself from the body. `@pytest.mark.multi_card(n)` makes the
+        # requirement selectable, and this step is where those tests get the
+        # cards: test_benchmark_l3_surfaces_per_rank_timing had never once run.
+        run: |
+          source activate.sh
+          task-submit --device "$DEVICE_ID" --device-num 2 --timeout 3600 --max-time 900 \
+            --run "cd $GITHUB_WORKSPACE/dist-checkout && source activate.sh && python -m pytest \
+              tests/st -v -m multi_card --ignore=tests/st/distributed \
+              --device=\$TASK_DEVICE --platform=a2a3"
 
       - name: Kill orphaned task-submit tasks
         if: always()

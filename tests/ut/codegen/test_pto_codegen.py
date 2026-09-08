@@ -151,6 +151,36 @@ def _single_line(lines: list[str], token: str, *, startswith: bool = False) -> s
     return matched[0]
 
 
+def test_gm_scalar_write_between_converted_ops_keeps_store_and_reload():
+    """The GM side effect survives the full pipeline, between its two loads."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            x: pl.InOut[pl.Tensor[[16, 32], pl.FP32]],
+            first: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+            second: pl.Out[pl.Tensor[[16, 32], pl.FP32]],
+        ):
+            r = pl.row_max(x)
+            first[0:16, 0:1] = r
+            pl.tensor.write(x, [0, 0], pl.const(1.0, pl.FP32))
+            y = pl.add(x, 2.0)
+            second[0:16, 0:32] = y
+            return  # noqa: PLR1711 (DSL return terminator)
+
+    mlir = _generate_default_mlir(Before)
+    lines = _get_mlir_lines(mlir)
+    scalar_store = _single_line(lines, "pto.store_scalar")
+    assert ", %arg0[" in scalar_store, "the scalar store must target the original x pointer"
+    assert "pto.tsetval" not in mlir, "a GM write must not be redirected into a UB tile"
+    loads = [line for line in lines if "pto.tload " in line]
+    assert len(loads) == 2, "the second computation must reload x after its GM write"
+    assert lines.index(loads[0]) < lines.index(scalar_store) < lines.index(loads[1])
+    assert mlir.count("pto.tstore ") == 2, "only the two output tensors need bulk stores"
+
+
 SAMPLE_PTOAS_OUTPUT = """\
 #include "pto/pto-inst.hpp"
 using namespace pto;

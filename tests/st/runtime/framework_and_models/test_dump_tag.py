@@ -425,6 +425,12 @@ def submit_dumps_manifest(submit_dumps_manifest_file: Path) -> list[dict]:
     return entries
 
 
+@pytest.mark.inline_case(
+    reason="the fixture runs the case itself and both tests read the artifact it wrote; "
+    "declaring it made the shared device run fail in CI under --dump-args -- all-zero "
+    "outputs on one run, a poisoned chip lane on another -- while passing locally. Two "
+    "cases in a step that never reaches the batched shard is not worth that."
+)
 class TestSubmitDumpsManifest:
     """Manifest validation for ``dumps=`` — only runs when ``--dump-args`` is enabled."""
 

@@ -15,7 +15,6 @@ all tasks in flattened stage k+1 must start after all tasks in flattened stage k
 finish.
 """
 
-import json
 import os
 from pathlib import Path
 from typing import Any
@@ -23,7 +22,9 @@ from typing import Any
 import pypto.language as pl
 import pytest
 import torch
-from harness.core.harness import PLATFORMS, DataType, PTOTestCase, TensorSpec
+from harness import st
+from harness.core.harness import DataType, PTOTestCase, TensorSpec
+from harness.swimlane import read_swimlane
 from pypto.ir.pass_manager import OptimizationStrategy
 
 from examples.utils.phase_fence_dep_compression import (
@@ -46,14 +47,6 @@ _DENSE_CORRECTNESS_BRANCHES = 3
 _DENSE_SWIMLANE_BRANCHES = 4
 _EXTRA_SWIMLANE_ENV = "PYPTO_PHASE_FENCE_EXTRA_SWIMLANE"
 _CHAINED_SNAPSHOT_BRANCHES_ENV = "PYPTO_PHASE_FENCE_CHAINED_SNAPSHOT_BRANCHES"
-
-
-def _require_extra_swimlane_case(label: str) -> None:
-    if os.environ.get(_EXTRA_SWIMLANE_ENV) != "1":
-        pytest.skip(
-            f"{label} is a manual profiling witness; set {_EXTRA_SWIMLANE_ENV}=1 "
-            "and run this test node by itself"
-        )
 
 
 def _assert_flattened_stage_strict(swimlane_data: dict, *, stages: int, branches: int) -> None:
@@ -123,6 +116,11 @@ def _snapshot_swimlane_branches_from_env() -> int:
     return branches
 
 
+# Read at import rather than inside the test: the chained-snapshot case is
+# declared, and a declared case has to exist before the pre-compile pool starts.
+_SNAPSHOT_SWIMLANE_BRANCHES = _snapshot_swimlane_branches_from_env()
+
+
 def _new_swimlane_file(test_runner, case: PTOTestCase, *, label: str) -> Path:
     if not test_runner.config.enable_chip_swimlane:
         pytest.skip(f"pass --enable-chip-swimlane to validate {label}")
@@ -139,7 +137,7 @@ def _new_swimlane_file(test_runner, case: PTOTestCase, *, label: str) -> Path:
 
 def _new_swimlane_json(test_runner, case: PTOTestCase, *, label: str) -> dict:
     path = _new_swimlane_file(test_runner, case, label=label)
-    return json.loads(path.read_text())
+    return read_swimlane(path)
 
 
 def _build_submit_flattened_program(*, epochs: int, layers: int, phases: int):
@@ -891,164 +889,122 @@ def _chained_snapshot_manual_dummy_case(*, branches: int = _BRANCHES, platform: 
     )
 
 
+@pytest.mark.without_swimlane(
+    reason="correctness cases run without --enable-chip-swimlane; swimlane mode runs profiling witnesses"
+)
 class TestPhaseFenceDepCompressionCorrectness:
-    @pytest.fixture(autouse=True)
-    def _skip_when_collecting_l2_swimlane(self, test_runner):
-        if test_runner.config.enable_chip_swimlane:
-            pytest.skip(
-                "correctness cases run without --enable-chip-swimlane; swimlane mode runs profiling witnesses"
-            )
+    @st.cases(st.from_legacy(_submit_case(epochs=2, layers=1, phases=3, name="phase_fence_submit_3l")))
+    def test_submit_three_level_correctness(self, case_run):
+        case_run.assert_passed()
 
-    @pytest.mark.parametrize("platform", PLATFORMS)
-    def test_submit_three_level_correctness(self, test_runner, platform):
-        result = test_runner.run(
-            _submit_case(epochs=2, layers=1, phases=3, name="phase_fence_submit_3l", platform=platform)
-        )
-        assert result.passed, f"three-level submit phase-fence failed: {result.error}"
+    @st.cases(st.from_legacy(_pl_at_case(epochs=2, phases=3, name="phase_fence_pl_at_3l")))
+    def test_pl_at_three_level_correctness(self, case_run):
+        case_run.assert_passed()
 
-    @pytest.mark.parametrize("platform", PLATFORMS)
-    def test_pl_at_three_level_correctness(self, test_runner, platform):
-        result = test_runner.run(
-            _pl_at_case(epochs=2, phases=3, name="phase_fence_pl_at_3l", platform=platform)
-        )
-        assert result.passed, f"three-level pl.at phase-fence failed: {result.error}"
+    @st.cases(st.from_legacy(_reset_case()))
+    def test_reset_per_outer_correctness(self, case_run):
+        case_run.assert_passed()
 
-    @pytest.mark.parametrize("platform", PLATFORMS)
-    def test_reset_per_outer_correctness(self, test_runner, platform):
-        result = test_runner.run(_reset_case(platform=platform))
-        assert result.passed, f"reset-per-outer phase-fence failed: {result.error}"
+    @st.cases(st.from_legacy(_sibling_loops_case()))
+    def test_sibling_loops_correctness(self, case_run):
+        case_run.assert_passed()
 
-    @pytest.mark.parametrize("platform", PLATFORMS)
-    def test_sibling_loops_correctness(self, test_runner, platform):
-        result = test_runner.run(_sibling_loops_case(platform=platform))
-        assert result.passed, f"sibling-loop phase-fence failed: {result.error}"
+    @st.cases(st.from_legacy(_manual_dummy_auto_mix_case()))
+    def test_manual_dummy_auto_mix_correctness(self, case_run):
+        case_run.assert_passed()
 
-    @pytest.mark.parametrize("platform", PLATFORMS)
-    def test_manual_dummy_auto_mix_correctness(self, test_runner, platform):
-        result = test_runner.run(_manual_dummy_auto_mix_case(platform=platform))
-        assert result.passed, f"manual-dummy/auto phase-fence mix failed: {result.error}"
+    @st.cases(st.from_legacy(_if_consumer_case()))
+    def test_if_consumer_correctness(self, case_run):
+        case_run.assert_passed()
 
-    @pytest.mark.parametrize("platform", PLATFORMS)
-    def test_if_consumer_correctness(self, test_runner, platform):
-        result = test_runner.run(_if_consumer_case(platform=platform))
-        assert result.passed, f"if-consumer phase-fence failed: {result.error}"
+    @st.cases(st.from_legacy(_if_mixed_fallback_case()))
+    def test_if_mixed_fallback_correctness(self, case_run):
+        case_run.assert_passed()
 
-    @pytest.mark.parametrize("platform", PLATFORMS)
-    def test_if_mixed_fallback_correctness(self, test_runner, platform):
-        result = test_runner.run(_if_mixed_fallback_case(platform=platform))
-        assert result.passed, f"if-mixed-fallback phase-fence failed: {result.error}"
+    @st.cases(st.from_legacy(_multiloop_chain_case()))
+    def test_multiloop_chain_correctness(self, case_run):
+        case_run.assert_passed()
 
-    @pytest.mark.parametrize("platform", PLATFORMS)
-    def test_multiloop_chain_correctness(self, test_runner, platform):
-        result = test_runner.run(_multiloop_chain_case(platform=platform))
-        assert result.passed, f"multi-loop chain phase-fence failed: {result.error}"
+    @st.cases(st.from_legacy(_dense_mixed_case()))
+    def test_dense_mixed_phase_graph_correctness(self, case_run):
+        case_run.assert_passed()
 
-    @pytest.mark.parametrize("platform", PLATFORMS)
-    def test_dense_mixed_phase_graph_correctness(self, test_runner, platform):
-        result = test_runner.run(_dense_mixed_case(platform=platform))
-        assert result.passed, f"dense mixed phase-fence failed: {result.error}"
+    @st.cases(st.from_legacy(_partial_reduce_chain_case()))
+    def test_partial_reduce_chain_correctness(self, case_run):
+        case_run.assert_passed()
 
-    @pytest.mark.parametrize("platform", PLATFORMS)
-    def test_partial_reduce_chain_correctness(self, test_runner, platform):
-        result = test_runner.run(_partial_reduce_chain_case(platform=platform))
-        assert result.passed, f"partial-reduce chain phase-fence failed: {result.error}"
+    @st.cases(st.from_legacy(_chained_snapshot_case(branches=_BRANCHES, name="phase_fence_chained_snapshot")))
+    def test_chained_snapshot_correctness(self, case_run):
+        case_run.assert_passed()
 
-    @pytest.mark.parametrize("platform", PLATFORMS)
-    def test_chained_snapshot_correctness(self, test_runner, platform):
-        result = test_runner.run(
-            _chained_snapshot_case(
-                branches=_BRANCHES,
-                name="phase_fence_chained_snapshot",
-                platform=platform,
-            )
-        )
-        assert result.passed, f"chained snapshot phase-fence failed: {result.error}"
-
-    @pytest.mark.parametrize("platform", PLATFORMS)
-    def test_chained_snapshot_manual_dummy_correctness(self, test_runner, platform):
-        # Unlike test_chained_snapshot_correctness, this case uses user-written
-        # pl.system.task_dummy barriers instead of auto phase-fence compression.
-        result = test_runner.run(
-            _chained_snapshot_manual_dummy_case(
-                branches=_BRANCHES,
-                platform=platform,
-            )
-        )
-        assert result.passed, f"manual-dummy chained snapshot phase-fence failed: {result.error}"
+    # Unlike test_chained_snapshot_correctness, this case uses user-written
+    # pl.system.task_dummy barriers instead of auto phase-fence compression.
+    @st.cases(st.from_legacy(_chained_snapshot_manual_dummy_case(branches=_BRANCHES)))
+    def test_chained_snapshot_manual_dummy_correctness(self, case_run):
+        case_run.assert_passed()
 
 
+@pytest.mark.swimlane
 class TestPhaseFenceDepCompressionSwimlane:
-    def test_multiloop_chain_default(self, test_runner):
-        data = _new_swimlane_json(test_runner, _multiloop_chain_case(), label="multi-loop chain phase-fence")
-        _assert_multiloop_chain_shape(data)
+    @st.cases(st.from_legacy(_multiloop_chain_case()))
+    def test_multiloop_chain_default(self, case_run):
+        swimlane = case_run.swimlane()
+        _assert_multiloop_chain_shape(swimlane)
 
-    def test_submit_three_level_strict(self, test_runner):
-        data = _new_swimlane_json(
-            test_runner,
-            _submit_case(epochs=2, layers=1, phases=3, name="phase_fence_submit_3l_swimlane"),
-            label="three-level submit phase-fence",
-        )
-        _assert_flattened_stage_strict(data, stages=2 * 3, branches=_BRANCHES)
+    @st.cases(
+        st.from_legacy(_submit_case(epochs=2, layers=1, phases=3, name="phase_fence_submit_3l_swimlane"))
+    )
+    def test_submit_three_level_strict(self, case_run):
+        swimlane = case_run.swimlane()
+        _assert_flattened_stage_strict(swimlane, stages=2 * 3, branches=_BRANCHES)
 
-    def test_pl_at_three_level_strict(self, test_runner):
-        _require_extra_swimlane_case("three-level pl.at swimlane")
-        data = _new_swimlane_json(
-            test_runner,
-            _pl_at_case(epochs=2, phases=3, name="phase_fence_pl_at_3l_swimlane"),
-            label="three-level pl.at phase-fence",
-        )
-        _assert_flattened_stage_strict(data, stages=2 * 3, branches=_BRANCHES)
+    @pytest.mark.extra_swimlane("three-level pl.at swimlane")
+    @st.cases(st.from_legacy(_pl_at_case(epochs=2, phases=3, name="phase_fence_pl_at_3l_swimlane")))
+    def test_pl_at_three_level_strict(self, case_run):
+        swimlane = case_run.swimlane()
+        _assert_flattened_stage_strict(swimlane, stages=2 * 3, branches=_BRANCHES)
 
-    def test_reset_per_outer_generates_swimlane(self, test_runner):
-        _require_extra_swimlane_case("reset-per-outer swimlane")
-        data = _new_swimlane_json(test_runner, _reset_case(), label="reset-per-outer phase-fence")
-        _assert_min_task_count(data, expected=2 * 2 * _BRANCHES)
+    @pytest.mark.extra_swimlane("reset-per-outer swimlane")
+    @st.cases(st.from_legacy(_reset_case()))
+    def test_reset_per_outer_generates_swimlane(self, case_run):
+        swimlane = case_run.swimlane()
+        _assert_min_task_count(swimlane, expected=2 * 2 * _BRANCHES)
 
-    def test_sibling_loops_strict(self, test_runner):
-        _require_extra_swimlane_case("sibling-loop swimlane")
-        data = _new_swimlane_json(test_runner, _sibling_loops_case(), label="sibling-loop phase-fence")
-        _assert_flattened_stage_strict(data, stages=2, branches=_BRANCHES)
+    @pytest.mark.extra_swimlane("sibling-loop swimlane")
+    @st.cases(st.from_legacy(_sibling_loops_case()))
+    def test_sibling_loops_strict(self, case_run):
+        swimlane = case_run.swimlane()
+        _assert_flattened_stage_strict(swimlane, stages=2, branches=_BRANCHES)
 
-    def test_if_consumer_strict(self, test_runner):
-        _require_extra_swimlane_case("if-consumer swimlane")
-        data = _new_swimlane_json(test_runner, _if_consumer_case(), label="if-consumer phase-fence")
-        _assert_flattened_stage_strict(data, stages=2, branches=_BRANCHES)
+    @pytest.mark.extra_swimlane("if-consumer swimlane")
+    @st.cases(st.from_legacy(_if_consumer_case()))
+    def test_if_consumer_strict(self, case_run):
+        swimlane = case_run.swimlane()
+        _assert_flattened_stage_strict(swimlane, stages=2, branches=_BRANCHES)
 
-    def test_if_mixed_fallback_swimlane(self, test_runner):
-        _require_extra_swimlane_case("if-mixed-fallback swimlane")
-        data = _new_swimlane_json(
-            test_runner,
-            _if_mixed_fallback_case(),
-            label="if-mixed-fallback phase-fence",
-        )
-        _assert_min_task_count(data, expected=3 * _BRANCHES)
+    @pytest.mark.extra_swimlane("if-mixed-fallback swimlane")
+    @st.cases(st.from_legacy(_if_mixed_fallback_case()))
+    def test_if_mixed_fallback_swimlane(self, case_run):
+        swimlane = case_run.swimlane()
+        _assert_min_task_count(swimlane, expected=3 * _BRANCHES)
 
-    def test_manual_dummy_auto_mix_generates_swimlane(self, test_runner):
-        data = _new_swimlane_json(
-            test_runner,
-            _manual_dummy_auto_mix_case(),
-            label="manual-dummy/auto phase-fence mix",
-        )
-        _assert_min_task_count(data, expected=3 * _BRANCHES)
+    @st.cases(st.from_legacy(_manual_dummy_auto_mix_case()))
+    def test_manual_dummy_auto_mix_generates_swimlane(self, case_run):
+        swimlane = case_run.swimlane()
+        _assert_min_task_count(swimlane, expected=3 * _BRANCHES)
 
-    def test_dense_mixed_extra(self, test_runner):
-        _require_extra_swimlane_case("dense mixed swimlane")
-        data = _new_swimlane_json(
-            test_runner,
-            _dense_mixed_case(branches=_DENSE_SWIMLANE_BRANCHES),
-            label="dense mixed phase-fence",
-        )
-        _assert_dense_mixed_shape(data, branches=_DENSE_SWIMLANE_BRANCHES)
+    @pytest.mark.extra_swimlane("dense mixed swimlane")
+    @st.cases(st.from_legacy(_dense_mixed_case(branches=_DENSE_SWIMLANE_BRANCHES)))
+    def test_dense_mixed_extra(self, case_run):
+        swimlane = case_run.swimlane()
+        _assert_dense_mixed_shape(swimlane, branches=_DENSE_SWIMLANE_BRANCHES)
 
-    def test_partial_reduce_chain_strict(self, test_runner):
-        _require_extra_swimlane_case("partial-reduce chain swimlane")
-        data = _new_swimlane_json(
-            test_runner,
-            _partial_reduce_chain_case(),
-            label="partial-reduce chain phase-fence",
-        )
-        _assert_min_task_count(data, expected=2 * _BRANCHES + 1)
-        tasks = sorted(data["tasks"], key=lambda t: t["start_time_us"])[: 2 * _BRANCHES + 1]
+    @pytest.mark.extra_swimlane("partial-reduce chain swimlane")
+    @st.cases(st.from_legacy(_partial_reduce_chain_case()))
+    def test_partial_reduce_chain_strict(self, case_run):
+        swimlane = case_run.swimlane()
+        _assert_min_task_count(swimlane, expected=2 * _BRANCHES + 1)
+        tasks = sorted(swimlane["tasks"], key=lambda t: t["start_time_us"])[: 2 * _BRANCHES + 1]
         producers = tasks[:_BRANCHES]
         reducer = tasks[_BRANCHES : _BRANCHES + 1]
         consumers = tasks[_BRANCHES + 1 :]
@@ -1065,18 +1021,18 @@ class TestPhaseFenceDepCompressionSwimlane:
             f"before reducer ends at {reducer_end:.2f}us"
         )
 
-    def test_chained_snapshot_strict(self, test_runner):
-        _require_extra_swimlane_case("chained snapshot swimlane")
-        branches = _snapshot_swimlane_branches_from_env()
-        data = _new_swimlane_json(
-            test_runner,
+    @pytest.mark.extra_swimlane("chained snapshot swimlane")
+    @st.cases(
+        st.from_legacy(
             _chained_snapshot_case(
-                branches=branches,
-                name=f"phase_fence_chained_snapshot_b{branches}_swimlane",
-            ),
-            label="chained snapshot phase-fence",
+                branches=_SNAPSHOT_SWIMLANE_BRANCHES,
+                name=f"phase_fence_chained_snapshot_b{_SNAPSHOT_SWIMLANE_BRANCHES}_swimlane",
+            )
         )
-        _assert_flattened_stage_strict(data, stages=4, branches=branches)
+    )
+    def test_chained_snapshot_strict(self, case_run):
+        swimlane = case_run.swimlane()
+        _assert_flattened_stage_strict(swimlane, stages=4, branches=_SNAPSHOT_SWIMLANE_BRANCHES)
 
 
 if __name__ == "__main__":

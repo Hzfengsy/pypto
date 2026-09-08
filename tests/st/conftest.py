@@ -16,6 +16,7 @@ harness package (migrated from pto-testing-framework).
 
 import ast
 import inspect
+import os
 import queue
 import shutil
 import sys
@@ -75,6 +76,12 @@ _temp_precompile_dirs: list[Path] = []
 # Per-device test counter populated by ``_report_device`` and dumped at
 # session end via ``pytest_terminal_summary``.
 _device_counter: Counter[int] = Counter()
+
+# Node ids that use ``test_runner`` but that collection could not turn into a
+# case, so each compiles inline instead of in the pool. Reported at session end
+# by ``pytest_terminal_summary``; a ``@st.cases`` declaration is never in here,
+# because it is read rather than guessed.
+_undiscovered_items: list[str] = []
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -297,6 +304,29 @@ def pytest_addoption(parser):
         help="Deprecated alias for --enable-chip-swimlane.",
     )
     parser.addoption(
+        "--execute-workers",
+        type=int,
+        default=0,
+        help="Cap on concurrent device runs in the local device-pool path. 0 (the default) "
+        "means one per card in --device. Lower it for a host that cannot sustain that; the "
+        "device-context race that used to force a cap is fixed in "
+        "pypto.runtime.worker._device_init_lock.",
+    )
+    parser.addoption(
+        "--strict-case-discovery",
+        action="store_true",
+        default=False,
+        help="Fail collection when a test reaches test_runner without a case collection "
+        "could read. Every system test declares its case today, so an undeclared one is "
+        "a regression: the pool cannot see it and it compiles one at a time. Off by "
+        "default because discovery legitimately gives up on some bodies -- a "
+        "`pytest.importorskip` for an absent module raises out of the walk and is "
+        "recovered as 'unresolvable' -- and a developer's run must not abort over that. "
+        "CI turns it on for the steps where an undeclared case costs real time. A case "
+        "that permanently cannot be a collection-time value carries "
+        "@pytest.mark.inline_case(reason=...), which exempts that one test either way.",
+    )
+    parser.addoption(
         "--dump-args",
         nargs="?",
         type=int,
@@ -445,6 +475,28 @@ def _report_device(request) -> None:
     _device_counter[device_id] += 1
 
 
+def _undiscovered_report(config: pytest.Config) -> str:
+    """Explain the inline-compiled items, listing at most 20 and filing the rest.
+
+    Shared by the collection-time guard and the end-of-session summary so the
+    two never drift. The full list goes to a file rather than only a truncated
+    tail: reading "... and 56 more" as the whole inventory is exactly the
+    mistake this report exists to prevent.
+    """
+    lines = [
+        "These reach test_runner but collection could not read a case from them, so each",
+        "compiles on its own thread of control while the pre-compile pool idles. Declare",
+        "them with @st.cases(st.case(...)) or @st.cases(st.from_legacy(...)) to batch them.",
+    ]
+    shown = _undiscovered_items[:20]
+    lines += [f"  {node_id}" for node_id in shown]
+    if len(_undiscovered_items) > len(shown):
+        report = Path(config.rootpath) / "undiscovered_cases.txt"
+        report.write_text("\n".join(_undiscovered_items) + "\n")
+        lines.append(f"  ... and {len(_undiscovered_items) - len(shown)} more; full list in {report}")
+    return "\n".join(lines)
+
+
 def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:  # noqa: ARG001
     """Emit a per-device test count + task-submit batch summary at session end.
 
@@ -452,6 +504,13 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:  # no
     clean log, so this is the one place the borrowed-card batched execution is
     made visible: how many batches ran and how the runs spread across cards.
     """
+    if _undiscovered_items:
+        terminalreporter.write_sep(
+            "=", f"{len(_undiscovered_items)} case(s) compiled inline, not in the pool"
+        )
+        for line in _undiscovered_report(terminalreporter.config).splitlines():
+            terminalreporter.write_line(line)
+
     batch_lines = execution_summary_lines()
     if not _device_counter and not batch_lines:
         return
@@ -688,6 +747,45 @@ def pytest_configure(config):
         "step); the split is by fixture usage, so new tests self-classify with no "
         "ci.yml change.",
     )
+    config.addinivalue_line(
+        "markers",
+        "extra_swimlane(label): a manual profiling witness, run only with "
+        "PYPTO_PHASE_FENCE_EXTRA_SWIMLANE=1. Declared rather than checked in the body, "
+        "because the body runs after `case_run` has already put the case on a card: a "
+        "body check skips a test that has just cost 12s of device time.",
+    )
+    config.addinivalue_line(
+        "markers",
+        "multi_card(n): the test needs n devices. Declared rather than checked in the "
+        "body, so the requirement is visible to selection: `-m multi_card` routes these "
+        "to the job that borrows enough cards, and the single-card steps deselect them "
+        "instead of running them only to skip. A body check cannot do either — it is "
+        "how test_benchmark_l3_surfaces_per_rank_timing sat skipped in every CI run.",
+    )
+    config.addinivalue_line(
+        "markers",
+        "inline_case(reason): this test's case cannot be a collection-time value, so it "
+        "compiles inline instead of in the pre-compile pool. Exempts the test from the "
+        "collection guard, which otherwise fails the session. A reason is required — an "
+        "unexplained exemption is indistinguishable from a test nobody got round to "
+        "declaring, which is what let the count reach 76.",
+    )
+    config.addinivalue_line(
+        "markers",
+        "without_swimlane(reason): the inverse of `swimlane` — the test must NOT run "
+        "while the record is being collected. A marker rather than an autouse fixture "
+        "because collection cannot see a fixture's skip, and the device-pool submitter "
+        "runs every registered case before the item loop starts.",
+    )
+    config.addinivalue_line(
+        "markers",
+        "swimlane: the test asserts on a chip-swimlane record, so it needs "
+        "`--enable-chip-swimlane` and skips without it. CI selects the whole set "
+        "with `-m swimlane` in one flagged step, and the batched shards exclude "
+        "it — otherwise these run there only to skip, and a real skip is lost in "
+        "the noise. The skip is applied by pytest_runtest_setup, so a class that "
+        "declares its case with @st.cases needs no fixture to enforce it.",
+    )
 
     # Set the PyPTO runtime log level independently of the per-ST-item C++ logger.
     try:
@@ -785,6 +883,69 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
         metafunc.parametrize("_st_platform", allowed, ids=list(allowed), indirect=True)
 
 
+def marker_skip_reason(item: pytest.Item) -> str | None:
+    """Why *item*'s markers say it cannot run here, or None if it can.
+
+    Read at two moments that must agree. ``pytest_runtest_setup`` applies it, so
+    the skip lands before fixtures build and no case reaches a card for a test
+    that was never going to assert on it. Collection reads it too: a case whose
+    every test is skipped is not registered, so the pool neither compiles it nor
+    (once the device-pool path submits ahead) runs it.
+
+    Splitting these two into separate copies of the conditions is how a case
+    ends up compiled and executed for a test that skips in its first line --
+    which is exactly what the ``extra_swimlane`` witnesses used to do, at 12s of
+    card time each.
+
+    Raises:
+        pytest.UsageError: ``multi_card`` carries no usable device count.
+    """
+    # The option is read only once its marker is present: asking every item in
+    # the session for an option it has no reason to care about fails outright
+    # against a config that exposes only the ones its own test needs.
+    if item.get_closest_marker("swimlane"):
+        if not _resolve_swimlane_option(item.config):
+            return "pass --enable-chip-swimlane to collect the record this test asserts on"
+        if item.config.getoption("--codegen-only"):
+            return "--codegen-only skips device execution, so no record is written"
+
+    # The mirror image: a test that must NOT run while the record is being
+    # collected. Stated as a marker rather than an autouse fixture because a
+    # fixture's skip is invisible to collection, and the device-pool submitter
+    # runs every registered case before the item loop starts -- so the case
+    # would be compiled and put on a card for a test that then skips.
+    excluded = item.get_closest_marker("without_swimlane")
+    if excluded is not None and _resolve_swimlane_option(item.config):
+        reason = excluded.kwargs.get("reason") or (excluded.args[0] if excluded.args else None)
+        if not reason:
+            raise pytest.UsageError(
+                f"{item.nodeid}: @pytest.mark.without_swimlane needs a reason explaining why "
+                "this test cannot run while the swimlane record is being collected."
+            )
+        return str(reason)
+
+    witness = item.get_closest_marker("extra_swimlane")
+    if witness is not None and os.environ.get("PYPTO_PHASE_FENCE_EXTRA_SWIMLANE") != "1":
+        label = witness.kwargs.get("label") or (witness.args[0] if witness.args else item.name)
+        return (
+            f"{label} is a manual profiling witness; set PYPTO_PHASE_FENCE_EXTRA_SWIMLANE=1 "
+            "and run this test node by itself"
+        )
+
+    cards = item.get_closest_marker("multi_card")
+    if cards is not None:
+        wanted = cards.kwargs.get("n") or (cards.args[0] if cards.args else None)
+        if not isinstance(wanted, int) or wanted < 2:
+            raise pytest.UsageError(
+                f"{item.nodeid}: @pytest.mark.multi_card needs an integer device count >= 2, got {wanted!r}."
+            )
+        available = _parse_device_option(item.config.getoption("--device"))
+        if len(available) < wanted:
+            return f"needs {wanted} devices, this run has {available or 'none'}"
+
+    return None
+
+
 @pytest.hookimpl(tryfirst=True)
 def pytest_runtest_setup(item: pytest.Item) -> None:
     """Publish this item's platform, then apply ``@pytest.mark.platform_xfail``.
@@ -810,6 +971,16 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
         pytest.UsageError: The marker names no/unknown platforms, or no reason.
     """
     set_current_item_platform(_resolve_item_platform(item, item.config))
+
+    # A DFX marker has always meant "needs its collection flag and skips without
+    # it", but each DFX fixture implemented that skip itself. A test that
+    # declares its case instead has no such fixture, so enforce the marker's own
+    # contract here -- otherwise it runs with no artifact to read and fails where
+    # it used to skip. `--codegen-only` is the same condition by another route:
+    # nothing executes, so nothing is written.
+    reason = marker_skip_reason(item)
+    if reason is not None:
+        pytest.skip(reason)
 
     marker = item.get_closest_marker("platform_xfail")
     if marker is None:
@@ -848,7 +1019,9 @@ def pytest_collection_modifyitems(config, items):
     A third layer applies to a declared ``Case`` that pinned its own platform:
     since that pin outranks the item's, only the matrix variant the pin names
     is kept. Without it the other variants would run the pinned platform and
-    report themselves as covering one they never touched.
+    report themselves as covering one they never touched. A single-platform run
+    grows no matrix variants at all, so there the pin is checked against the
+    allowed set directly.
     """
     cli_platforms = _parse_platform_filter(config.getoption("--platform"))
     cli_filter = set(cli_platforms or ALL_PLATFORM_IDS)
@@ -878,9 +1051,17 @@ def pytest_collection_modifyitems(config, items):
         # declaration and `get_platform()` is exactly the pin, or None.
         declared_case = params.get("_st_case")
         case_pin = declared_case.get_platform() if isinstance(declared_case, Case) else None
-        if case_pin is not None and platform_param is not None and case_pin != platform_param:
-            deselected.append(item)
-            continue
+        if case_pin is not None:
+            # The matrix only expands when the CLI names more than one platform,
+            # so a single-platform run leaves `platform_param` None. Comparing
+            # the pin against the allowed set covers both shapes; without the
+            # second arm a pinned case survived every single-platform run, which
+            # is the shape CI uses -- an A5-pinned case would have been handed an
+            # A2A3 card.
+            unwanted = case_pin != platform_param if platform_param is not None else case_pin not in allowed
+            if unwanted:
+                deselected.append(item)
+                continue
 
         if platform_param is not None:
             if platform_param in allowed:
@@ -974,32 +1155,20 @@ def _is_st_item(item: pytest.Item) -> bool:
         return False
 
 
-def _collect_test_case_from_item(
-    item: pytest.Item,
+def _collect_declared_case(
+    callspec: Any,
+    params: dict[str, Any],
     seen: dict[str, PTOTestCase],
     session_memory_planner: MemoryPlanner | None,
     session_platform: str,
-) -> None:
-    """Inspect *item* and add any discovered PTOTestCase instances to *seen*.
+) -> bool:
+    """Read a ``@st.cases(...)`` declaration out of this item's parametrize params.
 
-    Parses the test body and resolves every ``SomeCase(...)`` constructor call
-    (callee + all positional/keyword args) against this item's parametrize
-    params, locals assigned earlier in the body, and the test module globals,
-    then instantiates it exactly as the body would.  This reconstructs the case
-    regardless of parametrize→__init__ name renames (``valid`` →
-    ``valid_shape``), hard-coded literal args (``dtype=DataType.FP16``),
-    positional args, the class-as-parameter pattern (``op_cls(...)``), or a
-    locally-built config (``cfg = RunConfig(...); run(Case(config=cfg))``) — so
-    the case is pre-compiled and batched instead of falling to the per-case
-    inline path.  Cases whose args genuinely can't be resolved (built in a loop,
-    arithmetic on params) are left for the inline path.
+    Split out of :func:`_collect_test_case_from_item` because the two discovery
+    routes share nothing: this one reads a value pytest already holds, the other
+    parses the test's source and rebuilds the constructor call. Returns ``True``
+    when a declaration was found and filed.
     """
-    if any(m.name == "skip" for m in item.iter_markers()):
-        return
-
-    callspec = getattr(item, "callspec", None)
-    params: dict[str, Any] = callspec.params if callspec else {}
-
     # A case declared with ``@st.cases(...)`` is already a collection-time
     # value: read it straight out of the parametrize params. No source parsing,
     # no re-construction, and no silent fallback — if the declaration is there,
@@ -1025,18 +1194,55 @@ def _collect_test_case_from_item(
         # variants a pin excludes; this keeps the surviving one keyed by what it
         # will actually be built for.
         seen.setdefault(_cache_key(bound, bound.get_platform() or platform, session_memory_planner), bound)
-        return
+        return True
+    return False
 
+
+def _collect_test_case_from_item(
+    item: pytest.Item,
+    seen: dict[str, PTOTestCase],
+    session_memory_planner: MemoryPlanner | None,
+    session_platform: str,
+) -> bool:
+    """Inspect *item* and add any discovered PTOTestCase instances to *seen*.
+
+    Parses the test body and resolves every ``SomeCase(...)`` constructor call
+    (callee + all positional/keyword args) against this item's parametrize
+    params, locals assigned earlier in the body, and the test module globals,
+    then instantiates it exactly as the body would.  This reconstructs the case
+    regardless of parametrize→__init__ name renames (``valid`` →
+    ``valid_shape``), hard-coded literal args (``dtype=DataType.FP16``),
+    positional args, the class-as-parameter pattern (``op_cls(...)``), or a
+    locally-built config (``cfg = RunConfig(...); run(Case(config=cfg))``) — so
+    the case is pre-compiled and batched instead of falling to the per-case
+    inline path.  Cases whose args genuinely can't be resolved (built in a loop,
+    arithmetic on params) are left for the inline path.
+
+    Returns:
+        ``True`` when this item contributed a case. ``False`` means it will
+        compile inline, one case at a time, instead of in the pool — which is a
+        silent slowdown, so ``pytest_collection_finish`` counts the misses and
+        names them. A ``@st.cases`` declaration always returns ``True``: it is
+        read, never guessed.
+    """
+    if any(m.name == "skip" for m in item.iter_markers()):
+        return False
+
+    callspec = getattr(item, "callspec", None)
+    params: dict[str, Any] = callspec.params if callspec else {}
+
+    if _collect_declared_case(callspec, params, seen, session_memory_planner, session_platform):
+        return True
     module = item.module
     if module is None:
-        return
+        return False
     globalns = vars(module)
 
     try:
         source = textwrap.dedent(inspect.getsource(item.function))
         tree = ast.parse(source)
     except (OSError, TypeError, SyntaxError):
-        return
+        return False
 
     # Build a local namespace from simple ``name = <expr>`` assignments, in
     # source order, so a constructor arg referencing a local (``config=cfg``)
@@ -1054,6 +1260,11 @@ def _collect_test_case_from_item(
             except Exception:  # noqa: BLE001 — best-effort; unresolved locals just stay unknown
                 continue
 
+    # Every constructor in the body is filed, not just the first: a test that
+    # runs two distinct cases needs a compile future for both, and returning
+    # early would hand the second to the serial inline path while reporting
+    # ``True`` -- so the miss would not even reach the undiscovered inventory.
+    found = False
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -1097,6 +1308,117 @@ def _collect_test_case_from_item(
             _cache_key(instance, instance.get_platform() or platform, session_memory_planner),
             instance,
         )
+        found = True
+    return found
+
+
+def _inline_case_reason(item: pytest.Item) -> str | None:
+    """Return the ``inline_case`` marker's reason, or None when unmarked.
+
+    Raises:
+        pytest.UsageError: The marker carries no reason. The marker is the one
+            way to keep a case out of the pool on purpose, so it has to say why
+            — otherwise it reads exactly like a test nobody declared yet.
+    """
+    marker = item.get_closest_marker("inline_case")
+    if marker is None:
+        return None
+    reason = marker.kwargs.get("reason") or (marker.args[0] if marker.args else None)
+    if not reason:
+        raise pytest.UsageError(
+            f"{item.nodeid}: @pytest.mark.inline_case needs a reason explaining why this "
+            "case cannot be declared with @st.cases(...)."
+        )
+    return str(reason)
+
+
+def _will_not_run(item: pytest.Item) -> bool:
+    """Will *item* be skipped before it can assert on a case?
+
+    Collection-only. ``pytest_runtest_setup`` applies :func:`marker_skip_reason`
+    and nothing else, so this stays a superset used for two decisions here: a
+    case is registered only from items that will run, and only a running item
+    can be reported as undiscovered.
+
+    ``skip`` and ``skipif`` are folded in because the pool now *executes* what it
+    registers -- the device-pool submitter puts every registered case on a card
+    before the item loop starts -- so a case behind either marker would be
+    compiled and run for a test pytest never intends to call. ``skipif``'s
+    condition is not evaluated: treating a conditional skip as "may skip" costs
+    at most a serial inline compile, while guessing the other way costs a device
+    run. ``iter_markers`` reports the two under different names, and matching
+    only ``"skip"`` misses ``skipif`` entirely.
+    """
+    if any(m.name in ("skip", "skipif") for m in item.iter_markers()):
+        return True
+    return marker_skip_reason(item) is not None
+
+
+def _discover_cases(
+    session: pytest.Session,
+    seen: dict[str, PTOTestCase],
+    session_memory_planner: MemoryPlanner | None,
+    session_platform: str,
+) -> None:
+    """Fill *seen* from every collected item, and record the ones that miss.
+
+    An item that reaches ``test_runner`` but contributes no case compiles
+    inline, one at a time, while the pre-compile pool sits idle. Nothing
+    reported that, so a test whose constructor arguments the source-parsing
+    route cannot resolve only ever showed up as a slower run. The misses are
+    named in the terminal summary instead.
+
+    A case is registered only from items that will actually run. A test its
+    markers already exclude — no ``--enable-chip-swimlane``, a profiling
+    witness, not enough cards — must not put its case in the pool: the pool
+    would compile it, and the device-pool submitter would run it, for a test
+    that skips before asserting anything. A case several tests share survives as
+    long as one of them runs, which is the right rule and falls out of only
+    registering from the ones that do.
+
+    Detection is deliberately *not* narrowed the same way. Whether a test
+    declared its case is a property of the test, not of this run's flags, so the
+    guard still sees an undeclared swimlane test in a run with no
+    ``--enable-chip-swimlane``. Skipped items therefore collect into a throwaway
+    dict: the answer is computed, the case is not kept.
+    """
+    discarded: dict[str, PTOTestCase] = {}
+    for item in session.items:
+        # Session hook: without this it walks tests/ut bodies too. See _is_st_item.
+        if not _is_st_item(item):
+            continue
+        runs = not _will_not_run(item)
+        found = _collect_test_case_from_item(
+            item, seen if runs else discarded, session_memory_planner, session_platform
+        )
+        if found or "test_runner" not in getattr(item, "fixturenames", ()):
+            continue
+        if _will_not_run(item):
+            continue
+        if _inline_case_reason(item) is not None:
+            continue
+        _undiscovered_items.append(item.nodeid)
+
+    # Fail here rather than only reporting at the end. tests/st is at zero
+    # inline-compiled cases, and that is a property worth keeping: an undeclared
+    # case is invisible to the pool, so it costs a serial compile that no
+    # summary line reliably gets anyone to fix -- the previous, advisory-only
+    # version of this report sat unread while the count grew to 76. Collection
+    # is also the right moment: nothing has run yet, so the failure is about the
+    # declaration and not about a device.
+    #
+    # Opt-in, though. Discovery gives up on some bodies for reasons that are not
+    # the author's fault -- `pytest.importorskip` for an absent module raises
+    # out of the walk and lands here as an undiscovered item -- and aborting a
+    # developer's session over that is exactly what #2676 fixed. CI passes the
+    # flag on the steps that pay for a serial compile; the end-of-run summary
+    # reports the same list everywhere else.
+    if _undiscovered_items and session.config.getoption("--strict-case-discovery"):
+        raise pytest.UsageError(
+            f"{len(_undiscovered_items)} test(s) reach test_runner with no case collection "
+            f"could read.\n{_undiscovered_report(session.config)}\n"
+            "Declare them, or mark one @pytest.mark.inline_case(reason=...)."
+        )
 
 
 def pytest_collection_finish(session: pytest.Session) -> None:
@@ -1123,10 +1445,7 @@ def pytest_collection_finish(session: pytest.Session) -> None:
     session_platform: str = platform_filter[0] if platform_filter else "a2a3"
     seen: dict[str, PTOTestCase] = {}  # effective cache_key → instance (deduped)
 
-    for item in session.items:
-        if not _is_st_item(item):
-            continue
-        _collect_test_case_from_item(item, seen, session_memory_planner, session_platform)
+    _discover_cases(session, seen, session_memory_planner, session_platform)
 
     # Read the task-submit / pipeline options *before* the empty-discovery guard:
     # a suite that only creates PTOTestCases dynamically leaves ``seen`` empty yet
@@ -1138,6 +1457,7 @@ def pytest_collection_finish(session: pytest.Session) -> None:
     task_queue_timeout: int = session.config.getoption("--task-queue-timeout")
     task_submit_device: str = (session.config.getoption("--task-submit-device") or "").strip()
     execute_batch_size: int = session.config.getoption("--execute-batch-size")
+    execute_workers: int = session.config.getoption("--execute-workers")
 
     # Guard against a silently-wrong card. ``--task-submit-device="$DEVICE_RANGE"``
     # with an *unset* DEVICE_RANGE (e.g. the var didn't propagate to a de-dockered
@@ -1259,6 +1579,7 @@ def pytest_collection_finish(session: pytest.Session) -> None:
             task_queue_timeout=task_queue_timeout,
             task_submit_device=task_submit_device,
             execute_batch_size=execute_batch_size,
+            execute_workers=execute_workers,
             memory_planner=session_memory_planner,
         )
     finally:

@@ -376,8 +376,19 @@ void CheckReinterpretViewIncoreLayout(const CallPtr& call) {
          "yet be preserved by tensor-to-tile lowering";
 }
 
+/// Converters without explicit input_reqs consume ordinary tensor operands as
+/// tiles. Memory operations and distributed transfers manage GM operands
+/// themselves; loading their operands would erase the destination identity.
+bool UsesDefaultTileInputs(const CallPtr& call) {
+  if (!call || call->op_->name_.rfind("tensor.", 0) != 0) return false;
+  return !(IsOp(call, "tensor.slice") || IsOp(call, "tensor.assemble") || IsOp(call, "tensor.read") ||
+           IsOp(call, "tensor.write") || IsOp(call, "tensor.expand_clone") || IsOp(call, "tensor.gather") ||
+           IsOp(call, "tensor.paged_gather") || IsOp(call, "tensor.create_l1") ||
+           IsOp(call, "tensor.gather_row"));
+}
+
 /**
- * @brief Visitor that collects tensor-typed variable names used directly by converted ops.
+ * @brief Visitor that collects tensor-typed variables used directly by converted ops.
  *
  * Traverses the IR tree via IRVisitor and records the name of every Var/IterArg argument
  * whose type is TensorType and that appears in a call to an op registered in
@@ -402,20 +413,21 @@ class TensorArgsInConvertedOpsCollector : public IRVisitor {
    * @brief Trace from collected IterArgs to their ForStmt/WhileStmt initValue_ expressions.
    *
    * When an IterArg is in used_ (consumed by a converted op), its initValue_ may be a
-   * function parameter that also needs a Phase-1 tile.load.  This fixpoint loop propagates
-   * through chains of IterArgs (e.g. nested loops) until no new entries are added.
+   * function parameter eligible for a shared entry load. Follow each newly
+   * discovered seed once, including chains of nested IterArgs, in O(N). Only
+   * tile-valued carries consume such a preload; GM carries load their current
+   * value at the computation, which may differ from their initializer.
    */
-  void TraceIterArgInitValues() {
-    bool changed = true;
-    while (changed) {
-      changed = false;
-      for (const auto& [iter_arg_ptr, init_expr] : iter_arg_to_init_) {
-        if (used_.count(iter_arg_ptr) == 0) continue;
-        if (auto var = As<Var>(init_expr)) {
-          if (AsTensorTypeLike(var->GetType()) && used_.insert(var.get()).second) {
-            changed = true;
-          }
-        }
+  template <typename IsTileValue>
+  void TraceIterArgInitValues(IsTileValue is_tile_value) {
+    std::vector<const Var*> worklist(used_.begin(), used_.end());
+    for (size_t i = 0; i < worklist.size(); ++i) {
+      if (!is_tile_value(worklist[i])) continue;
+      auto it = iter_arg_to_init_.find(worklist[i]);
+      if (it == iter_arg_to_init_.end()) continue;
+      if (auto var = AsVarLike(it->second);
+          var && AsTensorTypeLike(var->GetType()) && used_.insert(var.get()).second) {
+        worklist.push_back(var.get());
       }
     }
   }
@@ -431,11 +443,7 @@ class TensorArgsInConvertedOpsCollector : public IRVisitor {
       // Skip ops whose inputs are handled by their own converter (self-loading):
       // they create loads with specific offsets/spaces, so Phase-1 default Vec loads
       // would be redundant or wrong.
-      static const std::unordered_set<std::string> kSelfLoadingOps = {
-          "tensor.slice",        "tensor.assemble",     "tensor.read",
-          "tensor.write",        "tensor.expand_clone", "tensor.gather",
-          "tensor.paged_gather", "tensor.create_l1",    "tensor.gather_row"};
-      if (kSelfLoadingOps.count(call->op_->name_)) {
+      if (!UsesDefaultTileInputs(call)) {
         IRVisitor::VisitStmt_(op);
         return;
       }
@@ -698,6 +706,187 @@ class ConsumerSpaceCollector : public IRVisitor {
   std::vector<std::pair<const Var*, const Var*>> propagation_edges_;
 };
 
+/// Predict which SSA values become tiles, including phi values. A GM handle
+/// carried through a write remains GM; a carry updated by a computation needs
+/// a tile seed. Propagate along value-flow edges, not every operand use. Each
+/// edge and marked value is processed once, including cyclic loop carries.
+/// A separate backward dependency walk conservatively excludes parameters
+/// whose GM storage or loaded tile values may be modified from load sharing.
+class TensorConversionAnalysis : public IRVisitor {
+ public:
+  explicit TensorConversionAnalysis(const OpConversionRegistry& registry) : registry_(registry) {}
+
+  void Propagate() {
+    // Yield edges can precede the tuple definitions in their branch/body.
+    // Resolve projections only after the complete definition index exists.
+    for (const auto& [source, target] : projection_flows_) {
+      if (auto var = AsVarLike(ResolveFlowSource(source))) AddFlow(var, target);
+    }
+    while (!worklist_.empty()) {
+      const auto* value = worklist_.back();
+      worklist_.pop_back();
+      auto it = users_.find(value);
+      if (it == users_.end()) continue;
+      for (const auto* user : it->second) MarkTile(user);
+    }
+    while (!write_worklist_.empty()) {
+      const auto* value = write_worklist_.back();
+      write_worklist_.pop_back();
+      auto it = sources_.find(value);
+      if (it == sources_.end()) continue;
+      for (const auto* source : it->second) MarkWritten(source);
+    }
+  }
+
+  [[nodiscard]] bool IsTile(const Var* var) const { return tiles_.count(var) != 0; }
+  [[nodiscard]] bool IsTile(const VarPtr& var) const { return IsTile(var.get()); }
+  [[nodiscard]] bool HasOpaqueCalls() const { return has_opaque_calls_; }
+  [[nodiscard]] bool MayWriteSource(const VarPtr& var) const {
+    return written_sources_.count(var.get()) != 0;
+  }
+
+ protected:
+  void VisitExpr_(const CallPtr& op) override {
+    if (std::dynamic_pointer_cast<const GlobalVar>(op->op_)) has_opaque_calls_ = true;
+    if (const auto* entry = LookupOpEntry(op->op_)) {
+      for (size_t i = 0; i < op->args_.size(); ++i) {
+        if (!ArgEffectWrites(entry->GetArgEffect(i, op->kwargs_))) continue;
+        var_collectors::VarDefUseCollector refs;
+        refs.VisitExpr(op->args_[i]);
+        for (const auto* var : refs.var_uses_ordered) MarkWritten(var);
+      }
+    }
+    IRVisitor::VisitExpr_(op);
+  }
+
+  void VisitExpr_(const SubmitPtr& op) override {
+    has_opaque_calls_ = true;
+    IRVisitor::VisitExpr_(op);
+  }
+
+  void VisitStmt_(const AssignStmtPtr& op) override {
+    // Include tuple packing/projection and other expression-valued aliases,
+    // not just direct Call operands. Each assignment's expression is visited
+    // once and the collector stops at Var/IterArg references.
+    var_collectors::VarDefUseCollector refs;
+    refs.VisitExpr(op->value_);
+    sources_[op->var_.get()] = std::move(refs.var_uses_ordered);
+    if (As<TupleType>(op->var_->GetType())) tuple_definitions_[op->var_.get()] = op->value_;
+    if (As<TileType>(op->var_->GetType())) {
+      MarkTile(op->var_.get());
+    } else if (AsTensorTypeLike(op->var_->GetType())) {
+      if (AsVarLike(op->value_) || As<TupleGetItemExpr>(op->value_)) {
+        AddFlow(op->value_, op->var_);
+      } else if (auto call = As<Call>(op->value_); call && registry_.Lookup(call->op_->name_)) {
+        if (IsOp(call, "tensor.write") || IsOp(call, "tensor.assemble")) {
+          AddFlow(call->args_[0], op->var_);
+        } else if (IsOp(call, "tensor.expand_clone")) {
+          AddFlow(call->args_[1], op->var_);
+        } else {
+          MarkTile(op->var_.get());
+        }
+      }
+    }
+    IRVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const ForStmtPtr& op) override {
+    AddLoopFlows(op->body_, op->iter_args_, op->return_vars_);
+    IRVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const WhileStmtPtr& op) override {
+    AddLoopFlows(op->body_, op->iter_args_, op->return_vars_);
+    IRVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const IfStmtPtr& op) override {
+    AddYieldFlows(op->then_body_, op->return_vars_);
+    if (op->else_body_) AddYieldFlows(*op->else_body_, op->return_vars_);
+    IRVisitor::VisitStmt_(op);
+  }
+
+ private:
+  void MarkTile(const Var* var) {
+    if (tiles_.insert(var).second) worklist_.push_back(var);
+  }
+
+  void MarkWritten(const Var* var) {
+    if (written_sources_.insert(var).second) write_worklist_.push_back(var);
+  }
+
+  /// Reuse immutable MakeTuple nodes as shared descriptors. Aliases select
+  /// the same descriptor, and projections select only their indexed element.
+  /// Memoization visits each alias/projection once without copying wide tuples.
+  /// Tensor leaves remain Var/IterArg nodes so their phi cycles use the worklist.
+  ExprPtr ResolveFlowSource(const ExprPtr& source) {
+    auto cached = resolved_flow_sources_.find(source.get());
+    if (cached != resolved_flow_sources_.end()) return cached->second;
+
+    ExprPtr resolved;
+    if (auto var = AsVarLike(source)) {
+      if (!As<TupleType>(var->GetType())) {
+        resolved = var;
+      } else if (auto definition = tuple_definitions_.find(var.get());
+                 definition != tuple_definitions_.end()) {
+        resolved = ResolveFlowSource(definition->second);
+      }
+    } else if (As<MakeTuple>(source)) {
+      resolved = source;
+    } else if (auto projection = As<TupleGetItemExpr>(source)) {
+      if (auto tuple = As<MakeTuple>(ResolveFlowSource(projection->tuple_))) {
+        resolved = ResolveFlowSource(tuple->elements_[projection->index_]);
+      }
+    }
+    resolved_flow_sources_.emplace(source.get(), resolved);
+    return resolved;
+  }
+
+  void AddFlow(const ExprPtr& source, const VarPtr& target) {
+    if (As<TupleGetItemExpr>(source)) {
+      projection_flows_.emplace_back(source, target);
+      return;
+    }
+    auto var = AsVarLike(source);
+    if (!var) return;
+    users_[var.get()].push_back(target.get());
+    sources_[target.get()].push_back(var.get());
+    if (As<TileType>(var->GetType())) MarkTile(var.get());
+  }
+
+  void AddYieldFlows(const StmtPtr& body, const std::vector<VarPtr>& targets) {
+    auto yield = transform_utils::GetLastYieldStmt(body);
+    if (!yield) return;
+    for (size_t i = 0; i < targets.size() && i < yield->value_.size(); ++i) {
+      AddFlow(yield->value_[i], targets[i]);
+    }
+  }
+
+  void AddLoopFlows(const StmtPtr& body, const std::vector<IterArgPtr>& iter_args,
+                    const std::vector<VarPtr>& returns) {
+    std::vector<VarPtr> targets;
+    targets.reserve(iter_args.size());
+    for (size_t i = 0; i < iter_args.size(); ++i) {
+      AddFlow(iter_args[i]->initValue_, iter_args[i]);
+      if (i < returns.size()) AddFlow(iter_args[i], returns[i]);
+      targets.push_back(iter_args[i]);
+    }
+    AddYieldFlows(body, targets);
+  }
+
+  const OpConversionRegistry& registry_;
+  std::unordered_map<const Var*, ExprPtr> tuple_definitions_;
+  std::unordered_map<const Expr*, ExprPtr> resolved_flow_sources_;
+  std::vector<std::pair<ExprPtr, VarPtr>> projection_flows_;
+  std::unordered_map<const Var*, std::vector<const Var*>> users_;
+  std::unordered_set<const Var*> tiles_;
+  std::vector<const Var*> worklist_;
+  std::unordered_map<const Var*, std::vector<const Var*>> sources_;
+  std::unordered_set<const Var*> written_sources_;
+  std::vector<const Var*> write_worklist_;
+  bool has_opaque_calls_ = false;
+};
+
 // ============================================================================
 // TypePropagatingMutator: base class that extends IRMutator with type
 // propagation through control flow (IterArg types, ForStmt/WhileStmt
@@ -709,10 +898,6 @@ class ConsumerSpaceCollector : public IRVisitor {
 // ============================================================================
 
 class TypePropagatingMutator : public IRMutator {
- public:
-  /// Add a mapping from an old variable to a new one (populates var_remap_).
-  void AddMapping(const Expr* old_ptr, const ExprPtr& new_expr) { var_remap_[old_ptr] = new_expr; }
-
  protected:
   /// Override IterArg to propagate type from initValue_ when it changes.
   /// The base IRMutator preserves the original type; we want the new type
@@ -878,21 +1063,64 @@ class TypePropagatingMutator : public IRMutator {
 
 // ============================================================================
 // TensorToTileMutator: converts tensor ops to tile ops in InCore function
-// bodies.  Overrides AssignStmt/EvalStmt to run converters from
-// OpConversionRegistry; everything else (control flow recursion, variable
-// substitution, IterArg/return_var type propagation) comes from the base.
+// bodies. Materializes compute operands and tile-valued control-flow seeds,
+// then runs converters from OpConversionRegistry. The base handles SSA
+// substitution and propagation of the resulting types.
 // ============================================================================
 
 class TensorToTileMutator : public TypePropagatingMutator {
  public:
   TensorToTileMutator(const OpConversionRegistry& conv_registry, const OpRegistry& op_registry,
-                      const ConsumerSpaceCollector& consumer_collector, CachePolicyByParam cache_policies)
+                      const ConsumerSpaceCollector& consumer_collector,
+                      const TensorConversionAnalysis& tile_values, CachePolicyByParam cache_policies)
       : conv_registry_(conv_registry),
         op_registry_(op_registry),
         consumer_collector_(consumer_collector),
+        tile_values_(tile_values),
         cache_policies_(std::move(cache_policies)) {}
 
+  /// A cached load is a compute operand, never an SSA replacement for its GM
+  /// source. Only parameters proven unwritten throughout the function enter
+  /// this map; all other GM operands load at the consuming statement.
+  StmtPtr PreloadReadOnlyParam(const VarPtr& var) {
+    std::vector<StmtPtr> stmts;
+    auto tile = LoadTensorOperand(var, var->span_, stmts);
+    preloaded_tiles_[var.get()] = tile;
+    INTERNAL_CHECK_SPAN(stmts.size() == 1, var->span_) << "Internal error: parameter already preloaded";
+    return stmts.front();
+  }
+
  protected:
+  StmtPtr VisitStmt_(const ForStmtPtr& op) override { return ConvertLoop(op); }
+
+  StmtPtr VisitStmt_(const WhileStmtPtr& op) override { return ConvertLoop(op); }
+
+  StmtPtr VisitStmt_(const IfStmtPtr& op) override {
+    auto saved_targets = std::move(yield_tile_targets_);
+    SetYieldTileTargets(op->return_vars_);
+    auto result = TypePropagatingMutator::VisitStmt_(op);
+    yield_tile_targets_ = std::move(saved_targets);
+    return result;
+  }
+
+  StmtPtr VisitStmt_(const YieldStmtPtr& op) override {
+    auto result = As<YieldStmt>(IRMutator::VisitStmt_(op));
+    auto values = result->value_;
+    std::vector<StmtPtr> stmts;
+    for (size_t i = 0; i < values.size() && i < yield_tile_targets_.size(); ++i) {
+      if (yield_tile_targets_[i] && AsTensorTypeLike(values[i]->GetType())) {
+        values[i] = LoadTensorOperand(values[i], op->span_, stmts);
+      }
+    }
+    if (values != result->value_) {
+      auto copy = MutableCopy(result);
+      copy->value_ = std::move(values);
+      result = std::move(copy);
+    }
+    stmts.push_back(result);
+    return SeqStmts::Flatten(std::move(stmts), op->span_);
+  }
+
   /// Honour a ``pl.set_cache_policy`` declaration on a ``tile.load`` that was
   /// already in the body (user-written, or produced by an earlier pass) rather
   /// than synthesised here. Hooked on the generic Call visit so the loads a
@@ -916,7 +1144,13 @@ class TensorToTileMutator : public TypePropagatingMutator {
     auto call = As<Call>(new_value);
 
     // Non-call values: propagate type change
-    if (!call) return HandlePassThroughAssign(op, new_value);
+    if (!call) {
+      // Sharing a read-only operand through a plain SSA alias must preserve
+      // the alias's GM type while making its already-loaded value reusable.
+      auto cached = preloaded_tiles_.find(new_value.get());
+      if (cached != preloaded_tiles_.end()) preloaded_tiles_[op->var_.get()] = cached->second;
+      return HandlePassThroughAssign(op, new_value);
+    }
 
     // Function calls (GlobalVar) pass through — only process op calls
     if (std::dynamic_pointer_cast<const GlobalVar>(call->op_)) {
@@ -1026,6 +1260,66 @@ class TensorToTileMutator : public TypePropagatingMutator {
   }
 
  private:
+  void SetYieldTileTargets(const std::vector<VarPtr>& vars) {
+    yield_tile_targets_.clear();
+    for (const auto& var : vars) yield_tile_targets_.push_back(tile_values_.IsTile(var));
+  }
+
+  template <typename LoopPtr>
+  StmtPtr ConvertLoop(const LoopPtr& op) {
+    std::vector<StmtPtr> stmts;
+    auto loop = MutableCopy(op);
+    auto saved_targets = std::move(yield_tile_targets_);
+    SetYieldTileTargets(op->return_vars_);
+    for (size_t i = 0; i < op->iter_args_.size(); ++i) {
+      const auto& iter = op->iter_args_[i];
+      auto init = VisitExpr(iter->initValue_);
+      if (tile_values_.IsTile(iter) && AsTensorTypeLike(init->GetType())) {
+        init = LoadTensorOperand(init, iter->span_, stmts);
+      }
+      if (init != iter->initValue_) {
+        auto new_iter = std::make_shared<IterArg>(iter->name_hint_, init->GetType(), init, iter->span_);
+        RetainVar(new_iter);
+        var_remap_[iter.get()] = new_iter;
+        loop->iter_args_[i] = std::move(new_iter);
+      }
+    }
+    stmts.push_back(TypePropagatingMutator::VisitStmt_(LoopPtr(loop)));
+    for (const auto& iter : op->iter_args_) var_remap_.erase(iter.get());
+    yield_tile_targets_ = std::move(saved_targets);
+    return SeqStmts::Flatten(std::move(stmts), op->span_);
+  }
+
+  ExprPtr LoadTensorOperand(const ExprPtr& source, const Span& span, std::vector<StmtPtr>& stmts) {
+    auto cached = preloaded_tiles_.find(source.get());
+    if (cached != preloaded_tiles_.end()) return cached->second;
+
+    auto tensor_type = AsTensorTypeLike(source->GetType());
+    INTERNAL_CHECK_SPAN(tensor_type, span) << "Internal error: expected a GM tensor operand";
+    auto offsets = MakeZeroOffsets(tensor_type->shape_.size(), span);
+    auto valid = MakeShapeTuple(tensor_type->shape_, span);
+    auto var = AsVarLike(source);
+    auto req = var ? consumer_collector_.GetConsumerReq(var.get()) : std::nullopt;
+    // There is no GM -> Acc load. Keep the natural load so memory inference
+    // reports the unsupported accumulator input at its consumer.
+    if (req && req->space == MemorySpace::Acc) req.reset();
+    std::vector<std::pair<std::string, std::any>> kwargs;
+    if (req) kwargs.emplace_back("target_memory", req->space);
+    AppendCachePolicyKwarg(source, cache_policies_, &kwargs);
+    ExprPtr shapes = valid;
+    if (req && req->cube_m_align > 0) {
+      auto boxed = BoxCubeMAxis(tensor_type->shape_, req->cube_m_align, req->cube_m_axis, span);
+      if (!AreExprVectorsEqual(boxed, tensor_type->shape_)) shapes = MakeShapeTuple(boxed, span);
+    }
+    auto load = MarkCompilerMatBridge(
+        op_registry_.Create("tile.load", {source, offsets, shapes, valid}, kwargs, span),
+        req ? req->space : MemorySpace::Vec);
+    auto tile =
+        std::make_shared<Var>(MakeTileValueName(var ? var->name_hint_ : "operand"), load->GetType(), span);
+    stmts.push_back(std::make_shared<AssignStmt>(tile, load, span));
+    return tile;
+  }
+
   /// Handle a `tensor.create` that seeds a cube accumulator: allocate whole NZ
   /// fractal boxes on the row axis and declare the requested rectangle as
   /// `valid_shape`.
@@ -1178,10 +1472,22 @@ class TensorToTileMutator : public TypePropagatingMutator {
   /// Returns the (possibly modified) args and any load statements to prepend.
   std::pair<std::vector<ExprPtr>, std::vector<StmtPtr>> BridgeInputSpaces(
       const CallPtr& call, const std::unordered_map<size_t, InputSpaceReq>& input_reqs) {
-    if (input_reqs.empty()) return {call->args_, {}};
-
     auto args = call->args_;
     std::vector<StmtPtr> stmts;
+
+    // The default requirements are the same ones used to select read-only
+    // entry loads. Apply them only to this call's operands. GM memory ops keep
+    // their source/destination handles even if another consumer loaded them.
+    if (UsesDefaultTileInputs(call)) {
+      std::unordered_map<const Expr*, ExprPtr> loaded_args;
+      for (size_t i = 0; i < args.size(); ++i) {
+        if (input_reqs.count(i) || !AsTensorTypeLike(args[i]->GetType())) continue;
+        auto [it, inserted] = loaded_args.try_emplace(args[i].get());
+        if (inserted) it->second = LoadTensorOperand(args[i], call->span_, stmts);
+        args[i] = it->second;
+      }
+    }
+    if (input_reqs.empty()) return {std::move(args), std::move(stmts)};
 
     // An operand of rank > 2 means this matmul lowers to tile.batch_matmul, not
     // tile.matmul (see the rank dispatch in op_conversion_registry.cpp).
@@ -1303,6 +1609,9 @@ class TensorToTileMutator : public TypePropagatingMutator {
   const OpConversionRegistry& conv_registry_;
   const OpRegistry& op_registry_;
   const ConsumerSpaceCollector& consumer_collector_;
+  const TensorConversionAnalysis& tile_values_;
+  std::unordered_map<const Expr*, ExprPtr> preloaded_tiles_;
+  std::vector<bool> yield_tile_targets_;
   /// Declared GM cache policies of this function's params (empty when the
   /// function carries no ``pl.set_cache_policy`` declaration).
   const CachePolicyByParam cache_policies_;
@@ -2282,76 +2591,29 @@ IncoreTransformResult TransformIncoreFunction(const FunctionPtr& func) {
   // erased when the transformed function is rebuilt.
   auto cache_policies = BuildCachePolicyByParam(func);
 
-  // Create the body mutator
-  TensorToTileMutator mutator(conv_registry, op_registry, consumer_collector, cache_policies);
+  TensorConversionAnalysis tile_values(conv_registry);
+  tile_values.VisitStmt(canonical_body);
+  tile_values.Propagate();
+
+  TensorToTileMutator mutator(conv_registry, op_registry, consumer_collector, tile_values, cache_policies);
 
   // New body statements (prefix tile.loads + mutated body)
   std::vector<StmtPtr> new_stmts;
 
-  // Phase 1: Insert tile.load for each TensorType parameter that is directly consumed
-  // by a converted tensor op.  Parameters that are only referenced by non-converted ops
-  // (e.g. tile.load, tile.move) already manage their own tile representation and must
-  // NOT get an additional load inserted here.
+  // Phase 1: Share entry loads for read-only default compute operands. These
+  // tiles are kept in a separate cache, never installed in the SSA var map.
   TensorArgsInConvertedOpsCollector collector(conv_registry);
   collector.VisitStmt(canonical_body);
-  collector.TraceIterArgInitValues();
+  collector.TraceIterArgInitValues([&tile_values](const Var* var) { return tile_values.IsTile(var); });
   const auto& params_used_by_converted_ops = collector.GetUsed();
-
   for (const auto& var : func->params_) {
-    // ``AsTensorTypeLike`` covers ``DistributedTensorType`` window params too --
-    // the entry load reads this rank's local GM, same as for a plain tensor.
-    auto tensor_type = AsTensorTypeLike(var->GetType());
-    if (!tensor_type) continue;
-
-    if (params_used_by_converted_ops.find(var.get()) == params_used_by_converted_ops.end()) continue;
-
-    // Attribute the entry load to the parameter declaration it loads, not to `def`.
-    const auto& load_span = var->span_;
-    auto offsets = MakeZeroOffsets(tensor_type->shape_.size(), load_span);
-    auto valid = MakeShapeTuple(tensor_type->shape_, load_span);
-
-    // Honour the same consumer demand the mutator honours for the loads it
-    // creates (see BridgeInputSpaces): a parameter feeding a matmul goes
-    // straight to Mat rather than landing in Vec and being moved out again.
-    //
-    // With no demand recorded, leave `target_memory` *absent*. It used to be
-    // hard-coded to Vec, which is a guess this pass is not equipped to make --
-    // it sees only the ops it converts, while InferTileMemorySpace (pass 20)
-    // sees the whole function and places the tile from actual consumer demand.
-    // An unset space is the IR's "not decided yet", so stating Vec here would
-    // overwrite a real answer with a default and make pass 20 honour it (it
-    // never overrides a present kwarg).
-    auto entry_req = consumer_collector.GetConsumerReq(var.get());
-    // An Acc demand is not a load target either (see BridgeInputSpaces): a
-    // parameter cannot be loaded into L0C, so the entry load stays natural and
-    // the accumulator constraint is reported where it actually holds.
-    if (entry_req.has_value() && entry_req->space == MemorySpace::Acc) entry_req.reset();
-    std::vector<std::pair<std::string, std::any>> load_kwargs;
-    if (entry_req.has_value()) {
-      load_kwargs.emplace_back("target_memory", entry_req->space);
+    if (!AsTensorTypeLike(var->GetType()) || tile_values.MayWriteSource(var) ||
+        tile_values.HasOpaqueCalls()) {
+      continue;
     }
-    AppendCachePolicyKwarg(var, cache_policies, &load_kwargs);
-    // A parameter that reaches a matmul directly, or through an inherit-input
-    // chain such as tensor.set_validshape, is loaded here rather than by
-    // BridgeInputSpaces / HandleConsumerDrivenLoad -- so the same row boxing has
-    // to apply, or the cube operand keeps its unaligned physical row count.
-    ExprPtr shapes = valid;
-    if (entry_req.has_value() && entry_req->cube_m_align > 0) {
-      auto boxed =
-          BoxCubeMAxis(tensor_type->shape_, entry_req->cube_m_align, entry_req->cube_m_axis, load_span);
-      if (!AreExprVectorsEqual(boxed, tensor_type->shape_)) {
-        shapes = MakeShapeTuple(boxed, load_span);
-      }
+    if (params_used_by_converted_ops.count(var.get())) {
+      new_stmts.push_back(mutator.PreloadReadOnlyParam(var));
     }
-    auto load_call = MarkCompilerMatBridge(
-        op_registry.Create("tile.load", {var, offsets, shapes, valid}, load_kwargs, load_span),
-        entry_req.has_value() ? entry_req->space : MemorySpace::Vec);
-
-    std::string tile_name = MakeTileValueName(var->name_hint_);
-    auto tile_var = std::make_shared<Var>(tile_name, load_call->GetType(), load_span);
-
-    new_stmts.push_back(std::make_shared<AssignStmt>(tile_var, load_call, load_span));
-    mutator.AddMapping(var.get(), tile_var);
   }
 
   // Phase 2: Transform body via mutator (handles control flow recursion + op conversion)

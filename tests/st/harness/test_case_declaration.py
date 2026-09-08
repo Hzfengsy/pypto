@@ -27,6 +27,7 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 
@@ -518,6 +519,43 @@ class TestPlatformMatrixCollection:
             "test_it[a5sim]",
         ]
 
+    @classmethod
+    def _unexpanded_item(cls, case_obj: Case) -> "list[Any]":
+        """The single-platform shape: no matrix, so no platform param at all."""
+        items = cls._items(case_obj)[:1]
+        del items[0].callspec.params["_st_platform"]
+        items[0].name = "test_it"
+        return items
+
+    def test_a_pinned_case_is_deselected_when_the_only_platform_is_not_its_own(self):
+        """The matrix expands only for a multi-platform CLI.
+
+        A plain ``--platform=a2a3`` run -- the shape CI uses -- grows no
+        variants, so the pin had no platform param to disagree with and every
+        pinned case survived. An A5-pinned case would then have been handed an
+        A2A3 card.
+        """
+        conf = self._conftest()
+        items = self._unexpanded_item(_jit_case(name="abs_pin_single", platform="a5"))
+        config = self._config("a2a3")
+
+        kept = list(items)
+        conf.pytest_collection_modifyitems(config, kept)
+
+        assert kept == []
+        assert [i.name for i in config.hook.deselected] == ["test_it"]
+
+    def test_a_pinned_case_survives_a_single_platform_run_naming_its_pin(self):
+        conf = self._conftest()
+        items = self._unexpanded_item(_jit_case(name="abs_pin_single_kept", platform="a5"))
+        config = self._config("a5")
+
+        kept = list(items)
+        conf.pytest_collection_modifyitems(config, kept)
+
+        assert [i.name for i in kept] == ["test_it"]
+        assert config.hook.deselected == []
+
     def test_a_pinned_case_is_collected_once_under_its_pin(self):
         """Keyed by the pin, not by the item — even with no deselect in front.
 
@@ -635,6 +673,25 @@ class TestCustomCompare:
             shutil.rmtree(empty, ignore_errors=True)
 
 
+class _TwoNameCase(AbsLegacyCase):
+    """A legacy case whose name is an argument, so one body can build two."""
+
+    __test__ = False
+
+    def __init__(self, name: str) -> None:
+        super().__init__()
+        self._name = name
+
+    def get_name(self) -> str:
+        return self._name
+
+
+def _body_that_runs_two_distinct_cases(test_runner):
+    """Stand-in for a test body that runs more than one case."""
+    test_runner.run(_TwoNameCase("first_of_two"))
+    test_runner.run(_TwoNameCase("second_of_two"))
+
+
 def _body_that_skips_on_a_missing_optional_dep():
     """Stand-in for a unit-test body guarding an optional dependency.
 
@@ -695,6 +752,23 @@ class TestCollectionIsNeverAbortedByADiscoveredCall:
 
         assert seen == {}, "no PTOTestCase in that body — and no crash reaching that conclusion"
 
+    def test_every_constructor_in_a_body_is_filed(self):
+        """Not just the first. A body running two cases needs a future for both.
+
+        Returning after the first left the second to the serial inline path
+        *and* reported ``True``, so the undiscovered inventory never named it --
+        the miss was invisible to the very guard meant to catch it.
+        """
+        conf = self._conftest()
+        seen: dict[str, Any] = {}
+
+        found = conf._collect_test_case_from_item(
+            self._item(_body_that_runs_two_distinct_cases), seen, None, "a2a3"
+        )
+
+        assert found is True
+        assert sorted(c.get_name() for c in seen.values()) == ["first_of_two", "second_of_two"]
+
     def test_only_items_under_tests_st_are_walked(self):
         """A session hook fires for every item; only ST bodies are ours to parse."""
         conf = self._conftest()
@@ -707,6 +781,104 @@ class TestCollectionIsNeverAbortedByADiscoveredCall:
         ut_case = tests_dir / "ut" / "ir" / "expressions" / "test_call_arg_directions.py"
         assert conf._is_st_item(_PathItem(Path(__file__)))
         assert not conf._is_st_item(_PathItem(ut_case))
+
+
+class TestInlineCaseGuard:
+    """Collection fails when a test reaches the runner with no declared case.
+
+    tests/st is at zero inline-compiled cases. Keeping it there needs a hard
+    failure rather than a summary line: the advisory-only version of this report
+    sat unread while the count reached 76.
+    """
+
+    @staticmethod
+    def _conftest() -> Any:
+        return TestPlatformMatrixCollection._conftest()
+
+    @staticmethod
+    def _item(node_id: str, markers: "list[Any]", swimlane_level: int = 0) -> Any:
+        opts = {
+            "--chip-swimlane-level": swimlane_level,
+            "--enable-chip-swimlane": swimlane_level,
+            "--codegen-only": False,
+            "--device": "0",
+        }
+
+        class _Item:
+            nodeid = node_id
+            name = node_id.rsplit("::", 1)[-1]
+            module = None
+            fixturenames = ("test_runner",)
+            config = SimpleNamespace(getoption=lambda n, default=None: opts.get(n, default))
+
+            def iter_markers(self, name: str | None = None) -> Any:
+                return iter([m for m in markers if name is None or m.name == name])
+
+            def get_closest_marker(self, name: str) -> Any:
+                return next((m for m in markers if m.name == name), None)
+
+        return _Item()
+
+    @staticmethod
+    def _marker(name: str, *args: Any, **kwargs: Any) -> Any:
+        class _Marker:
+            pass
+
+        m = _Marker()
+        m.name, m.args, m.kwargs = name, args, kwargs
+        return m
+
+    def test_a_fixture_shaped_skip_is_stated_as_a_marker(self):
+        """`without_swimlane` is the inverse of `swimlane`, and readable at collection.
+
+        As an autouse fixture this condition was invisible to `_will_not_run`,
+        so the class's cases were registered -- and the device-pool submitter
+        puts every registered case on a card before the item loop starts. The
+        case was compiled and run for a test that then skipped.
+        """
+        conf = self._conftest()
+        marker = self._marker("without_swimlane", reason="runs without the record")
+
+        on = self._item("t.py::test_x", [marker], swimlane_level=4)
+        off = self._item("t.py::test_x", [marker], swimlane_level=0)
+
+        assert conf.marker_skip_reason(on) == "runs without the record"
+        assert conf.marker_skip_reason(off) is None
+
+    def test_a_reasonless_exclusion_is_refused(self):
+        conf = self._conftest()
+        item = self._item("t.py::test_x", [self._marker("without_swimlane")], swimlane_level=4)
+        with pytest.raises(pytest.UsageError, match="needs a reason"):
+            conf.marker_skip_reason(item)
+
+    def test_skipif_counts_as_will_not_run(self):
+        """`iter_markers` names it `skipif`; matching only `skip` missed it.
+
+        Registering a case behind either marker now costs a device run, not just
+        a compile, because the submitter runs what the pool holds.
+        """
+        conf = self._conftest()
+        for name in ("skip", "skipif"):
+            item = self._item(f"t.py::test_{name}", [self._marker(name)], swimlane_level=0)
+            assert conf._will_not_run(item), name
+        plain = self._item("t.py::test_plain", [], swimlane_level=0)
+        assert not conf._will_not_run(plain)
+
+    def test_an_unmarked_reason_is_refused(self):
+        """A bare `inline_case` reads exactly like a test nobody declared."""
+        conf = self._conftest()
+        item = self._item("t.py::test_bare", [self._marker("inline_case")])
+        with pytest.raises(pytest.UsageError, match="needs a reason"):
+            conf._inline_case_reason(item)
+
+    def test_a_reasoned_marker_exempts_the_test(self):
+        conf = self._conftest()
+        item = self._item("t.py::test_ok", [self._marker("inline_case", reason="probes the card first")])
+        assert conf._inline_case_reason(item) == "probes the card first"
+
+    def test_an_unmarked_test_is_not_exempt(self):
+        conf = self._conftest()
+        assert conf._inline_case_reason(self._item("t.py::test_plain", [])) is None
 
 
 if __name__ == "__main__":

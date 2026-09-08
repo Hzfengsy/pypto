@@ -41,15 +41,41 @@ program_tiled = convert_pass(program)
 
 1. **预扫描消费端内存需求**（`ConsumerSpaceCollector`）：由 `OpConversionRegistry` 中声明的 `input_reqs` 驱动，为每个变量收集其下游消费者所需的 memory space。典型场景是 `tensor.slice` 喂给 `tensor.matmul`——它需要生成 Mat 空间的 `tile.load`（自然 load，转置时再叠加零拷贝 `tile.transpose_view`），而不是先落到 Vec 再搬出去——但该机制是通用的，并非 matmul 专用。
 
-2. **插入 tile.load（入口加载）**：为每个被转换 op 直接使用的 `TensorType` 参数，在函数入口插入 `tile.load(param, zeros, shape, shape, target_memory=Vec)`。仅被自加载 op（`tensor.slice`、`tensor.matmul`、`tensor.read`、`tensor.write`、`tensor.assemble`）引用的参数不会生成额外加载。
+2. **分析写入并共享只读加载**：转换前，根据算子参数效应，跨 GM 别名和控制流追踪写入。使用默认 tile 输入转换的参数，仅在函数中不会被写入时，才可共享入口 `tile.load`。对参数派生的局部值执行写入，也会保守地禁用该参数的加载共享。含有不透明副作用的调用会禁用入口加载共享。加载出的 tile 保存在独立的操作数缓存中，GM 参数保留原有身份和类型。加载空间遵循消费端需求；没有需求时保持未设置，由 `InferTileMemorySpace` 决定。
 
-3. **通过 TensorToTileMutator 转换函数体**：遍历函数体，使用 `OpConversionRegistry` 将每个 `tensor.*` 调用转换为对应的 `tile.*` 调用。Mutator 通过控制流传播类型变更（IterArgs、ForStmt/WhileStmt return_vars、IfStmt return_vars）。
+3. **通过 TensorToTileMutator 转换函数体**：使用 `OpConversionRegistry` 转换已注册的调用。`BridgeInputSpaces` 在消费语句处提供 tile 操作数：默认输入可复用只读入口加载，可变 GM 操作数则在每次使用时加载。内存操作转换器保留 GM 操作数，并自行执行加载和存储。局部计算结果仍映射到 tile。值流分析（value-flow analysis）识别循环和分支中变为 tile 的结果：通过写操作传递的 GM 句柄保持 GM 类型，计算型循环携带值则获得 tile 初值和类型一致的 yield。
 
 4. **插入 tile.store（出口存储）**：对每个从 `TensorType` 转换为 `TileType` 的返回值，添加 `Out` 参数并插入 `tile.store(tile, zeros, out_param)`。如果返回值来自 `tile.assemble` 循环，则将循环重写为直接使用 `tile.store`（转换时 assemble-loop 重写；与 `OptimizeOrchTensors` 模式 3 不同，该模式处理跨函数优化）。
 
 5. **升级被写入参数的方向（direction）**：通过别名溯源分析（`AnalyzeCallAccess`）把每次读/写归属到其来源参数，再把被写入的 `In` 参数升级为 `Out`（只写）或 `InOut`（既读又写）。**某个算子写哪个实参不再由本 pass 判定**，而是读取该算子在注册表上的声明（`set_arg_effect`，参见 [算子](../ir/05-operators.md#参数效应argument-effects)）；因此 `tile.store`、`tile.mscatter`、`tensor.write`、`tensor.assemble`、`tensor.expand_clone`、`pld.tile.*` / `pld.tensor.*` 推送与拉取家族、`pld.system.notify`、`system.syncall` 以及复合集合通信都经由同一张表进入本分析。被声明为 `Write` 的实参不计为读：只写入子区域的 store 从不读取未触及的部分。由 kwarg 决定的效应按调用逐个解析，因此原子 store 或 `AtomicAdd` 形式的 notify 会把目的操作数标记为读+写，而普通形式不会。用户已显式声明为 `Out` / `InOut` 的参数保持不变。
 
    从未声明效应的算子仍然按"读取全部实参"处理。该默认值如今只覆盖注册表无话可说的算子（其中绝大多数是纯函数式的），而不再是一张手工维护清单的兜底——新增的写类算子曾经可以悄无声息地从这张清单里漏掉。
+
+### GM 身份与读写顺序
+
+为计算加载 GM 张量会创建一个 tile 值，不能用它替换该张量的所有引用。
+例如，下面的 kernel 先读取 `x` 进行计算，再修改一个 GM 元素：
+
+```python
+@pl.jit.incore
+def kernel(
+    x: pl.InOut[pl.Tensor[[16, 32], pl.FP32]],
+    out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+):
+    r = pl.row_max(x)
+    out[0:16, 0:1] = r
+    pl.tensor.write(x, [0, 0], pl.const(1.0, pl.FP32))
+    return out
+```
+
+归约接收 `tile.load(x, ...)` 的结果。最后的写入保留为
+`tensor.write(x, ...)`，生成 GM `pto.store_scalar`；它不会变成针对归约输入
+tile 的 `tile.write`。同样的规则适用于 `pld.DistributedTensor` 参数、标量读取
+以及返回的 GM 别名。
+
+如果后续计算在 GM 写入之后再次读取 `x`，它会在该语句处加载更新后的值。
+可变 GM 加载不会跨写入、分支或循环迭代共享。返回其他张量或者不返回值，都不会
+丢弃 GM 写入。`InOut` 描述参数效应，不表示在函数退出时无条件存储整个张量。
 
 ### GM 存储一致性限制
 

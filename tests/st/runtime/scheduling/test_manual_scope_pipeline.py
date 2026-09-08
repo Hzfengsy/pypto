@@ -53,13 +53,13 @@ How to run
     # numerical correctness is checked.
 """
 
-import json
 from pathlib import Path
 from typing import Any
 
 import pypto.language as pl
 import pytest
 import torch
+from harness import st
 from harness.core.harness import PLATFORMS, DataType, PTOTestCase, TensorSpec
 from pypto.ir.pass_manager import OptimizationStrategy
 
@@ -201,27 +201,10 @@ class TestManualScopePipeline:
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture(scope="module")
-def manual_scope_swimlane_file(test_runner) -> Path:
-    """Run the pipeline once with profiling and return the swimlane JSON."""
-    if not test_runner.config.enable_chip_swimlane:
-        pytest.skip("pass --enable-chip-swimlane to validate the manual_scope swimlane")
-
-    before: set[Path] = set(_BUILD_OUTPUT_DIR.glob("*/dfx_outputs/chip_swimlane_records.json"))
-    result = test_runner.run(_ManualScopePipelinePTO())
-    assert result.passed, f"Manual-scope pipeline failed: {result.error}"
-
-    after: set[Path] = set(_BUILD_OUTPUT_DIR.glob("*/dfx_outputs/chip_swimlane_records.json"))
-    new_files = after - before
-    assert new_files, "No chip_swimlane_records.json was generated for the manual_scope run"
-    return max(new_files, key=lambda p: p.stat().st_mtime)
+_MANUAL_SCOPE_CASE = st.from_legacy(_ManualScopePipelinePTO())
 
 
-@pytest.fixture(scope="module")
-def manual_scope_swimlane_data(manual_scope_swimlane_file: Path) -> dict:
-    return json.loads(manual_scope_swimlane_file.read_text())
-
-
+@pytest.mark.swimlane
 class TestManualScopeSwimlane:
     """Validate the on-board execution graph encoded in the swimlane JSON.
 
@@ -231,9 +214,10 @@ class TestManualScopeSwimlane:
     actually does.
     """
 
-    def test_total_task_count(self, manual_scope_swimlane_data: dict):
+    @st.cases(_MANUAL_SCOPE_CASE)
+    def test_total_task_count(self, case_run):
         """Each of the ``M * N`` tiles submits 2 kernel tasks (stage1 + stage2)."""
-        tasks = manual_scope_swimlane_data["tasks"]
+        tasks = case_run.swimlane()["tasks"]
         # The tile grid runs ``M * N`` iterations of (stage1 + stage2). Some
         # platforms may emit extra runtime/setup tasks; the lower bound is
         # the only safe assertion.
@@ -241,7 +225,8 @@ class TestManualScopeSwimlane:
             f"expected at least {_M * _N * 2} tasks (M*N tiles x 2 stages), got {len(tasks)}"
         )
 
-    def test_inner_parallel_loop_runs_concurrently(self, manual_scope_swimlane_data: dict):
+    @st.cases(_MANUAL_SCOPE_CASE)
+    def test_inner_parallel_loop_runs_concurrently(self, case_run):
         """Inner ``pl.parallel(N)`` iterations must overlap across cores.
 
         With manual_scope and no cross-iteration dependency edge, the runtime
@@ -251,7 +236,7 @@ class TestManualScopeSwimlane:
         in fact parallelize). On a 1-core simulator this assertion is
         relaxed automatically.
         """
-        tasks = manual_scope_swimlane_data["tasks"]
+        tasks = case_run.swimlane()["tasks"]
         core_ids = {t["core_id"] for t in tasks}
         # On a multi-core target the inner parallel loop should spread work
         # across cores; on single-core simulators just check we ran at all.
@@ -261,7 +246,8 @@ class TestManualScopeSwimlane:
                 f"only saw core_ids={sorted(core_ids)}"
             )
 
-    def test_no_blocking_serialization_chain(self, manual_scope_swimlane_data: dict):
+    @st.cases(_MANUAL_SCOPE_CASE)
+    def test_no_blocking_serialization_chain(self, case_run):
         """No single task may fan out to more than the necessary downstream count.
 
         If the codegen mistakenly cross-linked iterations,
@@ -271,7 +257,7 @@ class TestManualScopeSwimlane:
         stage2). The threshold below allows for runtime-injected sync
         tasks but catches grossly serialized graphs.
         """
-        tasks = manual_scope_swimlane_data["tasks"]
+        tasks = case_run.swimlane()["tasks"]
         _skip_if_no_fanout(tasks)
         max_fanout = max((t["fanout_count"] for t in tasks), default=0)
         assert max_fanout <= 4, (
@@ -496,42 +482,13 @@ class TestPhaseFenceAuto:
         assert result.passed, f"phase-fence auto execution failed: {result.error}"
 
 
-@pytest.fixture(scope="module")
-def phase_fence_swimlane_file(test_runner) -> Path:
-    if not test_runner.config.enable_chip_swimlane:
-        pytest.skip("pass --enable-chip-swimlane to validate the phase-fence swimlane")
-    before: set[Path] = set(_BUILD_OUTPUT_DIR.glob("*/dfx_outputs/chip_swimlane_records.json"))
-    result = test_runner.run(_PhaseFenceManualScopePTO())
-    assert result.passed, f"phase-fence manual_scope failed: {result.error}"
-    after: set[Path] = set(_BUILD_OUTPUT_DIR.glob("*/dfx_outputs/chip_swimlane_records.json"))
-    new_files = after - before
-    assert new_files, "No chip_swimlane_records.json generated for the phase-fence run"
-    return max(new_files, key=lambda p: p.stat().st_mtime)
+_PHASE_FENCE_CASE = st.from_legacy(_PhaseFenceManualScopePTO())
 
 
-@pytest.fixture(scope="module")
-def phase_fence_swimlane_data(phase_fence_swimlane_file: Path) -> dict:
-    return json.loads(phase_fence_swimlane_file.read_text())
+_PHASE_FENCE_AUTO_CASE = st.from_legacy(_PhaseFenceAutoPTO())
 
 
-@pytest.fixture(scope="module")
-def phase_fence_auto_swimlane_file(test_runner) -> Path:
-    if not test_runner.config.enable_chip_swimlane:
-        pytest.skip("pass --enable-chip-swimlane to validate the auto phase-fence swimlane")
-    before: set[Path] = set(_BUILD_OUTPUT_DIR.glob("*/dfx_outputs/chip_swimlane_records.json"))
-    result = test_runner.run(_PhaseFenceAutoPTO())
-    assert result.passed, f"phase-fence auto failed: {result.error}"
-    after: set[Path] = set(_BUILD_OUTPUT_DIR.glob("*/dfx_outputs/chip_swimlane_records.json"))
-    new_files = after - before
-    assert new_files, "No chip_swimlane_records.json generated for the auto phase-fence run"
-    return max(new_files, key=lambda p: p.stat().st_mtime)
-
-
-@pytest.fixture(scope="module")
-def phase_fence_auto_swimlane_data(phase_fence_auto_swimlane_file: Path) -> dict:
-    return json.loads(phase_fence_auto_swimlane_file.read_text())
-
-
+@pytest.mark.swimlane
 class TestPhaseFenceSwimlane:
     """Validate the manual-scope phase-fence ordering in the runtime swimlane.
 
@@ -540,14 +497,16 @@ class TestPhaseFenceSwimlane:
     ordering rather than requiring direct all-to-all producer fanout.
     """
 
-    def test_total_task_count(self, phase_fence_swimlane_data: dict):
-        tasks = phase_fence_swimlane_data["tasks"]
+    @st.cases(_PHASE_FENCE_CASE)
+    def test_total_task_count(self, case_run):
+        tasks = case_run.swimlane()["tasks"]
         assert len(tasks) >= _PHASE_FENCE_N_PHASES * _PHASE_FENCE_N_BRANCHES, (
             f"expected ≥ {_PHASE_FENCE_N_PHASES * _PHASE_FENCE_N_BRANCHES} tasks "
             f"({_PHASE_FENCE_N_PHASES} phases × {_PHASE_FENCE_N_BRANCHES} branches), got {len(tasks)}"
         )
 
-    def test_phase_fence_strict(self, phase_fence_swimlane_data: dict):
+    @st.cases(_PHASE_FENCE_CASE)
+    def test_phase_fence_strict(self, case_run):
         """Every task in phase N+1 starts AFTER every task in phase N ends.
 
         Group all kernel_stripe tasks by start time into ``N_PHASES`` batches
@@ -557,7 +516,7 @@ class TestPhaseFenceSwimlane:
         when phase N+1 begins.
         """
         expected = _PHASE_FENCE_N_PHASES * _PHASE_FENCE_N_BRANCHES
-        tasks = phase_fence_swimlane_data["tasks"]
+        tasks = case_run.swimlane()["tasks"]
         assert len(tasks) >= expected, f"need >= {expected} tasks for phase fence check, got {len(tasks)}"
         tasks = sorted(tasks, key=lambda t: t["start_time_us"])[:expected]
         phases = [
@@ -572,9 +531,10 @@ class TestPhaseFenceSwimlane:
                 f"ends at {n_end:.2f}us — multi-deps fence violated"
             )
 
-    def test_barrier_shape_allows_extra_dummy_tasks(self, phase_fence_swimlane_data: dict):
+    @st.cases(_PHASE_FENCE_CASE)
+    def test_barrier_shape_allows_extra_dummy_tasks(self, case_run):
         """The compressed fence may add dummy tasks without dropping kernels."""
-        tasks = phase_fence_swimlane_data["tasks"]
+        tasks = case_run.swimlane()["tasks"]
         expected_kernels = _PHASE_FENCE_N_PHASES * _PHASE_FENCE_N_BRANCHES
         assert len(tasks) >= expected_kernels, (
             f"expected at least {expected_kernels} kernel tasks plus optional dummy barriers, "
@@ -582,11 +542,13 @@ class TestPhaseFenceSwimlane:
         )
 
 
+@pytest.mark.swimlane
 class TestPhaseFenceAutoSwimlane:
     """Basic runtime validation for the auto-scope phase-fence control case."""
 
-    def test_total_task_count(self, phase_fence_auto_swimlane_data: dict):
-        tasks = phase_fence_auto_swimlane_data["tasks"]
+    @st.cases(_PHASE_FENCE_AUTO_CASE)
+    def test_total_task_count(self, case_run):
+        tasks = case_run.swimlane()["tasks"]
         assert len(tasks) >= _PHASE_FENCE_N_PHASES * _PHASE_FENCE_N_BRANCHES, (
             f"expected at least {_PHASE_FENCE_N_PHASES * _PHASE_FENCE_N_BRANCHES} tasks "
             f"({_PHASE_FENCE_N_PHASES} phases x {_PHASE_FENCE_N_BRANCHES} branches), got {len(tasks)}"
@@ -716,35 +678,23 @@ class TestBranchChainManualScope:
         assert result.passed, f"branch-chain manual_scope execution failed: {result.error}"
 
 
-@pytest.fixture(scope="module")
-def branch_chain_swimlane_file(test_runner) -> Path:
-    if not test_runner.config.enable_chip_swimlane:
-        pytest.skip("pass --enable-chip-swimlane to validate the branch-chain swimlane")
-    before: set[Path] = set(_BUILD_OUTPUT_DIR.glob("*/dfx_outputs/chip_swimlane_records.json"))
-    result = test_runner.run(_BranchChainManualScopePTO())
-    assert result.passed, f"branch-chain manual_scope failed: {result.error}"
-    after: set[Path] = set(_BUILD_OUTPUT_DIR.glob("*/dfx_outputs/chip_swimlane_records.json"))
-    new_files = after - before
-    assert new_files, "No chip_swimlane_records.json generated for the branch-chain run"
-    return max(new_files, key=lambda p: p.stat().st_mtime)
+_BRANCH_CHAIN_CASE = st.from_legacy(_BranchChainManualScopePTO())
 
 
-@pytest.fixture(scope="module")
-def branch_chain_swimlane_data(branch_chain_swimlane_file: Path) -> dict:
-    return json.loads(branch_chain_swimlane_file.read_text())
-
-
+@pytest.mark.swimlane
 class TestBranchChainSwimlane:
     """Validate per-branch linear chain + cross-branch parallelism."""
 
-    def test_total_task_count(self, branch_chain_swimlane_data: dict):
-        tasks = branch_chain_swimlane_data["tasks"]
+    @st.cases(_BRANCH_CHAIN_CASE)
+    def test_total_task_count(self, case_run):
+        tasks = case_run.swimlane()["tasks"]
         assert len(tasks) >= _BRANCH_CHAIN_N_BRANCHES * _BRANCH_CHAIN_N_STEPS, (
             f"expected ≥ {_BRANCH_CHAIN_N_BRANCHES * _BRANCH_CHAIN_N_STEPS} tasks "
             f"({_BRANCH_CHAIN_N_BRANCHES} branches × {_BRANCH_CHAIN_N_STEPS} steps), got {len(tasks)}"
         )
 
-    def test_intra_branch_linear_chain(self, branch_chain_swimlane_data: dict):
+    @st.cases(_BRANCH_CHAIN_CASE)
+    def test_intra_branch_linear_chain(self, case_run):
         """Within each branch, step k+1 starts after step k ends.
 
         Tasks dispatch in branch-major / step-minor order (outer for-loop
@@ -753,7 +703,7 @@ class TestBranchChainSwimlane:
         and so on.
         """
         expected = _BRANCH_CHAIN_N_BRANCHES * _BRANCH_CHAIN_N_STEPS
-        tasks = branch_chain_swimlane_data["tasks"]
+        tasks = case_run.swimlane()["tasks"]
         if len(tasks) < expected:
             pytest.skip(f"need ≥ {expected} tasks for chain check, got {len(tasks)}")
         tasks = sorted(tasks, key=lambda t: t["task_id"])[:expected]
@@ -767,27 +717,29 @@ class TestBranchChainSwimlane:
                     f"step {s} ends at {prev_end:.2f}us — seq chain broken"
                 )
 
-    def test_no_cross_branch_fanout(self, branch_chain_swimlane_data: dict):
+    @st.cases(_BRANCH_CHAIN_CASE)
+    def test_no_cross_branch_fanout(self, case_run):
         """Each task has at most 1 successor (next step in its own branch).
 
         A cross-branch dep would push ``fanout_count`` above 1 for at least
         one task — indicating the codegen accidentally cross-linked sibling
         parallel iterations.
         """
-        tasks = branch_chain_swimlane_data["tasks"]
+        tasks = case_run.swimlane()["tasks"]
         _skip_if_no_fanout(tasks)
         for t in tasks:
             assert t["fanout_count"] <= 1, (
                 f"task fanout_count = {t['fanout_count']}, expected ≤ 1 (per-branch linear chain only)"
             )
 
-    def test_branches_dispatch_to_distinct_cores(self, branch_chain_swimlane_data: dict):
+    @st.cases(_BRANCH_CHAIN_CASE)
+    def test_branches_dispatch_to_distinct_cores(self, case_run):
         """The 4 branches should land on different AIV cores (true parallelism).
 
         On single-core simulators this assertion is relaxed.
         """
         expected = _BRANCH_CHAIN_N_BRANCHES * _BRANCH_CHAIN_N_STEPS
-        tasks = branch_chain_swimlane_data["tasks"]
+        tasks = case_run.swimlane()["tasks"]
         if len(tasks) < expected:
             pytest.skip(f"need ≥ {expected} tasks for parallelism check, got {len(tasks)}")
         tasks = sorted(tasks, key=lambda t: t["task_id"])[:expected]
@@ -937,42 +889,27 @@ class _OriginalKVProjOuterParallelPTO(PTOTestCase):
         tensors["v_proj"][:] = torch.matmul(normed, tensors["wv"].to(torch.float32))
 
 
-@pytest.fixture(scope="module")
-def original_kv_proj_swimlane_file(test_runner) -> Path:
-    """Run the original kv_proj case once and return the generated swimlane JSON."""
-    if not test_runner.config.enable_chip_swimlane:
-        pytest.skip("pass --enable-chip-swimlane to validate the original kv_proj swimlane")
-
-    before: set[Path] = set(_BUILD_OUTPUT_DIR.glob("*/dfx_outputs/chip_swimlane_records.json"))
-    result = test_runner.run(_OriginalKVProjOuterParallelPTO())
-    assert result.passed, f"original kv_proj outer-parallel execution failed: {result.error}"
-    after: set[Path] = set(_BUILD_OUTPUT_DIR.glob("*/dfx_outputs/chip_swimlane_records.json"))
-    new_files = after - before
-    assert new_files, "No chip_swimlane_records.json generated for the original kv_proj run"
-    return max(new_files, key=lambda p: p.stat().st_mtime)
+_ORIGINAL_KV_PROJ_CASE = st.from_legacy(_OriginalKVProjOuterParallelPTO())
 
 
-@pytest.fixture(scope="module")
-def original_kv_proj_swimlane_data(original_kv_proj_swimlane_file: Path) -> dict:
-    return json.loads(original_kv_proj_swimlane_file.read_text())
-
-
+@pytest.mark.swimlane
 class TestOriginalKVProjOuterParallelSwimlane:
     """Validate that the original kv_proj case emits a basic swimlane artifact."""
 
-    def test_file_generated(self, original_kv_proj_swimlane_file: Path):
-        assert original_kv_proj_swimlane_file.exists(), (
-            f"Swimlane file not found: {original_kv_proj_swimlane_file}"
-        )
+    @st.cases(_ORIGINAL_KV_PROJ_CASE)
+    def test_file_generated(self, case_run):
+        # `dfx` asserts existence itself, naming the path and the flag that
+        # collects it; calling it is the whole assertion.
+        case_run.dfx("chip_swimlane_records.json")
 
-    def test_top_level_structure(self, original_kv_proj_swimlane_data: dict):
-        assert "chip_swimlane_level" in original_kv_proj_swimlane_data
-        assert original_kv_proj_swimlane_data["chip_swimlane_level"] in (1, 2, 3, 4), (
-            f"Unexpected chip_swimlane_level: "
-            f"{original_kv_proj_swimlane_data['chip_swimlane_level']} (expected 1-4)"
+    @st.cases(_ORIGINAL_KV_PROJ_CASE)
+    def test_top_level_structure(self, case_run):
+        assert "chip_swimlane_level" in case_run.swimlane()
+        assert case_run.swimlane()["chip_swimlane_level"] in (1, 2, 3, 4), (
+            f"Unexpected chip_swimlane_level: {case_run.swimlane()['chip_swimlane_level']} (expected 1-4)"
         )
-        assert "tasks" in original_kv_proj_swimlane_data
-        assert len(original_kv_proj_swimlane_data["tasks"]) > 0
+        assert "tasks" in case_run.swimlane()
+        assert len(case_run.swimlane()["tasks"]) > 0
 
 
 if __name__ == "__main__":
