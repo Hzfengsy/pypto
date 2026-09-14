@@ -11,11 +11,12 @@ data through exactly this object.
 
 ## The idea
 
-Distributed memory in `pld` is **symmetric**: every rank allocates the *same*
-window buffer at the same virtual address, so "the buffer" is one object that
-every rank can reach — its own slice locally, peers' slices through RMA. The
-window buffer is an HCCL buffer with a **signal tail** that the runtime
-reserves for cross-rank signaling (steps 04–06 use it).
+Distributed memory in `pld` is **symmetric**: every rank allocates a window
+buffer with the *same size and layout* — each rank's own base address can
+differ — so "the buffer" is one object that every rank can reach: its own
+slice locally, peers' slices through RMA. The window buffer is an HCCL
+buffer with a **signal tail** that the runtime reserves for cross-rank
+signaling (steps 04–06 use it).
 
 Two calls create it. `pld.alloc_window_buffer(...)` allocates the buffer; a
 `pld.window(...)` call gives you a `pld.DistributedTensor` view of it — the
@@ -73,8 +74,8 @@ def window_program(
 ```
 
 The **host orchestrator owns the window**. `alloc_window_buffer` runs once,
-before the dispatch loop — every rank's runtime allocates the same buffer at
-the same address. Inside the loop, `pld.window(...)` produces this rank's
+before the dispatch loop — every rank's runtime allocates a buffer with the
+same size and layout. Inside the loop, `pld.window(...)` produces this rank's
 `DistributedTensor` view, which is passed down to the kernel.
 
 **The 4 KiB floor.** The window buffer is padded up to at least 4 KiB

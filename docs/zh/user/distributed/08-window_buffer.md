@@ -9,10 +9,11 @@ slice——尚无通信，但后续每一步都通过这个对象移动数据。
 
 ## 思路（The idea）
 
-`pld` 中的分布式内存是**对称的**：每个 rank 在相同的虚拟地址分配*相同*的
-window buffer，因此"该 buffer"是一个每个 rank 都能到达的对象——本地是
-自己的 slice，对端通过 RMA 到达。window buffer 是一个 HCCL buffer，带有一个
-**信号尾（signal tail）**，运行时为跨 rank 信号保留（步骤 04–06 会用到）。
+`pld` 中的分布式内存是**对称的**：每个 rank 分配的 window buffer 具有*相同
+的大小和布局*（每个 rank 自己的 base 地址可以不同），因此"该 buffer"是一个
+每个 rank 都能到达的对象——本地是自己的 slice，对端通过 RMA 到达。window
+buffer 是一个 HCCL buffer，带有一个**信号尾（signal tail）**，运行时为跨
+rank 信号保留（步骤 04–06 会用到）。
 
 两个调用创建它。`pld.alloc_window_buffer(...)` 分配 buffer；
 `pld.window(...)` 调用给出它的 `pld.DistributedTensor` 视图——即对端可见的
@@ -68,7 +69,7 @@ def window_program(
 ```
 
 **主机编排器拥有 window。** `alloc_window_buffer` 在分发循环之前运行一次
-——每个 rank 的运行时在相同地址分配相同的 buffer。循环内部，
+——每个 rank 的运行时分配的 buffer 具有相同的大小和布局。循环内部，
 `pld.window(...)` 产生本 rank 的 `DistributedTensor` 视图，向下传给 kernel。
 
 **4 KiB 下限。** 无论数据大小如何，window buffer 至少会被补齐到 4 KiB。
