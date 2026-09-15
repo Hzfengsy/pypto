@@ -792,9 +792,9 @@ def legalize_graph_boundary() -> Pass:
     """Make every ``FunctionType.Graph`` function legal to record and replay.
 
     Hoists each boundary scalar a Graph body *derives* out to its call sites.
-    Under ``host_build_graph`` a boundary scalar is tracked by the address of its
-    argument slot, so a value computed inside the region has no slot and would be
-    frozen at its first-call value on every later replay, with no warning.
+    Under ``host_build_graph`` a boundary scalar carries its parameter origin.
+    A value computed inside the region loses that origin and would be frozen at
+    its first-call value on every later replay.
 
     Also rejects, at compile time, the boundary shapes the runtime would decline
     to cache — an oversized or empty tensor boundary, runtime-allocated outputs,

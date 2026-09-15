@@ -19,10 +19,9 @@
  * exists to catch all three at compile time:
  *
  * **Step A — derived boundary scalars (silent wrong answers).** A boundary
- * scalar is tracked by *pointer identity*: the runtime anchors the address of
- * each `args.scalar(k)` slot during recording and re-reads it on replay. A value
- * the body *derives* from a scalar parameter (`base = layer * 5120`) has no such
- * slot, so it is classified as static data and frozen at its first-call value —
+ * scalar carries its parameter origin in the runtime's InheritableScalar wrapper.
+ * A value the body *derives* from a scalar parameter (`base = layer * 5120`) loses
+ * that origin, so it is classified as static data and frozen at its first-call value —
  * with no warning on any later replay. Step A hoists those computations to the
  * call sites, where they become ordinary pass-through scalars.
  *
@@ -237,14 +236,8 @@ class DerivedScalarCollector : public IRVisitor {
         // call site, where what it names may itself be a hoist not yet bound.
         definition_index_[var.get()] = next_definition_++;
         passthrough_order_.emplace_back(var.get(), aliased);
-        // Also recorded for *body* substitution, which is a different problem
-        // from the call-site binding above. The name has to go away entirely:
-        // orchestration codegen emits a surviving scalar alias as a value copy
-        // (`int64_t n = batch;`), and recording matches a boundary scalar by the
-        // address of its argument slot, so the copy is classified as static data
-        // and frozen at the first call's value. `IsDerivable` has already proven
-        // the target is a scalar parameter or an earlier such alias, so every
-        // chain bottoms out somewhere that does own a slot.
+        // Resolve body aliases to their boundary parameter so codegen forwards
+        // its InheritableScalar wrapper without an integer conversion.
         scalar_alias_target_[var.get()] = aliased;
         return;
       }
@@ -670,8 +663,8 @@ class UnhoistableScalarChecker : public IRVisitor {
         CHECK_SPAN(invariant_.IsInvariant(arg), span)
             << "Graph function '" << func_->name_
             << "' computes a scalar inline in a task argument. Under host_build_graph a boundary "
-               "scalar is tracked by the address of its argument slot; a value computed inside the "
-               "region has no slot, so the runtime would freeze the first call's value into the "
+               "scalar carries its parameter origin; a value computed inside the "
+               "region loses that origin, so the runtime would freeze the first call's value into the "
                "recorded graph and silently reuse it on every replay. Bind it to a name first — a "
                "named value derived from this function's scalar parameters and constants is hoisted "
                "to the call site automatically.";
@@ -685,8 +678,8 @@ class UnhoistableScalarChecker : public IRVisitor {
       CHECK_SPAN(false, span)
           << "Graph function '" << func_->name_ << "' passes scalar '" << var->name_hint_
           << "' to a task, but its value can differ between calls and has nowhere to be patched. "
-             "Under host_build_graph a boundary scalar is tracked by the address of its argument "
-             "slot; a value computed inside the region has no slot, so the runtime would freeze the "
+             "Under host_build_graph a boundary scalar carries its parameter origin; "
+             "a value computed inside the region loses that origin, so the runtime would freeze the "
              "first call's value into the recorded graph and silently reuse it on every replay. "
              "Compute '"
           << var->name_hint_
@@ -704,14 +697,9 @@ class UnhoistableScalarChecker : public IRVisitor {
 /// Replaces hoisted body variables with their new parameters and erases the
 /// assignments that used to compute them — the value now arrives as an argument.
 ///
-/// Also erases every scalar `alias = <name>` binding, redirecting its readers to
-/// whatever the chain bottoms out at. A surviving alias is not merely redundant:
-/// orchestration codegen emits it as `int64_t n = batch;`, and the recording
-/// classifies a scalar by the address of the argument slot it came from
-/// (`graph_scalar_source_ref` compares against `&boundary_args->scalar(i)`), so
-/// the copy has no matching slot, is recorded as `STATIC_VALUE`, and every later
-/// replay reuses the first call's number. Substituting the name away is what
-/// keeps `add_scalar(batch)` reading the slot itself.
+/// Erases scalar aliases so readers forward the boundary's InheritableScalar.
+/// A surviving `int64_t n = batch;` would fail to compile; explicitly extracting
+/// its value with `to<int64_t>()` would instead lose the parameter origin.
 class HoistedValueRewriter : public IRMutator {
  public:
   explicit HoistedValueRewriter(const GraphPlan& plan) {
@@ -1490,9 +1478,8 @@ class CallSiteExtender : public IRMutator {
     std::unordered_map<const Var*, ExprPtr> local_for;
     auto bind = [&](const HoistedValue& h) {
       auto value = SubstituteAtCallSite(h.value, binding);
-      // Bound to a local, not spliced in as an expression: codegen emits a
-      // boundary scalar as `const uint64_t&` into the argument slot, so the
-      // value needs an addressable home at the call site.
+      // Bind to a local so add_scalar receives an lvalue, which the runtime
+      // declares dynamic before turning it into a Graph boundary parameter.
       auto local = std::make_shared<Var>(h.param->name_hint_ + "__graph_arg" + std::to_string(next_local_++),
                                          h.param->GetType(), h.param->span_);
       pending_prefix_.push_back(std::make_shared<AssignStmt>(local, value, h.param->span_));

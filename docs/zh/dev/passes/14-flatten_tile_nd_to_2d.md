@@ -54,12 +54,14 @@ program_2d = flatten_pass(program)
 | `tile.store`（2D 张量） | 直接透传 |
 | `tile.create`/`tile.full`（>2D） | 直接使用展平的 2D 形状重建 |
 | `tile.assemble`（>2D 目标） | 用与 `tile.load` 折叠 tensor-rank 偏移相同的行主序折叠，把 ND 偏移折进展平后的 `(row, col)` 空间（`row = ((o0*d1 + o1)*d2 + o2)*… + o[k-2]`，`col = o[k-1]`）；Tile 操作数本身由其定义处的算子展平。要求 source、target 与 offset 具有相同 rank，且写入区域能折叠为连续的行区间（`IsRowMajorCollapseContiguous`），否则在前置条件阶段报错。若不折叠，偏移会以 ND rank 残留在 2D Tile 上，而 codegen 只按位置读取 `elements[0]`/`elements[1]` 并忽略其余元素，从而静默地写到错误地址 |
-| `tile.transpose` | `pto.ttrans` scratch 物化的唯一归属。进入时为 3-arg（input, axis1, axis2）。**2D**：创建一块 scratch tile（shape = 源页，位于输入所在 memory），产出 codegen-ready 的 4-arg `tile.transpose(in, a1, a2, scratch)`。**>2D**（末两轴交换）：展开为逐 batch 的 2D transpose，每个都是 4-arg 形态，scratch 从扁平 `[batch*A, B]` 池中切片，再 assemble 进合并后的 2D 输出。交换 batch 轴属用户错误 |
+| `tile.transpose` | `pto.ttrans` scratch 物化的唯一归属。进入时为 3-arg（input, axis1, axis2）。**2D**：创建一块 scratch tile（shape = 源页，位于输入所在 memory），产出 codegen-ready 的 4-arg `tile.transpose(in, a1, a2, scratch)`。**>2D**（末两轴交换）：展开为逐 batch 的 2D transpose，scratch 视图保持源页形状 `[A, B]`，从补齐容量的 `[batch*scratch_page_rows, B]` 池中切片，再 assemble 进合并后的 2D 输出。交换 batch 轴属用户错误 |
 | `tile.batch_matmul` | 展开为逐 batch 的 2D `tile.matmul`，处理 batch broadcast。b_trans/a_trans 操作数以一个零拷贝 `tile.transpose_view`（覆盖在自然 load 之上）出现（不再 transpose-at-load、不搬数据）；tile 级算子本身无 transpose 语义。每个操作数处理方式一致（见下方操作数处理）。**当结果本身就是批量累加器**（下游 `tile.batch_matmul_acc` 会继续写它）时，各页改为通过 `tile.matmul_acc(window, lhs_b, rhs_b, init_cond=True)` 写入同一块按列打包的 `Acc` tile —— 见[批量累加器按列打包](#批量累加器按列打包) |
 | `tile.batch_matmul_acc` | 展开为逐 batch 的 2D `tile.matmul_acc`，按 batch 索引取（已展平的）累加器的一个窗口：链按列打包时取 `[M, B*N]` tile 的**列**窗口 `[0, b*N]`，否则取 `[B*M, N]` tile 的旧**行**窗口 `[b*M, 0]` —— 见[批量累加器按列打包](#批量累加器按列打包)。本 pass 未直接确定的内存空间决策（行打包累加器上的 Vec/Acc 来回搬运、上游 `tile.create` 的可重定向生产者改写、TileView 刷新）交由 `InferTileMemorySpace`（pass 20）负责 —— 本 pass 不发射任何 `tile.move` |
 | `tile.reshape` / `tile.reinterpret_view`（>2D 结果） | 将字面量目标 shape 操作数改写为合并后的 2D `[product(leading), last]` 并重新推导类型。这两个是仅有的结果 rank 来自 shape 操作数而非某个操作数类型的 tile 算子，因此下面的通用路径无法下降它们——通用路径会用**同一个** ND 元组重建调用，rank>2 的结果就此存活到 PTO codegen，被 `ExtractTileTypeInfo` 按前两维定型。此处的折叠严格保持语义：tile 是一段连续的行主序数据，`[2, 8, 128]` 与 `[16, 128]` 指向同一批元素、同一顺序。由此得到的 2D reshape 往往是恒等变换，随后由 `FoldNoOpReshape`（pass 38）消除。喂给 `tile.batch_matmul` 的安全 batch-only reshape 由该 lowering 剥离（见上），不会走到这个分支 |
 | 其他 Tile 操作（>2D） | 替换变量，使用 2D 类型重新创建 |
 | 1D/2D Tile 操作 | 不变 |
+
+N-D transpose 的 scratch 将 A 对齐到 32 个元素（8-bit 类型）或 16 个元素（16/32-bit 类型）。列方向至少保留一个 32 字节块，16-bit vtranspose 则保留两条覆盖完整高度的 16 列带。将所得 workspace 容量向上取整为每行 B 个元素的整行数，得到 `scratch_page_rows`；池的分配大小和每页偏移均使用该补齐值。因此，FP32 `[24, 8]` 页拥有 1024 字节 workspace，而 scratch 视图仍保持 `[24, 8]` 形状。 页维度必须为正，元素存储大小必须为 1、2 或 4 字节。workspace 对齐、池维度及池的总字节数必须可用 `int64_t` 表示；不支持的类型和超大 workspace 会在展开 batch 前被拒绝。
 
 **统一的操作数处理 —— 整块切片 vs 逐 batch load。** 每个 batch_matmul 操作数
 （lhs 或 rhs、转置与否、来自 load 或 move）处理方式完全一致。路由**按操作数**判定：

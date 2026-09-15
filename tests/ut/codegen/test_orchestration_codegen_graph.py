@@ -16,9 +16,9 @@ lambda would mint one pointer per syntactic occurrence and burn through the
 16-entry Definition cache.
 
 The assertions that matter most are the ones covering silent failures. A
-boundary scalar bound by value instead of by reference severs the pointer
-identity the runtime uses to track it, and the value is frozen at its first-call
-number on every later replay — with no warning anywhere.
+boundary scalar converted to an integer loses the parameter origin the runtime
+uses to track it, and the value is frozen at its first-call number on every
+later replay. Preserve the runtime's InheritableScalar wrapper instead.
 """
 
 import os
@@ -135,17 +135,11 @@ def test_boundary_tensors_are_bound_from_the_task_args(orch):
     assert "const Tensor& c = args.tensor(1).ref();" in body
 
 
-def test_boundary_scalars_are_bound_by_reference(orch):
-    """The single most consequential line in the whole feature.
-
-    The runtime tracks a boundary scalar by the *address* of its argument slot.
-    Copying it into a local (``uint64_t base = args.scalar(1);``) severs that
-    link, so the value is frozen at the first call's number and silently reused
-    on every replay.
-    """
+def test_boundary_scalars_preserve_the_runtime_parameter(orch):
+    """Forward InheritableScalar without converting it to the first call's value."""
     body = _graph_body(orch)
-    assert "const uint64_t& layer_idx = args.scalar(0);" in body
-    assert "const uint64_t& base = args.scalar(1);" in body
+    assert "const auto layer_idx = args.scalar(0);" in body
+    assert "const auto base = args.scalar(1);" in body
 
 
 def test_graph_body_allocates_nothing(orch):
@@ -277,7 +271,14 @@ def test_generated_orchestration_compiles_against_the_pinned_runtime(artifact_ro
         pytest.skip("no C++ compiler available")
 
     result = subprocess.run(
-        [compiler, "-std=c++17", "-fsyntax-only", *_runtime_include_args(repo_root), str(main_cpp)],
+        [
+            compiler,
+            "-std=c++17",
+            "-fsyntax-only",
+            "-Werror=deprecated-declarations",
+            *_runtime_include_args(repo_root),
+            str(main_cpp),
+        ],
         capture_output=True,
         text=True,
         check=False,

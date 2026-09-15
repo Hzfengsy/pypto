@@ -4685,10 +4685,9 @@ std::string GenerateDynamicDimDefs(const std::vector<VarPtr>& params, const std:
 ///   name the prologue already declares (issue #2605).
 /// * A task-var prefix, because this instance's counters restart at 0.
 ///
-/// Boundary scalars are bound as ``const uint64_t&``, never by value. The
-/// runtime tracks a boundary scalar by the *address* of its argument slot, so
-/// copying it into a local would sever that link and the value would be frozen
-/// into the recording at its first-call value.
+/// Preserve the InheritableScalar returned by args.scalar(). It carries the
+/// boundary parameter's origin through task argument forwarding. Converting it
+/// to an integer would freeze the recording invocation's value on every replay.
 std::string GenerateGraphFunctions(const ProgramPtr& program, const FunctionPtr& entry,
                                    std::map<std::string, int>* func_name_to_id,
                                    std::map<std::string, CoreType>* func_name_to_core_type,
@@ -4748,9 +4747,7 @@ std::string GenerateGraphFunctions(const ProgramPtr& program, const FunctionPtr&
         ++tensor_index;
         continue;
       }
-      // Reference, not a copy: the runtime anchors this slot's address during
-      // recording and re-reads it on every replay.
-      oss << "    const uint64_t& " << name << " = args.scalar(" << scalar_index << ");\n";
+      oss << "    const auto " << name << " = args.scalar(" << scalar_index << ");\n";
       ++scalar_index;
     }
 

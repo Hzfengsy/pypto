@@ -9,6 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include <algorithm>
 #include <any>
 #include <cstddef>
 #include <cstdint>
@@ -92,7 +93,11 @@ NdTransposeResult LowerNdTranspose(const AssignStmtPtr& assign, const CallPtr& c
   std::vector<int64_t> batch_dims(input_dims.begin(), input_dims.end() - 2);
   int64_t a = input_dims[ndim - 2];
   int64_t b = input_dims[ndim - 1];
+  CHECK_SPAN(a > 0 && b > 0, span)
+      << "FlattenTileNdTo2D: tile.transpose page dimensions must be positive, got [" << a << ", " << b << "]";
   int64_t batch_count = MultiplyStaticDims(batch_dims, "tile.transpose batch size");
+  const int64_t input_rows = MultiplyStaticDims({batch_count, a}, "tile.transpose input rows");
+  const int64_t output_rows = MultiplyStaticDims({batch_count, b}, "tile.transpose output rows");
 
   // Resolve the input operand. After var_map substitution it is usually the
   // already-flattened 2D tile [batch_count*A, B]. But a producer that this pass
@@ -108,9 +113,9 @@ NdTransposeResult LowerNdTranspose(const AssignStmtPtr& assign, const CallPtr& c
 
   if (operand_type->shape_.size() > 2) {
     auto [merged, last] = ComputeMergedShape(operand_type->shape_, "tile.transpose input");
-    INTERNAL_CHECK_SPAN(merged == batch_count * a && last == b, span)
+    INTERNAL_CHECK_SPAN(merged == input_rows && last == b, span)
         << "Internal error: tile.transpose flattened input shape [" << merged << ", " << last
-        << "] does not match expected [" << (batch_count * a) << ", " << b << "]";
+        << "] does not match expected [" << input_rows << ", " << b << "]";
     auto reshape_shape = std::make_shared<MakeTuple>(Make2DShapeExprs(merged, last, span), span);
     auto reshape = op_registry.Create("tile.reshape", {operand, reshape_shape}, span);
     auto reshape_var = std::make_shared<Var>("trans_in_2d", reshape->GetType(), span);
@@ -120,7 +125,7 @@ NdTransposeResult LowerNdTranspose(const AssignStmtPtr& assign, const CallPtr& c
   }
 
   // Pre-create the flat output tile [batch_count*B, A].
-  auto out_shape = std::make_shared<MakeTuple>(Make2DShapeExprs(batch_count * b, a, span), span);
+  auto out_shape = std::make_shared<MakeTuple>(Make2DShapeExprs(output_rows, a, span), span);
   std::vector<std::pair<std::string, std::any>> create_kw = {
       {"dtype", operand_type->dtype_},
       {"target_memory", target_mem},
@@ -129,19 +134,37 @@ NdTransposeResult LowerNdTranspose(const AssignStmtPtr& assign, const CallPtr& c
   VarPtr out_var = std::make_shared<Var>(assign->var_->name_hint_, create_out->GetType(), span);
   out.stmts.push_back(std::make_shared<AssignStmt>(out_var, create_out, assign->span_));
 
-  // Pre-create one flat scratch pool [batch_count*A, B] sliced per batch.
-  // pto.ttrans requires a scratch operand whose type matches the source page's;
-  // its codegen reuses the SOURCE's type for BOTH ins operands
-  // (MakeTileTransposeCodegenPTO emits "src_type, src_type"). The source page is
-  // a tile.slice -> pto.subview, which produces a NEW SSA value with STATIC valid
-  // [A, B]. The scratch must be the same kind of value, so it is sliced from this
-  // pool per batch (a partial tile.slice -> pto.subview), NOT
-  // created+set_validshape: set_validshape mutates the alloc in place (dynamic
-  // valid ?x?) without renaming it, so ttrans would see the same SSA value typed
-  // both dynamic (at its def/set_validshape) and static (at the ttrans use) ->
-  // ptoas type conflict. The pool lives across the loop; being a single
-  // allocation it is cheap relative to per-batch scratch churn.
-  auto tmp_pool_shape = std::make_shared<MakeTuple>(Make2DShapeExprs(batch_count * a, b, span), span);
+  // A2/A3 TTrans.hpp: BLOCK_BYTE_SIZE, Y_ELEM_B8, Y_ELEM_OTHER, and the
+  // full-height tmpA/tmpB strips used by TTransVtransposeB16.
+  constexpr int64_t kBlockBytes = 32;
+  constexpr int64_t kB8RowAlignment = 32;
+  constexpr int64_t kB16B32RowAlignment = 16;
+  constexpr int64_t kB16StagingStrips = 2;
+  constexpr int64_t kB8Bytes = 1;
+  constexpr int64_t kB16Bytes = 2;
+  constexpr int64_t kB32Bytes = 4;
+  const int64_t element_bytes = static_cast<int64_t>(operand_type->dtype_.GetByte());
+  CHECK_SPAN(element_bytes == kB8Bytes || element_bytes == kB16Bytes || element_bytes == kB32Bytes, span)
+      << "FlattenTileNdTo2D: tile.transpose requires a 1-, 2-, or 4-byte element type, got "
+      << operand_type->dtype_.ToString();
+  const int64_t block_elements = kBlockBytes / element_bytes;
+  const int64_t row_alignment = element_bytes == kB8Bytes ? kB8RowAlignment : kB16B32RowAlignment;
+  // Quotient/remainder ceiling division avoids overflowing the numerator.
+  const int64_t row_blocks = a / row_alignment + (a % row_alignment != 0);
+  const int64_t tmp_stride =
+      MultiplyStaticDims({row_blocks, row_alignment}, "tile.transpose scratch row alignment");
+  const int64_t staging_cols =
+      element_bytes == kB16Bytes ? kB16StagingStrips * block_elements : block_elements;
+  const int64_t scratch_elements =
+      MultiplyStaticDims({tmp_stride, std::max(b, staging_cols)}, "tile.transpose scratch page elements");
+  const int64_t scratch_page_rows = scratch_elements / b + (scratch_elements % b != 0);
+  const int64_t scratch_pool_rows =
+      MultiplyStaticDims({batch_count, scratch_page_rows}, "tile.transpose scratch pool rows");
+  (void)MultiplyStaticDims({scratch_pool_rows, b, element_bytes}, "tile.transpose scratch pool bytes");
+
+  // Pad backing pages while keeping each scratch subview's shape and static
+  // valid shape identical to the source: pto.ttrans uses one type for both inputs.
+  auto tmp_pool_shape = std::make_shared<MakeTuple>(Make2DShapeExprs(scratch_pool_rows, b, span), span);
   std::vector<std::pair<std::string, std::any>> tmp_pool_kw = {
       {"dtype", operand_type->dtype_},
       {"target_memory", target_mem},
@@ -163,9 +186,8 @@ NdTransposeResult LowerNdTranspose(const AssignStmtPtr& assign, const CallPtr& c
     ExprPtr src_page = std::make_shared<Var>("trans_page_" + suffix, slice->GetType(), span);
     out.stmts.push_back(std::make_shared<AssignStmt>(As<Var>(src_page), slice, assign->span_));
 
-    // Slice the i-th 2D scratch page [A, B] from the flat tmp pool (subview with
-    // STATIC valid [A, B], matching the source page's type exactly).
-    auto tmp_offset = MakeShapeTupleFromInts({i * a, 0}, span);
+    // Advance by the padded page capacity.
+    auto tmp_offset = MakeShapeTupleFromInts({i * scratch_page_rows, 0}, span);
     auto tmp_shape = MakeShapeTupleFromInts({a, b}, span);
     auto tmp_slice = op_registry.Create("tile.slice", {tmp_pool_var, tmp_shape, tmp_offset}, span);
     ExprPtr scratch_page = std::make_shared<Var>("trans_tmp_" + suffix, tmp_slice->GetType(), span);
