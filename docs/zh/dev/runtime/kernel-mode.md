@@ -53,13 +53,56 @@ frame 使用期间，调用方不能 resize 或使借用的 storage 失效。
 也不同步或入队。这些上下文查询可能初始化 torch_npu 自身的框架上下文，但不创建或
 初始化 Simpler/PyPTO Worker。
 
+## 内部 schema 与 Fake/Meta 辅助
+
+`pypto.torch.registration.RegistrationSignature` 复制相同的 `ParamInfo` carrier shape
+及返回参数索引。`schema(name)` 将 Out/InOut Tensor 标记为可写，并把每个 Tensor
+返回值关联到对应输入的别名集合（alias set）。全部参数均须传入，不推导输出分配。
+Scalar 输入映射为 dispatcher 的 `SymInt`、`float` 或 `bool`。`SymInt` 接受普通整数，
+并在 dispatch 中保留符号整数，包括没有具体值提示的符号。Scalar 校验保留 dtype
+范围检查，不将符号转换为 Python 整数。拒绝直接返回只读输入、Scalar 输出、
+纯 Scalar 算子、非法名称与返回别名，以及 UINT64 Scalar：dispatcher 的有符号整数
+类型无法表达完整 UINT64 范围。返回别名必须指向 Out/InOut Tensor，因为 dispatcher
+schema 检查器不允许直接返回只读输入对象。
+
+`fake(*args)` 接受 FakeTensor 或 Meta Tensor，校验 dtype、rank、静态 shape、
+连续性、设备一致性及仅推理约束，然后返回声明的原始输入对象。动态维度及符号整数
+Scalar 保持符号形式。直接返回输入保留 stride、storage offset 与别名身份，包括
+空切片。该辅助不读取 storage 或地址，不查询 NPU format/device/stream，不分配
+业务输出，也不调用 Worker。抽象 Tensor 无法证明真实物理布局与 storage 重叠情况，
+因此这些校验仍由真实调用适配器执行。
+
+`define(library, name)` 仅在调用方持有的 `torch.library.Library` 中定义 schema
+并注册 fake kernel；调用方负责保留 library 对象及其注册生命周期。重复定义，包括
+同名不同签名，均抛出 PyTorch 的重复定义错误，不替换已有定义。导入或重新加载模块
+不注册算子。`pypto.torch` 不新增公开注册 API，本阶段也不安装真实设备 kernel。
+如果当前 PyTorch 缺少 `torch.library.register_fake`，则回退到
+`torch.library.impl_abstract`（PyTorch 2.2–2.3 提供），并保留调用方 Library 的
+生命周期管理。两种 API 均不可用时，在安装 schema 前明确报错。该可选辅助要求
+至少存在其中一种 API；此回退不新增 PyTorch 2.0–2.1 支持，也不调整整个包的最低依赖版本。
+
+测试使用临时 namespace 和 CPU 实现夹具。在 PyTorch 2.6 上，无 dispatcher 返回值
+的纯修改 schema 通过全部
+[`torch.library.opcheck`](https://docs.pytorch.org/docs/2.6/library.html#torch.library.opcheck)
+检查以及 `torch.compile(backend="aot_eager", fullgraph=True, dynamic=True)`；
+测试 wrapper 在调用算子后返回调用方传入的输出 Tensor。通过注册后的 `torch.ops`
+验证有具体值提示（backed）和无具体值提示（unbacked）的整数符号原样到达 fake kernel，
+且不添加等值 guard；另以 shape 派生的 Scalar 验证不同输入尺寸复用同一编译图。
+API 选择测试在 PyTorch 2.6 上模拟旧注册入口，验证 Fake/Meta dispatch、重复定义拒绝
+及 Library 清理；不据此宣称旧版 PyTorch 已通过端到端编译器兼容性验证。
+带返回别名的 schema 分别
+验证 schema 正确性与 Fake/Meta 行为，不把这些检查视为该类算子已支持函数化
+（functionalization）或编译执行。正式 kernel 注册、设备执行、autograd 与最终编译器
+接线仍属于后续工作。
+
 ## 可选依赖与范围
 
-`import pypto.torch` 不导出执行 API。导入该包或 `interop` 模块不请求 torch_npu、
+`import pypto.torch` 不导出执行 API。导入该包、`interop` 或 `registration` 模块不请求 torch_npu、
 Simpler 或 native launch 扩展；`torch` 仍是 PyPTO 的常规依赖。真正描述 NPU 调用时
 才按需加载 `torch_npu`，缺失时给出针对性的错误信息。
 
-本基础能力覆盖 metadata 校验和 Python 调用 frame 所有权，不表示 kernel launch、
+本基础能力覆盖 metadata 校验、Python 调用 frame 所有权及内部 schema/Fake 辅助，
+不表示 kernel launch、
 taskQueue 顺序、allocator 安全、eager 数值执行或 ACLGraph 已可用。公开入口切换
 必须等待 native adapter 和 runtime 集成完成。
 
@@ -72,3 +115,7 @@ taskQueue 顺序、allocator 安全、eager 数值执行或 ACLGraph 已可用�
 `tests/st/runtime/kernel/test_torch_interop.py` 核对真实 NPU Tensor、非默认 stream、
 offset view 和非连续输入拒绝行为。没有真实 NPU 或所选平台为模拟器时跳过。
 这些是 metadata 测试，不是 PyPTO kernel 执行测试。
+
+`tests/ut/torch/test_registration.py` 覆盖 schema mutation/alias 契约、Fake/Meta
+与符号输入、隔离导入、重复定义，以及不依赖真实 kernel executor 的测试内
+dispatcher/compiler 集成。
