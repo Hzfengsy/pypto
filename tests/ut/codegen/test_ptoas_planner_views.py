@@ -446,6 +446,114 @@ def test_transposed_matmul_operand_is_a_re_view_under_pypto_planner():
     assert "blayout=row_major, slayout=col_major" in decl, decl
 
 
+# ── a transposed operand may not come from a Mat *window* ────────────────────
+
+PARENT_ROWS, WINDOW_ROWS = 512, 64
+
+
+@pl.program
+class MatmulBTransOverSliceProgram:
+    """`b_trans=True` on a `tile.slice` of a Mat-resident parent.
+
+    The window is selected per iteration, so its offset is a runtime value and the
+    slice reaches codegen as a `pto.subview`.
+    """
+
+    @pl.function
+    def kernel(
+        self,
+        query: pl.Tensor[[PARENT_ROWS, QK], pl.INT8],
+        key: pl.Tensor[[QM, QK], pl.INT8],
+        out: pl.Out[pl.Tensor[[QM, WINDOW_ROWS], pl.INT32]],
+    ) -> pl.Tensor[[QM, WINDOW_ROWS], pl.INT32]:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="qk_window"):
+            query_all = pl.slice(query, [PARENT_ROWS, QK], [0, 0])
+            for q in pl.range(PARENT_ROWS // WINDOW_ROWS):
+                window = pl.slice(query_all, [WINDOW_ROWS, QK], [q * WINDOW_ROWS, 0])
+                out[:, :] = pl.matmul(key[:, :], window, out_dtype=pl.INT32, b_trans=True)
+        return out
+
+
+@pytest.mark.parametrize("planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.PTOAS])
+def test_transposed_matmul_operand_over_a_mat_slice_is_rejected(planner):
+    """A transposed view of a Mat window has no lowering, and must not be aliased.
+
+    `tile.transpose_view` is a zero-copy relabel of a whole buffer. Its source
+    here is a `pto.subview`, which carries a runtime offset and the *parent's* row
+    pitch — and neither of the op's two lowerings can express that. ptoas refuses
+    a mat-source `pto.tmov` on a view ("matching src/dst shapes") and refuses a
+    `pto.treshape` on one at every destination size ("same total byte size").
+
+    Left alone, the PyPTO planner took the no-op branch and the result's own
+    `pto.alloc_tile` landed at the *parent's base* with the *window's* extent: a
+    dynamic slice offset cannot fold into a constant `addr`, and the parent pitch
+    is absent from the alloc's type. The matmul then read the same wrong bytes on
+    every iteration, silently. Reject at codegen instead, under both planners.
+    """
+    with pytest.raises(ValueError, match="cannot be taken from a slice of an on-chip Mat tile"):
+        _emit_incore_pto(MatmulBTransOverSliceProgram, planner)
+
+
+@pl.program
+class MatmulBTransOverIdentitySliceProgram:
+    """`b_trans=True` on a slice covering its Mat parent's FULL extent at [0, 0].
+
+    Same bytes, same pitch, same address as the parent — the one window a
+    transpose loses nothing on.
+    """
+
+    @pl.function
+    def kernel(
+        self,
+        query: pl.Tensor[[KN, QK], pl.INT8],
+        key: pl.Tensor[[QM, QK], pl.INT8],
+        out: pl.Out[pl.Tensor[[QM, KN], pl.INT32]],
+    ) -> pl.Tensor[[QM, KN], pl.INT32]:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="qk_identity"):
+            query_all = pl.slice(query, [KN, QK], [0, 0])
+            key_tile = pl.slice(key, [QM, QK], [0, 0])
+            window = pl.slice(query_all, [KN, QK], [0, 0])
+            out[:, :] = pl.matmul(key_tile, window, out_dtype=pl.INT32, b_trans=True)
+        return out
+
+
+@pytest.mark.parametrize("planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.PTOAS])
+def test_transposed_matmul_operand_over_an_identity_mat_slice_is_folded(planner):
+    """An identity window keeps working, and folds back to its parent.
+
+    A full-extent slice at a constant `[0, 0]` offset names exactly the source's
+    bytes with the source's own pitch, so the guard above must not reject it --
+    `FlattenTileNdTo2D` emits one per page for a leading-dim-1 batch, making this
+    ordinary input rather than a degenerate case.
+
+    Folding to the parent (rather than merely exempting the window) is what keeps
+    the PTOAS planner correct too: with no baked address the transpose falls back
+    to `pto.treshape`, which ptoas refuses against a `pto.subview` source however
+    identity it is, but accepts against the parent's dense handle.
+    """
+    mlir = _emit_incore_pto(MatmulBTransOverIdentitySliceProgram, planner)
+
+    right_mov = _tmov_into(mlir, "loc=right")
+    transposed = "blayout=row_major, slayout=col_major"
+
+    if planner is passes.MemoryPlanner.PTOAS:
+        treshape = _sole_line(mlir, "pto.treshape")
+        # Reads the parent's own handle, never the `pto.subview` SSA.
+        source = treshape.split("pto.treshape ", 1)[1].split(" ", 1)[0]
+        assert not source.startswith("%slice_view"), (
+            f"the identity window must fold back to its parent, got {source}:\n{mlir}"
+        )
+        assert "blayout=col_major, slayout=row_major" in _operand_type(treshape), treshape
+        assert transposed in _result_type(treshape), treshape
+        assert f"ins({treshape.split('=', 1)[0].strip()} " in right_mov, f"{treshape}\n{right_mov}"
+    else:
+        # Default planner: the transposed alias is a second alloc_tile, as for a
+        # whole Mat load — no reinterpret is needed at all.
+        assert "pto.treshape" not in mlir, mlir
+        src = right_mov.split("ins(", 1)[1].split(" ", 1)[0]
+        assert transposed in _sole_line(mlir, f"{src} = pto.alloc_tile"), mlir
+
+
 # ── pto.treshape results must carry STATIC valid dims ────────────────────────
 
 COLVEC_ROWS = 16
