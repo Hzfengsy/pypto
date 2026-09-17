@@ -13,7 +13,6 @@
 #define PYPTO_IR_TRANSFORMS_DSA_MEMREF_DSA_ADAPTER_H_
 
 #include <cstdint>
-#include <set>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -24,6 +23,7 @@
 #include "pypto/ir/memref.h"
 #include "pypto/ir/transforms/dsa/allocation_plan.h"
 #include "pypto/ir/transforms/dsa/dsa_reuse_penalty_solver.h"
+#include "pypto/ir/transforms/utils/memref_utils.h"
 
 namespace pypto {
 namespace backend {
@@ -47,7 +47,6 @@ using MemRefWithSpace = std::pair<MemRefPtr, MemorySpace>;
 struct PreparedProblem {
   dsa::DsaProblem strict_problem;
   std::unordered_map<const Var*, dsa::BufferId> buffer_id_by_base;
-  std::set<const Var*> declared_allocation_bases;
   std::vector<dsa::Separation> pipeline_pairs;
 };
 
@@ -66,10 +65,14 @@ struct PreparedProblem {
 
 /**
  * @brief Convert validated offsets to fresh MemRefs, preserving view offsets.
+ *
+ * Each MemRef's address is its buffer's placement plus its entry in
+ * ``relative_offsets``, which must cover every MemRef in ``memrefs``.
  */
 [[nodiscard]] std::vector<std::pair<const MemRef*, MemRefPtr>> BuildMemRefReplacements(
     const PreparedProblem& prepared, const dsa::DsaSolution& solution,
-    const std::vector<MemRefWithSpace>& memrefs, const MemoryAllocatorPolicy& policy);
+    const std::vector<MemRefWithSpace>& memrefs, const MemoryAllocatorPolicy& policy,
+    const RelativeMemRefOffsets& relative_offsets);
 
 }  // namespace dsa_adapter
 }  // namespace ir

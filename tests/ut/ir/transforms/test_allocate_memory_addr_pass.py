@@ -12,7 +12,8 @@ import re
 import pypto
 import pypto.language as pl
 import pytest
-from pypto import ir, passes
+from pypto import DataType, ir, passes
+from pypto.arith import Analyzer
 from pypto.backend import (
     BackendType,
     get_backend_type,
@@ -822,6 +823,116 @@ def test_allocate_memory_addr_preserves_sibling_slice_offsets():
     After = passes.init_mem_ref()(Before)
     After = passes.allocate_memory_addr()(After)
     ir.assert_structural_equal(After, Expected)
+
+
+def _tile_memrefs_by_name(program: ir.Program) -> dict[str, ir.MemRef]:
+    """Map each tile definition in the program's first function to its MemRef."""
+    result: dict[str, ir.MemRef] = {}
+
+    class _Collector(ir.IRVisitor):
+        def visit_assign_stmt(self, stmt):  # type: ignore[override]
+            if isinstance(stmt.var.type, ir.TileType) and stmt.var.type.memref is not None:
+                result[stmt.var.name_hint] = stmt.var.type.memref
+            super().visit_assign_stmt(stmt)
+
+    _Collector().visit_stmt(next(iter(program.functions.values())).body)
+    return result
+
+
+@pytest.mark.parametrize("planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.DSA_RP])
+def test_allocate_memory_addr_keeps_symbolic_view_offset(planner):
+    """A slice view at a runtime row is placed at ``base + offset``, on every planner.
+
+    The view's offset ``row * 16 * 4`` cannot fold, so the address stays an
+    expression. It must not collapse onto the buffer base: ``c`` reshapes the slice,
+    and codegen addresses a reshape only through its own ``pto.alloc_tile addr``, so a
+    dropped offset makes ``c`` read row 0 whatever ``row`` is. The same symbolic
+    offset arises for a constant row under an ``if``, where Simplify does not
+    substitute it.
+
+    Checked on the MemRefs directly: ``assert_structural_equal`` binds a MemRef as a
+    Var and does not compare its offset.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def main(
+            self,
+            input_a: pl.Tensor[[8, 16], pl.FP32],
+            row: pl.Scalar[pl.INDEX],
+            out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+        ) -> pl.Tensor[[16, 1], pl.FP32]:
+            tile_a: pl.Tile[[8, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                input_a, [0, 0], [8, 16], target_memory=pl.Mem.Vec
+            )
+            s: pl.Tile[[1, 16], pl.FP32, pl.MemorySpace.Vec] = pl.tile.slice(tile_a, [1, 16], [row, 0])
+            c: pl.Tile[[16, 1], pl.FP32, pl.MemorySpace.Vec] = pl.tile.reshape(s, [16, 1])
+            r: pl.Tensor[[16, 1], pl.FP32] = pl.store(c, [0, 0], out)
+            return r
+
+    initialized = passes.init_mem_ref()(Before)
+    relative = _tile_memrefs_by_name(initialized)
+    with passes.PassContext([], memory_planner=planner):
+        placed = _tile_memrefs_by_name(
+            passes.allocate_memory_addr()(passes.materialize_semantic_aliases()(initialized))
+        )
+
+    base = placed["tile_a"].byte_offset_
+    assert isinstance(base, ir.ConstInt)
+    for view in ("s", "c"):
+        assert not isinstance(relative[view].byte_offset_, ir.ConstInt)
+        displacement = Analyzer().simplify(
+            ir.Sub(placed[view].byte_offset_, relative[view].byte_offset_, DataType.INDEX, ir.Span.unknown())
+        )
+        assert isinstance(displacement, ir.ConstInt), (
+            f"'{view}' lost its row offset: placed at {placed[view].byte_offset_}"
+        )
+        assert displacement.value == base.value
+
+
+@pytest.mark.parametrize("planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.DSA_RP])
+def test_allocate_memory_addr_folds_constant_scalar_view_offset(planner):
+    """A slice view whose row is a scalar bound to a constant gets a constant address.
+
+    ``r0 = 1`` stays a Var in the view's offset ``r0 * 16 * 4`` whenever Simplify
+    did not substitute it (a binding inside an ``if``, loop, or ``pl.spmd`` body).
+    The address must fold to ``base + 64`` here: a symbolic address would name ``r0``,
+    and once the body is outlined the final Simplify substitutes the constant into the
+    statements and deletes the binding without remapping MemRef offsets, leaving an
+    address that names an undefined Var.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def main(
+            self,
+            input_a: pl.Tensor[[8, 16], pl.FP32],
+            out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+        ) -> pl.Tensor[[16, 1], pl.FP32]:
+            tile_a: pl.Tile[[8, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                input_a, [0, 0], [8, 16], target_memory=pl.Mem.Vec
+            )
+            r0: pl.Scalar[pl.INDEX] = 1
+            s: pl.Tile[[1, 16], pl.FP32, pl.MemorySpace.Vec] = pl.tile.slice(tile_a, [1, 16], [r0, 0])
+            c: pl.Tile[[16, 1], pl.FP32, pl.MemorySpace.Vec] = pl.tile.reshape(s, [16, 1])
+            r: pl.Tensor[[16, 1], pl.FP32] = pl.store(c, [0, 0], out)
+            return r
+
+    initialized = passes.init_mem_ref()(Before)
+    assert not isinstance(_tile_memrefs_by_name(initialized)["c"].byte_offset_, ir.ConstInt)
+    with passes.PassContext([], memory_planner=planner):
+        placed = _tile_memrefs_by_name(
+            passes.allocate_memory_addr()(passes.materialize_semantic_aliases()(initialized))
+        )
+
+    base = placed["tile_a"].byte_offset_
+    assert isinstance(base, ir.ConstInt)
+    for view in ("s", "c"):
+        address = placed[view].byte_offset_
+        assert isinstance(address, ir.ConstInt), f"'{view}' kept a symbolic address: {address}"
+        assert address.value == base.value + 16 * 4
 
 
 def test_allocate_memory_addr_resolves_aic_reserve_buffer_in_mat_space():
