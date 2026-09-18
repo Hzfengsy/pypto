@@ -154,8 +154,15 @@ def _content_entries(
     relative: str,
     python_only: bool,
     ancestors: frozenset[Path],
+    resolved: Path | None = None,
+    via_symlink: bool = True,
 ) -> list[tuple[Any, ...]]:
-    resolved = path.resolve(strict=True)
+    # An entry that is not itself a symlink inherits its parent's resolution,
+    # so only a symlinked entry needs a full readlink walk of every component.
+    # ``via_symlink`` records which case produced ``resolved``, selecting the
+    # cheapest post-read check that still detects replacement of this entry.
+    if resolved is None:
+        resolved = path.resolve(strict=True)
     mode = resolved.stat().st_mode
     if stat.S_ISDIR(mode):
         if resolved in ancestors:
@@ -163,23 +170,40 @@ def _content_entries(
         # scandir propagates unreadable-directory errors; glob may silently
         # omit them and give a smaller, apparently valid dependency set.
         with os.scandir(path) as scan:
-            names = sorted(entry.name for entry in scan)
+            children = sorted(scan, key=lambda entry: entry.name)
+        names = [entry.name for entry in children]
         entries: list[tuple[Any, ...]] = [] if python_only else [("directory", relative, str(resolved))]
-        for name in names:
+        for entry in children:
+            name = entry.name
             if name in _IGNORED_DIRECTORIES:
                 continue
             child = path / name
             child_relative = f"{relative}/{name}" if relative else name
             # is_dir() returns False for dangling links, which must not turn
             # an unavailable source subtree into an excluded non-Python file.
-            child_mode = child.resolve(strict=True).stat().st_mode
+            # resolve(strict=True) still raises for a dangling symlink here.
+            if entry.is_symlink():
+                child_resolved = child.resolve(strict=True)
+                child_mode = child_resolved.stat().st_mode
+            else:
+                child_resolved = resolved / name
+                child_mode = entry.stat(follow_symlinks=False).st_mode
             if not (stat.S_ISDIR(child_mode) or stat.S_ISREG(child_mode)):
                 raise ValueError(f"Identity input is not a regular file or directory: {child}")
             if stat.S_ISREG(child_mode) and (
                 child.suffix in _IGNORED_SUFFIXES or (python_only and child.suffix != ".py")
             ):
                 continue
-            entries.extend(_content_entries(child, child_relative, python_only, ancestors | {resolved}))
+            entries.extend(
+                _content_entries(
+                    child,
+                    child_relative,
+                    python_only,
+                    ancestors | {resolved},
+                    child_resolved,
+                    entry.is_symlink(),
+                )
+            )
         with os.scandir(path) as scan:
             after = sorted(entry.name for entry in scan)
         if names != after or resolved != path.resolve(strict=True):
@@ -188,7 +212,15 @@ def _content_entries(
     if not stat.S_ISREG(mode):
         raise ValueError(f"Identity input is not a regular file or directory: {path}")
     size, digest = _file_digest(path)
-    if resolved != path.resolve(strict=True):
+    # An inherited resolution only has to prove that this entry did not become
+    # a symlink while its bytes were read: replacement of an ancestor component
+    # is caught by that directory's own post-read check. _file_digest already
+    # rejects a same-path regular file swapped in during the read.
+    if via_symlink:
+        replaced = resolved != path.resolve(strict=True)
+    else:
+        replaced = stat.S_ISLNK(os.lstat(path).st_mode)
+    if replaced:
         raise ValueError(f"Identity symlink changed while being read: {path}")
     return [("file", relative, str(resolved), size, digest)]
 

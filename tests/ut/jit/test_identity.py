@@ -288,6 +288,49 @@ def test_extra_source_filter_cannot_hide_unreadable_subtrees(tmp_path, monkeypat
     assert identity.failure is not None and "Cannot inspect plugins" in identity.failure
 
 
+def test_nested_entries_record_their_true_resolved_paths(tmp_path):
+    # Entries inherit their parent's resolution instead of resolving every
+    # component again; the recorded path must still be the real path.
+    actual = tmp_path / "actual"
+    (actual / "nested").mkdir(parents=True)
+    (actual / "nested/kernel.py").write_text("rows = 32\n")
+    (actual / "plain.py").write_text("rows = 16\n")
+    (actual / "linked.py").symlink_to(actual / "nested/kernel.py")
+    root = tmp_path / "link"
+    root.symlink_to(actual, target_is_directory=True)
+
+    entries = _identity._content_entries(root, "", False, frozenset())
+    recorded = {entry[1]: entry[2] for entry in entries}
+    assert recorded
+    for relative, resolved in recorded.items():
+        assert resolved == os.path.realpath(root / relative if relative else root)
+    assert recorded["linked.py"] == str((actual / "nested/kernel.py").resolve())
+
+
+def test_child_replaced_by_symlink_after_hashing_is_unavailable(tmp_path, monkeypatch):
+    # Whether _file_digest's own metadata comparison notices this swap depends
+    # on the filesystem: replacing the name changes st_nlink, but not every
+    # filesystem reports that as a ctime change. Swap after the read returns so
+    # the entry's post-read check is the only thing that can reject it.
+    source = tmp_path / "compiler.bin"
+    source.write_bytes(b"original")
+    target = tmp_path / "target.bin"
+    target.write_bytes(b"original")
+    original_file_digest = _identity._file_digest
+
+    def replace_after_reading(path):
+        result = original_file_digest(path)
+        if path == source and not source.is_symlink():
+            source.unlink()
+            source.symlink_to(target)
+        return result
+
+    monkeypatch.setattr(_identity, "_file_digest", replace_after_reading)
+    identity = fingerprint_content((ContentRoot(tmp_path),))
+    assert identity.digest is None
+    assert identity.failure is not None and "symlink changed while being read" in identity.failure
+
+
 def test_special_files_are_rejected_without_opening_them(tmp_path):
     fifo = tmp_path / "pipe"
     os.mkfifo(fifo)
