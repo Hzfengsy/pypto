@@ -1403,6 +1403,57 @@ class TestInlineFunctionsParamRebinding:
         After = passes.inline_functions()(Before)
         ir.assert_structural_equal(After, Expected)
 
+    def test_rebound_array_param_gains_no_bare_alias(self):
+        """A rebound ``pl.Array`` param keeps aliasing the caller's Var.
+
+        An Array is a handle like a tensor: ``a[i] = v`` parses as
+        ``a = pl.array.update_element(a, i, v)``, so the rebinding *is* the
+        update and the caller must see it. Binding a call-site temporary would
+        emit a bare ``vals_inline0 = vals`` alias, which orchestration codegen
+        cannot declare — an array Var comes from ``array.create`` or an alias
+        onto a backing array, never from its type, so it aborts with
+        ``GetCppType called for ArrayType``."""
+
+        @pl.jit.inline
+        def fill(vals: pl.Array[2, pl.INDEX], base: pl.Scalar[pl.INDEX]):
+            for i in pl.range(2):
+                vals[i] = base + i
+
+        @pl.jit
+        def drv(
+            x: pl.Tensor[[64], pl.FP32],
+            k: pl.Scalar[pl.INDEX],
+            o: pl.Out[pl.Tensor[[64], pl.FP32]],
+        ):
+            vals = pl.array.create(2, pl.INDEX)
+            fill(vals, k)
+            o[0:64] = pl.add(x[0:64], x[0:64])
+            return o
+
+        # An Inline function with an Array param trips the ArrayNotEscaped
+        # verifier on the *input* program. The real pipeline never sees it —
+        # InlineFunctions runs first and splices the callee away before any
+        # verification — so run the pass the same way here.
+        with core_passes.PassContext([], core_passes.VerificationLevel.NONE):
+            spliced = passes.inline_functions()(drv.specialize())
+        orch = next(f for f in spliced.functions.values() if f.func_type == ir.FunctionType.Orchestration)
+
+        class BareArrayAliasCollector(ir.IRVisitor):
+            def __init__(self):
+                super().__init__()
+                self.aliases: list[str] = []
+
+            def visit_assign_stmt(self, op):
+                if isinstance(op.value, ir.Var) and isinstance(op.value.type, ir.ArrayType):
+                    self.aliases.append(f"{op.var.name_hint} = {op.value.name_hint}")
+                super().visit_assign_stmt(op)
+
+        collector = BareArrayAliasCollector()
+        collector.visit_function(orch)
+        assert collector.aliases == [], (
+            f"InlineFunctions emitted a bare array alias codegen cannot declare: {collector.aliases}"
+        )
+
     def test_jit_inline_loop_carried_scalar_rebind_keeps_caller_arg(self):
         """End-to-end: a ``@pl.jit.inline`` scalar rebind inside a loop.
 

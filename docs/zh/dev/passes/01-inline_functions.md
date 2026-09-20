@@ -35,7 +35,7 @@ program_inlined = inline_pass(program)
 2. **环检测** Inline → Inline 调用图;若发现环,抛出 `pypto::ValueError` 并在消息中标明环路径。
 3. **迭代到不动点** — 每次迭代遍历所有函数(包括 Inline 函数本身,以便嵌套的 Inline-calls-Inline 也能传递展开):
    - 对函数体中每个顶层 `LHS = inline_call(args)` 或 `EvalStmt(inline_call(args))`:
-     - 构建参数替换映射(形参 `Var` → 实参 `Expr`)。该映射同时作用于使用点**和**定义点,因此被调函数中的重绑定 `out = pl.tensor.assemble(out, ...)` 会重绑定调用方的实参 `Var` —— 但仅限于带有原地(in-place)契约的形参(见[重绑定形参](#重绑定形参))。有三类实参会先在展开体之前绑定到新的 `<param>_inline<counter>` `Var`,再用该 `Var` 替换:被重绑定形参的非可赋值 `Var` 实参(切片 `c[r]`、`IterArg`、计算得到的标量);**不带**原地契约的被重绑定形参的实参(即既非 `pl.Out` 也非 `pl.InOut` 的按值传递标量 / `Array` / `Ptr`);以及任何计算得到的 tensor / tile 实参(如 `a[r]` 这样的 `Call`),Python 在调用点对其只求值一次。其余实参 —— 绑定到只读形参的 `Var`、标量表达式、常量 —— 仍直接替换,因此读取形参的形状表达式仍可折叠。
+     - 构建参数替换映射(形参 `Var` → 实参 `Expr`)。该映射同时作用于使用点**和**定义点,因此被调函数中的重绑定 `out = pl.tensor.assemble(out, ...)` 会重绑定调用方的实参 `Var` —— 但仅限于带有原地(in-place)契约的形参(见[重绑定形参](#重绑定形参))。有三类实参会先在展开体之前绑定到新的 `<param>_inline<counter>` `Var`,再用该 `Var` 替换:被重绑定形参的非可赋值 `Var` 实参(切片 `c[r]`、`IterArg`、计算得到的标量);被重绑定的按值传递形参的实参(即既非 `pl.Out` 也非 `pl.InOut` 的普通标量);以及任何计算得到的 tensor / tile 实参(如 `a[r]` 这样的 `Call`),Python 在调用点对其只求值一次。其余实参 —— 绑定到只读形参的 `Var`、标量表达式、常量 —— 仍直接替换,因此读取形参的形状表达式仍可折叠。
      - 对内联体中每个本地绑定的 `Var` 做 alpha 重命名(`<orig>_inline<counter>`,并去掉 `<orig>` 末尾的 `_`),避免多个调用点之间冲突。
      - 在调用点之前插入重命名+替换后的函数体语句。
      - 按调用点形态接线被内联函数的尾部返回值:`LHS = renamed_return`(单返回值赋值;当 `LHS` 与替换后的返回 `Var` 是同一个 `Var` 时省略该赋值,以避免冗余 SSA 拷贝)、逐元素替换 `TupleGetItemExpr` 而不发出 `MakeTuple` 绑定(多返回值赋值)、新的 `ReturnStmt`(`return inline_call(...)`),或者当返回值被丢弃但其求值可观测时发出新的 `EvalStmt`(`EvalStmt` 调用点 — 参见[边界情况](#边界情况))。
@@ -119,8 +119,8 @@ scope 被原样保留,稍后由 `OutlineIncoreScopes` 提取为独立的 InCore 
 | 形参 | 重绑定落在 | 原因 |
 | ---- | ---------- | ---- |
 | `pl.Out[...]` / `pl.InOut[...]` | 调用方的 `Var` | 作者显式选择了原地契约。 |
-| 任意 tensor / tile 形参 | 调用方的 `Var` | 内联被调函数的带形状形参本就是调用方句柄的原地别名 —— 这正是 `c[...] = v`(解析为 `c = pl.tensor.assemble(c, ...)`)得以写回的原因。`@pl.jit.inline` 正因如此会剥掉带形状形参上的 `pl.Out` / `pl.InOut`,所以不能仅凭方向(direction)判断。 |
-| 其余情形 —— 标量、`Array`、`Ptr` | 新的 `<param>_inline<counter>` `Var` | 按值传递,与 Python 一致。 |
+| 任意 tensor / tile / `Array` 形参 | 调用方的 `Var` | 这些形参是*句柄*,其重绑定**就是**那次原地更新:`c[...] = v` 解析为 `c = pl.tensor.assemble(c, ...)`,`a[i] = v` 解析为 `a = pl.array.update_element(a, i, v)`。`@pl.jit.inline` 正因如此会剥掉带形状形参上的 `pl.Out` / `pl.InOut`,所以不能仅凭方向(direction)判断。此处若绑定临时变量,还会产生裸的 `arr_inline0 = arr` 别名,而 orchestration codegen 无法声明它 —— array `Var` 只能来自 `array.create` 或对已有后备数组的别名,绝不能由其类型声明。 |
+| 普通标量 | 新的 `<param>_inline<counter>` `Var` | 按值传递,与 Python 一致。 |
 
 最后一行最容易出错。给定:
 
