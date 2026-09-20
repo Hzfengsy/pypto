@@ -27,6 +27,7 @@ import sysconfig
 import threading
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -514,11 +515,134 @@ def _ptoas_inputs(launcher: Path, ancestors: frozenset[Path] = frozenset()) -> s
     return paths
 
 
+def _unaccounted_checkout_state(checkout: Path) -> str:
+    """Report everything in ``checkout`` that its committed revision does not cover.
+
+    ``--ignored`` is the point: the resolver's own cleanliness check omits
+    ignored paths, so a generated file sitting in the tree leaves both the
+    revision and that check unchanged. Anything reported here -- ignored,
+    untracked or modified -- means the revision no longer describes the bytes.
+    An unusable git answer reports itself rather than passing as clean.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain", "--ignored"],
+            cwd=checkout,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"git status is unavailable: {exc}"
+    if result.returncode != 0:
+        return f"git status failed: {result.stderr.strip()[:200]}"
+    return result.stdout.strip()
+
+
+def _pto_isa_component(isa_root: Path) -> ComponentInputs:
+    """Identify the ISA checkout by the pin its own resolution already verified.
+
+    ``ensure_pto_isa_root`` returns a checkout only after proving it is clean
+    and at the pinned commit -- git objects are content-addressed, so a clean
+    tree at ``HEAD == pin`` *is* the pinned tree -- and re-clones it from the
+    pin otherwise, never checking out over a dirty tree. Reading the same
+    ~5.8k files again re-proves what that resolution established.
+
+    That resolution decides cleanliness with ``git status --porcelain``, which
+    omits paths the checkout ignores -- a build writing generated files into the
+    ISA tree would not disturb it. Re-asking with ``--ignored`` closes that gap
+    for 18ms against the 0.71s the content read costs, and covers the tracked
+    state again at the same time, so anything at all in the tree that git does
+    not account for sends this component back to its contents.
+
+    Falls back to the content inventory whenever the revision cannot be read or
+    the tree cannot be accounted for, so neither weakens anything.
+    """
+    from simpler_setup.pto_isa import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+        get_pto_isa_head,
+    )
+
+    revision = get_pto_isa_head(str(isa_root))
+    if not revision or _unaccounted_checkout_state(isa_root) != "":
+        return _component({isa_root})
+    return ComponentInputs(unavailable_reason=None, verified_revision=revision)
+
+
+def _ptoas_component(ptoas_bin: str) -> ComponentInputs:
+    """Identify the assembler by the version it reports about itself.
+
+    Unlike PTO-ISA, nothing proves this installation's bytes: ptoas is an
+    external tree selected by ``PTOAS_ROOT``, its releases carry no manifest
+    the installer checks, and the sha256 in ``toolchain/versions.env`` names
+    the downloaded wheel rather than anything reachable from the unpacked
+    tree. This identity therefore rests on a deployment property -- that ptoas
+    arrives as an unmodified published build -- and not on evidence PyPTO can
+    check. A rebuild or a patch applied in place under an unchanged version is
+    invisible here, where the full inventory would have caught it.
+
+    The probe's complete output is the identity, not the number parsed out of
+    it: the parser keeps only the numeric part, so a dev build's suffix -- the
+    one marker that separates it from the release it came from -- would
+    otherwise be discarded. check_ptoas_version already runs this probe once
+    per executable, so no extra process is started, and an assembler it
+    rejects never reaches this point.
+
+    Falls back to the content inventory whenever the probe fails.
+    """
+    from pypto.backend._ptoas_locate import check_ptoas_version  # noqa: PLC0415
+
+    try:
+        reported = check_ptoas_version(ptoas_bin).strip()
+    except RuntimeError:
+        reported = ""
+    if not reported:
+        return _component(_ptoas_inputs(Path(ptoas_bin)))
+    return ComponentInputs(unavailable_reason=None, reported_version=reported)
+
+
+_CANN_INSTALL_INFO = "ascend_toolkit_install.info"
+
+
+def _cann_install_version(cann_root: Path) -> str:
+    """Return the build the CANN installation states about itself, or "".
+
+    ``innerversion`` is preferred over ``version``: it carries the vendor's
+    build number, so two builds of one release are distinguishable, while the
+    release number alone is not. Exactly one install-info *file* must be
+    present -- several would mean this is not a single installation -- but an
+    installation reaches its own through more than one path, so candidates are
+    counted by the file they name: CANN ships `arm64-linux` as a symlink to
+    `aarch64-linux`, and both spell the same inode. The value must be
+    non-empty, or the caller reads the contents instead.
+    """
+    try:
+        found = {path.resolve(strict=True) for path in cann_root.glob(f"*/{_CANN_INSTALL_INFO}")}
+    except OSError:
+        return ""
+    if len(found) != 1:
+        return ""
+    fields: dict[str, str] = {}
+    try:
+        for line in found.pop().read_text().splitlines():
+            key, separator, value = line.partition("=")
+            if separator:
+                fields[key.strip()] = value.strip()
+    except OSError:
+        return ""
+    return fields.get("innerversion") or fields.get("version") or ""
+
+
+def _outside(paths: set[Path], install_root: Path) -> set[Path]:
+    """Return the paths an installation does not own."""
+    return {p for p in paths if p != install_root and install_root not in p.parents}
+
+
 def _discover(compiler: Any, ptoas: str, runtime_name: str) -> ToolchainInputs:
     """Collect the compiler, linker, SDK and PTO assembler inputs for cache identity."""
     if sys.platform != "linux":
         raise ValueError(f"Unsupported dependency discovery platform: {sys.platform}")
-    ptoas_paths = _ptoas_inputs(Path(ptoas))
+    ptoas_component = _ptoas_component(ptoas)
     pypto = _package("pypto")
     pypto.update(_elf_inputs(Path(sys.executable).resolve()))
     stdlib = Path(sysconfig.get_path("stdlib"))
@@ -551,6 +675,7 @@ def _discover(compiler: Any, ptoas: str, runtime_name: str) -> ToolchainInputs:
     )
     orchestration = compiler._orchestration_toolchain(runtime_name)
     device = _gcc_inputs(_executable(orchestration.cxx_path))
+    cann_root: Path | None = None
     if compiler.platform.endswith("sim"):
         device.update(_gcc_inputs(_executable(compiler.sdk.gxx15.cxx_path)))
     else:
@@ -562,14 +687,33 @@ def _discover(compiler: Any, ptoas: str, runtime_name: str) -> ToolchainInputs:
         if ccec.parent.name != "bin" or ccec.parent.parent.name != "bisheng_compiler":
             raise ValueError(f"Unsupported CCEC installation layout: {ccec}")
         device.add(ccec.parent.parent)
+        # <cann>/tools/bisheng_compiler/bin/ccec -- the layout checked above
+        # fixes the first two levels, so require the third before trusting it
+        # to name the installation whose stated build covers these files.
+        if ccec.parent.parent.parent.name == "tools":
+            cann_root = ccec.parents[3]
         for core_type in ("aiv", "aic"):
             flags = [
                 flag for flag in compiler.sdk.ccec.get_compile_flags(core_type=core_type) if flag != "-c"
             ]
             output = _run([str(ccec), *flags, "-E", "-v", os.devnull])
             device.update(_include_roots(output, ccec))
+    # The device compiler runs on the host, so its inputs come from two
+    # sources: the CANN installation, which states its own build, and files the
+    # host OS provides, which state nothing. Cover each with the evidence it
+    # actually has rather than letting one version speak for both. Without a
+    # usable CANN version every input is read, as before.
+    cann_version = _cann_install_version(cann_root) if cann_root is not None else ""
+    if cann_root is not None and cann_version:
+        device_component = replace(_component(_outside(device, cann_root)), reported_version=cann_version)
+    else:
+        device_component = _component(device)
     return ToolchainInputs(
-        _component(pypto), _component(runtime), _component({isa}), _component(ptoas_paths), _component(device)
+        _component(pypto),
+        _component(runtime),
+        _pto_isa_component(isa),
+        ptoas_component,
+        device_component,
     )
 
 
