@@ -35,7 +35,7 @@ program_inlined = inline_pass(program)
 2. **Cycle-detect** the Inline → Inline call graph; raise `pypto::ValueError` naming the cycle if one is found.
 3. **Iterate to fixpoint** — each iteration walks every function (including the Inline ones, so that nested Inline-calls-Inline expands transitively):
    - For every top-level `LHS = inline_call(args)` or `EvalStmt(inline_call(args))` in a function body:
-     - Build the param-substitution map (formal `Var` → actual `Expr`). The map applies at use-sites **and** def-sites, so a callee rebinding `out = pl.tensor.assemble(out, ...)` rebinds the caller's actual `Var`. Two kinds of actual arg are instead bound to a fresh `<param>_inline<counter>` `Var` ahead of the spliced body, and that `Var` is substituted: the arg of a rebound param that is not an assignable `Var` (a slice `c[r]`, an `IterArg`, a computed scalar), and any computed tensor / tile arg (a `Call` such as `a[r]`), which Python evaluates once at the call site. Other args — `Var`s, scalar expressions, constants — are substituted directly, so shape expressions that read a param still fold.
+     - Build the param-substitution map (formal `Var` → actual `Expr`). The map applies at use-sites **and** def-sites, so a callee rebinding `out = pl.tensor.assemble(out, ...)` rebinds the caller's actual `Var` — but only for a param that carries an in-place contract (see [Rebinding a parameter](#rebinding-a-parameter)). Three kinds of actual arg are instead bound to a fresh `<param>_inline<counter>` `Var` ahead of the spliced body, and that `Var` is substituted: the arg of a rebound param that is not an assignable `Var` (a slice `c[r]`, an `IterArg`, a computed scalar); the arg of a rebound param that carries **no** in-place contract (a pass-by-value scalar / `Array` / `Ptr` that is neither `pl.Out` nor `pl.InOut`); and any computed tensor / tile arg (a `Call` such as `a[r]`), which Python evaluates once at the call site. Other args — `Var`s bound to read-only params, scalar expressions, constants — are substituted directly, so shape expressions that read a param still fold.
      - Alpha-rename every locally-bound `Var` in the inlined body to a fresh name (`<orig>_inline<counter>`, with any trailing `_` trimmed off `<orig>`) to avoid collisions across multiple call sites.
      - Splice the renamed-and-substituted body's statements before the call site.
      - Wire up the callee's trailing return value according to the call-site form: `LHS = renamed_return` (single-return assign; omitted when `LHS` resolves to the same `Var` as the substituted value, to avoid a redundant SSA copy), per-element `TupleGetItemExpr` substitution instead of a `MakeTuple` binding (multi-return assign), a fresh `ReturnStmt` (`return inline_call(...)`), or a fresh `EvalStmt` when the value is discarded but its evaluation is observable (`EvalStmt` call site — see [Edge cases](#edge-cases)).
@@ -112,6 +112,41 @@ def main(self, a, b):
 
 The scope is preserved verbatim and gets outlined by `OutlineIncoreScopes` later in the pipeline, exactly as if it had been written at the call site.
 
+## Rebinding a parameter
+
+Because substitution reaches def-sites, a callee that rebinds one of its own parameters could land that rebinding on the caller's `Var`. Whether it *should* depends on the parameter's calling convention:
+
+| Parameter | Rebinding lands on | Why |
+| --------- | ------------------ | --- |
+| `pl.Out[...]` / `pl.InOut[...]` | the caller's `Var` | The author opted into the in-place contract explicitly. |
+| Any tensor / tile param | the caller's `Var` | An inline callee's shaped params are in-place aliases of the caller's handles — that is what lets `c[...] = v` (parsed as `c = pl.tensor.assemble(c, ...)`) write through. `@pl.jit.inline` strips `pl.Out` / `pl.InOut` from shaped params for exactly this reason, so direction alone cannot be the test. |
+| Everything else — scalar, `Array`, `Ptr` | a fresh `<param>_inline<counter>` `Var` | Pass-by-value, as in Python. |
+
+The last row is the one that is easy to get wrong. Given:
+
+```python
+@pl.function(type=pl.FunctionType.Inline)
+def bump(self, n: pl.Scalar[pl.INDEX]) -> pl.Scalar[pl.INDEX]:
+    n = n + 1
+    return n
+
+@pl.function
+def main(self, k: pl.Scalar[pl.INDEX]) -> pl.Scalar[pl.INDEX]:
+    m: pl.Scalar[pl.INDEX] = self.bump(k)
+    return k + m                              # k + (k + 1)
+```
+
+the call site binds a temporary first, so the caller's `k` stays readable afterwards:
+
+```python
+n_inline0: pl.Scalar[pl.INDEX] = k
+n_inline0 = n_inline0 + 1
+m: pl.Scalar[pl.INDEX] = n_inline0
+s: pl.Scalar[pl.INDEX] = k + m                # the ORIGINAL k
+```
+
+Substituting `k` at the def-site instead would splice `k = k + 1` into the caller and silently compute `2k + 2`. Note that the JIT specializer's alpha-rename does **not** cover this: it renames a rebinding only at the scope depth where the name was first bound, so a rebind inside `pl.range` / `pl.spmd` reaches this pass as a genuine def-site of the param.
+
 ## Edge cases
 
 | Case | Behaviour |
@@ -120,6 +155,7 @@ The scope is preserved verbatim and gets outlined by `OutlineIncoreScopes` later
 | Inline function as program entry | Not detected as an error here — but no Call to it exists, so it is removed in the cleanup phase like any other no-caller function. |
 | Inline calls Inline (transitive) | Iteratively expanded to fixpoint. |
 | Computed tensor / tile arg, e.g. `f(a[r], c[r])` where the callee reads `x` and writes `c[0:4, j] = v` | Each arg is bound once at the call site — `x_inline0 = a[r]`, `c_inline1 = c[r]`, then `c_inline1 = pl.tensor.assemble(c_inline1, v, ...)` — the IR the parser emits when the caller names the slices itself. Substituting `c[r]` would put a `Call` on the LHS of the rebinding; substituting `a[r]` would re-evaluate it inside the callee's `pl.spmd` / `pl.pipeline` bodies and move it into the outlined kernel. Each slice is a view of its source, so the write reaches the caller's `c`. |
+| Rebound pass-by-value param, e.g. an inline callee doing `n = n + 1` on a scalar param | The arg is bound once at the call site (`n_inline0 = k`) and the rebinding stays on that temporary, so the caller's `k` is unchanged afterwards. See [Rebinding a parameter](#rebinding-a-parameter). |
 | Recursive Inline (self or mutual) | `pypto::ValueError` raised before any splicing, with the cycle named (`a -> b -> a`). |
 | Multi-return inline | No `LHS = MakeTuple([rets...])` is emitted — orchestration codegen cannot lower `MakeTuple`. The cloned return values are recorded against the LHS `Var` and downstream `TupleGetItemExpr(LHS, i)` uses are rewritten to value `i`, leaving the LHS binding unreferenced (see `SpliceInlineCallAsTupleSub`). |
 | Nested call to Inline (e.g. `pl.add(inline_fn(x), y)`, or the `array.update_element(arr, i, inline_fn(x))` the parser desugars `arr[i] = inline_fn(x)` into) | Hoisted onto an `AssignStmt` of its own, then spliced in the same iteration — see [Nested call sites](#nested-call-sites). |
