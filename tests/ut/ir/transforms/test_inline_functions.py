@@ -1329,6 +1329,178 @@ class TestInlineFunctionsParamRebinding:
         After = passes.inline_functions()(Before)
         ir.assert_structural_equal(After, Expected)
 
+    def test_rebound_scalar_param_does_not_clobber_caller_arg(self):
+        """A rebound pass-by-value scalar param binds a call-site temporary.
+
+        ``n`` is an ``In`` scalar — Python pass-by-value, no in-place contract.
+        Substituting the caller's ``k`` at the *def*-site would splice
+        ``k = k + 1`` into the caller, so the later ``k + m`` would read the
+        bumped value and compute ``2k + 2`` instead of ``2k + 1``."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def bump(self, n: pl.Scalar[pl.INDEX]) -> pl.Scalar[pl.INDEX]:
+                n = n + 1
+                return n
+
+            @pl.function
+            def main(self, k: pl.Scalar[pl.INDEX]) -> pl.Scalar[pl.INDEX]:
+                m: pl.Scalar[pl.INDEX] = self.bump(k)
+                s: pl.Scalar[pl.INDEX] = k + m
+                return s
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, k: pl.Scalar[pl.INDEX]) -> pl.Scalar[pl.INDEX]:
+                n_inline0: pl.Scalar[pl.INDEX] = k  # call-site temporary
+                n_inline0 = n_inline0 + 1  # rebinding stays callee-local
+                m: pl.Scalar[pl.INDEX] = n_inline0
+                s: pl.Scalar[pl.INDEX] = k + m  # reads the ORIGINAL k
+                return s
+
+        After = passes.inline_functions()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_rebound_tensor_param_still_aliases_caller_arg(self):
+        """A rebound tensor param keeps aliasing the caller's Var.
+
+        Guards the counterpart of the test above: an inline callee's shaped
+        params *are* in-place aliases of the caller's handles — that is what
+        lets ``c[...] = v`` write through — so ``@pl.jit.inline`` strips
+        ``pl.Out`` from them. Direction alone therefore cannot decide, and a
+        tensor param must not gain a call-site temporary."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def fill(self, x: pl.Tensor[[4], pl.FP32], c: pl.Tensor[[4], pl.FP32]) -> pl.Tensor[[4], pl.FP32]:
+                c = pl.tensor.assemble(c, x, [0])
+                return c
+
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[4], pl.FP32],
+                ext: pl.Out[pl.Tensor[[4], pl.FP32]],
+            ) -> pl.Tensor[[4], pl.FP32]:
+                v: pl.Tensor[[4], pl.FP32] = self.fill(a, ext)
+                return v
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[4], pl.FP32],
+                ext: pl.Out[pl.Tensor[[4], pl.FP32]],
+            ) -> pl.Tensor[[4], pl.FP32]:
+                ext = pl.tensor.assemble(ext, a, [0])  # no temporary: writes through
+                v: pl.Tensor[[4], pl.FP32] = ext
+                return v
+
+        After = passes.inline_functions()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_rebound_array_param_gains_no_bare_alias(self):
+        """A rebound ``pl.Array`` param keeps aliasing the caller's Var.
+
+        An Array is a handle like a tensor: ``a[i] = v`` parses as
+        ``a = pl.array.update_element(a, i, v)``, so the rebinding *is* the
+        update and the caller must see it. Binding a call-site temporary would
+        emit a bare ``vals_inline0 = vals`` alias, which orchestration codegen
+        cannot declare — an array Var comes from ``array.create`` or an alias
+        onto a backing array, never from its type, so it aborts with
+        ``GetCppType called for ArrayType``."""
+
+        @pl.jit.inline
+        def fill(vals: pl.Array[2, pl.INDEX], base: pl.Scalar[pl.INDEX]):
+            for i in pl.range(2):
+                vals[i] = base + i
+
+        @pl.jit
+        def drv(
+            x: pl.Tensor[[64], pl.FP32],
+            k: pl.Scalar[pl.INDEX],
+            o: pl.Out[pl.Tensor[[64], pl.FP32]],
+        ):
+            vals = pl.array.create(2, pl.INDEX)
+            fill(vals, k)
+            o[0:64] = pl.add(x[0:64], x[0:64])
+            return o
+
+        # An Inline function with an Array param trips the ArrayNotEscaped
+        # verifier on the *input* program. The real pipeline never sees it —
+        # InlineFunctions runs first and splices the callee away before any
+        # verification — so run the pass the same way here.
+        with core_passes.PassContext([], core_passes.VerificationLevel.NONE):
+            spliced = passes.inline_functions()(drv.specialize())
+        orch = next(f for f in spliced.functions.values() if f.func_type == ir.FunctionType.Orchestration)
+
+        class BareArrayAliasCollector(ir.IRVisitor):
+            def __init__(self):
+                super().__init__()
+                self.aliases: list[str] = []
+
+            def visit_assign_stmt(self, op):
+                if isinstance(op.value, ir.Var) and isinstance(op.value.type, ir.ArrayType):
+                    self.aliases.append(f"{op.var.name_hint} = {op.value.name_hint}")
+                super().visit_assign_stmt(op)
+
+        collector = BareArrayAliasCollector()
+        collector.visit_function(orch)
+        assert collector.aliases == [], (
+            f"InlineFunctions emitted a bare array alias codegen cannot declare: {collector.aliases}"
+        )
+
+    def test_jit_inline_loop_carried_scalar_rebind_keeps_caller_arg(self):
+        """End-to-end: a ``@pl.jit.inline`` scalar rebind inside a loop.
+
+        The JIT specializer alpha-renames a rebinding only at the scope depth
+        where the name was first bound, so a rebind inside ``pl.range`` reaches
+        InlineFunctions as a genuine def-site of the param. The loop carry must
+        run over a call-site temporary, leaving the caller's ``k`` readable
+        afterwards (``s == k + (k + 6)``, not ``(k + 6) * 2``)."""
+
+        @pl.jit.inline
+        def acc(n: pl.Scalar[pl.INDEX]) -> pl.Scalar[pl.INDEX]:
+            for i in pl.range(4):
+                n = n + i
+            return n
+
+        @pl.jit
+        def drv(
+            a: pl.Tensor[[256], pl.FP32],
+            k: pl.Scalar[pl.INDEX],
+            out: pl.Out[pl.Tensor[[64], pl.FP32]],
+        ):
+            m = acc(k)
+            s = k + m
+            out[0:64] = pl.add(a[s : s + 64], a[s : s + 64])
+            return out
+
+        spliced = passes.inline_functions()(drv.specialize())
+        orch = next(f for f in spliced.functions.values() if f.func_type == ir.FunctionType.Orchestration)
+        caller_k = orch.params[1]
+
+        # The loop must rebind a temporary, never the caller's `k` param.
+        class LoopCarryCollector(ir.IRVisitor):
+            def __init__(self):
+                super().__init__()
+                self.rebound: list[ir.Var] = []
+
+            def visit_assign_stmt(self, op):
+                self.rebound.append(op.var)
+                super().visit_assign_stmt(op)
+
+        collector = LoopCarryCollector()
+        collector.visit_function(orch)
+        rebound_ids = {v.unique_id for v in collector.rebound}
+        assert caller_k.unique_id not in rebound_ids, (
+            "InlineFunctions spliced the callee's rebinding onto the caller's `k`"
+        )
+
     def test_jit_subscript_write_through_sliced_arg_lowers(self):
         """End-to-end repro: a ``@pl.jit.inline`` helper writing ``c[...] = v``
         into a tensor param, called with ``c[r]``, lowers through the default
