@@ -33,6 +33,7 @@ from pypto.jit.decorator import (
     _extract_call_args_for_dep,
     _extract_local_tensor_metas,
     _extract_tensor_meta,
+    _param_dtypes,
     _resolve_dep_call_metadata,
     _rewrite_jit_error,
     _scan_dep_io,
@@ -66,13 +67,62 @@ class TestJitDecoration:
 
         assert my_kernel.__name__ == "my_kernel"
 
-    def test_torch_fp4_x2_shape_becomes_logical_ir_shape(self):
+    def test_torch_fp32_without_expected_dtype_does_not_crash(self):
+        """Unannotated FP32 must not hit DataType.__eq__(None) via ``in``."""
+        torch = pytest.importorskip("torch")
+        t = torch.empty((4, 8), dtype=torch.float32)
+        meta = _extract_tensor_meta(t)
+        assert meta.dtype == DataType.FP32
+        assert meta.static_shape() == (4, 8)
+
+    def test_torch_index_annotation_accepts_int64_abi(self):
+        """pl.INDEX is semantic; torch carries it as int64 — do not strict-mismatch."""
+        torch = pytest.importorskip("torch")
+        t = torch.empty((4,), dtype=torch.int64)
+        # Even if a caller passes INDEX as expected_dtype, keep torch→INT64 ABI.
+        meta = _extract_tensor_meta(t, expected_dtype=DataType.INDEX)
+        assert meta.dtype == DataType.INT64
+        assert meta.static_shape() == (4,)
+
+    def test_param_dtypes_only_records_fp4_family(self):
+        """_param_dtypes is FP4 dual-path only; INDEX/FP32 annotations are omitted."""
+
+        def kernel(
+            idx: pl.Tensor[[4], pl.INDEX],
+            x: pl.Tensor[[8, 16], pl.FP32],
+            packed: pl.Tensor[[8, 16], pl.FP4E2M1X2],
+            logical: pl.Tensor[[8, 32], pl.FP4],
+        ):
+            return idx, x, packed, logical
+
+        assert _param_dtypes(kernel) == {
+            "packed": DataType.FP4E2M1X2,
+            "logical": DataType.FP4,
+        }
+
+    def test_torch_fp4_x2_default_keeps_carrier_shape(self):
+        """Bare / packed annotation: torch float4 stays FP4E2M1X2 carrier extents."""
         torch = pytest.importorskip("torch")
         fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
         if fp4_dtype is None:
             pytest.skip("torch.float4_e2m1fn_x2 required")
         packed = torch.empty((128, 32), dtype=fp4_dtype)
         meta = _extract_tensor_meta(packed)
+        assert meta.dtype == DataType.FP4E2M1X2
+        assert meta.static_shape() == (128, 32)
+
+        meta_x2 = _extract_tensor_meta(packed, expected_dtype=DataType.FP4E2M1X2)
+        assert meta_x2.dtype == DataType.FP4E2M1X2
+        assert meta_x2.static_shape() == (128, 32)
+
+    def test_torch_fp4_x2_with_logical_fp4_annotation_expands(self):
+        """pl.FP4 annotation restores legacy carrier→nibble expand at the API boundary."""
+        torch = pytest.importorskip("torch")
+        fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+        if fp4_dtype is None:
+            pytest.skip("torch.float4_e2m1fn_x2 required")
+        packed = torch.empty((128, 32), dtype=fp4_dtype)
+        meta = _extract_tensor_meta(packed, expected_dtype=DataType.FP4)
         assert meta.dtype == DataType.FP4
         assert meta.static_shape() == (128, 64)
 
