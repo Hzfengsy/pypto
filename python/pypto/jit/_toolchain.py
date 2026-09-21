@@ -48,8 +48,23 @@ _LDD_WORKERS = 32
 _identities: dict[tuple[Any, ...], ToolchainIdentity] = {}
 
 
+# Every probe below reads its answer out of a tool's diagnostic output, and
+# those strings are translated: on a non-English host gcc prints its own
+# rendering of "#include <...> search starts here:", which no marker here
+# matches. Pin the C locale for the probes rather than teach every parser
+# every translation.
+_C_LOCALE = {"LC_ALL": "C", "LANG": "C", "LANGUAGE": ""}
+
+
 def _run(command: list[str]) -> str:
-    result = subprocess.run(command, capture_output=True, text=True, timeout=30, check=True)
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+        env={**os.environ, **_C_LOCALE},
+    )
     return result.stdout + result.stderr
 
 
@@ -64,12 +79,38 @@ def _executable(name: str) -> Path:
     return path
 
 
+def _invocable(name: str) -> Path:
+    """Return the compiler as the build invokes it, without resolving it.
+
+    A compiler on PATH may be a wrapper that dispatches on argv[0]: ccache
+    installs a directory of symlinks, one per compiler name, every one of them
+    pointing at the single ccache binary, and decides which compiler to run
+    from the name it was called by. Resolving that symlink first discards the
+    name, and the wrapper then answers ``-print-prog-name`` about *itself* --
+    ccache rejects the option outright -- so discovery fails on a host whose
+    PATH puts those shims first, which is the ordinary state of a build
+    machine. Invoking the path the build invokes keeps the dispatch intact and
+    reaches the real compiler underneath.
+
+    The file behind the name still has to be an ELF image; a wrapper written
+    as a shell script needs its own dependency adapter, exactly as before.
+    """
+    selected = shutil.which(name)
+    if selected is None:
+        raise ValueError(f"Compiler executable is unavailable: {name}")
+    path = Path(selected)
+    with path.open("rb") as stream:
+        if stream.read(4) != b"\x7fELF":
+            raise ValueError(f"Unsupported compiler launcher (requires dependency adapter): {selected}")
+    return path
+
+
 def _elf_inputs(path: Path, library_path: str | None = None) -> set[Path]:
     """ldd reports the loader's transitive resolution, including the interpreter."""
     with path.open("rb") as stream:
         if stream.read(4) != b"\x7fELF":
             raise ValueError(f"Expected an ELF installation input: {path}")
-    environment = dict(os.environ)
+    environment = {**os.environ, **_C_LOCALE}
     if library_path is not None:
         environment["LD_LIBRARY_PATH"] = library_path
     result = subprocess.run(
@@ -137,20 +178,42 @@ def _component(paths: set[Path]) -> ComponentInputs:
 
 
 def _package(name: str) -> set[Path]:
+    """Inventory every tree a package actually loads from.
+
+    An editable install splits one package across two: scikit-build-core maps
+    the Python sources to the checkout and leaves the built extensions as real
+    files under ``site-packages/<name>``, which is the layout the documented
+    ``pip install -e`` workflow produces. Refusing that split does not make the
+    identity safer -- it makes the whole toolchain unavailable, and with it the
+    persistent cache -- so a submodule loading from outside the first tree adds
+    *its* tree instead.
+
+    A redirect is only accepted when it still lands inside a directory named
+    for the package: that is the build system placing the package's own files,
+    and every later import from it is covered because the whole directory is
+    inventoried. A redirect anywhere else is still refused, because nothing
+    bounds what it would drag in.
+    """
     module = importlib.import_module(name)
     filename = getattr(module, "__file__", None)
     if filename is None:
         raise ValueError(f"Compiler module has no inspectable installation: {name}")
-    root = Path(filename).resolve().parent
-    paths = {root}
+    roots = {Path(filename).resolve().parent}
     for imported_name, imported in tuple(sys.modules.items()):
         if imported_name == name or imported_name.startswith(f"{name}."):
             origin = getattr(imported, "__file__", None)
-            if origin is not None:
-                selected = Path(origin).resolve(strict=True)
-                if root not in selected.parents:
-                    raise ValueError(f"Compiler package uses an external import redirect: {imported_name}")
-    paths.update(_elf_inputs_many(root.rglob("*.so")))
+            if origin is None:
+                continue
+            selected = Path(origin).resolve(strict=True)
+            if any(root == selected.parent or root in selected.parents for root in roots):
+                continue
+            anchor = next((parent for parent in selected.parents if parent.name == name), None)
+            if anchor is None:
+                raise ValueError(f"Compiler package uses an external import redirect: {imported_name}")
+            roots.add(anchor)
+    paths = set(roots)
+    for root in roots:
+        paths.update(_elf_inputs_many(root.rglob("*.so")))
     return paths
 
 
@@ -160,6 +223,100 @@ def _include_roots(output: str, executable: Path) -> set[Path]:
     except IndexError as exc:
         raise ValueError(f"Cannot discover implicit C++ include roots: {executable}") from exc
     return {Path(line.strip()).resolve(strict=True) for line in includes.splitlines() if line.strip()}
+
+
+# ccache is the wrapper this project actually meets. Its manual names the
+# settings that decide which compiler runs, and each has an environment
+# override; those overrides therefore select a tool exactly as PATH does, and
+# belong in the discovery key beside it. A wrapper absent from this table has
+# selection inputs nobody has enumerated here, so an identity taken through it
+# would not move when the compiler it picks does -- discovery refuses instead.
+# Settings that only govern the wrapper's own cache validity, such as
+# CCACHE_COMPILERCHECK, do not change which compiler runs and are not listed.
+_WRAPPER_SELECTION: dict[str, tuple[str, ...]] = {
+    "ccache": (
+        "CCACHE_CC",  # deprecated alias of CCACHE_COMPILER
+        "CCACHE_COMPILER",  # forces the compiler outright
+        "CCACHE_CONFIGPATH",  # selects the config file that may set it
+        "CCACHE_DISABLE",  # takes ccache out of the chain
+        "CCACHE_NODISABLE",
+        "CCACHE_PREFIX",  # inserts another program, e.g. distcc
+        "CCACHE_PREFIX_CPP",
+    ),
+}
+# The discovery key reads these by name; a test fails if the table ever grows
+# a variable that key does not read.
+_WRAPPER_VARIABLES = tuple(sorted({name for names in _WRAPPER_SELECTION.values() for name in names}))
+
+
+# Settings that send compilation somewhere this inventory does not follow: a
+# different compiler, a different place to look for it, or another program
+# spliced into the chain. Read from the wrapper itself rather than from the
+# environment, so a value set in a config file counts the same as one exported.
+_WRAPPER_REDIRECTS = ("compiler", "path", "prefix_command", "prefix_command_cpp")
+
+
+def _wrapper_redirects(wrapper: Path) -> list[str]:
+    """Report every configured redirect of a wrapper, with where it came from.
+
+    A prefix is the case the rest of this module cannot see: it applies to
+    compilation, not preprocessing, so the -E probe never runs it and the
+    driver that probe reports is unchanged. Two hosts differing only in
+    prefix_command would otherwise agree on an identity and share each other's
+    artifacts.
+    """
+    try:
+        output = _run([str(wrapper), "--show-config"])
+    except (OSError, subprocess.SubprocessError) as exc:
+        return [f"its configuration could not be read ({exc})"]
+    redirects = []
+    for line in output.splitlines():
+        origin, marker, setting = line.partition(") ")
+        key, separator, value = setting.partition(" = ")
+        if marker and separator and key.strip() in _WRAPPER_REDIRECTS and value.strip():
+            redirects.append(f"{key.strip()}={value.strip()} from {origin.strip()})")
+    return redirects
+
+
+def _driver_executed(output: str, executable: Path) -> Path:
+    """Return the compiler driver the invocation actually ran.
+
+    Invoking through a wrapper reaches a different binary: ccache's shim execs
+    /usr/bin/g++, and it is that driver's specs, subprograms and built-ins that
+    decide the compilation -- the wrapper contributes none of them. Inventorying
+    only the path invoked would leave the real compiler out, so replacing it
+    between two runs would not move the fingerprint and a stale artifact could
+    be reused.
+
+    GCC reports the driver it ran as COLLECT_GCC in its verbose output, which is
+    the outcome of whatever selection the wrapper performed -- stronger evidence
+    than the wrapper's configuration, because a configuration change that picks
+    a different compiler changes this value. Without it the real compiler cannot
+    be identified at all, so refuse rather than guess: an unusable identity
+    leaves the cache off, which is the safe direction.
+    """
+    driver = None
+    for line in output.splitlines():
+        if line.startswith("COLLECT_GCC="):
+            driver = Path(line.partition("=")[2].strip()).resolve(strict=True)
+            break
+    if driver is None:
+        raise ValueError(f"Cannot identify the compiler driver actually executed: {executable}")
+    invoked = executable.resolve(strict=True)
+    if driver != invoked:
+        # COLLECT_GCC naming a different file is the signal that something
+        # mediated the choice of compiler.
+        if invoked.name not in _WRAPPER_SELECTION:
+            raise ValueError(
+                f"Compiler wrapper with untracked selection inputs: {invoked.name} at {executable}"
+            )
+        redirects = _wrapper_redirects(invoked)
+        if redirects:
+            raise ValueError(
+                f"Compiler wrapper redirects compilation beyond this inventory: "
+                f"{invoked.name} has {', '.join(redirects)}"
+            )
+    return driver
 
 
 def _gcc_inputs(executable: Path) -> set[Path]:
@@ -173,6 +330,7 @@ def _gcc_inputs(executable: Path) -> set[Path]:
     paths.add(libgcc.parent)  # GCC specs, plugins, startup objects, resources.
     output = _run([str(executable), "-E", "-x", "c++", "-v", os.devnull])
     paths.update(_include_roots(output, executable))
+    paths.update(_elf_inputs(_driver_executed(output, executable)))
     paths.update(_gcc_link_inputs(executable))
     return paths
 
@@ -309,6 +467,13 @@ if __name__ == '__main__':
         sys.argv[0] = sys.argv[0][:-11]
     elif sys.argv[0].endswith('.exe'):
         sys.argv[0] = sys.argv[0][:-4]
+    sys.exit(main())
+""",
+    # pip 26 onwards. Same shim, expressed with str.removesuffix.
+    """import sys
+from ptoas._cli import main
+if __name__ == '__main__':
+    sys.argv[0] = sys.argv[0].removesuffix('.exe')
     sys.exit(main())
 """,
 )
@@ -483,7 +648,7 @@ def _ptoas_inputs(launcher: Path, ancestors: frozenset[Path] = frozenset()) -> s
     library_path = str(root / "lib") + os.pathsep + os.environ.get("LD_LIBRARY_PATH", "")
     # Query interpreter resources without loading PTOAS or running a compiler.
     # Match the launcher's PYTHONHOME removal and library search environment.
-    environment = dict(os.environ)
+    environment = {**os.environ, **_C_LOCALE}
     environment.pop("PYTHONHOME", None)
     environment["LD_LIBRARY_PATH"] = library_path
     probe = subprocess.run(
@@ -674,10 +839,10 @@ def _discover(compiler: Any, ptoas: str, runtime_name: str) -> ToolchainInputs:
         if Path(p).exists()
     )
     orchestration = compiler._orchestration_toolchain(runtime_name)
-    device = _gcc_inputs(_executable(orchestration.cxx_path))
+    device = _gcc_inputs(_invocable(orchestration.cxx_path))
     cann_root: Path | None = None
     if compiler.platform.endswith("sim"):
-        device.update(_gcc_inputs(_executable(compiler.sdk.gxx15.cxx_path)))
+        device.update(_gcc_inputs(_invocable(compiler.sdk.gxx15.cxx_path)))
     else:
         ccec = _executable(compiler.sdk.ccec.cxx_path)
         device.update(_elf_inputs(ccec))
@@ -769,6 +934,18 @@ def capture_toolchain(platform: str, runtime_name: str) -> ToolchainIdentity:
             os.environ.get("PYTHONNOUSERSITE"),
             os.environ.get("PYTHONSAFEPATH"),
             os.environ.get("PYTHONOPTIMIZE"),
+            # A wrapper's selection overrides pick a compiler exactly as PATH
+            # does, so a change to one has to re-run discovery rather than
+            # reuse the identity of the compiler previously chosen. Read by
+            # name rather than by iterating the table, so each one is a
+            # classified environment input and not an opaque dynamic read.
+            os.environ.get("CCACHE_CC"),
+            os.environ.get("CCACHE_COMPILER"),
+            os.environ.get("CCACHE_CONFIGPATH"),
+            os.environ.get("CCACHE_DISABLE"),
+            os.environ.get("CCACHE_NODISABLE"),
+            os.environ.get("CCACHE_PREFIX"),
+            os.environ.get("CCACHE_PREFIX_CPP"),
         )
         with _discovery_lock:
             identity = _identities.get(selected)

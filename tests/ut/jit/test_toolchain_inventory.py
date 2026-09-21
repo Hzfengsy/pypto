@@ -9,6 +9,7 @@
 
 """Dependency inventories fail closed and hash compiler resource contents."""
 
+import inspect
 import json
 import os
 import subprocess
@@ -17,7 +18,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from pypto._identity import fingerprint_content
+from pypto._identity import (
+    ComponentInputs,
+    InstallationIdentityCache,
+    ToolchainInputs,
+    fingerprint_content,
+)
 from pypto.jit import _toolchain
 
 
@@ -255,6 +261,318 @@ def test_outside_keeps_only_what_the_installation_does_not_own(tmp_path):
     assert _toolchain._outside(paths, install) == {outside, tmp_path / "usr/lib64/libc.so.6"}
 
 
+def _split_package(tmp_path, name="splitpkg", stray=None):
+    """An editable install: sources in a checkout, built extension elsewhere."""
+    checkout = tmp_path / "checkout" / name
+    installed = tmp_path / "site-packages" / name
+    checkout.mkdir(parents=True)
+    installed.mkdir(parents=True)
+    (checkout / "__init__.py").write_text("sources = 1\n")
+    (installed / "built.py").write_text("extension = 1\n")
+    modules = {name: checkout / "__init__.py", f"{name}.built": installed / "built.py"}
+    if stray is not None:
+        stray.write_text("elsewhere = 1\n")
+        modules[f"{name}.stray"] = stray
+    return checkout, installed, modules
+
+
+def _install_modules(monkeypatch, modules):
+    for module_name, origin in modules.items():
+        monkeypatch.setitem(sys.modules, module_name, SimpleNamespace(__file__=str(origin)))
+    monkeypatch.setattr(_toolchain.importlib, "import_module", lambda n: sys.modules[n], raising=False)
+
+
+def test_package_inventories_both_trees_of_an_editable_install(tmp_path, monkeypatch):
+    # scikit-build-core maps sources to the checkout and leaves the built
+    # extension under site-packages; refusing that split made the whole
+    # toolchain unavailable and silently disabled the persistent cache.
+    checkout, installed, modules = _split_package(tmp_path)
+    _install_modules(monkeypatch, modules)
+
+    paths = _toolchain._package("splitpkg")
+
+    assert paths == {checkout, installed}
+
+
+def test_the_second_tree_is_covered_not_merely_listed(tmp_path, monkeypatch):
+    checkout, installed, modules = _split_package(tmp_path)
+    _install_modules(monkeypatch, modules)
+    component = _toolchain._component(_toolchain._package("splitpkg"))
+
+    before = fingerprint_content(component.roots)
+    (installed / "built.py").write_text("extension = 2\n")
+
+    assert fingerprint_content(component.roots).digest != before.digest
+
+
+def test_the_second_trees_native_dependencies_are_resolved(tmp_path, monkeypatch):
+    # In an editable install the checkout holds no extension at all -- the
+    # built .so lives in the second tree, so that is where its shared-library
+    # closure has to be discovered.
+    checkout, installed, modules = _split_package(tmp_path)
+    native = installed / "built.so"
+    native.write_bytes(b"\x7fELF")
+    dependency = tmp_path / "libbuilt.so.1"
+    dependency.write_bytes(b"\x7fELF")
+    _install_modules(monkeypatch, modules)
+    monkeypatch.setattr(_toolchain, "_elf_inputs", lambda p, *rest: {p, dependency} if p == native else {p})
+
+    assert dependency in _toolchain._package("splitpkg")
+
+
+def test_a_redirect_outside_the_package_is_still_refused(tmp_path, monkeypatch):
+    # Nothing bounds what an arbitrary redirect would drag in, so only a tree
+    # named for the package is accepted.
+    _, _, modules = _split_package(tmp_path, stray=tmp_path / "elsewhere.py")
+    _install_modules(monkeypatch, modules)
+
+    with pytest.raises(ValueError, match="external import redirect: splitpkg.stray"):
+        _toolchain._package("splitpkg")
+
+
+def test_invocable_keeps_the_name_a_wrapper_dispatches_on(tmp_path, monkeypatch):
+    # ccache installs one symlink per compiler name, all pointing at the single
+    # ccache binary, and picks the compiler from the name it was invoked by.
+    # Resolving the symlink first discards that name.
+    real = tmp_path / "bin" / "ccache"
+    real.parent.mkdir()
+    real.write_bytes(b"\x7fELF" + b"\x00" * 16)
+    real.chmod(0o755)
+    shims = tmp_path / "shims"
+    shims.mkdir()
+    shim = shims / "g++"
+    shim.symlink_to(real)
+    monkeypatch.setenv("PATH", str(shims))
+
+    assert _toolchain._invocable("g++") == shim
+    # The contrast is deliberate: the inventory still wants the real file.
+    assert _toolchain._executable("g++") == real.resolve()
+
+
+def test_invocable_still_refuses_a_non_elf_launcher(tmp_path, monkeypatch):
+    shims = tmp_path / "shims"
+    shims.mkdir()
+    (shims / "g++").write_text('#!/bin/sh\nexec something "$@"\n')
+    (shims / "g++").chmod(0o755)
+    monkeypatch.setenv("PATH", str(shims))
+
+    with pytest.raises(ValueError, match="Unsupported compiler launcher"):
+        _toolchain._invocable("g++")
+
+
+def test_the_driver_a_wrapper_executes_is_inventoried(tmp_path, monkeypatch):
+    # A wrapper contributes none of the specs, subprograms or built-ins that
+    # decide the compilation -- the driver it execs does. Inventorying only the
+    # path invoked would let the real compiler be replaced without moving the
+    # fingerprint.
+    driver = _elf(tmp_path / "real-g++")
+    wrapper = _fake_ccache(tmp_path / "bin" / "ccache")
+    shim = tmp_path / "shims" / "g++"
+    shim.parent.mkdir()
+    shim.symlink_to(wrapper)
+    output = f"COLLECT_GCC={driver}\nsome other line\n"
+
+    assert _toolchain._driver_executed(output, shim) == driver.resolve()
+
+
+def test_an_unidentifiable_driver_refuses_rather_than_guesses(tmp_path):
+    shim = _elf(tmp_path / "wrapper-g++")
+
+    with pytest.raises(ValueError, match="compiler driver actually executed"):
+        _toolchain._driver_executed("no marker here\n", shim)
+
+
+def test_gcc_inputs_covers_both_the_wrapper_and_its_driver(tmp_path, monkeypatch):
+    wrapper = _fake_ccache(tmp_path / "bin" / "ccache")
+    shim = tmp_path / "shims" / "g++"
+    shim.parent.mkdir()
+    shim.symlink_to(wrapper)
+    driver = _elf(tmp_path / "real-g++")
+    subprogram = tmp_path / "cc1plus"
+    subprogram.write_bytes(b"\x7fELF")
+    subprogram.chmod(0o755)
+    libgcc = tmp_path / "lib" / "libgcc.a"
+    libgcc.parent.mkdir()
+    libgcc.write_bytes(b"!<arch>\n")
+
+    def run(command):
+        if "--version" in command:
+            return "g++ (GCC) 13\n"
+        if any(arg.startswith("-print-prog-name") for arg in command):
+            return f"{subprogram}\n"
+        if "-print-libgcc-file-name" in command:
+            return f"{libgcc}\n"
+        return f"COLLECT_GCC={driver}\n#include <...> search starts here:\n {tmp_path}\nEnd of search list.\n"
+
+    monkeypatch.setattr(_toolchain, "_run", run)
+    monkeypatch.setattr(_toolchain, "_gcc_link_inputs", lambda executable: set())
+    monkeypatch.setattr(_toolchain, "_elf_inputs", lambda p, *rest: {p})
+
+    paths = _toolchain._gcc_inputs(shim)
+
+    assert {shim, driver} <= paths
+
+
+def _elf(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"\x7fELF")
+    path.chmod(0o755)
+    return path
+
+
+def test_a_tracked_wrapper_is_accepted(tmp_path):
+    driver = _elf(tmp_path / "real-g++")
+    wrapper = _fake_ccache(tmp_path / "bin" / "ccache")
+    shim = tmp_path / "shims" / "g++"
+    shim.parent.mkdir()
+    shim.symlink_to(wrapper)
+
+    assert _toolchain._driver_executed(f"COLLECT_GCC={driver}\n", shim) == driver.resolve()
+
+
+def test_an_untracked_wrapper_refuses_rather_than_trusting_it(tmp_path):
+    # Its selection inputs are not enumerated anywhere here, so an identity
+    # taken through it would not move when the compiler it picks does.
+    driver = _elf(tmp_path / "real-g++")
+    wrapper = _fake_ccache(tmp_path / "bin" / "somecache")
+    shim = tmp_path / "shims" / "g++"
+    shim.parent.mkdir()
+    shim.symlink_to(wrapper)
+
+    with pytest.raises(ValueError, match="untracked selection inputs: somecache"):
+        _toolchain._driver_executed(f"COLLECT_GCC={driver}\n", shim)
+
+
+def test_a_compiler_invoked_directly_is_not_treated_as_a_wrapper(tmp_path):
+    compiler = _elf(tmp_path / "g++")
+
+    assert _toolchain._driver_executed(f"COLLECT_GCC={compiler}\n", compiler) == compiler.resolve()
+
+
+@pytest.mark.usefixtures("compiler_metadata")
+@pytest.mark.parametrize("variable", ["CCACHE_COMPILER", "CCACHE_PREFIX", "CCACHE_CONFIGPATH"])
+def test_changing_a_wrapper_selection_rediscovers_in_the_same_process(monkeypatch, variable):
+    # The wrapper picks the compiler from these, exactly as PATH does, so the
+    # identity of the compiler chosen before must not be reused after a change.
+    seen = []
+
+    def discover(compiler, ptoas, runtime_name):
+        chosen = os.environ.get(variable, "default")
+        seen.append(chosen)
+        component = ComponentInputs(unavailable_reason=None, reported_version=chosen)
+        return ToolchainInputs(component, component, component, component, component)
+
+    monkeypatch.setattr(_toolchain, "_discover", discover)
+    monkeypatch.setattr(_toolchain, "_identities", {})
+    monkeypatch.setattr(_toolchain, "_identity_cache", InstallationIdentityCache())
+    monkeypatch.setattr(
+        _toolchain, "_compiler", lambda *a, **k: SimpleNamespace(project_root="/x", _sanitizers="")
+    )
+    monkeypatch.setattr(_toolchain, "find_ptoas_binary", lambda: "/usr/bin/true")
+
+    monkeypatch.setenv(variable, "/compiler/A")
+    first = _toolchain.capture_toolchain("a2a3", "tensormap_and_ringbuffer")
+    monkeypatch.setenv(variable, "/compiler/B")
+    second = _toolchain.capture_toolchain("a2a3", "tensormap_and_ringbuffer")
+
+    # Report why capture gave up before discovery rather than leaving an
+    # empty list to explain itself: the reason is host-dependent and this
+    # test cannot reproduce every host.
+    assert first.usable, [failure.reason for failure in first.failures]
+    assert second.usable, [failure.reason for failure in second.failures]
+    assert seen == ["/compiler/A", "/compiler/B"]
+    assert first.digest != second.digest
+
+
+def _fake_ccache(wrapper: Path, **settings: str) -> Path:
+    """A ccache that answers --show-config the way the real one does."""
+    lines = {
+        "compiler": "",
+        "compiler_check": "mtime",
+        "path": "",
+        "prefix_command": "",
+        "prefix_command_cpp": "",
+        **settings,
+    }
+    body = "".join(f'echo "({"environment" if lines[k] else "default"}) {k} = {lines[k]}"\n' for k in lines)
+    wrapper.parent.mkdir(parents=True, exist_ok=True)
+    wrapper.write_text(f"#!/bin/sh\n{body}")
+    wrapper.chmod(0o755)
+    return wrapper
+
+
+def test_a_wrapper_at_its_defaults_redirects_nothing(tmp_path):
+    assert _toolchain._wrapper_redirects(_fake_ccache(tmp_path / "ccache")) == []
+
+
+@pytest.mark.parametrize("setting", ["compiler", "path", "prefix_command", "prefix_command_cpp"])
+def test_a_configured_redirect_is_reported_with_its_origin(tmp_path, setting):
+    wrapper = _fake_ccache(tmp_path / "ccache", **{setting: "/somewhere/else"})
+
+    reported = _toolchain._wrapper_redirects(wrapper)
+
+    assert reported == [f"{setting}=/somewhere/else from (environment)"]
+
+
+def test_a_setting_that_does_not_redirect_is_ignored(tmp_path):
+    # compiler_check governs the wrapper's own cache validity, not which
+    # compiler runs, and it is non-empty by default.
+    assert _toolchain._wrapper_redirects(_fake_ccache(tmp_path / "ccache")) == []
+
+
+def test_an_unreadable_wrapper_configuration_is_reported(tmp_path):
+    missing = tmp_path / "not-installed"
+
+    assert _toolchain._wrapper_redirects(missing) != []
+
+
+def test_a_redirecting_wrapper_is_refused(tmp_path):
+    # prefix_command splices another program into the compile step only, so
+    # the -E probe never sees it and the driver it reports is unchanged --
+    # two hosts differing only in it would otherwise share an identity.
+    driver = _elf(tmp_path / "real-g++")
+    wrapper = _fake_ccache(tmp_path / "bin" / "ccache", prefix_command="distcc")
+    shim = tmp_path / "shims" / "g++"
+    shim.parent.mkdir()
+    shim.symlink_to(wrapper)
+
+    with pytest.raises(ValueError, match="redirects compilation beyond this inventory"):
+        _toolchain._driver_executed(f"COLLECT_GCC={driver}\n", shim)
+
+
+def test_every_tracked_wrapper_variable_reaches_the_discovery_key():
+    # The key reads these by name so each is a classified environment input;
+    # that means adding a wrapper to the table is not enough on its own.
+    source = inspect.getsource(_toolchain.capture_toolchain)
+    missing = [name for name in _toolchain._WRAPPER_VARIABLES if f'"{name}"' not in source]
+
+    assert not missing, f"tracked but never re-read: {missing}"
+
+
+def test_probes_do_not_read_translated_output(tmp_path, monkeypatch):
+    # gcc translates its diagnostics: on a non-English host it renders
+    # "#include <...> search starts here:" in that language, and no marker
+    # here matches the result.
+    compiler = tmp_path / "g++"
+    compiler.write_text(
+        "#!/bin/sh\n"
+        'if [ "$LC_ALL" = C ]; then\n'
+        '  echo "#include <...> search starts here:"\n'
+        '  echo " /usr/include"\n'
+        '  echo "End of search list."\n'
+        "else\n"
+        '  echo "#include <...> translated marker"\n'
+        "fi\n"
+    )
+    compiler.chmod(0o755)
+    monkeypatch.setenv("LC_ALL", "zh_CN.UTF-8")
+    monkeypatch.setenv("LANG", "zh_CN.UTF-8")
+
+    roots = _toolchain._include_roots(_toolchain._run([str(compiler)]), compiler)
+
+    assert roots == {Path("/usr/include")}
+
+
 def test_unknown_shell_launcher_is_not_an_executable_identity(tmp_path):
     script = tmp_path / "ptoas"
     script.write_text("#!/bin/sh\neval some_dynamic_command\n")
@@ -460,8 +778,12 @@ def test_gcc_link_plan_selects_actual_inputs_only(tmp_path, monkeypatch):
         "    elif sys.argv[0].endswith('.exe'):\n"
         "        sys.argv[0] = sys.argv[0][:-4]\n"
         "    sys.exit(main())\n",
+        "import sys\nfrom ptoas._cli import main\n"
+        "if __name__ == '__main__':\n"
+        "    sys.argv[0] = sys.argv[0].removesuffix('.exe')\n"
+        "    sys.exit(main())\n",
     ],
-    ids=["pip", "uv"],
+    ids=["pip", "uv", "pip26"],
 )
 def test_wheel_console_script_preserves_virtualenv_interpreter(tmp_path, body):
     interpreter = tmp_path / "bin/python"
@@ -515,9 +837,29 @@ def test_python_optimization_splits_persistent_identity(monkeypatch):
     assert _semantic_environment() != ordinary
 
 
+# capture_toolchain refuses before discovery when any of these is set, and a
+# CI runner may well set one.
+_IMPLICIT_DEPENDENCY_OVERRIDES = (
+    "CPATH",
+    "CPLUS_INCLUDE_PATH",
+    "C_INCLUDE_PATH",
+    "COMPILER_PATH",
+    "GCC_EXEC_PREFIX",
+    "LIBRARY_PATH",
+    "LD_PRELOAD",
+    "LD_AUDIT",
+)
+
+
 @pytest.fixture
 def compiler_metadata(monkeypatch):
-    """Keep discovery tests independent of optional runtime installations."""
+    """Keep discovery tests independent of the host, not just of its runtime.
+
+    capture_toolchain gives up before discovery for two host-dependent reasons
+    -- an optional runtime that is not installed, and an implicit dependency
+    override that is set -- and either one silently turns a test of the memo
+    into a test of that refusal.
+    """
     monkeypatch.setitem(sys.modules, "simpler_setup", None)
     monkeypatch.setitem(sys.modules, "simpler", None)
     monkeypatch.setitem(
@@ -525,6 +867,8 @@ def compiler_metadata(monkeypatch):
         "pypto.runtime.kernel_compiler",
         SimpleNamespace(KernelCompiler=SimpleNamespace(_sanitizers=None)),
     )
+    for override in _IMPLICIT_DEPENDENCY_OVERRIDES:
+        monkeypatch.delenv(override, raising=False)
 
 
 @pytest.mark.usefixtures("compiler_metadata")
