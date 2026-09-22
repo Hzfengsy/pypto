@@ -1955,7 +1955,8 @@ jobs:
       - name: Install pypto-serving and its dependencies
         # pypto's `setup-ci-job` installs what pypto needs; serving carries its
         # own runtime stack (msgspec for the engine<->worker IPC, transformers
-        # for the tokenizer, fastapi/uvicorn for the HTTP surface). Mirrors the
+        # for the tokenizer, fastapi/uvicorn for the HTTP surface, and
+        # prometheus-client for metrics). Mirrors the
         # equivalent step in pypto-serving's own setup action -- keep the two in
         # step, since a dependency added there fails here as a bare
         # ModuleNotFoundError.
@@ -1981,12 +1982,12 @@ jobs:
               pip install "$@"
             fi
           }
-          py_install 'nanobind<3' transformers safetensors numpy fastapi uvicorn pytest msgspec
+          py_install 'nanobind<3' transformers safetensors numpy fastapi uvicorn pytest msgspec prometheus-client
           py_install --no-deps -e "$GITHUB_WORKSPACE/pypto-serving"
           # Prove the venv can see them, so a silent install into the wrong
           # interpreter fails here rather than as a ModuleNotFoundError inside
           # a task-submit child forty lines of traceback later.
-          python -c 'import msgspec, transformers, pypto_serving' \
+          python -c 'import msgspec, prometheus_client, transformers, pypto_serving' \
             || { echo "::error::serving dependencies are not importable from $(command -v python)"; exit 1; }
           # Which pypto and which pypto-serving the tests will actually load.
           # This runner's workspace can hold a sibling pypto-lib left by another
