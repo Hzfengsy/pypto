@@ -397,10 +397,16 @@ def set_cache_policy(tensor: Tensor, policy: CachePolicy) -> None:
       ``cache=pl.CachePolicy.DEFAULT`` opts a single read back into the cache
       inside a bypassing scope.
 
-    Requires PTOAS >= v0.61: a declared read compiles to
-    a ``cache_policy`` attribute on ``pto.tload``, which the assembler lowers to
-    pto-isa's own L2 hint. ``CachePolicy.DEFAULT`` emits nothing, so a read that
-    declares no policy generates exactly the code it did before.
+    Requires PTOAS >= v0.64. **On A2/A3** a declared read compiles to a
+    ``cache_policy`` attribute on ``pto.tload`` plus the device's no-cache alias
+    offset, which the assembler adds to that one load's source address; the
+    offset comes from the driver through the dispatch payload, and a device that
+    reports no alias reports zero, leaving the read ordinary and correct. Other
+    architectures do not map GM twice — A5 expresses the policy on the load
+    instruction instead — and PTOAS lowers the bare attribute to an ordinary
+    load, so a declaration there is accepted and currently does nothing.
+    ``CachePolicy.DEFAULT`` emits nothing, so a read that declares no policy
+    generates exactly the code it did before.
 
     Args:
         tensor: The tensor whose reads the policy applies to. Must be a
@@ -1372,19 +1378,21 @@ def row_prod(input: Tensor) -> Tensor:
     return Tensor(expr=call_expr)
 
 
-def col_sum(input: Tensor) -> Tensor:
+def col_sum(input: Tensor, *, is_binary: bool = False) -> Tensor:
     """Column-wise sum reduction (reduces along axis=-2, keeps dim).
 
     Output shape is ``[..., 1, N]`` for an input of shape ``[..., M, N]``.
 
     Args:
         input: Input tensor
+        is_binary: Use binary-tree reduction with compiler-managed scratch.
+            Defaults to sequential reduction; True changes floating-point sum order.
 
     Returns:
         Tensor wrapping the col_sum operation
     """
     input_expr = input.unwrap()
-    call_expr = _ir_ops.col_sum(input_expr)
+    call_expr = _ir_ops.col_sum(input_expr, is_binary=is_binary)
     return Tensor(expr=call_expr)
 
 

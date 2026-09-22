@@ -33,9 +33,11 @@
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
+#include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
@@ -353,6 +355,17 @@ class DispatchAnalyzer : public IRVisitor {
     return window->alloc;
   }
 
+  // Nullable variant of ResolveWindowAlloc for operands that are window-bound
+  // on the builtin rails but may legally stay plain Tensors on the InCore
+  // composite rail (send_counts today): returns nullptr instead of failing
+  // when the expression is not a pld.tensor.window view.
+  [[nodiscard]] AllocRecord* TryResolveWindowAlloc(const ExprPtr& expr) {
+    auto view_var = AsVarLike(expr);
+    if (!view_var) return nullptr;
+    auto window = ResolveWindowRecord(view_var);
+    return window ? window->alloc : nullptr;
+  }
+
   void AnalyzeCollective(const CallPtr& op) {
     if (!op || !op->op_) return;
 
@@ -410,9 +423,12 @@ class DispatchAnalyzer : public IRVisitor {
       // args[0] = input        (window-bound on HOST path; distinct from target)
       // args[1] = target       (DistributedTensor, window-bound, window-as-result)
       // args[2] = signal       (DistributedTensor, window-bound, barrier)
-      // args[3] = send_counts  (window-bound on HOST path; LOCAL only, never
-      //                          cross-rank-notified — no consumer entry,
-      //                          same rationale as `input` above)
+      // args[3] = send_counts  (window-bound on the builtin rails; peers READ
+      //                          it remotely via the counts pull, so — like
+      //                          `signal` and `recv_counts` — it inherits
+      //                          target's device coverage; conditional,
+      //                          because the InCore composite rail may pass a
+      //                          plain Tensor, written locally only)
       // args[4] = recv_counts  (DistributedTensor, window-bound; published
       //                          cross-rank via notify, so needs target's
       //                          device coverage exactly like `signal` does)
@@ -425,17 +441,21 @@ class DispatchAnalyzer : public IRVisitor {
       // overrides above).
       CHECK_SPAN(repeating_scope_depth_ == 0, op->span_)
           << "pld.tensor.all_to_all_v is not supported inside a for/while loop in a HOST "
-             "orchestrator. The signal protocol is single-use and cannot reuse a signal "
-             "across dynamic invocations (same restriction LowerCompositeOps enforces on "
-             "the InCore path via CheckAllReduceLoopUse).";
+             "orchestrator yet: dynamic re-invocation needs loop-carried comm-domain window "
+             "lifetime management this compiler does not model (the credit-based signal "
+             "itself is reusable across sequential calls). Same restriction LowerCompositeOps "
+             "enforces on the InCore path via CheckAllReduceLoopUse.";
       auto* data_alloc = ResolveWindowAlloc(op->args_[1], "pld.tensor.all_to_all_v", "target");
       auto* signal_alloc = ResolveWindowAlloc(op->args_[2], "pld.tensor.all_to_all_v", "signal");
       auto* recv_counts_alloc = ResolveWindowAlloc(op->args_[4], "pld.tensor.all_to_all_v", "recv_counts");
-      // Two consumer entries sharing the same data_alloc: both signal and
-      // recv_counts need to inherit target's device coverage (Phase 3 loop
-      // below merges generically per entry).
+      // Consumer entries sharing the same data_alloc: signal, recv_counts and
+      // (when window-bound) send_counts inherit target's device coverage
+      // (Phase 3 loop below merges generically per entry).
       collective_consumers.push_back({data_alloc, signal_alloc, op->span_});
       collective_consumers.push_back({data_alloc, recv_counts_alloc, op->span_});
+      if (auto* send_counts_alloc = TryResolveWindowAlloc(op->args_[3])) {
+        collective_consumers.push_back({data_alloc, send_counts_alloc, op->span_});
+      }
       return;
     }
   }
@@ -553,6 +573,52 @@ class DispatchAnalyzer : public IRVisitor {
                                                                 dt->tensor_view_, std::make_optional(wb));
   return std::make_shared<IterArg>(iter_arg->name_hint_, new_type, iter_arg->initValue_, iter_arg->span_);
 }
+
+/// Re-mint the Call that *defines* a re-typed view Var so its own result type
+/// carries the same ``window_buffer_`` back-reference.
+///
+/// ``transform_utils::Substitute`` rewrites Var *references* — including an
+/// AssignStmt's LHS — but never the result type of the expression on the RHS.
+/// Without this rewrite, every ``data = pld.tensor.window(...)`` ends the pass
+/// with ``var.type.window_buffer_`` set and ``value.type.window_buffer_`` still
+/// ``nullopt``, which violates the ``AssignTypeSymmetry`` contract (#1285) that
+/// an AssignStmt's two sides carry structurally equal types.
+///
+/// The rewrite only ever *adds* the back-reference: it rebuilds the Call type
+/// from the Call's own fields plus the Var's window buffer and keeps it only
+/// when that reconstruction is structurally equal to the Var's type, so a
+/// genuine shape / dtype / view disagreement is left alone to be reported
+/// rather than papered over.
+///
+/// Call-only is exhaustive here, not an oversight of ``Submit`` (see
+/// `pass-submit-awareness.md`): a Var enters ``view_subst`` only as a
+/// ``pld.tensor.window`` result, a collective result, or a loop carry over one
+/// of those, and the collector records all three from a ``Call`` RHS. A Submit
+/// returns a TASK_ID-augmented TupleType, which is not a window view type.
+class DefiningCallRetyper : public IRMutator {
+ protected:
+  StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
+    auto base = IRMutator::VisitStmt_(op);
+    auto assign = As<AssignStmt>(base);
+    if (!assign || !assign->var_ || !assign->value_) return base;
+
+    auto var_dt = As<DistributedTensorType>(assign->var_->GetType());
+    if (!var_dt || !var_dt->window_buffer_.has_value()) return base;
+
+    auto call = As<Call>(assign->value_);
+    if (!call) return base;
+    auto call_dt = As<DistributedTensorType>(call->GetType());
+    if (!call_dt || structural_equal(call_dt, var_dt)) return base;
+
+    auto retyped = std::make_shared<const DistributedTensorType>(
+        call_dt->shape_, call_dt->dtype_, call_dt->memref_, call_dt->tensor_view_, var_dt->window_buffer_);
+    if (!structural_equal(retyped, var_dt)) return base;
+
+    auto new_call =
+        std::make_shared<Call>(call->op_, call->args_, call->kwargs_, call->attrs_, retyped, call->span_);
+    return std::make_shared<AssignStmt>(assign->var_, new_call, assign->span_);
+  }
+};
 
 /// Follow a Var's def chain (through window / allreduce / all_to_all / allgather /
 /// all_to_all_v aliases and loop-carry init values) to the alloc-window-buffer it
@@ -755,8 +821,14 @@ FunctionPtr ProcessHostOrch(const FunctionPtr& func, const std::map<std::string,
   // Phase 7: rewrite host_orch body so every reference to a pld.tensor.window result
   // Var picks up the type-updated copy. The base IRMutator handles all uses;
   // Substitute is the wrapper that does exactly this transformation.
-  StmtPtr new_body = view_subst.empty() ? materialization_body
-                                        : transform_utils::Substitute(materialization_body, view_subst);
+  StmtPtr new_body = materialization_body;
+  if (!view_subst.empty()) {
+    new_body = transform_utils::Substitute(new_body, view_subst);
+    // Substitute rewrites references only; bring each re-typed Var's defining
+    // Call along so both sides of the assignment agree (#1285).
+    DefiningCallRetyper retyper;
+    new_body = retyper.VisitStmt(new_body);
+  }
 
   // Phase 8: wrap new_body in nested CommDomainScopeStmts. Outer = first
   // declared domain, inner = last. ``name_hint_`` is ``"comm_d<n>"`` so

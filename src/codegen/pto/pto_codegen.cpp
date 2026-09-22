@@ -198,19 +198,28 @@ class TilePhiBaseCollector : public ir::IRVisitor {
 
 // Allocations with two or more slots selected inside one loop body.
 //
-// ptoas derives the per-slot WAR guard from the slot expression, but only for the
-// FIRST `multi_tile_get` of a region in an iteration: given two co-live slots it
-// emits the dynamic `wait_flag`/`set_flag` pair for one and leaves the other load
-// unguarded, so the next iteration's write into that slot races the current
-// iteration's read of it. Measured on ptoas 0.54 (`--enable-insert-sync`,
-// `--pto-level=level2`, a3) — the kernel is silently wrong on device, not slow.
-// Filed as hw-native-sys/PTOAS#1118.
+// ptoas synchronizes such a body from the slot expressions, and has gotten two
+// forms of it wrong:
 //
-// The ping-pong the region form exists for takes ONE slot per iteration, and that
-// shape is guarded correctly. So the co-live shape is rejected rather than
-// miscompiled, and the author is pointed at the PyPTO planner, whose baked
-// addresses and PyPTO-emitted sync handle it. Straight-line code is untouched:
-// with no loop there is no cross-iteration reuse to guard.
+// - Two slots filled and read in the same iteration. ptoas <= 0.55 guarded only
+//   the FIRST `multi_tile_get` of an iteration, leaving the other load unguarded
+//   against the next iteration's write — measured silently wrong on device with
+//   ptoas 0.54 (hw-native-sys/PTOAS#1118). Fixed in 0.56, which guards the body
+//   with one static event for the whole region: correct, but with none of the
+//   per-slot overlap the region form exists for.
+// - The prefetch: slot 0 filled before the loop, then each iteration fills slot
+//   (i+1)%2 while reading slot i%2. ptoas <= 0.62 primes and drains both slots'
+//   events as for a one-slot rotation, which is off by one here — wrong data for
+//   an even trip count, a device hang for an odd one (hw-native-sys/PTOAS#1519,
+//   fixed in 0.63).
+//
+// This collector only counts slot selections per loop body, so it cannot tell the
+// two apart, and the pinned ptoas still has the second bug. Both are rejected
+// rather than miscompiled, and the author is pointed at the PyPTO planner, whose
+// baked-address alloc_tile path runs the same-iteration form correctly on device.
+// The ping-pong the region form exists for takes ONE slot per iteration and is
+// guarded correctly. Straight-line code is untouched: with no loop there is no
+// cross-iteration reuse to guard.
 class CoLiveSlotCollector : public ir::IRVisitor {
  public:
   std::set<const ir::Var*> bases;  ///< Allocations with >= 2 slots live in one loop body
@@ -579,6 +588,14 @@ class MemRefCollectorVisitor : public ir::IRVisitor {
   /// the ccec get_subblockid() register.
   [[nodiscard]] bool UsesSubblockOp() const { return uses_subblock_op_; }
 
+  /// Returns true when the visited body contains a tile.load that declared
+  /// CachePolicy.BYPASS. Drives PTOCodegen's decision to append the synthetic
+  /// i64 device L2 no-cache alias offset param to the emitted func.func
+  /// signature; the kernel wrapper resolves it from
+  /// intrinsic.h::get_l2_cache_offset(args) at dispatch time, and each
+  /// bypassing pto.tload passes it as its `offset`.
+  [[nodiscard]] bool UsesL2BypassLoad() const { return uses_l2_bypass_load_; }
+
   [[nodiscard]] const std::set<const ir::Var*>& GetFFTSWorkspaceVars() const { return ffts_workspace_vars_; }
 
   void VisitExpr_(const VarPtr& op) override {
@@ -608,6 +625,10 @@ class MemRefCollectorVisitor : public ir::IRVisitor {
       if (!uses_subblock_op_ && ir::IsOp(op, "tile.get_subblock_idx")) {
         uses_subblock_op_ = true;
       }
+      if (!uses_l2_bypass_load_ && ir::IsOp(op, "tile.load") &&
+          static_cast<ir::CachePolicy>(op->GetKwarg<int>("cache", 0)) == ir::CachePolicy::kBypass) {
+        uses_l2_bypass_load_ = true;
+      }
       if (ir::IsOp(op, "system.set_ffts") && op->args_.size() == 1) {
         if (auto workspace = As<ir::Var>(op->args_[0])) {
           ffts_workspace_vars_.insert(workspace.get());
@@ -626,6 +647,7 @@ class MemRefCollectorVisitor : public ir::IRVisitor {
   bool uses_deferred_completion_ = false;
   bool uses_spmd_block_ops_ = false;
   bool uses_subblock_op_ = false;
+  bool uses_l2_bypass_load_ = false;
   std::set<const ir::Var*> ffts_workspace_vars_;
 
   void AddMemRefIfUnique(const MemRefPtr& memref, const std::shared_ptr<const TileType>& tile_type) {
@@ -794,7 +816,7 @@ std::string PTOCodegen::EmitCommRemoteOffsetInline(const std::string& ctx_ssa, c
   const int64_t elem_size_bytes = static_cast<int64_t>(elem_bits / 8);
 
   namespace cl = codegen::distributed::comm_layout;
-  // CommContext field indices, expressed in u64 slots (one ``pto.load_scalar``
+  // CommContext field indices, expressed in u64 slots (one ``pto.load``
   // step = one slot). Pinned via static_assert in
   // include/pypto/codegen/distributed/comm_layout.h so a runtime ABI shift
   // fails PyPTO compilation rather than silently emitting wrong addresses.
@@ -810,7 +832,7 @@ std::string PTOCodegen::EmitCommRemoteOffsetInline(const std::string& ctx_ssa, c
   // Read rankId (the low 32 bits of the (rankId, rankNum) 8-byte slot at
   // u64 index k_rank_idx).
   const std::string rk_pair = NewTemp();
-  Emit(rk_pair + " = pto.load_scalar " + ctx_ssa + "[" + c_r + "] : !pto.ptr<i64> -> i64");
+  Emit(rk_pair + " = pto.load " + ctx_ssa + "[" + c_r + "] : !pto.ptr<i64> -> i64");
   const std::string rk_i32 = NewTemp();
   Emit(rk_i32 + " = arith.trunci " + rk_pair + " : i64 to i32");
   const std::string rk_idx = NewTemp();
@@ -820,13 +842,13 @@ std::string PTOCodegen::EmitCommRemoteOffsetInline(const std::string& ctx_ssa, c
   const std::string lb_off = NewTemp();
   Emit(lb_off + " = arith.addi " + c_w + ", " + rk_idx + " : index");
   const std::string lbase = NewTemp();
-  Emit(lbase + " = pto.load_scalar " + ctx_ssa + "[" + lb_off + "] : !pto.ptr<i64> -> i64");
+  Emit(lbase + " = pto.load " + ctx_ssa + "[" + lb_off + "] : !pto.ptr<i64> -> i64");
 
   // peer_base = windowsIn[peer]
   const std::string pb_off = NewTemp();
   Emit(pb_off + " = arith.addi " + c_w + ", " + peer_ssa + " : index");
   const std::string pbase = NewTemp();
-  Emit(pbase + " = pto.load_scalar " + ctx_ssa + "[" + pb_off + "] : !pto.ptr<i64> -> i64");
+  Emit(pbase + " = pto.load " + ctx_ssa + "[" + pb_off + "] : !pto.ptr<i64> -> i64");
 
   // delta_bytes = peer_base - local_base; converted to an element offset
   // because pto.addptr takes element counts, not bytes.
@@ -928,12 +950,22 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
   const bool uses_deferred_completion = collector.UsesDeferredCompletion();
   const bool uses_spmd_params = collector.UsesSpmdBlockOps();
   const bool uses_subblock_param = collector.UsesSubblockOp();
+  // A2/A3 reaches the uncached mapping of a page by adding a driver-owned
+  // offset to the address, so a bypassing load needs that value threaded in.
+  // No other architecture maps GM twice -- a5 expresses the policy on the
+  // instruction instead -- and no other runtime exposes an accessor to read a
+  // distance, so the parameter would be unfillable there.
+  const bool uses_l2_cache_offset =
+      collector.UsesL2BypassLoad() && backend_->GetHandler()->GetPtoTargetArch() == "a2a3";
   fs_.ffts_workspace_vars = collector.GetFFTSWorkspaceVars();
   if (uses_sdma_workspace) {
     fs_.used_ssa_names.insert("arg" + std::to_string(func->params_.size() + dyn_vars.size()));
   }
   if (uses_deferred_completion) {
     fs_.used_ssa_names.insert("__pypto_deferred_raw_args");
+  }
+  if (uses_l2_cache_offset) {
+    fs_.used_ssa_names.insert("__pypto_l2_cache_offset");
   }
   if (uses_spmd_params) {
     fs_.used_ssa_names.insert("__pypto_spmd_block_idx");
@@ -1072,7 +1104,7 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
   // Pair each DistributedTensor param with its explicit CommCtxType param (in
   // IR-param order). The runtime CommContext is passed as a GM ``uint64_t*``
   // (see ``runtime/src/common/platform_comm/comm_context.h``); codegen indexes
-  // its fields via ``pto.load_scalar`` and the ``comm_layout::k*`` constants.
+  // its fields via ``pto.load`` and the ``comm_layout::k*`` constants.
   INTERNAL_CHECK_SPAN(dist_tensor_params.size() == comm_ctx_params.size(), func->span_)
       << "PTOCodegen: function '" << func->name_ << "' has " << dist_tensor_params.size()
       << " DistributedTensor params but " << comm_ctx_params.size()
@@ -1104,8 +1136,19 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
   // before SPMD identity params. The Python wrapper mirrors this exact order.
   if (uses_sdma_workspace) {
     if (!first_param) stream_ << ", ";
+    first_param = false;
     fs_.sdma_workspace_arg_ssa = "%arg" + std::to_string(next_arg_idx++);
     stream_ << fs_.sdma_workspace_arg_ssa << ": !pto.ptr<i8>";
+  }
+
+  // Append the device L2 no-cache alias offset after the SDMA workspace and
+  // before the SPMD identity params. Both are runtime-owned values the kernel
+  // wrapper reads out of the dispatch payload, so they stay adjacent; the
+  // Python wrapper mirrors this exact order.
+  if (uses_l2_cache_offset) {
+    if (!first_param) stream_ << ", ";
+    fs_.l2_cache_offset_arg = "%__pypto_l2_cache_offset";
+    stream_ << fs_.l2_cache_offset_arg << ": i64";
   }
 
   // Append SPMD identity params after the dynamic-dim and SDMA workspace args,
@@ -1267,6 +1310,43 @@ void PTOCodegen::BuildVarToMemRefMapping(const FunctionPtr& func) {
   }
 }
 
+void PTOCodegen::ExpandPackedFp4MakeTensorViewDims(DataType dtype, ir::TensorLayout layout,
+                                                   const std::vector<ir::ExprPtr>& shape_exprs,
+                                                   std::vector<std::string>& shape_ssas,
+                                                   const std::vector<ir::ExprPtr>* stride_exprs,
+                                                   std::vector<std::string>& stride_ssas) {
+  // PackFp4 IR / hand-written FP4E2M1X2 / tile_buf use pair (carrier) extents.
+  // pto-isa GetByteSize for float4_e*x2_t treats indices as nibbles
+  // ((n+1)>>1 → bytes), and EmitC expands Tile cols the same way. Expand last
+  // dim + leading strides so GM views share that nibble unit (multi-row TLOAD
+  // pitch matches Tile). Unit table: docs/en/dev/fp4.md#unit-convention
+  if (!dtype.IsPackedFp4() || IsMxTensorLayout(layout) || shape_ssas.empty()) return;
+  const size_t rank = shape_ssas.size();
+  auto two = GetOrEmitConstant(static_cast<int64_t>(2), DataType::INDEX);
+  auto times_two = [&](const std::string& ssa, const ir::ExprPtr& expr) -> std::string {
+    if (expr) {
+      if (auto ci = As<ir::ConstInt>(expr)) {
+        return GetOrEmitConstant(ci->value_ * 2, DataType::INDEX);
+      }
+    }
+    std::string mul = NewTemp();
+    Emit(mul + " = arith.muli " + ssa + ", " + two + " : index");
+    return mul;
+  };
+  ir::ExprPtr last_shape;
+  if (!shape_exprs.empty() && shape_exprs.size() == rank) {
+    last_shape = shape_exprs.back();
+  }
+  shape_ssas.back() = times_two(shape_ssas.back(), last_shape);
+  for (size_t j = 0; j + 1 < rank && j < stride_ssas.size(); ++j) {
+    ir::ExprPtr stride_expr;
+    if (stride_exprs && j < stride_exprs->size()) {
+      stride_expr = (*stride_exprs)[j];
+    }
+    stride_ssas[j] = times_two(stride_ssas[j], stride_expr);
+  }
+}
+
 void PTOCodegen::EmitMakeTensorViews(const FunctionPtr& func) {
   // RFC #1300 P7 (canonical codegen).
   //
@@ -1308,6 +1388,8 @@ void PTOCodegen::EmitMakeTensorViews(const FunctionPtr& func) {
     // — see test_tensor_expand_clone[broadcast_dim=2] where input
     // ``[B, N, 1]`` is loaded into a ColMajor tile and PTOAS TLoad enforces
     // ``tile.BLayout == tensor.Layout``).
+    // Packed FP4E2M1X2 last-axis units are carriers, not logical column-vector
+    // width 1 — ND-only; reject non-ND annotations and the [M,1] DN force.
     bool is_column_vector = false;
     if (rank >= 2) {
       auto last_dim = As<ir::ConstInt>(tensor_type->shape_.back());
@@ -1320,7 +1402,17 @@ void PTOCodegen::EmitMakeTensorViews(const FunctionPtr& func) {
     if (tensor_type->tensor_view_.has_value()) {
       layout = tensor_type->tensor_view_->layout;
     }
-    const bool force_column_vector_dn = is_column_vector && !IsMxTensorLayout(layout);
+    if (tensor_type->dtype_.IsPackedFp4()) {
+      CHECK_SPAN(layout == ir::TensorLayout::ND, param->span_)
+          << "FP4E2M1X2 supports ND layout only; non-ND layouts and layout conversions "
+             "are not supported (see docs/en/dev/fp4.md)";
+      CHECK_SPAN(!is_column_vector, param->span_)
+          << "FP4E2M1X2 tensors with last carrier dimension 1 are not supported: "
+             "the ordinary [M,1] column-vector path forces a DN layout conversion "
+             "invalid for packed x2 carriers (see docs/en/dev/fp4.md)";
+    }
+    const bool force_column_vector_dn =
+        is_column_vector && !IsMxTensorLayout(layout) && !tensor_type->dtype_.IsPackedFp4();
     if (force_column_vector_dn) layout = ir::TensorLayout::DN;
 
     // Materialize one shape dimension as an MLIR SSA value.
@@ -1362,14 +1454,18 @@ void PTOCodegen::EmitMakeTensorViews(const FunctionPtr& func) {
     // but the codegen tolerates absent strides for any path that constructs
     // IR ad-hoc and skips the pipeline).
     std::vector<std::string> stride_names(rank);
-    bool has_explicit_stride =
-        tensor_type->tensor_view_.has_value() && !tensor_type->tensor_view_->stride.empty();
-    if (has_explicit_stride) {
-      const auto& strides = tensor_type->tensor_view_->stride;
-      CHECK(strides.size() == rank) << "EmitMakeTensorViews: explicit stride rank " << strides.size()
-                                    << " does not match tensor shape rank " << rank;
+    // Keep a non-optional pointer so later packed-FP4 stride scaling does not
+    // re-touch tensor_view_ (clang-tidy bugprone-unchecked-optional-access).
+    const std::vector<ir::ExprPtr>* explicit_strides = nullptr;
+    if (tensor_type->tensor_view_.has_value() && !tensor_type->tensor_view_->stride.empty()) {
+      explicit_strides = &tensor_type->tensor_view_->stride;
+    }
+    if (explicit_strides != nullptr) {
+      CHECK(explicit_strides->size() == rank)
+          << "EmitMakeTensorViews: explicit stride rank " << explicit_strides->size()
+          << " does not match tensor shape rank " << rank;
       for (size_t j = 0; j < rank; ++j) {
-        stride_names[j] = get_stride_mlir(strides[j]);
+        stride_names[j] = get_stride_mlir((*explicit_strides)[j]);
       }
     } else if (force_column_vector_dn) {
       // Forced-DN ``[..., M, 1]`` legacy stride pattern (PTOAS column-vector
@@ -1419,13 +1515,16 @@ void PTOCodegen::EmitMakeTensorViews(const FunctionPtr& func) {
       }
     }
 
+    ExpandPackedFp4MakeTensorViewDims(tensor_type->dtype_, layout, tensor_type->shape_, shape_dim_names,
+                                      explicit_strides, stride_names);
+
     // Buffer the statement so Emit() writes it as one line and can suffix the
     // parameter's source location.
     std::ostringstream view_line;
     view_line << tensor_view << " = pto.make_tensor_view ";
     view_line << GetVarName(param);
 
-    // Emit shape (verbatim from IR — canonical).
+    // Emit shape (verbatim from IR — canonical, then packed-FP4 nibble expand).
     view_line << ", shape = [";
     for (size_t j = 0; j < rank; ++j) {
       if (j > 0) view_line << ", ";
@@ -1588,10 +1687,11 @@ void PTOCodegen::PlanMultiBufferRegions(const FunctionPtr& func) {
   fs_.multi_buffer_regions.clear();
   fs_.multi_buffer_region_order.clear();
 
-  // PyPTO planner (ptoas --pto-level=level3): ptoas fans an explicit base address
-  // out into the per-slot addresses without folding them, so its multi-buffer slot
-  // narrowing falls back to conservative aliasing — measurably worse there than the
-  // baked-address alloc_tile path. See hw-native-sys/PTOAS#1106.
+  // PyPTO planner (ptoas --pto-level=level3): a level3 region needs an explicit
+  // `addr` base, and the region emitted below carries none, so that planner keeps
+  // the baked-address alloc_tile path. The gap is PyPTO's, not ptoas's: given a
+  // constant `addr`, ptoas has derived the same per-slot sync at level3 as at level2
+  // since 0.55 (hw-native-sys/PTOAS#1106, closed).
   if (emit_tile_addr_) return;
 
   TilePhiBaseCollector phi_collector;
@@ -1709,10 +1809,10 @@ void PTOCodegen::PlanMultiBufferRegions(const FunctionPtr& func) {
       candidate.blocker = "one of its slots is carried out of an if or a loop as a phi";
     } else if (colive_collector.bases.count(memref->base_.get()) != 0) {
       candidate.blocker =
-          "two of its slots are live at once inside a loop, and ptoas guards only the first slot "
-          "selected in an iteration — the second would be read while the next iteration overwrites "
-          "it (ptoas 0.54). Take one slot per iteration, which is the shape the region form "
-          "accelerates";
+          "two of its slots are live at once inside a loop, and ptoas before 0.63 mis-synchronizes "
+          "one form of that — a slot filled an iteration ahead of its read — into wrong data or a "
+          "device hang (hw-native-sys/PTOAS#1519). Take one slot per iteration, which is the shape "
+          "the region form accelerates";
     }
   }
 
@@ -2214,7 +2314,7 @@ void PTOCodegen::VisitStmt_(const AssignStmtPtr& op) {
   // tile.store into the alias can resolve its view instead of
   // GetOrCreateTensorView tripping its INTERNAL_CHECK on the synthetic var.
   // We additionally propagate the base-ptr mapping so element-wise alias
-  // consumers (pl.read / pl.write / store_scalar) resolve to the backing
+  // consumers (pl.read / pl.write / pto.store) resolve to the backing
   // pointer rather than the view SSA — as the IfStmt in-place-return path
   // (VisitStmt_(IfStmtPtr)) does for merged tensors.
   // Non-fatal: if the RHS has no registered view, fall through to the generic
@@ -2398,15 +2498,17 @@ std::string PTOCodegen::GetTypeString(const DataType& dtype) const {
   INTERNAL_CHECK(handler) << "PTOCodegen requires a backend handler";
   if (!handler->SupportsIncoreDataType(dtype)) {
     const std::string arch = handler->GetPtoTargetArch();
-    if (arch == "a2a3" && dtype.GetBit() == 4) {
-      CHECK(false) << "The 4-bit dtype " << dtype.ToString()
+    const char* dtype_kind = (dtype.GetBit() == 4) ? "The 4-bit dtype " : "The dtype ";
+    if (arch == "a2a3" && (dtype.GetBit() == 4 || dtype.IsFp4Family())) {
+      CHECK(false) << dtype_kind << dtype.ToString()
                    << " is not supported for end-to-end in-core codegen on backend 'a2a3'. "
                       "A2/A3 exposes only an isolated FP16<->INT4 conversion, while direct packed "
                       "4-bit load/store and carrier ABI are unavailable";
     }
-    CHECK(false) << "The 4-bit dtype " << dtype.ToString()
+    CHECK(false) << dtype_kind << dtype.ToString()
                  << " is not supported for end-to-end in-core codegen on backend '" << arch
-                 << "'; A5 currently supports only FP4 among 4-bit dtypes";
+                 << "'. A5 supports FP4 and packed FP4E2M1X2 among FP4-family / 4-bit paths; "
+                    "INT4 / UINT4 / HF4 are rejected (see docs/en/dev/fp4.md)";
   }
   return DataTypeToMLIR(dtype);
 }

@@ -226,6 +226,17 @@ class PTOCodegen : public CodegenBase {
   std::string GetOrEmitConstant(double value, DataType dt);
 
   /**
+   * @brief Expand packed FP4E2M1X2 make_tensor_view last-axis shape/strides
+   *        from IR carrier units to pto-isa nibble units (see docs/en/dev/fp4.md).
+   *        MX layouts are skipped. Mutates shape_ssas / stride_ssas in place.
+   */
+  void ExpandPackedFp4MakeTensorViewDims(DataType dtype, ir::TensorLayout layout,
+                                         const std::vector<ir::ExprPtr>& shape_exprs,
+                                         std::vector<std::string>& shape_ssas,
+                                         const std::vector<ir::ExprPtr>* stride_exprs,
+                                         std::vector<std::string>& stride_ssas);
+
+  /**
    * @brief Emit arith.index_cast if var is not already index type
    *
    * Valid_shape vars may be INT64/INT32 (from pl.min(...)), but pto.alloc_tile
@@ -546,6 +557,23 @@ class PTOCodegen : public CodegenBase {
   [[nodiscard]] std::string GetSdmaWorkspaceArgSSA() const { return fs_.sdma_workspace_arg_ssa; }
 
   /**
+   * @brief SSA name of the synthetic device L2 no-cache alias offset parameter.
+   *
+   * A2/A3 maps every GM page twice, and a load issued against the uncached
+   * alias does not allocate in L2. The distance between the two mappings is a
+   * per-device value only the driver knows, so it travels with the dispatch:
+   * the kernel wrapper reads ``intrinsic.h::get_l2_cache_offset(args)`` once at
+   * entry and forwards it through this hidden ``i64`` parameter, appended after
+   * the SDMA workspace pointer and before the SPMD identity parameters. Each
+   * ``tile.load`` that declared ``CachePolicy.BYPASS`` passes it as
+   * ``pto.tload``'s ``offset``, which PTOAS >= v0.64 adds to that one load's
+   * source address. Returns empty when the function has no bypassing load, and
+   * on every architecture but a2a3: the double mapping is an a2a3 property, and
+   * only its runtime exposes an accessor for the distance.
+   */
+  [[nodiscard]] std::string GetL2CacheOffsetArgSSA() const { return fs_.l2_cache_offset_arg; }
+
+  /**
    * @brief SSA name of the synthetic raw dispatch-args pointer parameter.
    *
    * Functions containing ``pld.system.defer_wait`` receive one hidden
@@ -656,7 +684,7 @@ class PTOCodegen : public CodegenBase {
    * ``pto.make_tensor_view`` — keeping ``addptr`` and ``make_tensor_view``
    * co-located in the user kernel's ``func.func``, which is what PTOAS's
    * per-func lowering check (``addptr must feed make_tensor_view /
-   * initialize_l2g2l_pipe(gm_addr) / load|store_scalar``) requires.
+   * initialize_l2g2l_pipe(gm_addr) / load|store``) requires.
    *
    * The arithmetic is emitted inline rather than shared through a
    * module-level ``func.func`` helper. A mixed cube+vector kernel group is
@@ -904,11 +932,11 @@ class PTOCodegen : public CodegenBase {
    * expression. Emitting N unrelated `alloc_tile`s instead throws that away.
    *
    * Runs only under the PTOAS memory planner (`emit_tile_addr_ == false`). Under
-   * the PyPTO planner, ptoas runs at `--pto-level=level3`, where the fan-out of an
-   * explicit base address is not constant-folded, so its slot narrowing degrades
-   * to conservative aliasing — the multi-buffer form is measurably *worse* there
-   * than the baked-address `alloc_tile` path (an extra false WAR pair between two
-   * constant slots). See hw-native-sys/PTOAS#1106.
+   * the PyPTO planner, ptoas runs at `--pto-level=level3`, where a region needs an
+   * explicit `addr` base that codegen does not emit, so the baked-address
+   * `alloc_tile` path stays. ptoas itself handles such a region: given a constant
+   * `addr`, it has derived the same per-slot sync at level3 as at level2 since 0.55
+   * (hw-native-sys/PTOAS#1106, closed).
    *
    * A region is eligible when every tile bound to that allocation selects a slot,
    * the slots share one tile_buf type and one static valid extent, at most one of
@@ -916,7 +944,8 @@ class PTOCodegen : public CodegenBase {
    * for multi_tile_buf (vec / mat / acc), and the count is within ptoas's `[2, 16]`.
    *
    * The one-slot-per-iteration condition is a ptoas synchronization limit, not a
-   * typing one — see CoLiveSlotCollector.
+   * typing one (hw-native-sys/PTOAS#1519 in the pinned ptoas) — see
+   * CoLiveSlotCollector.
    *
    * Anything else is a `ValueError` naming the shape, *not* a fallback: under this
    * planner per-slot `alloc_tile`s would leave ptoas free to plan the slots on top
@@ -1045,6 +1074,11 @@ class PTOCodegen : public CodegenBase {
     /// Empty when the current function does not use prefetch.make_context.
     std::string sdma_workspace_arg_ssa;
 
+    /// SSA name of the synthetic device L2 no-cache alias offset param. Empty
+    /// when no tile.load in the current function declared CachePolicy.BYPASS,
+    /// and on every architecture but a2a3.
+    std::string l2_cache_offset_arg;
+
     /// Raw runtime dispatch-args pointer used by deferred completion adapters.
     std::string deferred_completion_raw_args_ssa;
 
@@ -1123,6 +1157,7 @@ class PTOCodegen : public CodegenBase {
       ffts_workspace_vars.clear();
 
       sdma_workspace_arg_ssa.clear();
+      l2_cache_offset_arg.clear();
       deferred_completion_raw_args_ssa.clear();
       spmd_block_idx_arg.clear();
       spmd_block_num_arg.clear();

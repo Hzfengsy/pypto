@@ -35,6 +35,7 @@
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/memref.h"
+#include "pypto/ir/op_registry.h"
 #include "pypto/ir/phase.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
@@ -60,6 +61,7 @@ using pto_ops_detail::CheckArity;
 using pto_ops_detail::EmitFlatOffsetSSAFromValues;
 using pto_ops_detail::EmitIndexOperand;
 using pto_ops_detail::EmitPartitionViewPTO;
+using pto_ops_detail::ExpandPackedFp4GmLastAxis;
 using pto_ops_detail::GetDimStrings;
 using pto_ops_detail::GetIndexOffsetCodes;
 using pto_ops_detail::GetSizeCodes;
@@ -109,11 +111,13 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
   INTERNAL_CHECK_SPAN(!shapes_tuple->elements_.empty(), op->span_)
       << "tile.load shapes tuple must have at least one element";
 
-  // The declared GM cache-access policy (pypto #2680). PTOAS >= v0.61 carries a
-  // streaming read as a `cache_policy` attribute on `pto.tload`, which lowers to
-  // pto-isa's own L2 hint (`TLOAD<pto::TLoadL2Hint::NotAllocKeep>`), so there is
-  // no architecture-specific address alias to build here. It is attached below,
-  // alongside the MX layout attribute when both apply.
+  // The declared GM cache-access policy (pypto #2680). PTOAS >= v0.64 carries a
+  // streaming read as a `cache_policy` attribute on `pto.tload` plus an optional
+  // byte `offset` it adds to that one load's source address. On a2a3 the offset
+  // is the driver-owned distance to the page's uncached alias, threaded in as a
+  // synthetic kernel parameter (see PTOCodegen::GetL2CacheOffsetArgSSA); the
+  // attribute alone declares the policy but moves no address. Both are attached
+  // below, alongside the MX layout attribute when it applies.
   const auto policy = static_cast<ir::CachePolicy>(op->GetKwarg<int>("cache", 0));
 
   std::string dtype_str = codegen.GetTypeString(tensor_type->dtype_);
@@ -150,6 +154,14 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
   std::vector<std::string> partition_dims = GetDimStrings(valid_shape_tuple->elements_);
   std::vector<std::string> offset_codes = GetIndexOffsetCodes(offsets_tuple->elements_, codegen);
   std::vector<std::string> size_codes = GetSizeCodes(valid_shape_tuple->elements_, codegen);
+  const ir::ExprPtr last_size =
+      valid_shape_tuple->elements_.empty() ? nullptr : valid_shape_tuple->elements_.back();
+  const ir::ExprPtr last_offset =
+      offsets_tuple->elements_.empty() ? nullptr : offsets_tuple->elements_.back();
+  const ir::TensorLayout gm_layout =
+      tensor_type->tensor_view_.has_value() ? tensor_type->tensor_view_->layout : ir::TensorLayout::ND;
+  ExpandPackedFp4GmLastAxis(tensor_type->dtype_, offset_codes, size_codes, partition_dims, codegen, last_size,
+                            last_offset, gm_layout);
   std::string tensor_view = codegen.GetOrCreateTensorView(tensor);
   std::string tensor_view_type = codegen.GetTensorViewTypeString(tensor_type.get());
 
@@ -179,6 +191,18 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
       tload_line << attrs[i];
     }
     tload_line << "}";
+  }
+
+  // The offset operand follows the attribute dict, and PTOAS applies it only to
+  // a load that also declared l2_bypass. It is empty on an architecture with no
+  // address alias to reach, which leaves the declaration carried by the
+  // attribute alone -- and PTOAS v0.64 lowers a bare attribute to an ordinary
+  // TLOAD, so that declaration costs nothing and does nothing.
+  if (policy == ir::CachePolicy::kBypass) {
+    const std::string l2_cache_offset = codegen.GetL2CacheOffsetArgSSA();
+    if (!l2_cache_offset.empty()) {
+      tload_line << " offset = " << l2_cache_offset << " : i64";
+    }
   }
   codegen.Emit(tload_line.str());
 
@@ -239,10 +263,18 @@ static std::string MakeTileStoreCodegenPTO(const CallPtr& op, codegen::CodegenBa
     // N-rank partition path: use the explicit shapes tuple from FlattenTileNdTo2D.
     const auto& shape_elems = shapes_tuple->elements_;
     const auto& offset_elems = offsets_tuple->elements_;
-    partition_type = MakePartitionTensorViewType(GetDimStrings(shape_elems), dtype_str);
+    auto partition_dims = GetDimStrings(shape_elems);
+    auto offset_codes = GetIndexOffsetCodes(offset_elems, codegen);
+    auto size_codes = GetSizeCodes(shape_elems, codegen);
+    const ir::ExprPtr last_size = shape_elems.empty() ? nullptr : shape_elems.back();
+    const ir::ExprPtr last_offset = offset_elems.empty() ? nullptr : offset_elems.back();
+    const ir::TensorLayout gm_layout =
+        tensor_type->tensor_view_.has_value() ? tensor_type->tensor_view_->layout : ir::TensorLayout::ND;
+    ExpandPackedFp4GmLastAxis(tensor_type->dtype_, offset_codes, size_codes, partition_dims, codegen,
+                              last_size, last_offset, gm_layout);
+    partition_type = MakePartitionTensorViewType(partition_dims, dtype_str);
     partition_view = EmitPartitionViewPTO(output_tensor->name_hint_, tensor_view, tensor_view_type,
-                                          partition_type, GetIndexOffsetCodes(offset_elems, codegen),
-                                          GetSizeCodes(shape_elems, codegen), codegen);
+                                          partition_type, offset_codes, size_codes, codegen);
   } else if (tensor_type->tensor_view_.has_value() &&
              ir::IsMxTensorLayout(tensor_type->tensor_view_->layout)) {
     // MX scale tiles are logically [M,G] / [G,N], while their GM destination
@@ -270,10 +302,19 @@ static std::string MakeTileStoreCodegenPTO(const CallPtr& op, codegen::CodegenBa
     std::string height_dim = "?", width_dim = "?";
     if (auto h = As<ir::ConstInt>(valid_shape[0])) height_dim = std::to_string(h->value_);
     if (auto w = As<ir::ConstInt>(valid_shape[1])) width_dim = std::to_string(w->value_);
-    partition_type = MakePartitionTensorViewType({height_dim, width_dim}, dtype_str);
-    partition_view = EmitPartitionViewPTO(
-        output_tensor->name_hint_, tensor_view, tensor_view_type, partition_type,
-        GetIndexOffsetCodes(offsets_tuple->elements_, codegen), {height_code, width_code}, codegen);
+    std::vector<std::string> partition_dims = {height_dim, width_dim};
+    auto offset_codes = GetIndexOffsetCodes(offsets_tuple->elements_, codegen);
+    std::vector<std::string> size_codes = {height_code, width_code};
+    const ir::ExprPtr last_size = valid_shape.size() > 1 ? valid_shape[1] : nullptr;
+    const ir::ExprPtr last_offset =
+        offsets_tuple->elements_.empty() ? nullptr : offsets_tuple->elements_.back();
+    const ir::TensorLayout gm_layout =
+        tensor_type->tensor_view_.has_value() ? tensor_type->tensor_view_->layout : ir::TensorLayout::ND;
+    ExpandPackedFp4GmLastAxis(tensor_type->dtype_, offset_codes, size_codes, partition_dims, codegen,
+                              last_size, last_offset, gm_layout);
+    partition_type = MakePartitionTensorViewType(partition_dims, dtype_str);
+    partition_view = EmitPartitionViewPTO(output_tensor->name_hint_, tensor_view, tensor_view_type,
+                                          partition_type, offset_codes, size_codes, codegen);
   }
 
   std::ostringstream tstore_line;
@@ -281,9 +322,31 @@ static std::string MakeTileStoreCodegenPTO(const CallPtr& op, codegen::CodegenBa
   if (!tile_buf_type.empty()) {
     tstore_line << " : " << tile_buf_type;
   }
+  // FIXPIPE scalar pre-quantization: the accumulator is multiplied by this FP32
+  // scale on the way out, which is what lets an INT32 accumulator reach an FP16
+  // tensor (DEQF16) or an INT8 one (REQ8) without a vector round-trip. PTOAS
+  // takes the packed word as a second `ins(...)` operand here — unlike
+  // `pto.tinsert`, which spells it as a trailing `pre_quant <ssa> : i64` clause
+  // (both verified against ptoas v0.61).
+  const auto pre_quant = ir::GetOptionalDoubleKwarg(op->kwargs_, "pre_quant");
+  if (pre_quant.has_value()) {
+    const int64_t word = codegen::EncodeFixpipePreQuant(*pre_quant, tensor_type->dtype_);
+    tstore_line << ", " << codegen.GetOrEmitConstant(word, DataType::INT64) << " : i64";
+  }
   tstore_line << ") outs(" << partition_view << " : " << partition_type << ")";
 
   std::vector<std::string> attrs;
+
+  // FIXPIPE activation. It runs on the *accumulator*, ahead of the pre-quant
+  // multiply -- hence `reluPreMode` -- so the pair reproduces
+  // `maximum(tile, 0) * s` and NOT `maximum(tile * s, 0)`. The two agree for
+  // every s > 0, which is why only a negative scale separates them; measured
+  // that way on a2a3 by `acc_to_gm_negative_scale` in
+  // tests/st/runtime/ops/test_fixpipe_epilogue.py. The destination clamp is
+  // last, after the multiply.
+  if (op->GetKwarg<bool>("pre_relu", false)) {
+    attrs.emplace_back("reluPreMode = #pto<relu_pre_mode normal_relu>");
+  }
 
   const int st_phase = op->GetKwarg<int>("st_phase", static_cast<int>(ir::STPhase::kUnspecified));
   INTERNAL_CHECK_SPAN(ir::IsValidSTPhase(st_phase), op->span_)
@@ -691,7 +754,7 @@ static std::string MakeTensorReadCodegenPTO(const CallPtr& op, codegen::CodegenB
   INTERNAL_CHECK_SPAN(scalar_type_ptr, op->span_) << "tensor.read result must be ScalarType";
   std::string scalar_type = codegen.GetTypeString(scalar_type_ptr->dtype_);
 
-  // store_scalar/load_scalar need the base !pto.ptr; resolve via the tensor var
+  // pto.store/pto.load need the base !pto.ptr; resolve via the tensor var
   // even after a slice-assign rebound it to a tensor_view (issue #1493).
   std::string src = codegen.GetTensorBasePtr(AsVarLike(op->args_[0]));
   std::string src_type = codegen.GetExprTypeAnnotation(op->args_[0]);
@@ -704,7 +767,7 @@ static std::string MakeTensorReadCodegenPTO(const CallPtr& op, codegen::CodegenB
   std::string off = GetFlatOffsetSSA(indices_tuple, tensor_type_ptr->shape_, codegen);
 
   std::ostringstream oss;
-  oss << result << " = pto.load_scalar " << src << "[" << off << "]";
+  oss << result << " = pto.load " << src << "[" << off << "]";
   if (!src_type.empty()) {
     oss << " : " << src_type;
   }
@@ -724,7 +787,7 @@ static std::string MakeTensorWriteCodegenPTO(const CallPtr& op, codegen::Codegen
   auto indices_tuple = As<ir::MakeTuple>(op->args_[1]);
   INTERNAL_CHECK_SPAN(indices_tuple, op->span_) << "tensor.write second argument must be MakeTuple (indices)";
 
-  // store_scalar needs the base !pto.ptr; resolve via the tensor var even after
+  // pto.store needs the base !pto.ptr; resolve via the tensor var even after
   // a prior slice-assign rebound it to a tensor_view (issue #1493).
   std::string tensor = codegen.GetTensorBasePtr(AsVarLike(op->args_[0]));
   std::string tensor_type_str = codegen.GetExprTypeAnnotation(op->args_[0]);
@@ -738,7 +801,7 @@ static std::string MakeTensorWriteCodegenPTO(const CallPtr& op, codegen::Codegen
   std::string off = GetFlatOffsetSSA(indices_tuple, tensor_type_ptr->shape_, codegen);
 
   std::ostringstream oss;
-  oss << "pto.store_scalar " << value << ", " << tensor << "[" << off << "]";
+  oss << "pto.store " << value << ", " << tensor << "[" << off << "]";
   if (!tensor_type_str.empty() || !value_type.empty()) {
     oss << " : ";
     if (!tensor_type_str.empty()) oss << tensor_type_str;
@@ -981,6 +1044,9 @@ void RegisterMemoryOps(Backend& backend, const std::unordered_set<std::string>& 
     for (size_t j = 0; j < rank; ++j) shape_dim_names[j] = emit_dim(lhs_type->shape_[j]);
     std::vector<std::string> stride_names(rank);
     for (size_t j = 0; j < rank; ++j) stride_names[j] = emit_dim(view.stride[j]);
+
+    codegen.ExpandPackedFp4MakeTensorViewDims(lhs_type->dtype_, view.layout, lhs_type->shape_,
+                                              shape_dim_names, &view.stride, stride_names);
 
     std::string layout_str = "nd";
     switch (view.layout) {

@@ -27,7 +27,7 @@ TPUT/TGET 在该侧只需要一段可读/可写的*本地* GM 区域。窗口绑
 | `pld.tensor.reduce_scatter` | 跨 rank 规约并分散 | `DistributedTensorType`（同 src） | builtin collective |
 | `pld.tensor.allgather` | 从所有 rank 收集数据到窗口 | `DistributedTensorType`（同 src） | builtin collective |
 | `pld.tensor.all_to_all` | 基于推送的对称个性化交换——每个 rank 通过 `pld.tensor.put`（TPUT）将自己的各目标 block 推送到每个对等方的窗口中，返回窗口作为结果 | `DistributedTensorType`（同 src） | composite / HOST builtin |
-| `pld.tensor.all_to_all_v` | 变长 all-to-all（MPI_Alltoallv）——按每个目标推送 `clamp(send_counts[dest], 0, MAX_RECV)` 行，写入平面 2D 暂存窗口（传输大小是运行时行数，因此填充不会经过链路），同时通过 `pld.system.notify`（Set）把同一钳制后的计数发布到对端 `recv_counts[my_rank, 0]`，使接收方知道哪些行有效；返回窗口作为结果（与对称 `all_to_all` 相同的窗口即结果模式） | `DistributedTensorType`（与 target 相同） | composite / HOST builtin / CHIP builtin |
+| `pld.tensor.all_to_all_v` | 变长 all-to-all（MPI_Alltoallv）——按每个目标推送 `clamp(send_counts[dest], 0, MAX_RECV)` 行，写入平面 2D 暂存窗口（传输大小是运行时行数，因此填充不会经过链路），并填充 `recv_counts[src, 0]` 使接收方知道哪些行有效——builtin 内核从每个对端自己的 `send_counts` 窗口中读取自己所需的**一个字**（标量读取，无固定宽度要求）并在读取方做钳制，由两轮信用屏障守护；composite 通路则用 `pld.system.notify`（Set）发布；返回窗口作为结果（与对称 `all_to_all` 相同的窗口即结果模式） | `DistributedTensorType`（与 target 相同） | composite / HOST builtin / CHIP builtin |
 | `pld.system.notify` | 给 peer 的槽位发信号 | `Unknown`（副作用） | TNOTIFY |
 | `pld.system.wait` | 在自身槽位上阻塞 | `Unknown`（副作用） | TWAIT |
 | `pld.system.defer_wait` | 让本任务的逻辑完成等待本地 counter | `Unknown`（副作用） | Simpler completion runtime（无 PTOAS wait op） |
@@ -158,6 +158,12 @@ cell 上 —— set 可能会覆盖已经被推高的计数器。
 `N`（尾声要减去的信用总数）可以是**运行时常量** —— `pld.system.notify` 的
 `value` 只需要 `ScalarType` —— 因此 mesh allreduce 的每块信用计数不需要在编译期
 已知。
+
+`all_to_all_v` 的 builtin 内核是唯一的**两轮**变体：其计数拉取需要保护计数的
+生命周期与接收窗口的复用，因此它在拉取前执行 Barrier A（`+1` / 等待 `Ge(1)`），
+在推送后执行 Barrier B（`+1` / 等待 `Ge(2)`），最后对每个本地槽位做一次
+`AtomicAdd(-2)` 收尾——从不重置，因此下一次调用提前到达的信用会被保留。它同样
+可在连续多次调用间复用；其 InCore composite 通路仍采用上述单轮自清理协议。
 
 **约束：**
 
@@ -359,8 +365,11 @@ pld.tensor.all_to_all_v(
 
 - `input` — Tensor 或 DistributedTensor `[NR*MAX_RECV, SIZE]`
 - `target` — DistributedTensor `[NR*MAX_RECV, SIZE]`（窗口即结果）
-- `signal` — DistributedTensor INT32 `[NR, 1]`（自清理信用屏障；可在多次调用间复用）
-- `send_counts` — Tensor-like INT32 `[NR]` 或 `[NR, 1]`（运行时每目标行数）
+- `signal` — DistributedTensor INT32 `[NR, 1]`（信用式两轮屏障；可在连续多次调用间复用——初始化一次置零，切勿重置）
+- `send_counts` — INT32 `[NR]` 或 `[NR, 1]`（运行时每目标行数）。在 HOST/CHIP
+builtin 通路上必须是窗口绑定的 `DistributedTensor`（每个对端通过
+`CommRemotePtr` 读取本 rank 的条目）；纯 `Tensor` 仅在 InCore composite
+通路上被接受
 - `recv_counts` — DistributedTensor INT32 `[NR, 1]`（InOut recvcounts）
 
 `input` 和 `target` 都以扁平元素算术寻址，因此两者都必须是紧凑行主序视图，且必须是
@@ -374,9 +383,18 @@ CHIP 通路上，操作数是以函数参数的形式到达的，没有这样的
 调用方的义务。
 
 `MAX_RECV = target.shape[0] // NR`。降级在运行时读取 `send_counts[dest]`、钳制到
-`[0, MAX_RECV]`，并把**钳制后**的计数通过 `pld.system.notify`（Set）写入对端
-`recv_counts[my_rank, 0]`。推送只传输这么多行——传输形状是运行时的
-`[rows, SIZE]`，而非编译期容量——因此填充行不会经过链路。屏障之后接收方用
+`[0, MAX_RECV]`，并填充接收侧计数向量 `recv_counts[src, 0]`。builtin 内核
+（HOST 与托管 CHIP/L2 通路）以**拉取**方式完成：每个 rank 先把自身的发送向量
+暂存到自己的 `send_counts` 窗口，Barrier A 之后每个 rank 用一次标量（非缓存）
+读取从各对端窗口中取出自己所需的**一个字**——无批量传输、无固定宽度要求，
+`[NR]` INT32 向量就是该窗口需要的全部内容——并在**读取方**做钳制
+（`recv_counts[src, 0] = clamp(send_counts_of[src][my_rank], 0, MAX_RECV)`）。
+整个交换由**两轮信用屏障**守护：Barrier A（拉取前）证明所有 rank 已暂存计数，
+且都已消费上一次调用的接收窗口；Barrier B（推送后）证明每个对端都已读完本 rank
+的计数并完成推送，方可返回。
+InCore composite 通路则把已经钳制过的计数通过 `pld.system.notify`（Set）写入
+对端 `dest` 的 `recv_counts[my_rank, 0]`。推送只传输这么多行——传输形状是运行时
+的 `[rows, SIZE]`，而非编译期容量——因此填充行不会经过链路。调用结束之后接收方用
 `recv_counts[src, 0]` 识别有效行；其容量槽的其余部分根本不会被写入。窗口内存
 不*保证*清零，且可能在同一进程内残留，因此这些未触及的字节是未定义的。
 
@@ -428,8 +446,10 @@ notify/count 写入与内核读取竞争，control 与 control 之间是 notify 
 发布竞争）。内核在入口把 `MAX_RECV` 推导为 `target.shape[0] / nranks`（运行时
 通信域大小），因此块布局始终与实际运行的设备数一致——不再需要
 `signal.shape[0]` 与设备数**精确相等**的要求，也不再需要按 `MAX_RECV` 进行
-variant 混入。不支持在 `host_orch` 的 `for`/`while` 循环内调用（单次使用
-的信号协议）——与 `LowerCompositeOps` 在 InCore 路径上强制的限制相同。
+variant 混入。暂不支持在 `host_orch` 的 `for`/`while` 循环内调用——这是编译器的
+限制（动态重复调用需要循环携带的窗口生命周期管理，本编译器尚未建模），而不是
+信号本身的性质：信用屏障可跨顺序调用复用——与 `LowerCompositeOps` 在 InCore
+路径上强制的限制相同。
 
 ### `pld.tensor.allreduce`
 

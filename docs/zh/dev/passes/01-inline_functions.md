@@ -35,7 +35,7 @@ program_inlined = inline_pass(program)
 2. **环检测** Inline → Inline 调用图;若发现环,抛出 `pypto::ValueError` 并在消息中标明环路径。
 3. **迭代到不动点** — 每次迭代遍历所有函数(包括 Inline 函数本身,以便嵌套的 Inline-calls-Inline 也能传递展开):
    - 对函数体中每个顶层 `LHS = inline_call(args)` 或 `EvalStmt(inline_call(args))`:
-     - 构建参数替换映射(形参 `Var` → 实参 `Expr`)。该映射同时作用于使用点**和**定义点,因此被调函数中的重绑定 `out = pl.tensor.assemble(out, ...)` 会重绑定调用方的实参 `Var`。有两类实参会先在展开体之前绑定到新的 `<param>_inline<counter>` `Var`,再用该 `Var` 替换:被重绑定形参的非可赋值 `Var` 实参(切片 `c[r]`、`IterArg`、计算得到的标量),以及任何计算得到的 tensor / tile 实参(如 `a[r]` 这样的 `Call`),Python 在调用点对其只求值一次。其余实参 —— `Var`、标量表达式、常量 —— 仍直接替换,因此读取形参的形状表达式仍可折叠。
+     - 构建参数替换映射(形参 `Var` → 实参 `Expr`)。该映射同时作用于使用点**和**定义点,因此被调函数中的重绑定 `out = pl.tensor.assemble(out, ...)` 会重绑定调用方的实参 `Var` —— 但仅限于带有原地(in-place)契约的形参(见[重绑定形参](#重绑定形参))。有三类实参会先在展开体之前绑定到新的 `<param>_inline<counter>` `Var`,再用该 `Var` 替换:被重绑定形参的非可赋值 `Var` 实参(切片 `c[r]`、`IterArg`、计算得到的标量);被重绑定的按值传递形参的实参(即既非 `pl.Out` 也非 `pl.InOut` 的普通标量);以及任何计算得到的 tensor / tile 实参(如 `a[r]` 这样的 `Call`),Python 在调用点对其只求值一次。其余实参 —— 绑定到只读形参的 `Var`、标量表达式、常量 —— 仍直接替换,因此读取形参的形状表达式仍可折叠。
      - 对内联体中每个本地绑定的 `Var` 做 alpha 重命名(`<orig>_inline<counter>`,并去掉 `<orig>` 末尾的 `_`),避免多个调用点之间冲突。
      - 在调用点之前插入重命名+替换后的函数体语句。
      - 按调用点形态接线被内联函数的尾部返回值:`LHS = renamed_return`(单返回值赋值;当 `LHS` 与替换后的返回 `Var` 是同一个 `Var` 时省略该赋值,以避免冗余 SSA 拷贝)、逐元素替换 `TupleGetItemExpr` 而不发出 `MakeTuple` 绑定(多返回值赋值)、新的 `ReturnStmt`(`return inline_call(...)`),或者当返回值被丢弃但其求值可观测时发出新的 `EvalStmt`(`EvalStmt` 调用点 — 参见[边界情况](#边界情况))。
@@ -112,6 +112,41 @@ def main(self, a, b):
 
 scope 被原样保留,稍后由 `OutlineIncoreScopes` 提取为独立的 InCore 函数,与直接写在调用点处效果一致。
 
+## 重绑定形参
+
+由于替换会作用到定义点,被调函数对自身形参的重绑定有可能落到调用方的 `Var` 上。是否*应该*落上去,取决于该形参的调用约定:
+
+| 形参 | 重绑定落在 | 原因 |
+| ---- | ---------- | ---- |
+| `pl.Out[...]` / `pl.InOut[...]` | 调用方的 `Var` | 作者显式选择了原地契约。 |
+| 任意 tensor / tile / `Array` 形参 | 调用方的 `Var` | 这些形参是*句柄*,其重绑定**就是**那次原地更新:`c[...] = v` 解析为 `c = pl.tensor.assemble(c, ...)`,`a[i] = v` 解析为 `a = pl.array.update_element(a, i, v)`。`@pl.jit.inline` 正因如此会剥掉带形状形参上的 `pl.Out` / `pl.InOut`,所以不能仅凭方向(direction)判断。此处若绑定临时变量,还会产生裸的 `arr_inline0 = arr` 别名,而 orchestration codegen 无法声明它 —— array `Var` 只能来自 `array.create` 或对已有后备数组的别名,绝不能由其类型声明。 |
+| 普通标量 | 新的 `<param>_inline<counter>` `Var` | 按值传递,与 Python 一致。 |
+
+最后一行最容易出错。给定:
+
+```python
+@pl.function(type=pl.FunctionType.Inline)
+def bump(self, n: pl.Scalar[pl.INDEX]) -> pl.Scalar[pl.INDEX]:
+    n = n + 1
+    return n
+
+@pl.function
+def main(self, k: pl.Scalar[pl.INDEX]) -> pl.Scalar[pl.INDEX]:
+    m: pl.Scalar[pl.INDEX] = self.bump(k)
+    return k + m                              # k + (k + 1)
+```
+
+调用点会先绑定一个临时变量,因此其后调用方的 `k` 仍可读到原值:
+
+```python
+n_inline0: pl.Scalar[pl.INDEX] = k
+n_inline0 = n_inline0 + 1
+m: pl.Scalar[pl.INDEX] = n_inline0
+s: pl.Scalar[pl.INDEX] = k + m                # 原始的 k
+```
+
+若改为在定义点替换 `k`,则会把 `k = k + 1` 插入调用方,静默算出 `2k + 2`。注意 JIT specializer 的 alpha 重命名**覆盖不到**这种情况:它只在名字首次绑定的作用域深度上重命名重绑定,因此写在 `pl.range` / `pl.spmd` 内的重绑定会以形参真实定义点的形式到达本 pass。
+
 ## 边界情况
 
 | 情况 | 行为 |
@@ -120,6 +155,7 @@ scope 被原样保留,稍后由 `OutlineIncoreScopes` 提取为独立的 InCore 
 | 作为程序入口的 Inline 函数 | 此处不视为错误 — 但因为没有任何 Call 指向它,清理阶段会像任何无调用者函数那样移除。 |
 | Inline 调用 Inline(传递) | 迭代到不动点。 |
 | 计算得到的 tensor / tile 实参,如 `f(a[r], c[r])`,被调函数读取 `x` 并写入 `c[0:4, j] = v` | 每个实参在调用点只绑定一次 —— `x_inline0 = a[r]`、`c_inline1 = c[r]`,再 `c_inline1 = pl.tensor.assemble(c_inline1, v, ...)` —— 与调用方自行为切片命名时解析器生成的 IR 相同。直接替换 `c[r]` 会把 `Call` 放到重绑定的左值上;直接替换 `a[r]` 会在被调函数的 `pl.spmd` / `pl.pipeline` 体内重复求值,并把它移入外提的 kernel。切片是其源张量的视图,因此写入会到达调用方的 `c`。 |
+| 被重绑定的按值传递形参,例如内联被调函数对标量形参执行 `n = n + 1` | 实参在调用点绑定一次(`n_inline0 = k`),重绑定只作用在该临时变量上,因此其后调用方的 `k` 保持不变。见[重绑定形参](#重绑定形参)。 |
 | 递归 Inline(自递归或互相调用) | 在任何展开发生之前抛出 `pypto::ValueError`,消息中标明环路径(`a -> b -> a`)。 |
 | 多返回值 Inline | **不**发出 `LHS = MakeTuple([rets...])` — 编排层 codegen 无法 lower `MakeTuple`。改为把克隆后的返回值记录在 LHS `Var` 上,并把下游 `TupleGetItemExpr(LHS, i)` 的使用改写为第 `i` 个值,使该 LHS 绑定最终无人引用(参见 `SpliceInlineCallAsTupleSub`)。 |
 | 嵌套 Call 到 Inline(如 `pl.add(inline_fn(x), y)`,以及解析器把 `arr[i] = inline_fn(x)` 脱糖成的 `array.update_element(arr, i, inline_fn(x))`) | 先提升为独立的 `AssignStmt`,并在同一轮迭代中展开 — 参见[嵌套调用点](#嵌套调用点)。 |

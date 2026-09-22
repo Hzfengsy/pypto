@@ -173,12 +173,15 @@ struct BuiltinKernelSpec {
       {ParamDirection::In, ParamDirection::InOut, ParamDirection::InOut, ParamDirection::In,
        ParamDirection::InOut},
       {"input", "target", "signal", "send_counts", "recv_counts"},
-      // `input` and `send_counts` are Tensor-like on the public op: either a
-      // plain Tensor or a DistributedTensor. The kernel sees a flat `Tensor*`
-      // for both, so the synthesized signature fixes them as plain Tensor and
-      // the variant stays keyed on dtype alone. The three genuinely
-      // window-bound operands stay distributed, which is also what gives
-      // MaterializeDistTensorCtx the CommCtx parameters the kernel needs.
+      // `input` stays Tensor-like on the public op (plain Tensor or
+      // DistributedTensor — the kernel only reads it locally as the TPUT
+      // source). `send_counts` is required to be window-bound at the call site
+      // on this rail (peers pull it through CommRemotePtr; see LowerCollective),
+      // but BOTH are declared as plain `Tensor*` here: the synthesized
+      // signature fixes the ABI and the variant stays keyed on dtype alone. The
+      // three genuinely window-bound operands stay distributed, which is also
+      // what gives MaterializeDistTensorCtx the CommCtx parameters the kernel
+      // needs.
       {false, true, true, false, true},
   };
 }
@@ -186,9 +189,11 @@ struct BuiltinKernelSpec {
 /// The parameter type the synthesized signature declares, which is deliberately
 /// *not* whatever the call site passed.
 ///
-/// `input` and `send_counts` accept either a Tensor or a DistributedTensor, and
-/// the two are indistinguishable to the kernel — both arrive as a flat
-/// `Tensor*`. Copying the first call's types would make one cached function
+/// `input` and `send_counts` are both rendered as a flat `Tensor*` — the two
+/// kinds are indistinguishable to the kernel — and `send_counts` is additionally
+/// pinned to a window-bound DistributedTensor at the call site (LowerCollective),
+/// so the canonical declaration cannot depend on the call. Copying the first
+/// call's types would make one cached function
 /// carry an accidental ABI: a later call passing the other kind would inherit a
 /// signature whose CommCtx parameter count no longer matches its arguments,
 /// because MaterializeDistTensorCtx appends one per DistributedTensor
@@ -305,6 +310,18 @@ class LowerL2TensorCollectivesMutator : public IRMutator {
     INTERNAL_CHECK_SPAN(target_type, call->span_)
         << "LowerL2TensorCollectives: pld.tensor.all_to_all_v target must be DistributedTensorType";
 
+    // send_counts is read REMOTELY by every peer (the hand-written kernel
+    // resolves each peer's copy through CommRemotePtr for the counts pull), so
+    // it must be a DistributedTensor on this rail: a distributed operand is
+    // what the managed rail materializes as a window at runtime. The public
+    // op's deducer accepts a plain Tensor for the InCore composite path, where
+    // counts are consumed locally; reaching this rail with one is user error.
+    auto counts_type = As<DistributedTensorType>(call->args_[3]->GetType());
+    CHECK_SPAN(counts_type != nullptr, call->span_)
+        << "CHIP pld.tensor.all_to_all_v send_counts must be a DistributedTensor: peers read this "
+           "rank's send vector through CommRemotePtr, so a plain Tensor (accepted only on the InCore "
+           "composite path) is not supported on this rail";
+
     auto spec = MakeAllToAllVKernelSpec(target_type->dtype_, call->span_);
     // One kernel per dtype, shared by every call site in the Program. The
     // kernel reads each extent from the runtime `Tensor` descriptor
@@ -326,7 +343,8 @@ class LowerL2TensorCollectivesMutator : public IRMutator {
     //            CommCtx suffix MaterializeDistTensorCtx appends is driven by
     //            the callee's params, so args and params cannot disagree on it.
     //   rank   - the deducer pins every operand but send_counts to 2D, and
-    //            send_counts is addressed flatly (`send_counts_base[dest]`).
+    //            send_counts is addressed flatly (`send_counts_base[dest]`
+    //            locally; the remote pull word is `send_counts_base[my_rank]`).
     //
     // Relaxing any of those - a second dtype variant, a rank-3 payload - breaks
     // the sharing itself, not just this comment.

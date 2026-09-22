@@ -46,7 +46,7 @@ declared in the constants block before its use.
 ### Explicit Buffer input
 
 `GenerateBufferFunction` validates explicitly constructed Buffer IR before
-emission. Its GM path supports static, packed ND rank-2 FP32 Tensor parameters
+emission. Its GM path supports static, packed ND rank-2 FP16/BF16/FP32/INT32 Tensor parameters
 and normalized Tensor parameter returns. It shares the existing GM tensor-view
 prologue and native tensors-first/scalars-last ABI. Tensor returns remain in IR
 for orchestration aliasing; they do not create native return values.
@@ -59,8 +59,8 @@ from a `buffer.alloc` in the same scope; an address is emitted exactly when its
 operand is present, independently of the legacy emission flag. GM transfers
 never create a buffer, infer valid-state updates, or reconstruct a logical Tile.
 
-This direct path does not enable automatic Tile-to-Buffer conversion or change
-the default pipeline. See [Buffer contracts](../ir/02-types.md#buffer-operator-contracts)
+With `enable_buffer_ir=True`, the pipeline runs `LowerTileToBuffer` before
+entering this direct path. The default pipeline remains Functional during migration. See [Buffer contracts](../ir/02-types.md#buffer-operator-contracts)
 for descriptor, direction, dynamic-window, and ABI limits. Native compilation
 tests establish syntax and operand dataflow; numerical execution is a separate
 integration requirement.
@@ -193,6 +193,34 @@ when buffer reuse did not collapse `target` and the destination buffer; in
 that case it preserves any data outside the insertion window.  The
 trailing `pto.tmov src → dst_view` is the actual data write into the
 sub-window carved out by `pto.subview`.
+
+**FIXPIPE epilogue on the Acc writeback.**  A *converting* `Acc → Mat` assemble
+and every `Acc → GM` store are the cube's fix-pipe draining L0C, which can
+multiply by an FP32 scale and apply ReLU on the way out; both ops carry that as
+`pre_quant` / `pre_relu`. The order is **ReLU, then the multiply, then the
+destination clamp** — the activation is a *pre*-quant stage (pto-isa's
+`ReluPreMode`) that sees the raw accumulator, so the pair computes
+`maximum(tile, 0) * scale`, not `maximum(tile * scale, 0)`. Those agree for every
+`scale > 0`, which is why only a negative scale separates them; `acc_to_gm_negative_scale`
+in `tests/st/runtime/ops/test_fixpipe_epilogue.py` measures it on a2a3.
+
+The scale also *selects* the lowering — an `INT32` accumulator reaches an `FP16`
+Mat tile only because it carries one (`DEQF16`) — so one predicate,
+`ir::CubeMatWritebackUsesFixpipe`, decides it for the emitter and
+`FixpipeEpilogueValid` alike; a same-dtype assemble converts nothing, stays a
+plain `pto.tmov`, and carries no epilogue. `pto.tinsert` and `pto.tstore` spell
+the packed scale operand differently, neither form guessable from the other —
+both pinned with their provenance at the emission sites. See
+`codegen::EncodeFixpipePreQuant` for the register layout, `99-verifier.md` for
+the per-backend dtype tables.
+
+The `pto.tinsert` half is **emitted but not currently reachable**: both handlers
+withhold `pre_quant` for `FixpipeDest::kMat` because ptoas emits an ambiguous
+call for it (the scale binds to `indexRow` —
+[PTOAS#1570](https://github.com/hw-native-sys/PTOAS/issues/1570), and
+`99-verifier.md` for the mechanism), so the
+emitter code below is exercised only with verification off. `pre_relu` alone on
+`Acc → Mat`, and the whole `Acc → GM` path, are unaffected.
 
 **`tile.set_validshape` lowering details.**  `pto.set_validshape` mutates the
 operand's `valid_row` / `valid_col` operands, so the operand must be a handle
@@ -437,19 +465,26 @@ because falling back to per-slot `alloc_tile` would let ptoas plan the slots on
 top of each other.
 
 **One slot per iteration.** The co-live rejection is not a shape ptoas fails to
-*type* — it is one it fails to *synchronize*. ptoas 0.54 derives the per-slot WAR
-guard only for the first `multi_tile_get` of an iteration; given two, the second
-load is emitted with no `wait_flag`, so the next iteration overwrites that slot
-while the current one still reads it. Measured wrong on device, so codegen refuses
-the shape and points at the PyPTO planner, whose baked addresses and PyPTO-emitted
-sync handle it. Straight-line code is unaffected — with no loop there is no
-cross-iteration reuse to guard. Filed as
-[PTOAS#1118](https://github.com/hw-native-sys/PTOAS/issues/1118); lifting the
-restriction is one condition in `PlanMultiBufferRegions`.
+*type* — it is one it fails to *synchronize*. Two forms of it have gone wrong:
 
-Under `PYPTO` no region is emitted at all: at `--pto-level=level3` ptoas does not
-fold its per-slot address fan-out, so the region form would lose the slot analysis
-it exists for ([PTOAS#1106](https://github.com/hw-native-sys/PTOAS/issues/1106)).
+| Form | ptoas behaviour | Upstream |
+| ---- | --------------- | -------- |
+| Two slots filled and read in the same iteration | ≤ 0.55 guards only the first `multi_tile_get`; the second load races the next iteration's write (measured wrong on device with 0.54). 0.56+ guards the body with one static event for the whole region — correct, but none of the per-slot overlap the region form exists for | [PTOAS#1118](https://github.com/hw-native-sys/PTOAS/issues/1118), fixed in 0.56 |
+| Prefetch: slot 0 filled before the loop, then each iteration fills slot `(i+1) % 2` while reading slot `i % 2` | ≤ 0.62 primes and drains both slots' events as for a one-slot rotation, off by one here: wrong data for an even trip count, a device hang for an odd one | [PTOAS#1519](https://github.com/hw-native-sys/PTOAS/issues/1519), fixed in 0.63 |
+
+`CoLiveSlotCollector` counts slot selections per loop body, so it cannot tell the
+two forms apart, and the pinned ptoas (0.61) still has the second bug. Codegen
+therefore refuses both and points at the PyPTO planner, whose baked-address
+`alloc_tile` path runs the same-iteration form correctly on device.
+Straight-line code is unaffected — with no loop there is no cross-iteration reuse
+to guard. Lifting the restriction is one condition in `PlanMultiBufferRegions`;
+it needs the ptoas pin at 0.63 or later and a device run of both forms.
+
+Under `PYPTO` no region is emitted at all: a region at `--pto-level=level3` needs
+an explicit base `addr`, which codegen does not emit yet. ptoas is not the limit —
+given a constant `addr` it has derived the same per-slot sync at level3 as at
+level2 since 0.55 ([PTOAS#1106](https://github.com/hw-native-sys/PTOAS/issues/1106),
+closed).
 
 ### Load Operation Transformation
 

@@ -78,7 +78,7 @@ MIGRATION_FAMILIES = (
             "tile.part_max",
             "tile.part_min",
         ),
-        restricted=frozenset({"tile.add", "tile.mul"}),
+        restricted=frozenset({"tile.add", "tile.sub", "tile.mul", "tile.maximum", "tile.minimum"}),
     ),
     MigrationFamily(
         "G04: Scalar-vector operations",
@@ -95,6 +95,17 @@ MIGRATION_FAMILIES = (
             "tile.minimums",
             "tile.lrelu",
         ),
+        restricted=frozenset(
+            {
+                "tile.adds",
+                "tile.subs",
+                "tile.muls",
+                "tile.divs",
+                "tile.maximums",
+                "tile.minimums",
+                "tile.lrelu",
+            }
+        ),
     ),
     MigrationFamily(
         "G05: Unary and precision arithmetic",
@@ -109,6 +120,18 @@ MIGRATION_FAMILIES = (
             "tile.recip",
             "tile.div",
             "tile.rsqrt",
+        ),
+        restricted=frozenset(
+            {
+                "tile.abs",
+                "tile.exp",
+                "tile.sqrt",
+                "tile.neg",
+                "tile.relu",
+                "tile.log",
+                "tile.recip",
+                "tile.div",
+            }
         ),
     ),
     MigrationFamily(
@@ -144,6 +167,7 @@ MIGRATION_FAMILIES = (
             "tile.tri",
             "tile.random",
         ),
+        restricted=frozenset({"tile.full"}),
     ),
     MigrationFamily(
         "G09: Reductions and indices",

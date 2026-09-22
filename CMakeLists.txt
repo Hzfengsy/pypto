@@ -294,6 +294,7 @@ set(PYPTO_SOURCES
     src/ir/verifier/verify_aiv_split.cpp
     src/ir/verifier/verify_acc_compact.cpp
     src/ir/verifier/verify_acc_to_gm_store.cpp
+    src/ir/verifier/verify_fixpipe_epilogue.cpp
     src/ir/verifier/verify_atomic_add_dtype.cpp
     src/ir/verifier/verify_acc_store_phase.cpp
     src/ir/verifier/verify_no_scalar_kernel_return.cpp
@@ -365,6 +366,7 @@ set(PYPTO_SOURCES
     src/backend/common/backend.cpp
     src/backend/common/backend_config.cpp
     src/backend/common/backend_registry.cpp
+    src/backend/common/buffer_elementwise_recipes.cpp
     src/backend/common/pto_ops_common.cpp
     src/backend/common/pto_ops_shared.cpp
     src/backend/common/pto_ops_elementwise.cpp

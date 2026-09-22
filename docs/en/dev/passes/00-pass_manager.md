@@ -61,7 +61,7 @@ Framework for organizing and executing IR transformation passes on Programs with
 | `CommDomainScopesMaterialized` | Host_orch bodies wrapped in CommDomainScopeStmts, and `pld.tensor.window` result types carry `DistributedTensorType::window_buffer_` back-references |
 | `DistTensorCtxMaterialized` | No `pld.system.get_comm_ctx` survives outside host orchestration; every chip-orchestration / device communication context is an explicit CommCtxType SSA value traceable to a parameter |
 | `RuntimeScopesMaterialized` | Orchestration functions carry explicit RuntimeScopeStmt nodes, so codegen emits no implicit `SIMPLER_SCOPE()` wrappers |
-| `AssignTypeSymmetry` | Every AssignStmt has `structural_equal(var->GetType(), value->GetType())` (memref excluded as an allocation detail) |
+| `AssignTypeSymmetry` | Every singly-defined Var has `structural_equal(var->GetType(), value->GetType())` on its defining AssignStmt (memref excluded as an allocation detail; a pre-SSA rebind has no single defining value) |
 | `ManualDepsOnSubmitOnly` | No plain cross-function Call carries `attrs["manual_dep_edges"]` — manual edges live in `Submit::deps_` |
 | `ReturnParamsExplicit` | InCore/Group/Spmd/Graph tensor returns reference function params by pointer identity (#1702, #2601) |
 | `UnrollResolved` | No `ForKind::Unroll` survives; produced by UnrollLoops |
@@ -300,6 +300,11 @@ Print→parse roundtrip verification instrument. After every pass, it:
 1. Prints the resulting IR to Python DSL text via `python_print()`
 2. Parses the text back to an IR `Program` via `parse()`
 3. Asserts `structural_equal(original, reparsed)` — a failure means the printer or parser cannot faithfully represent the IR produced by that pass
+
+Buffer-stage programs use binary serialization roundtrip because their Python
+output is diagnostic text rather than executable DSL. Structural equality still
+checks the complete program, including device stages, descriptors and aliases;
+serialization failures are errors, not skipped verification.
 
 ```python
 from pypto.pypto_core import passes

@@ -283,6 +283,8 @@ TypePtr DeduceTileReshapeType(const std::vector<ExprPtr>& args,
   auto tile_type = As<TileType>(args[0]->GetType());
   CHECK(tile_type) << "tile.reshape requires first argument to be a TileType, but got "
                    << args[0]->GetType()->TypeName();
+  CHECK_SPAN(!tile_type->dtype_.IsFp4Family(), args[0]->span_)
+      << "tile.reshape is not supported for FP4/FP4E2M1X2 (see docs/en/dev/fp4.md)";
 
   // Second argument must be TupleType (shape)
   auto shape_tuple_type = As<TupleType>(args[1]->GetType());
@@ -456,6 +458,8 @@ TypePtr DeduceTileTransposeType(const std::vector<ExprPtr>& args,
 
   CHECK(axis1 != axis2) << "tile.transpose: axis1 and axis2 must be different, but got axis1=" << axis1
                         << ", axis2=" << axis2;
+  CHECK_SPAN(!input_type->dtype_.IsFp4Family(), args[0]->span_)
+      << "tile.transpose does not support FP4/FP4E2M1X2; PTOAS ttrans has no f4E2M1x2 lowering";
 
   std::vector<ExprPtr> new_shape = input_shape;
   std::swap(new_shape[axis1], new_shape[axis2]);
@@ -641,9 +645,19 @@ TypePtr DeduceTileAssembleType(const std::vector<ExprPtr>& args,
   const bool fixpipe_downcast =
       source_type->dtype_ == DataType::FP32 &&
       (target_type->dtype_ == DataType::BF16 || target_type->dtype_ == DataType::FP16);
-  CHECK(target_type->dtype_ == source_type->dtype_ || fixpipe_downcast)
+  // A ``pre_quant`` scale turns the writeback into a *scale-bearing* conversion
+  // (INT32->FP16 dequant, FP32->INT8 quant, ...), which reaches destinations the
+  // unscaled narrowing above cannot. Which pairs are actually legal is a backend
+  // property and cannot be decided here — memory spaces are still unresolved at
+  // this point, so we cannot even tell an Acc->Mat writeback from a Vec->Vec
+  // insert. Accepting the mismatch here and rejecting the illegal pairs in the
+  // ``FixpipeEpilogueValid`` verifier (after InferTileMemorySpace) keeps this
+  // deducer free of backend knowledge and keeps the error message able to name
+  // the memory spaces involved.
+  const bool has_pre_quant = GetOptionalDoubleKwarg(kwargs, "pre_quant").has_value();
+  CHECK(target_type->dtype_ == source_type->dtype_ || fixpipe_downcast || has_pre_quant)
       << "tile.assemble requires target and source to have the same dtype (or an "
-         "Acc->Mat FIXPIPE downcast to bf16/f16), but got "
+         "Acc->Mat FIXPIPE downcast to bf16/f16, or an explicit pre_quant scale), but got "
       << target_type->dtype_.ToString() << " and " << source_type->dtype_.ToString();
 
   // The result holds what the target already held plus what was just written.
@@ -694,6 +708,12 @@ REGISTER_OP("tile.assemble")
     .add_argument("target", "Target tile (TileType)")
     .add_argument("source", "Source tile to write (TileType)")
     .add_argument("offset", "Offset dimensions (TupleType of ScalarType(INT64/UINT64/INDEX))")
+    // FIXPIPE pre-ops on an Acc->Mat writeback (`pto.tinsert`): `pre_quant` is an
+    // FP32 scale the accumulator is multiplied by on the way out, `pre_relu` an
+    // activation applied after that multiply and the destination clamp. Both are
+    // absent on an ordinary same-space assemble.
+    .set_attr<double>("pre_quant")
+    .set_attr<bool>("pre_relu")
     // Rewrites the offset sub-region of `target` and passes the rest through to
     // the result, so the prior content is read. Tile-local, hence no channel.
     .set_arg_effect(0, ArgEffect::ReadWrite)

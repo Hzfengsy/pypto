@@ -474,8 +474,13 @@ def all_to_all_v(
     (staging window / result), INT32 barrier signal [NR, 1], INT32
     ``send_counts`` [NR] / [NR, 1] holding the number of rows to send to each
     destination, and window-bound INT32 ``recv_counts`` [NR, 1] that receives
-    per-source valid-row counts after the barrier (published via
-    ``pld.system.notify`` as ``clamp(send_counts[dest], 0, MAX_RECV)``). Powered
+    per-source valid-row counts after the barrier. The hand-written builtin
+    kernel pulls ONE scalar word per peer from that peer's own ``send_counts``
+    window (non-cacheable read; no bulk transfer, so the ``[NR]`` INT32 vector
+    is all the buffer needs) and clamps the value reader-side; the builtin
+    exchange is gated by a two-round credit barrier (Barrier A before the pull,
+    Barrier B before return). The InCore composite rail publishes the clamped
+    count via ``pld.system.notify``. Powered
     by LowerCompositeOps into a 2-phase push-based decomposition (push →
     barrier), returning the target window. Each push transfers exactly
     ``clamp(send_counts[dest], 0, MAX_RECV)`` rows — the transfer extent is the
@@ -488,8 +493,9 @@ def all_to_all_v(
     target.shape[0] // NR``: a count above it is capped, and a **negative**
     count is floored at ``0`` — so a negative ``send_counts[dest]`` publishes
     ``recv_counts = 0`` rather than the negative value. The barrier signal is
-    self-clearing (restored to zero after each call) and safe to reuse inside a
-    ``for``/``while`` loop.
+    credit-based (reusable across sequential calls; zero-initialise once and do
+    not reset it), and calls nested in ``for``/``while`` loops remain rejected
+    by the compiler.
 
     .. warning::
 

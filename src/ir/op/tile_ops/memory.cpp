@@ -38,6 +38,7 @@
 #include "pypto/ir/memory_space.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/phase.h"
+#include "pypto/ir/pipe.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/tile_view_semantics.h"
@@ -188,6 +189,12 @@ TypePtr DeduceTileLoadType(const std::vector<ExprPtr>& args,
       target_memory_opt = AnyCast<MemorySpace>(v, "target_memory");
       break;
     }
+  }
+  if (tensor_type->dtype_.IsFp4Family() && target_memory_opt.has_value()) {
+    CHECK_SPAN(!IsCubeMemorySpace(*target_memory_opt), args[0]->span_)
+        << "The operator " << op_name
+        << " cannot load FP4/FP4E2M1X2 into cube memory (Mat/Left/Right/Acc/Bias/scale); "
+           "load to Vec, cast to FP8, then move into cube";
   }
   const bool is_mx_load =
       tensor_type->tensor_view_.has_value() && IsMxTensorLayout(tensor_type->tensor_view_->layout);
@@ -579,6 +586,10 @@ TypePtr DeduceTileMoveType(const std::vector<ExprPtr>& args,
 
   // Extract MemorySpace
   MemorySpace space = GetKwarg<MemorySpace>(kwargs, "target_memory");
+  CHECK_SPAN(!tile_type->dtype_.IsFp4Family() || !IsCubeMemorySpace(space), args[0]->span_)
+      << "The operator " << op_name
+      << " cannot move FP4/FP4E2M1X2 into cube memory (Mat/Left/Right/Acc/Bias/scale); "
+         "cast to FP8 on Vec first";
 
   const auto& input_shape = tile_type->shape_;
 
@@ -755,6 +766,12 @@ TypePtr DeduceTileCreateTileType(const std::vector<ExprPtr>& args,
       << "The operator " << op_name
       << " does not support target_memory=LeftScale/RightScale; create the scale tile with tile.load "
          "to Mat followed by tile.move";
+  if (dtype.IsFp4Family() && target_memory_opt.has_value()) {
+    CHECK_SPAN(!IsCubeMemorySpace(*target_memory_opt), args[0]->span_)
+        << "The operator " << op_name
+        << " cannot create an FP4/FP4E2M1X2 tile on cube memory (Mat/Left/Right/Acc/Bias/scale); "
+           "create on Vec, cast to FP8, then move into cube";
+  }
 
   TileView tile_view;
   // `transpose=true` requests the transposed Mat (ZN) fractal layout
@@ -1313,6 +1330,12 @@ REGISTER_OP("tile.store")
                   "Injected by FlattenTileNdTo2D for ND tensors.")
     .set_attr<int>("atomic")
     .set_attr<int>("st_phase")
+    // FIXPIPE pre-ops on an Acc->GM writeback (`pto.tstore`): `pre_quant` is an
+    // FP32 scale the accumulator is multiplied by on the way out, `pre_relu` an
+    // activation applied after that multiply and the destination clamp. Both are
+    // meaningless for a Vec source and rejected there by `AccToGmStoreValid`.
+    .set_attr<double>("pre_quant")
+    .set_attr<bool>("pre_relu")
     .set_input_memory(0, {MemorySpace::Vec, MemorySpace::Acc})
     .set_output_reuses_input(2)
     // A plain store overwrites the region it lands on: the untouched remainder

@@ -25,6 +25,9 @@ import subprocess
 import sys
 import sysconfig
 import threading
+from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -40,11 +43,28 @@ from pypto.backend._ptoas_locate import find_ptoas_binary
 
 _identity_cache = InstallationIdentityCache()
 _discovery_lock = threading.Lock()
+# ldd is subprocess-bound, not CPU-bound; this only caps how many run at once.
+_LDD_WORKERS = 32
 _identities: dict[tuple[Any, ...], ToolchainIdentity] = {}
 
 
+# Every probe below reads its answer out of a tool's diagnostic output, and
+# those strings are translated: on a non-English host gcc prints its own
+# rendering of "#include <...> search starts here:", which no marker here
+# matches. Pin the C locale for the probes rather than teach every parser
+# every translation.
+_C_LOCALE = {"LC_ALL": "C", "LANG": "C", "LANGUAGE": ""}
+
+
 def _run(command: list[str]) -> str:
-    result = subprocess.run(command, capture_output=True, text=True, timeout=30, check=True)
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+        env={**os.environ, **_C_LOCALE},
+    )
     return result.stdout + result.stderr
 
 
@@ -59,12 +79,38 @@ def _executable(name: str) -> Path:
     return path
 
 
+def _invocable(name: str) -> Path:
+    """Return the compiler as the build invokes it, without resolving it.
+
+    A compiler on PATH may be a wrapper that dispatches on argv[0]: ccache
+    installs a directory of symlinks, one per compiler name, every one of them
+    pointing at the single ccache binary, and decides which compiler to run
+    from the name it was called by. Resolving that symlink first discards the
+    name, and the wrapper then answers ``-print-prog-name`` about *itself* --
+    ccache rejects the option outright -- so discovery fails on a host whose
+    PATH puts those shims first, which is the ordinary state of a build
+    machine. Invoking the path the build invokes keeps the dispatch intact and
+    reaches the real compiler underneath.
+
+    The file behind the name still has to be an ELF image; a wrapper written
+    as a shell script needs its own dependency adapter, exactly as before.
+    """
+    selected = shutil.which(name)
+    if selected is None:
+        raise ValueError(f"Compiler executable is unavailable: {name}")
+    path = Path(selected)
+    with path.open("rb") as stream:
+        if stream.read(4) != b"\x7fELF":
+            raise ValueError(f"Unsupported compiler launcher (requires dependency adapter): {selected}")
+    return path
+
+
 def _elf_inputs(path: Path, library_path: str | None = None) -> set[Path]:
     """ldd reports the loader's transitive resolution, including the interpreter."""
     with path.open("rb") as stream:
         if stream.read(4) != b"\x7fELF":
             raise ValueError(f"Expected an ELF installation input: {path}")
-    environment = dict(os.environ)
+    environment = {**os.environ, **_C_LOCALE}
     if library_path is not None:
         environment["LD_LIBRARY_PATH"] = library_path
     result = subprocess.run(
@@ -84,34 +130,90 @@ def _elf_inputs(path: Path, library_path: str | None = None) -> set[Path]:
     }
 
 
+def _elf_inputs_many(natives: Iterable[Path], library_path: str | None = None) -> set[Path]:
+    """Resolve several ELF dependency closures at once.
+
+    Each ``ldd`` is an independent subprocess whose wait releases the GIL, so a
+    bounded thread pool turns discovery's dominant serial cost into roughly one
+    round trip. Failure behaves as the serial loop did: ``map`` re-raises the
+    first worker error, and a partial inventory is never returned.
+    """
+    ordered = list(natives)
+    if not ordered:
+        return set()
+
+    # Reproduce each caller's own call shape: a site with no library path called
+    # _elf_inputs with one argument, and a stub standing in for it may accept
+    # only that one.
+    def resolve(native: Path) -> set[Path]:
+        return _elf_inputs(native) if library_path is None else _elf_inputs(native, library_path)
+
+    if len(ordered) == 1:
+        return resolve(ordered[0])
+    paths: set[Path] = set()
+    with ThreadPoolExecutor(min(_LDD_WORKERS, len(ordered))) as pool:
+        for closure in pool.map(resolve, ordered):
+            paths.update(closure)
+    return paths
+
+
 def _component(paths: set[Path]) -> ComponentInputs:
     # Parents already enumerate child contents. Retain logical paths in the
     # inventory; resolving every root would lose compiler selection aliases.
+    # Ancestors sort first, so a containing root has already been accepted by the
+    # time a descendant is tested: walking the candidate's own parents replaces
+    # rescanning every accepted root. resolve(strict=True) discarded its result,
+    # so it only asserted that the path exists; os.stat raises for the same
+    # missing, dangling and symlink-loop cases without the per-component
+    # readlink walk.
     ordered = sorted(paths, key=lambda p: (len(p.parts), str(p)))
     roots: list[Path] = []
+    accepted: set[Path] = set()
     for path in ordered:
-        path.resolve(strict=True)
-        if not any(parent in path.parents for parent in roots):
+        os.stat(path)
+        if accepted.isdisjoint(path.parents):
             roots.append(path)
+            accepted.add(path)
     return ComponentInputs(tuple(ContentRoot(p) for p in roots), unavailable_reason=None)
 
 
 def _package(name: str) -> set[Path]:
+    """Inventory every tree a package actually loads from.
+
+    An editable install splits one package across two: scikit-build-core maps
+    the Python sources to the checkout and leaves the built extensions as real
+    files under ``site-packages/<name>``, which is the layout the documented
+    ``pip install -e`` workflow produces. Refusing that split does not make the
+    identity safer -- it makes the whole toolchain unavailable, and with it the
+    persistent cache -- so a submodule loading from outside the first tree adds
+    *its* tree instead.
+
+    A redirect is only accepted when it still lands inside a directory named
+    for the package: that is the build system placing the package's own files,
+    and every later import from it is covered because the whole directory is
+    inventoried. A redirect anywhere else is still refused, because nothing
+    bounds what it would drag in.
+    """
     module = importlib.import_module(name)
     filename = getattr(module, "__file__", None)
     if filename is None:
         raise ValueError(f"Compiler module has no inspectable installation: {name}")
-    root = Path(filename).resolve().parent
-    paths = {root}
+    roots = {Path(filename).resolve().parent}
     for imported_name, imported in tuple(sys.modules.items()):
         if imported_name == name or imported_name.startswith(f"{name}."):
             origin = getattr(imported, "__file__", None)
-            if origin is not None:
-                selected = Path(origin).resolve(strict=True)
-                if root not in selected.parents:
-                    raise ValueError(f"Compiler package uses an external import redirect: {imported_name}")
-    for native in root.rglob("*.so"):
-        paths.update(_elf_inputs(native))
+            if origin is None:
+                continue
+            selected = Path(origin).resolve(strict=True)
+            if any(root == selected.parent or root in selected.parents for root in roots):
+                continue
+            anchor = next((parent for parent in selected.parents if parent.name == name), None)
+            if anchor is None:
+                raise ValueError(f"Compiler package uses an external import redirect: {imported_name}")
+            roots.add(anchor)
+    paths = set(roots)
+    for root in roots:
+        paths.update(_elf_inputs_many(root.rglob("*.so")))
     return paths
 
 
@@ -121,6 +223,100 @@ def _include_roots(output: str, executable: Path) -> set[Path]:
     except IndexError as exc:
         raise ValueError(f"Cannot discover implicit C++ include roots: {executable}") from exc
     return {Path(line.strip()).resolve(strict=True) for line in includes.splitlines() if line.strip()}
+
+
+# ccache is the wrapper this project actually meets. Its manual names the
+# settings that decide which compiler runs, and each has an environment
+# override; those overrides therefore select a tool exactly as PATH does, and
+# belong in the discovery key beside it. A wrapper absent from this table has
+# selection inputs nobody has enumerated here, so an identity taken through it
+# would not move when the compiler it picks does -- discovery refuses instead.
+# Settings that only govern the wrapper's own cache validity, such as
+# CCACHE_COMPILERCHECK, do not change which compiler runs and are not listed.
+_WRAPPER_SELECTION: dict[str, tuple[str, ...]] = {
+    "ccache": (
+        "CCACHE_CC",  # deprecated alias of CCACHE_COMPILER
+        "CCACHE_COMPILER",  # forces the compiler outright
+        "CCACHE_CONFIGPATH",  # selects the config file that may set it
+        "CCACHE_DISABLE",  # takes ccache out of the chain
+        "CCACHE_NODISABLE",
+        "CCACHE_PREFIX",  # inserts another program, e.g. distcc
+        "CCACHE_PREFIX_CPP",
+    ),
+}
+# The discovery key reads these by name; a test fails if the table ever grows
+# a variable that key does not read.
+_WRAPPER_VARIABLES = tuple(sorted({name for names in _WRAPPER_SELECTION.values() for name in names}))
+
+
+# Settings that send compilation somewhere this inventory does not follow: a
+# different compiler, a different place to look for it, or another program
+# spliced into the chain. Read from the wrapper itself rather than from the
+# environment, so a value set in a config file counts the same as one exported.
+_WRAPPER_REDIRECTS = ("compiler", "path", "prefix_command", "prefix_command_cpp")
+
+
+def _wrapper_redirects(wrapper: Path) -> list[str]:
+    """Report every configured redirect of a wrapper, with where it came from.
+
+    A prefix is the case the rest of this module cannot see: it applies to
+    compilation, not preprocessing, so the -E probe never runs it and the
+    driver that probe reports is unchanged. Two hosts differing only in
+    prefix_command would otherwise agree on an identity and share each other's
+    artifacts.
+    """
+    try:
+        output = _run([str(wrapper), "--show-config"])
+    except (OSError, subprocess.SubprocessError) as exc:
+        return [f"its configuration could not be read ({exc})"]
+    redirects = []
+    for line in output.splitlines():
+        origin, marker, setting = line.partition(") ")
+        key, separator, value = setting.partition(" = ")
+        if marker and separator and key.strip() in _WRAPPER_REDIRECTS and value.strip():
+            redirects.append(f"{key.strip()}={value.strip()} from {origin.strip()})")
+    return redirects
+
+
+def _driver_executed(output: str, executable: Path) -> Path:
+    """Return the compiler driver the invocation actually ran.
+
+    Invoking through a wrapper reaches a different binary: ccache's shim execs
+    /usr/bin/g++, and it is that driver's specs, subprograms and built-ins that
+    decide the compilation -- the wrapper contributes none of them. Inventorying
+    only the path invoked would leave the real compiler out, so replacing it
+    between two runs would not move the fingerprint and a stale artifact could
+    be reused.
+
+    GCC reports the driver it ran as COLLECT_GCC in its verbose output, which is
+    the outcome of whatever selection the wrapper performed -- stronger evidence
+    than the wrapper's configuration, because a configuration change that picks
+    a different compiler changes this value. Without it the real compiler cannot
+    be identified at all, so refuse rather than guess: an unusable identity
+    leaves the cache off, which is the safe direction.
+    """
+    driver = None
+    for line in output.splitlines():
+        if line.startswith("COLLECT_GCC="):
+            driver = Path(line.partition("=")[2].strip()).resolve(strict=True)
+            break
+    if driver is None:
+        raise ValueError(f"Cannot identify the compiler driver actually executed: {executable}")
+    invoked = executable.resolve(strict=True)
+    if driver != invoked:
+        # COLLECT_GCC naming a different file is the signal that something
+        # mediated the choice of compiler.
+        if invoked.name not in _WRAPPER_SELECTION:
+            raise ValueError(
+                f"Compiler wrapper with untracked selection inputs: {invoked.name} at {executable}"
+            )
+        redirects = _wrapper_redirects(invoked)
+        if redirects:
+            raise ValueError(
+                f"Compiler wrapper redirects compilation beyond this inventory: "
+                f"{invoked.name} has {', '.join(redirects)}"
+            )
+    return driver
 
 
 def _gcc_inputs(executable: Path) -> set[Path]:
@@ -134,6 +330,7 @@ def _gcc_inputs(executable: Path) -> set[Path]:
     paths.add(libgcc.parent)  # GCC specs, plugins, startup objects, resources.
     output = _run([str(executable), "-E", "-x", "c++", "-v", os.devnull])
     paths.update(_include_roots(output, executable))
+    paths.update(_elf_inputs(_driver_executed(output, executable)))
     paths.update(_gcc_link_inputs(executable))
     return paths
 
@@ -272,6 +469,13 @@ if __name__ == '__main__':
         sys.argv[0] = sys.argv[0][:-4]
     sys.exit(main())
 """,
+    # pip 26 onwards. Same shim, expressed with str.removesuffix.
+    """import sys
+from ptoas._cli import main
+if __name__ == '__main__':
+    sys.argv[0] = sys.argv[0].removesuffix('.exe')
+    sys.exit(main())
+""",
 )
 _CONSOLE_TREES = frozenset(ast.dump(ast.parse(body)) for body in _CONSOLE_BODIES)
 
@@ -375,13 +579,15 @@ def _wheel_inputs(launcher: Path) -> set[Path]:
     paths.update(_elf_inputs(interpreter.resolve(strict=True)))
     # Reduce nested roots before visiting native extensions and bundled ELF
     # libraries, including wheel-specific directories such as numpy.libs.
+    natives = []
     for root in _component(paths).roots:
         candidates = root.path.rglob("*") if root.path.is_dir() else (root.path,)
         for native in candidates:
             if native.is_file() and ".so" in native.name:
                 with native.open("rb") as stream:
                     if stream.read(4) == b"\x7fELF":
-                        paths.update(_elf_inputs(native.resolve(strict=True)))
+                        natives.append(native.resolve(strict=True))
+    paths.update(_elf_inputs_many(natives))
     return paths
 
 
@@ -442,7 +648,7 @@ def _ptoas_inputs(launcher: Path, ancestors: frozenset[Path] = frozenset()) -> s
     library_path = str(root / "lib") + os.pathsep + os.environ.get("LD_LIBRARY_PATH", "")
     # Query interpreter resources without loading PTOAS or running a compiler.
     # Match the launcher's PYTHONHOME removal and library search environment.
-    environment = dict(os.environ)
+    environment = {**os.environ, **_C_LOCALE}
     environment.pop("PYTHONHOME", None)
     environment["LD_LIBRARY_PATH"] = library_path
     probe = subprocess.run(
@@ -464,19 +670,174 @@ def _ptoas_inputs(launcher: Path, ancestors: frozenset[Path] = frozenset()) -> s
         raise ValueError("PTOAS requires its compatible self-contained CPython installation")
     paths = {launcher, root, prefix, *_elf_inputs(_executable("bash"))}
     paths.update(_elf_inputs(interpreter, library_path))
+    natives = []
     for directory in (root, Path(stdlib) / "lib-dynload"):
         for native in directory.rglob("*.so"):
             with native.open("rb") as stream:
                 if stream.read(4) == b"\x7fELF":
-                    paths.update(_elf_inputs(native, library_path))
+                    natives.append(native)
+    paths.update(_elf_inputs_many(natives, library_path))
     return paths
+
+
+def _unaccounted_checkout_state(checkout: Path) -> str:
+    """Report everything in ``checkout`` that its committed revision does not cover.
+
+    ``--ignored`` is the point: the resolver's own cleanliness check omits
+    ignored paths, so a generated file sitting in the tree leaves both the
+    revision and that check unchanged. Anything reported here -- ignored,
+    untracked or modified -- means the revision no longer describes the bytes.
+    An unusable git answer reports itself rather than passing as clean.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain", "--ignored"],
+            cwd=checkout,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"git status is unavailable: {exc}"
+    if result.returncode != 0:
+        return f"git status failed: {result.stderr.strip()[:200]}"
+    return result.stdout.strip()
+
+
+def _pto_isa_component(isa_root: Path) -> ComponentInputs:
+    """Identify the ISA checkout by the pin its own resolution already verified.
+
+    ``ensure_pto_isa_root`` returns a checkout only after proving it is clean
+    and at the pinned commit -- git objects are content-addressed, so a clean
+    tree at ``HEAD == pin`` *is* the pinned tree -- and re-clones it from the
+    pin otherwise, never checking out over a dirty tree. Reading the same
+    ~5.8k files again re-proves what that resolution established.
+
+    That resolution decides cleanliness with ``git status --porcelain``, which
+    omits paths the checkout ignores -- a build writing generated files into the
+    ISA tree would not disturb it. Re-asking with ``--ignored`` closes that gap
+    for 18ms against the 0.71s the content read costs, and covers the tracked
+    state again at the same time, so anything at all in the tree that git does
+    not account for sends this component back to its contents.
+
+    Falls back to the content inventory whenever the revision cannot be read or
+    the tree cannot be accounted for, so neither weakens anything.
+    """
+    from simpler_setup.pto_isa import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+        get_pto_isa_head,
+    )
+
+    revision = get_pto_isa_head(str(isa_root))
+    if not revision or _unaccounted_checkout_state(isa_root) != "":
+        return _component({isa_root})
+    return ComponentInputs(unavailable_reason=None, verified_revision=revision)
+
+
+def _ptoas_component(ptoas_bin: str) -> ComponentInputs:
+    """Identify the assembler by the version it reports about itself.
+
+    Unlike PTO-ISA, nothing proves this installation's bytes: ptoas is an
+    external tree selected by ``PTOAS_ROOT``, its releases carry no manifest
+    the installer checks, and the sha256 in ``toolchain/versions.env`` names
+    the downloaded wheel rather than anything reachable from the unpacked
+    tree. This identity therefore rests on a deployment property -- that ptoas
+    arrives as an unmodified published build -- and not on evidence PyPTO can
+    check. A rebuild or a patch applied in place under an unchanged version is
+    invisible here, where the full inventory would have caught it.
+
+    The probe's complete output is the identity, not the number parsed out of
+    it: the parser keeps only the numeric part, so a dev build's suffix -- the
+    one marker that separates it from the release it came from -- would
+    otherwise be discarded. check_ptoas_version already runs this probe once
+    per executable, so no extra process is started, and an assembler it
+    rejects never reaches this point.
+
+    Falls back to the content inventory whenever the probe fails.
+    """
+    from pypto.backend._ptoas_locate import check_ptoas_version  # noqa: PLC0415
+
+    try:
+        reported = check_ptoas_version(ptoas_bin).strip()
+    except RuntimeError:
+        reported = ""
+    if not reported:
+        return _component(_ptoas_inputs(Path(ptoas_bin)))
+    return ComponentInputs(unavailable_reason=None, reported_version=reported)
+
+
+_CANN_INSTALL_INFO = "ascend_toolkit_install.info"
+
+
+def _cann_install_version(cann_root: Path) -> str:
+    """Return the build the CANN installation states about itself, or "".
+
+    ``innerversion`` is preferred over ``version``: it carries the vendor's
+    build number, so two builds of one release are distinguishable, while the
+    release number alone is not. Exactly one install-info *file* must be
+    present -- several would mean this is not a single installation -- but an
+    installation reaches its own through more than one path, so candidates are
+    counted by the file they name: CANN ships `arm64-linux` as a symlink to
+    `aarch64-linux`, and both spell the same inode. The value must be
+    non-empty, or the caller reads the contents instead.
+    """
+    try:
+        found = {path.resolve(strict=True) for path in cann_root.glob(f"*/{_CANN_INSTALL_INFO}")}
+    except OSError:
+        return ""
+    if len(found) != 1:
+        return ""
+    fields: dict[str, str] = {}
+    try:
+        for line in found.pop().read_text().splitlines():
+            key, separator, value = line.partition("=")
+            if separator:
+                fields[key.strip()] = value.strip()
+    except OSError:
+        return ""
+    return fields.get("innerversion") or fields.get("version") or ""
+
+
+def _outside(paths: set[Path], install_root: Path) -> set[Path]:
+    """Return the paths an installation does not own."""
+    return {p for p in paths if p != install_root and install_root not in p.parents}
+
+
+def _without_subtree(paths: set[Path], excluded: Path) -> set[Path]:
+    """Cover everything in ``paths`` except ``excluded``, which is identified elsewhere.
+
+    A root that *contains* ``excluded`` cannot simply be dropped -- that would
+    lose the rest of its tree -- so it is replaced by the siblings along the way
+    down to ``excluded``. Every other file under that root is still inventoried,
+    and the logical path of each sibling is preserved, because the roots a
+    component reports are part of its identity.
+
+    Paths are compared resolved, so a root reached through a symlink still
+    recognises the subtree beneath it. Nothing is excluded when no root contains
+    ``excluded`` -- the checkout living outside the package is the ordinary
+    ``PTO_ISA_ROOT`` case, and then there is nothing to deduplicate.
+    """
+    target = excluded.resolve()
+    kept: set[Path] = set()
+    for path in paths:
+        resolved = path.resolve()
+        if resolved == target or target in resolved.parents:
+            continue
+        if resolved not in target.parents:
+            kept.add(path)
+            continue
+        current = path
+        for name in target.relative_to(resolved).parts:
+            kept.update(child for child in current.iterdir() if child.name != name)
+            current = current / name
+    return kept
 
 
 def _discover(compiler: Any, ptoas: str, runtime_name: str) -> ToolchainInputs:
     """Collect the compiler, linker, SDK and PTO assembler inputs for cache identity."""
     if sys.platform != "linux":
         raise ValueError(f"Unsupported dependency discovery platform: {sys.platform}")
-    ptoas_paths = _ptoas_inputs(Path(ptoas))
+    ptoas_component = _ptoas_component(ptoas)
     pypto = _package("pypto")
     pypto.update(_elf_inputs(Path(sys.executable).resolve()))
     stdlib = Path(sysconfig.get_path("stdlib"))
@@ -485,8 +846,7 @@ def _discover(compiler: Any, ptoas: str, runtime_name: str) -> ToolchainInputs:
     pypto.update(
         p for p in stdlib.iterdir() if p.name not in ("site-packages", "dist-packages", "__pycache__")
     )
-    for native in (stdlib / "lib-dynload").glob("*.so"):
-        pypto.update(_elf_inputs(native))
+    pypto.update(_elf_inputs_many((stdlib / "lib-dynload").glob("*.so")))
     runtime = _package("simpler") | _package("simpler_setup")
     runtime.update({compiler.project_root / "src", compiler.project_root / "build/lib"})
     native_interface = importlib.import_module("_task_interface")
@@ -509,9 +869,10 @@ def _discover(compiler: Any, ptoas: str, runtime_name: str) -> ToolchainInputs:
         if Path(p).exists()
     )
     orchestration = compiler._orchestration_toolchain(runtime_name)
-    device = _gcc_inputs(_executable(orchestration.cxx_path))
+    device = _gcc_inputs(_invocable(orchestration.cxx_path))
+    cann_root: Path | None = None
     if compiler.platform.endswith("sim"):
-        device.update(_gcc_inputs(_executable(compiler.sdk.gxx15.cxx_path)))
+        device.update(_gcc_inputs(_invocable(compiler.sdk.gxx15.cxx_path)))
     else:
         ccec = _executable(compiler.sdk.ccec.cxx_path)
         device.update(_elf_inputs(ccec))
@@ -521,14 +882,37 @@ def _discover(compiler: Any, ptoas: str, runtime_name: str) -> ToolchainInputs:
         if ccec.parent.name != "bin" or ccec.parent.parent.name != "bisheng_compiler":
             raise ValueError(f"Unsupported CCEC installation layout: {ccec}")
         device.add(ccec.parent.parent)
+        # <cann>/tools/bisheng_compiler/bin/ccec -- the layout checked above
+        # fixes the first two levels, so require the third before trusting it
+        # to name the installation whose stated build covers these files.
+        if ccec.parent.parent.parent.name == "tools":
+            cann_root = ccec.parents[3]
         for core_type in ("aiv", "aic"):
             flags = [
                 flag for flag in compiler.sdk.ccec.get_compile_flags(core_type=core_type) if flag != "-c"
             ]
             output = _run([str(ccec), *flags, "-E", "-v", os.devnull])
             device.update(_include_roots(output, ccec))
+    # The device compiler runs on the host, so its inputs come from two
+    # sources: the CANN installation, which states its own build, and files the
+    # host OS provides, which state nothing. Cover each with the evidence it
+    # actually has rather than letting one version speak for both. Without a
+    # usable CANN version every input is read, as before.
+    cann_version = _cann_install_version(cann_root) if cann_root is not None else ""
+    if cann_root is not None and cann_version:
+        device_component = replace(_component(_outside(device, cann_root)), reported_version=cann_version)
+    else:
+        device_component = _component(device)
+    # The ISA checkout lives inside the installed runtime package, and
+    # _pto_isa_component already identifies it -- by its verified revision, or
+    # by reading it when that cannot be trusted. Inventorying it here as well
+    # reads ~5.8k files a second time to prove what that component establishes.
     return ToolchainInputs(
-        _component(pypto), _component(runtime), _component({isa}), _component(ptoas_paths), _component(device)
+        _component(pypto),
+        _component(_without_subtree(runtime, isa)),
+        _pto_isa_component(isa),
+        ptoas_component,
+        device_component,
     )
 
 
@@ -584,6 +968,18 @@ def capture_toolchain(platform: str, runtime_name: str) -> ToolchainIdentity:
             os.environ.get("PYTHONNOUSERSITE"),
             os.environ.get("PYTHONSAFEPATH"),
             os.environ.get("PYTHONOPTIMIZE"),
+            # A wrapper's selection overrides pick a compiler exactly as PATH
+            # does, so a change to one has to re-run discovery rather than
+            # reuse the identity of the compiler previously chosen. Read by
+            # name rather than by iterating the table, so each one is a
+            # classified environment input and not an opaque dynamic read.
+            os.environ.get("CCACHE_CC"),
+            os.environ.get("CCACHE_COMPILER"),
+            os.environ.get("CCACHE_CONFIGPATH"),
+            os.environ.get("CCACHE_DISABLE"),
+            os.environ.get("CCACHE_NODISABLE"),
+            os.environ.get("CCACHE_PREFIX"),
+            os.environ.get("CCACHE_PREFIX_CPP"),
         )
         with _discovery_lock:
             identity = _identities.get(selected)

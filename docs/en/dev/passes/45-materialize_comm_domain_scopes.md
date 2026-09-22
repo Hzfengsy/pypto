@@ -80,7 +80,15 @@ For every host-orchestration function (`Function::level_ == Level::HOST` and
    fresh `Var` of the same `name_hint_` whose type is
    `DistributedTensorType(shape, dtype, memref, tensor_view, wb)` and run
    `Substitute` to swap every reference to the old view Var with the fresh
-   one. Two `pld.tensor.window` views over the same allocation share the same
+   one. `Substitute` rewrites *references* only, so the Call that defines each
+   re-typed Var is then re-minted with the same `window_buffer_`-bearing type —
+   otherwise the assignment ends the pass with the back-reference on its LHS
+   and not on its RHS, violating
+   [`AssignTypeSymmetry`](99-verifier.md#built-in-rules). The re-mint only ever
+   *adds* the back-reference: it keeps the rebuilt type only when that type is
+   structurally equal to the Var's, so a genuine shape / dtype / view
+   disagreement is left for the verifier to report. Two `pld.tensor.window`
+   views over the same allocation share the same
    `shared_ptr<const WindowBuffer>`. Chip-orch / InCore parameter types are
    not touched.
 
@@ -106,9 +114,10 @@ The pass raises `pypto::ValueError` (carrying the alloc's span) if:
 - Two allocations within the same comm domain share a `name_hint_` (the
   parser already enforces global uniqueness; the pass re-asserts).
 - A `pld.tensor.all_to_all_v` call sits inside a `for`/`while` loop in a HOST
-  orchestrator — its Set(1)/wait≥1 signal is single-use and cannot be reused
-  across dynamic invocations (same restriction `LowerCompositeOps` enforces on
-  the InCore path).
+  orchestrator — dynamic re-invocation needs loop-carried window lifetime
+  management this compiler does not model yet (the credit-based signal itself
+  is reusable across sequential calls); same restriction `LowerCompositeOps`
+  enforces on the InCore path.
 
 ## Output invariants
 
@@ -119,7 +128,8 @@ After the pass:
   inferred comm domain, outer = first declared, inner = last).
   Allocation-free host_orchs are left unchanged.
 - Every `pld.tensor.window` result Var's type is a `DistributedTensorType` whose
-  `window_buffer_` field points to the corresponding `WindowBuffer`.
+  `window_buffer_` field points to the corresponding `WindowBuffer`, and the
+  defining Call carries that same type — both sides of the assignment agree.
 - Every host-level `pld.tensor.allreduce` call has two positional arguments
   after [`SynthesizeAllReduceSignals`](44-synthesize_allreduce_signals.md) runs.
   For an omitted user signal, the second argument is a synthesized Var produced

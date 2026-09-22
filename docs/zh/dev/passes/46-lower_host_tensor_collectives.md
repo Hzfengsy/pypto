@@ -48,9 +48,11 @@ data = pld.tensor.all_to_all_v(input, target, signal, send_counts, recv_counts)
 携带一个按目的地划分的分片，形状为 `[NR, SIZE]`；`all_to_all_v` 的 `input`
 每个目的地携带一个 `MAX_RECV` 行容量块，形状为 `[NR*MAX_RECV, SIZE]`。
 `all_to_all` / `all_to_all_v` 两种情况下 `data`/`target` 都是 peer 推入的
-结果窗口。`all_to_all_v` 还额外要求 `send_counts`（在这一层是窗口绑定的，
-仅本地使用）和 `recv_counts`（窗口绑定，通过 `pld.system.notify` 跨 rank
-发布）——五个窗口参数都必须位于同一个 `CommDomainScopeStmt` 中，并且必须
+结果窗口。`all_to_all_v` 还额外要求 `send_counts`（在这一层是窗口绑定的；
+对端只会从中拉取自己所需的那一个字，`[NR]` INT32 向量就是该缓冲区需要的全部
+内容）和
+`recv_counts`（窗口绑定，由内核填充）——五个窗口参数都必须位于同一个
+`CommDomainScopeStmt` 中，并且必须
 两两互不相同（任意一对发生别名都是跨进程竞争，无论是 data 与 data、
 data 与 control，还是 control 与 control 之间）。
 
@@ -159,16 +161,18 @@ notify 与 count 发布竞争。`LowerHostTensorCollectives` 在生成 builtin d
 
 signal 可复用（对自清理的 host builtin 而言）：这些 kernel 会在每次调用后
 自清理屏障 cell（信用屏障尾声），因此一个合成或用户分配的 signal 可以支撑
-任意数量的连续调用或循环迭代，无需重新分配。
+任意数量的连续调用或循环迭代，无需重新分配。`all_to_all_v` 的 signal 同样
+可复用，只是机制不同：其 builtin 内核是唯一的**两轮**信用屏障（拉取前
+`+1` / `Ge(1)`，推送后 `+1` / `Ge(2)`，尾声对每个本地槽位做一次
+`AtomicAdd(-2)`），因此连续调用不会留下残留的“已满足” cell。
 
-`all_to_all_v` 的单次使用 Set(1)/wait≥1 信号无法在 `host_orch` 的
-`for`/`while` 循环中复用——本 pass 之前紧邻运行的
-[`MaterializeCommDomainScopes`](45-materialize_comm_domain_scopes.md) 会提前
-拒绝这种情况（与 `LowerCompositeOps` 在 InCore 路径上强制的限制相同）。在显式
-静态 device 子集上，`all_to_all_v` 的 signal `shape[0]` 必须与子集大小
-**精确相等**（而非其他 collective 所要求的 `>=`），因为 `MAX_RECV` 是由
-`target.shape[0] / signal.shape[0]` 推导得出的，signal 过度分配会导致
-静默的错误降级。
+`all_to_all_v` 在 `host_orch` 的 `for`/`while` 循环中调用仍会被本 pass 之前
+紧邻运行的 [`MaterializeCommDomainScopes`](45-materialize_comm_domain_scopes.md)
+提前拒绝——这是编译器的限制（动态重复调用需要循环携带的窗口生命周期管理），
+而不是信号本身的性质，也与 `LowerCompositeOps` 在 InCore 路径上强制的限制相同。
+在显式静态 device 子集上，`all_to_all_v` 的 signal 遵循通用容量约束——
+`shape[0] >=` 参与设备数——而 `MAX_RECV` 由内核入口根据
+`target.shape[0] / nranks`（运行时 rank 数）推导，从不取自 signal 形状。
 
 ## Pass 属性
 

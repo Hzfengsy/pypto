@@ -276,10 +276,36 @@ class ComponentInputs:
     An adapter must leave ``unavailable_reason`` set until it has accounted
     for all resources and dynamic dependencies, even if it knows some files.
     A caller-supplied application fingerprint cannot complete this inventory.
+
+    ``verified_revision`` is the narrow exception to reading contents: an
+    adapter may supply a revision when some *other* mechanism has already
+    proven, in the same resolution, that the component's bytes are exactly that
+    revision -- not merely that it claims to be. A version an installation
+    reports about itself is not such a proof. The adapter owns that proof and
+    must document what it does not cover; without one, leave this unset so the
+    contents are read.
+
+    ``reported_version`` is weaker on purpose and is named for what it is: a
+    version the installation states about *itself*, with nothing verifying it.
+    It distinguishes installations that say they differ; it cannot detect bytes
+    that changed while the version stayed put, so a rebuild or a patch applied
+    in place is invisible to it. Use it only where the deployment establishes
+    that the component arrives as an unmodified published build, and record
+    that reasoning where the adapter sets it. It is not interchangeable with
+    ``verified_revision`` and must not be treated as precedent for another
+    component.
+
+    ``reported_version`` may accompany ``roots``. A component whose files come
+    from more than one source -- a vendor package that states its own build
+    identity, alongside host files that state nothing -- covers each part with
+    the evidence that part actually has, and the identity records both. Do not
+    use this to let a version stand in for files the vendor does not publish.
     """
 
     roots: tuple[ContentRoot, ...] = ()
     unavailable_reason: str | None = "Dependency inventory has not been established"
+    verified_revision: str | None = None
+    reported_version: str | None = None
 
 
 @dataclass(frozen=True)
@@ -332,6 +358,37 @@ class InstallationIdentityCache:
         self._components: dict[ComponentInputs, str] = {}
         self._lock = threading.Lock()
 
+    def _evidence(self, name: str, component: ComponentInputs) -> ContentIdentity:
+        """Record every kind of evidence a component carries, keyed by its name.
+
+        Each kind keeps its own tag, so a self-reported version can never
+        produce the digest a verified revision would, and neither can collide
+        with a content digest or with another component's. Declared roots are
+        always read: a version never stands in for files the component lists.
+        Caller holds ``self._lock``.
+        """
+        if component.unavailable_reason is not None:
+            return ContentIdentity(None, component.unavailable_reason)
+        evidence: dict[str, Any] = {}
+        if component.verified_revision is not None:
+            evidence["verified_revision"] = component.verified_revision
+        if component.reported_version is not None:
+            evidence["reported_version"] = component.reported_version
+        if component.roots or not evidence:
+            # No evidence at all still reads the (empty) inventory, so an
+            # adapter that supplies nothing stays unavailable rather than
+            # acquiring an identity by omission.
+            if component in self._components:
+                content = ContentIdentity(self._components[component])
+            else:
+                content = fingerprint_content(component.roots)
+                if content.digest is not None:
+                    self._components[component] = content.digest
+            if content.digest is None:
+                return content
+            evidence["content"] = content.digest
+        return ContentIdentity(digest_record(("component", name, evidence)))
+
     def capture(self, inputs: ToolchainInputs) -> ToolchainIdentity:
         """Hash complete component inventories, preserving every failure reason."""
         digests: dict[str, str | None] = {}
@@ -339,14 +396,7 @@ class InstallationIdentityCache:
         with self._lock:
             for name in _COMPONENTS:
                 component: ComponentInputs = getattr(inputs, name)
-                if component.unavailable_reason is not None:
-                    result = ContentIdentity(None, component.unavailable_reason)
-                elif component in self._components:
-                    result = ContentIdentity(self._components[component])
-                else:
-                    result = fingerprint_content(component.roots)
-                    if result.digest is not None:
-                        self._components[component] = result.digest
+                result = self._evidence(name, component)
                 digests[name] = result.digest
                 if result.digest is None:
                     failures.append(IdentityFailure(name, result.failure or "Content identity unavailable"))

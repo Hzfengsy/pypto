@@ -292,6 +292,33 @@ def test_kernel_signature_is_canonical_not_call_site_typed():
     ], kinds
 
 
+def test_plain_tensor_send_counts_is_rejected():
+    """`send_counts` must be a DistributedTensor on this rail.
+
+    The hand-written kernel resolves each peer's copy through `CommRemotePtr`
+    for the counts pull, so only a distributed operand — the one the managed
+    rail materializes as a window — is usable. The public op's deducer accepts
+    a plain Tensor for the InCore composite path, where counts are consumed
+    locally; accepting it here would produce garbage peer reads.
+    """
+
+    @pl.program
+    class PlainCounts:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_pipeline(
+            self,
+            stage: pl.InOut[pld.DistributedTensor[[TOTAL, SIZE], pl.FP32]],
+            data: pl.InOut[pld.DistributedTensor[[TOTAL, SIZE], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[NR, 1], pl.INT32]],
+            counts: pl.Tensor[[NR, 1], pl.INT32],
+            recv: pl.InOut[pld.DistributedTensor[[NR, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[TOTAL, SIZE], pl.FP32]:
+            return pld.tensor.all_to_all_v(stage, data, signal, counts, recv)
+
+    with pytest.raises(ValueError, match="send_counts must be a DistributedTensor"):
+        passes.lower_l2_tensor_collectives()(PlainCounts)
+
+
 def test_collective_in_a_graph_body_is_lowered():
     """A `Graph` body is orchestration-like and lands on this rail too.
 

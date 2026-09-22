@@ -1038,16 +1038,31 @@ def all_to_all_v(
        masks by ``recv_counts`` afterwards will propagate NaN into
        otherwise-valid rows.  Mask first, then compute.
 
-    During the same push, each rank also publishes
-    ``clamp(send_counts[dest], 0, MAX_RECV)`` into peer ``dest``'s
-    ``recv_counts[my_rank, 0]`` via ``pld.system.notify`` (Set). After the
-    barrier, ``recv_counts[src, 0]`` tells this rank how many rows ``src``
-    sent — which is now also exactly how many were transferred — so use that
-    count to know where to stop reading. This is the MPI_Alltoallv recvcounts
-    side.
+    The recvcounts side is a peer-to-peer pull on the builtin rails: each rank
+    stages its own ``send_counts`` vector into its window, and after Barrier A
+    the kernel reads the ONE word it needs from every peer's window —
+    ``recv_counts[src, 0] = clamp(send_counts_of[src][my_rank], 0, MAX_RECV)``
+    — with a single non-cacheable scalar read (no bulk transfer, so the
+    ``[NR]`` INT32 vector is all the buffer needs). The exchange is gated by a
+    TWO-ROUND credit barrier: Barrier A certifies every rank staged its counts
+    AND finished consuming the previous invocation's receive window; Barrier B
+    certifies every peer read this rank's counts and pushed its payload, so
+    returning — and restaging counts for the next call — is safe. The InCore
+    composite rail instead publishes ``clamp(send_counts[dest], 0, MAX_RECV)``
+    into peer ``dest``'s ``recv_counts[my_rank, 0]`` via ``pld.system.notify``
+    (Set). Either way, after the call ``recv_counts[src, 0]`` tells this rank
+    how many rows ``src`` sent — which is also exactly how many were
+    transferred — so use that count to know where to stop reading. This is the
+    MPI_Alltoallv recvcounts side. A second call on the same windows must be
+    ordered after the first call's local consumer: the receive window is
+    overwritten in place.
 
-    The barrier ``signal`` is self-clearing (restored to zero after each call)
-    and safe to reuse inside a ``for``/``while`` loop.
+    The barrier ``signal`` is credit-based, not self-clearing: each call adds
+    +1 per round to every peer's slot (wait thresholds 1, then 2) and subtracts
+    2 per local slot at the end — never a reset, and never "wait for 1 twice" —
+    so back-to-back calls on the same buffer stay ordered. Zero-initialise it
+    once and do not reset it. Calls nested in ``for``/``while`` loops are still
+    rejected by the compiler.
 
     Args:
         input: Flat 2D Tensor or DistributedTensor [NR*MAX_RECV, SIZE] with
@@ -1059,7 +1074,10 @@ def all_to_all_v(
         send_counts: INT32 [NR] or [NR, 1] rows-per-destination counts (Input).
             A plain :class:`pl.Tensor` or a window-bound
             :class:`pld.DistributedTensor` (e.g. counts published by a
-            preceding exchange).
+            preceding exchange). On the builtin rails it must be window-bound:
+            peers read this rank's ``[my_rank]`` word with one scalar
+            (non-cacheable) read, so the ``[NR]`` INT32 vector is all the
+            buffer needs.
         recv_counts: :class:`pld.DistributedTensor` INT32 [NR, 1] — after the
             call, ``recv_counts[src, 0]`` holds how many rows ``src`` actually
             sent here, and how many were transferred — the count is clamped

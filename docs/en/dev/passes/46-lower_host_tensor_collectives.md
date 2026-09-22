@@ -52,8 +52,9 @@ and `data`/`target` (result) must be two distinct windows. For `allgather` the
 per destination and is `[NR*MAX_RECV, SIZE]`. In both `all_to_all` /
 `all_to_all_v` cases `data`/`target` is the peers'-push-in result window.
 `all_to_all_v` additionally requires `send_counts` (window-bound at this
-layer, LOCAL-only) and `recv_counts` (window-bound, published cross-rank via
-`pld.system.notify`) — all five window args must resolve into the same
+layer; peers pull ONE word per rank from it, so the `[NR]` INT32 vector is all
+the buffer must hold) and `recv_counts` (window-bound, filled by the kernel) —
+all five window args must resolve into the same
 `CommDomainScopeStmt` and must be pairwise-distinct window allocations
 (aliasing any pair is a cross-process race, whether data-vs-data,
 data-vs-control, or control-vs-control).
@@ -186,16 +187,23 @@ known there) — the same documented limitation as the signal-capacity check.
 Signals are reusable for the self-clearing host builtins: those kernels clear
 their barrier cells after every call (credit-barrier epilogue), so one
 synthesized or user-allocated signal can back any number of consecutive or
-loop-carried collective calls without re-allocation.
+loop-carried collective calls without re-allocation. `all_to_all_v`'s signal is
+reusable too, through a different mechanism: its builtin kernel is the one
+**two-round** credit barrier (+1 / `Ge(1)` before the pull, +1 / `Ge(2)` after
+the push, a single `AtomicAdd(-2)` per local slot in the epilogue), so a
+consecutive call leaves no stale satisfied cell behind.
 
-`all_to_all_v`'s single-use Set(1)/wait≥1 signal cannot be reused across a
-`for`/`while` loop in `host_orch` — [`MaterializeCommDomainScopes`](45-materialize_comm_domain_scopes.md),
-which runs immediately before this pass, rejects that case up front (the same
-restriction `LowerCompositeOps` enforces on the InCore path). On an explicit
-static device subset, `all_to_all_v`'s signal `shape[0]` must exactly equal
-the subset size (not merely `>=`, as required for the other collectives),
-since `MAX_RECV` is derived as `target.shape[0] / signal.shape[0]` and an
-over-provisioned signal would silently mis-lower.
+`all_to_all_v` calls inside a `for`/`while` loop in `host_orch` are still
+rejected up front by
+[`MaterializeCommDomainScopes`](45-materialize_comm_domain_scopes.md), which
+runs immediately before this pass — a compiler limitation (dynamic
+re-invocation would need loop-carried window lifetime management), not a
+property of the signal, and the same restriction `LowerCompositeOps` enforces
+on the InCore path. On an explicit static device subset, `all_to_all_v`'s
+signal follows the generic capacity bound — `shape[0] >=` the participating
+device count — and `MAX_RECV` is derived at kernel entry from
+`target.shape[0] / nranks` (the runtime rank count), never from the signal
+shape.
 
 ## Pass properties
 

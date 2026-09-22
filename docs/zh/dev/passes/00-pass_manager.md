@@ -61,7 +61,7 @@
 | `CommDomainScopesMaterialized` | host_orch 函数体已被 CommDomainScopeStmt 包裹，且 `pld.tensor.window` 结果类型带有 `DistributedTensorType::window_buffer_` 反向引用 |
 | `DistTensorCtxMaterialized` | host orchestration 之外不再残留 `pld.system.get_comm_ctx`；每个 chip-orchestration / device 通信上下文都是可追溯到参数的显式 CommCtxType SSA 值 |
 | `RuntimeScopesMaterialized` | Orchestration 函数带有显式的 RuntimeScopeStmt 节点，codegen 不再隐式生成 `SIMPLER_SCOPE()` 包裹 |
-| `AssignTypeSymmetry` | 每个 AssignStmt 满足 `structural_equal(var->GetType(), value->GetType())`（memref 作为分配细节被排除） |
+| `AssignTypeSymmetry` | 每个只被定义一次的 Var，在其定义所在的 AssignStmt 上满足 `structural_equal(var->GetType(), value->GetType())`（memref 作为分配细节被排除；pre-SSA 的重绑定没有唯一定义值） |
 | `ManualDepsOnSubmitOnly` | 普通跨函数 Call 不携带 `attrs["manual_dep_edges"]`——手写依赖边只存在于 `Submit::deps_` |
 | `ReturnParamsExplicit` | InCore/Group/Spmd/Graph 的 tensor 返回值按指针恒等引用函数参数（#1702、#2601） |
 | `UnrollResolved` | 不再残留 `ForKind::Unroll`；由 UnrollLoops 产生 |
@@ -298,6 +298,10 @@ with passes.PassContext([instrument]):
 1. 通过 `python_print()` 将结果 IR 打印为 Python DSL 文本
 2. 通过 `parse()` 将文本解析回 IR `Program`
 3. 断言 `structural_equal(original, reparsed)` —— 失败则说明 printer 或 parser 无法忠实表示该 Pass 输出的 IR
+
+Buffer 阶段程序使用二进制序列化往返检查，因为其 Python 输出是诊断文本，
+不属于可执行 DSL。结构相等检查仍覆盖整个程序的设备阶段、描述符和别名；
+序列化失败会报错，不跳过验证。
 
 ```python
 from pypto.pypto_core import passes

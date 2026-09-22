@@ -67,6 +67,8 @@ PTOAS 省略 `buffer.alloc` 的第二个操作数。地址规划器只传入一�
 转换后的 `InCore`、`AIC`、`AIV` 函数标记为 `FunctionIRStage.Buffer`，编排函数保持原样。
 pass 验证输出并保持幂等；转换失败不会修改输入程序。此边界之后不应运行功能式 Tile pass。
 
+合成分配的原始位置未知时，继承已索引 Tile 句柄的源码位置，使原生分配诊断能够定位用户源码。
+
 ## 分支
 
 存储合法化已经为每个 Tile 分支结果选择规范目标窗口，并在各分支体内放置必要的传输。
@@ -120,11 +122,20 @@ While 条件引用重写后的标量绑定。若 GM 初始值和回边都解析�
 buffer.store(left_buf, (row_result, column_result), (16, 32), Out)
 ```
 
+标量 SPMD 查询 `tile.get_block_idx`、`tile.get_block_num` 和
+`tile.get_subblock_idx` 转换为对应的内部 `buffer.*` 查询，返回 INDEX 值且没有内存效果。
+原生发射读取既有运行时传入的 kernel ABI 参数。查询保持为直接 SSA 赋值；
+源程序的嵌套调用由此前的 `FlattenCallExpr` 展开。
+
 ## 首批支持的转换
 
-当前转换支持直线程序、分支和循环、静态二维稠密 Vec FP32 Tile、每个分配一个描述符、静态有效范围、
+当前转换支持直线程序、分支和循环、静态二维稠密 Vec FP16/BF16/FP32/INT32 Tile、每个分配一个描述符、静态有效范围、
 普通紧密排列的 ND GM Tensor 以及默认加载/存储策略。
-它转换分配、create、load、store、加法、乘法、move 及已经合法化的别名。
+它转换分配、create、load、store、move、已经合法化的别名及[带类型的逐元素配方](../ir/05-operators.md#typed-buffer-elementwise-recipes)。
+标量输入在 lowering 中显式转换为目标 dtype；发射器直接消费这些类型。
+`tile.full` 的形状和 dtype 由目标描述符表示，不会重复作为指令属性发射。
+GM load/store 保留匹配的元素类型，不插入转换。`add`/`mul` 支持 FP16/FP32/INT32；
+BF16 传输支持不代表算术支持。
 
 辅助函数调用、其他布局、动态元数据、多槽位和其他操作转换由后续迁移切片补齐。
 暂不支持的形式会显式报错。在完整转换与运行时验收矩阵通过前，迁移选项默认关闭。
@@ -135,3 +146,42 @@ buffer.store(left_buf, (row_result, column_result), (16, 32), Out)
 
 `tests/ut/ir/transforms/test_lower_tile_to_buffer.py` 通过公开前端运行三种规划器的完整流水线，
 检查显式分配和目标写入、转换的不可变性与幂等性、二进制持久化，并使用原生 PTOAS 编译输出。
+
+数值系统测试应在公开 `@pl.jit` 入口对应的 case 上声明
+`st.case(..., enable_buffer_ir=True, memory_planner=...)`。
+测试框架 (Harness) 会在内联及预编译工作线程内部应用该选项；仅在测试线程外层设置
+`PassContext` 不会配置工作线程。启用的 case 使用独立缓存键。框架检查编译产生的最终
+设备函数阶段，并将转换后程序保存为原生构件旁的 `buffer_ir.msgpack`。
+
+`tests/st/runtime/ops/test_buffer_ir.py` 为三种规划器提供带编排的
+load/add/mul/store 数值测试。只运行这个目标文件：
+
+```bash
+source .claude/skills/testing/load-env.sh
+python -m pytest tests/st/runtime/ops/test_buffer_ir.py --platform=a2a3 --device=0 \
+    --precompile-workers "$PYPTO_TEST_JOBS" --save-kernels -v
+```
+
+预编译模式还会检查实际执行构件所保存的 Buffer 程序和 PTO 源码。
+`--codegen-only` 可用于编译检查，但不构成数值验证证据。
+框架测试无需设备即可覆盖内联及工作线程中的选项传递。
+
+`tests/st/runtime/control_flow/test_buffer_ir.py` 为每种规划器增加分支、For、While、
+嵌套循环和扇出数值测试。编排层从配置 Tensor 读取计数和条件，传给已编译的设备内核，
+因此一个构件可执行多条运行时路径。For 和 While 覆盖 0、1、2、3 次迭代、两个分支方向、
+奇偶次数交换、交错标量偏移以及同一 GM 的循环状态。独立输出区间保留未写入的哨兵值，
+另一个输出保留循环后的原始输入。非对称最终表达式能够发现可交换求和掩盖的交换错误。
+嵌套用例包含外层或内层零次迭代；扇出用例检查两个目标读取同一来源。
+
+在提供 task-submit 设备队列的主机上，只运行该有限矩阵：
+
+```bash
+source .claude/skills/testing/load-env.sh
+python -m pytest tests/st/runtime/control_flow/test_buffer_ir.py --platform=a2a3 \
+    --precompile-workers "$PYPTO_TEST_JOBS" --execute-via-task-submit \
+    --execute-batch-size=4 --task-max-time=120 --save-kernels -v
+```
+
+队列选择可用设备。其他主机应省略队列选项，并通过 `--device` 选择可用设备。
+已保存构件的检查还要求原生循环结果仅包含标量，并包含预期的显式操作；
+仅通过原生编译并不能证明数值正确。
