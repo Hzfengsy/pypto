@@ -30,7 +30,7 @@ There are **fifteen ops** and **four ABI enums**:
 | `pld.tensor.reduce_scatter` | reduce and scatter chunks across ranks | `DistributedTensorType` (same as src) | builtin collective |
 | `pld.tensor.allgather` | gather data from all ranks via window | `DistributedTensorType` (same as src) | builtin collective |
 | `pld.tensor.all_to_all` | push-based symmetric personalized exchange — every rank pushes its per-destination chunks to every peer's window via `pld.tensor.put` (TPUT), returns window as result | `DistributedTensorType` (same as src) | composite / HOST builtin |
-| `pld.tensor.all_to_all_v` | variable-size all-to-all (MPI_Alltoallv) — pushes `clamp(send_counts[dest], 0, MAX_RECV)` rows per destination into a flat 2D staging window (transfer size is the runtime row count, so padding never crosses the wire), and publishes that same clamped count into peer `recv_counts[my_rank, 0]` via `pld.system.notify` (Set) so the receiver knows which rows are valid; returns window as result (same window-as-result pattern as symmetric `all_to_all`) | `DistributedTensorType` (same as target) | composite / HOST builtin / CHIP builtin |
+| `pld.tensor.all_to_all_v` | variable-size all-to-all (MPI_Alltoallv) — pushes `clamp(send_counts[dest], 0, MAX_RECV)` rows per destination into a flat 2D staging window (transfer size is the runtime row count, so padding never crosses the wire), and fills `recv_counts[src, 0]` so the receiver knows which rows are valid — the builtin kernel pulls ONE word per peer from that peer's own `send_counts` window (scalar read; no fixed-width requirement) and clamps reader-side, gated by a two-round credit barrier; the composite rail publishes via `pld.system.notify` (Set); returns window as result (same window-as-result pattern as symmetric `all_to_all`) | `DistributedTensorType` (same as target) | composite / HOST builtin / CHIP builtin |
 | `pld.system.notify` | signal a peer's slot | `Unknown` (side effect) | TNOTIFY |
 | `pld.system.wait` | block on own slot | `Unknown` (side effect) | TWAIT |
 | `pld.system.defer_wait` | defer this task's logical completion on a local counter | `Unknown` (side effect) | Simpler completion runtime (no PTOAS wait op) |
@@ -142,9 +142,10 @@ against the enum range so codegen can cast back without a second guard.
 ## Barrier-signal protocol
 
 Every `pld.tensor.*` collective (`allreduce`, `barrier`, `broadcast`,
-`reduce_scatter`, `allgather`, `all_to_all`, `all_to_all_v`) synchronises through one shared,
+`reduce_scatter`, `allgather`, `all_to_all`) synchronises through one shared,
 **self-clearing credit barrier** built from `pld.system.notify` /
-`pld.system.wait`:
+`pld.system.wait` — except `all_to_all_v`'s builtin kernel, which uses the
+**two-round** variant described at the end of this section:
 
 ```text
 Body:      barrier(1); barrier(2); ...; barrier(N)   # g counted within this
@@ -176,6 +177,15 @@ advanced counter.
 `N` (the credit total the epilogue subtracts) may be a **runtime scalar** —
 `pld.system.notify`'s `value` only requires `ScalarType` — so a mesh
 allreduce's per-chunk credit count does not need to be known at compile time.
+
+`all_to_all_v`'s builtin kernel is the one **two-round** variant: its count
+pull requires the counts lifetime and the receive-window reuse to be protected
+across calls, so it runs Barrier A (`+1` / wait `Ge(1)`) before the pull and
+Barrier B (`+1` / wait `Ge(2)`) after the push, then subtracts 2 per local
+slot in a single `AtomicAdd(-2)` epilogue — never a reset, so an early credit
+from the next invocation is preserved. It is likewise reusable across
+sequential calls. Its InCore composite rail keeps the one-round self-clearing
+protocol above.
 
 **Constraints:**
 
@@ -407,8 +417,11 @@ Variable-size all-to-all (MPI_Alltoallv). Flat 2D layouts:
 
 - `input` — Tensor or DistributedTensor `[NR*MAX_RECV, SIZE]`
 - `target` — DistributedTensor `[NR*MAX_RECV, SIZE]` (window-as-result)
-- `signal` — DistributedTensor INT32 `[NR, 1]` (self-clearing credit barrier; reusable across calls)
-- `send_counts` — Tensor-like INT32 `[NR]` or `[NR, 1]` (runtime rows per dest)
+- `signal` — DistributedTensor INT32 `[NR, 1]` (credit-based two-round barrier; reusable across consecutive calls — zero-init once, never reset)
+- `send_counts` — INT32 `[NR]` or `[NR, 1]` (runtime rows per dest). On the
+HOST/CHIP builtin rails it must be a window-bound `DistributedTensor` (each
+peer reads this rank's entry through `CommRemotePtr`); a plain `Tensor` is
+accepted only on the InCore composite rail
 - `recv_counts` — DistributedTensor INT32 `[NR, 1]` (InOut recvcounts)
 
 `input` and `target` are addressed by flat element arithmetic, so both must be
@@ -425,14 +438,25 @@ InCore and CHIP rails the operands arrive as function parameters with no such
 provenance, so distinctness is the caller's obligation.
 
 `MAX_RECV = target.shape[0] // NR`. Lowering reads `send_counts[dest]` at
-runtime, clamps it to `[0, MAX_RECV]`, and publishes the **clamped** count into
-peer `recv_counts[my_rank, 0]` via `pld.system.notify` (Set). The push transfers
-exactly that many rows — the transfer shape is the runtime `[rows, SIZE]`, not
-the compile-time capacity — so padding rows never cross the wire. After the
-barrier the receiver uses `recv_counts[src, 0]` to identify the valid rows; the
-remainder of its capacity slot is never written at all. Window memory is not
-*guaranteed* zeroed and can carry over within a process, so those untouched
-bytes are undefined.
+runtime, clamps it to `[0, MAX_RECV]`, and fills the receive-side count vector
+`recv_counts[src, 0]`. The builtin kernel (HOST and managed CHIP/L2 rails) does
+this by **pulling**: each rank stages its own send vector into its `send_counts`
+window, and after Barrier A every rank reads the ONE word it needs from each
+peer's window with a scalar non-cacheable read — no bulk transfer and no
+fixed-width buffer requirement; the `[NR]` INT32 vector is all the window must
+hold — then clamps the raw value reader-side (`recv_counts[src, 0] =
+clamp(send_counts_of[src][my_rank], 0, MAX_RECV)`). The exchange is gated by a
+**two-round credit barrier**: Barrier A (before the pull) certifies every rank
+staged its counts and finished consuming the previous invocation's receive
+window; Barrier B (after the push) certifies every peer read this rank's counts
+and pushed before it returns. The InCore composite rail instead publishes the
+already-clamped count into peer `dest`'s `recv_counts[my_rank, 0]` via
+`pld.system.notify` (Set). The push transfers exactly that many rows — the
+transfer shape is the runtime `[rows, SIZE]`, not the compile-time capacity —
+so padding rows never cross the wire. After the call the receiver uses
+`recv_counts[src, 0]` to identify the valid rows; the remainder of its capacity
+slot is never written at all. Window memory is not *guaranteed* zeroed and can
+carry over within a process, so those untouched bytes are undefined.
 
 > [!WARNING]
 > **Trim to `recv_counts` before doing arithmetic over the capacity block.**
@@ -493,8 +517,10 @@ control-vs-control is a notify racing a count publish). The kernel derives
 size), so the block layout is always consistent with the devices actually
 running — no exact `signal.shape[0]` == device-count requirement and no
 per-`MAX_RECV` variant mangling. Not supported inside a `for`/`while` loop in
-`host_orch` (single-use signal protocol) — the same restriction
-`LowerCompositeOps` enforces on the InCore path.
+`host_orch` yet — a compiler limitation (`MaterializeCommDomainScopes` rejects
+it up front; the same restriction `LowerCompositeOps` enforces on the InCore
+path), not a property of the signal: the credit barrier is reusable across
+sequential calls.
 
 ### `pld.tensor.allreduce`
 

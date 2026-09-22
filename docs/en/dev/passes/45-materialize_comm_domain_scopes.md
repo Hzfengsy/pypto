@@ -114,9 +114,10 @@ The pass raises `pypto::ValueError` (carrying the alloc's span) if:
 - Two allocations within the same comm domain share a `name_hint_` (the
   parser already enforces global uniqueness; the pass re-asserts).
 - A `pld.tensor.all_to_all_v` call sits inside a `for`/`while` loop in a HOST
-  orchestrator — its Set(1)/wait≥1 signal is single-use and cannot be reused
-  across dynamic invocations (same restriction `LowerCompositeOps` enforces on
-  the InCore path).
+  orchestrator — dynamic re-invocation needs loop-carried window lifetime
+  management this compiler does not model yet (the credit-based signal itself
+  is reusable across sequential calls); same restriction `LowerCompositeOps`
+  enforces on the InCore path.
 
 ## Output invariants
 

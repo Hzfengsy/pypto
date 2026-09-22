@@ -95,8 +95,9 @@ alloc / view / dispatch 点在此时仍然可见。放在较晚阶段还能让�
 - 同一 comm-domain scope 内 `name_hint_` 重名（parser 已在程序范围内做了唯一性
   校验，本 pass 再次断言）。
 - `pld.tensor.all_to_all_v` 调用位于 HOST orchestrator 的 `for`/`while`
-  循环内——其 Set(1)/wait≥1 信号是单次使用的，无法在动态调用间复用（与
-  `LowerCompositeOps` 在 InCore 路径上强制的限制相同）。
+  循环内——动态重复调用需要循环携带的窗口生命周期管理，本编译器尚未建模
+  （信用式信号本身可跨顺序调用复用；与 `LowerCompositeOps` 在 InCore 路径上
+  强制的限制相同）。
 
 ## 输出不变量
 

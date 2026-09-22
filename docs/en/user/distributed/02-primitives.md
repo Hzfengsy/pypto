@@ -116,8 +116,9 @@ notify next to cube work.
 > value; after `wait` returns, the caller has observed the barrier. These
 > tile-level `notify`/`wait` primitives use monotonic counters that do not
 > self-reset — allocate a fresh buffer per call. The `pld.tensor.*`
-> collectives are the exception: their signal buffers are self-clearing and
-> reusable across back-to-back calls.
+> collectives are the exception: their signal buffers are reusable across
+> back-to-back calls (a self-clearing epilogue for most, a credit-carrying
+> two-round barrier for `all_to_all_v`'s builtin kernel).
 
 ## Deferred Completion: Release the Core, Keep the Task Pending
 

@@ -97,7 +97,8 @@ def handshake_step(
 
 > **Buffer 重用安全：** Signal 使用单调计数器且不会自重置。这些 tile 级
 > `notify`/`wait` 原语每次调用需分配新 buffer；`pld.tensor.*` 集合通信除外，
-> 其 signal buffer 自清理，可在连续调用间复用。
+> 其 signal buffer 可在连续调用间复用（多数为自清理尾声；`all_to_all_v` 的
+> builtin 内核为携带信用的两轮屏障）。
 
 ## 延迟完成：释放物理核，保留逻辑任务
 
