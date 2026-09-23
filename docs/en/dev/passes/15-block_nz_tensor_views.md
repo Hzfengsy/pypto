@@ -403,16 +403,16 @@ sees that attribute.
 
 ## Assembler version
 
-Whether this pass's output assembles at all depends on the PTOAS release, and
-the repository's pinned version is not yet the one that works.
+Whether this pass's output assembles at all depends on the PTOAS release.
 
 | PTOAS | Behavior |
 | ----- | -------- |
 | ≤ 0.60 | Infers the layout structurally. Blocked NZ and ND are structurally identical (both row-major), so it infers `nd`, overrides the explicit `nz` annotation, and fails with `layout mismatch: user-specified layout=nz but inferred=nd`. No NZ view assembles, at any rank. |
 | ≥ 0.61 | Treats an explicit `ND` / `DN` / `NZ` annotation as authoritative and validates it, so the descriptor above assembles. It also enforces NZ's arity directly: a view of any rank but 5 is refused with `'pto.make_tensor_view' op user-specified layout=nz requires a rank-5 view`. |
 
-`toolchain/versions.env` pins **v0.61**, so `pl.NZ` works end to end on the
-pinned toolchain. `tests/st/runtime/ops/test_matmul_nz.py` is what holds that:
+`toolchain/versions.env` pins a release at or above **v0.61**, so `pl.NZ` works
+end to end on the pinned toolchain. `tests/st/runtime/ops/test_matmul_nz.py` is
+what holds that:
 an ND activation against an NZ weight, with the host packer that produces the
 fractal bytes, plus sliced cases that pin both offset axes — the row fractal
 (`n0 // 16`) and the C0 column block (`k0 // c0`). A whole-tensor load leaves

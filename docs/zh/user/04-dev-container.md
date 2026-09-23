@@ -38,11 +38,22 @@ swr.cn-east-3.myhuaweicloud.com/cloud-pypto/pypto-dev:a3-dist
 | 架构 | ARM64（`linux/arm64`）—— 不能在 x86_64 宿主机上运行 |
 | 目标设备 | 昇腾 A2 / A3（PyPTO 平台名 `a2a3`） |
 | 用户态 | Ubuntu 22.04，CANN 9.0.0 |
-| ptoas | 0.61 —— 与 `toolchain/versions.env` 所 pin 的版本一致 |
+| ptoas | 0.61 —— 即镜像自带 pypto 提交所 pin 的版本；`main` 此后已升到更高版本 |
 | 未压缩大小 | 约 16.7 GB |
 | 工作目录 | `/workspace` |
 | 默认入口 | 已激活 PyPTO 环境的交互式 bash |
 | 已验证摘要 | `sha256:ffa6bef8ed34f565a2331a66369902303ff957e832476fa1abaad2be435b82b5` |
+
+**镜像里的 ptoas 落后于 `main`。** 它与构建镜像所用 pypto 提交（即下面 `dist-manifest` 的
+`pypto` 一行）中的 `toolchain/versions.env` 一致，而不是与仓库当前的 pin 一致。codegen 会拒绝
+低于源码 pin 的 ptoas，因此一旦容器里的源码 pin 的 ptoas 比镜像自带的新 —— 拉取了更新，或把当前
+checkout 挂载到 `/workspace` —— 每次 codegen 都会失败，直到重装 ptoas；见[更新源码并重建](#更新源码并重建)。
+对比两者：
+
+```bash
+grep '^PTOAS_VERSION=' "$PYPTO_SRC/toolchain/versions.env"
+/opt/pypto/ptoas/bin/ptoas --version
+```
 
 `/opt/pypto/dist-manifest` 记录了这个镜像到底是用什么构建的 —— pypto、runtime、pto-isa、
 pypto-lib 四个提交，以及构建时间。反馈问题时请附上它：
@@ -418,7 +429,7 @@ CANN 自己的变量，逻辑编号按列出顺序从 0 开始：
 | `npu-smi` 报 `-9005`，或 `DrvMngGetConsoleLogLevel failed (ret=4)` | 只暴露了部分卡，而 `npu-smi` 试图枚举整机 | 无害。以 `pypto-doctor` 的 `device access: aclrtSetDevice(0) ok` 为准 |
 | `/workspace/pypto` 不存在 | 绑定挂载高了一层 | 挂载包含 `pypto/` 的那一层：用 `-v "$PWD/workspace:/workspace"`，而不是 `-v "$PWD:/workspace"` |
 | `pypto-doctor` 报 simpler binding 与源码不匹配 | 挂进来的源码与镜像构建时用的不是同一份 | `pypto-build && pypto-doctor` |
-| codegen 报 `ptoas at '...' is version X, but PyPTO requires PTOAS >= vY` | 手工更新源码之后，汇编器落在了 `toolchain/versions.env` 后面 | 跑 `/workspace/pypto/.github/docker/pypto-update.sh` —— 只有它会重装 ptoas。镜像发布时二者是对齐的（0.61） |
+| codegen 报 `ptoas at '...' is version X, but PyPTO requires PTOAS >= vY` | 源码 pin 的 ptoas 比镜像自带的（0.61）新 —— 拉取了更新，或把当前 checkout 挂载到 `/workspace` | 跑 `/workspace/pypto/.github/docker/pypto-update.sh` —— 只有它会重装 ptoas。绑定挂载会把它遮住，而[更新源码并重建](#更新源码并重建)里的手动重建不会重装 ptoas；此时按 [FAQ](appendix/01-faq.md#编译) 安装 `toolchain/versions.env` 中的版本，并把 `PTOAS_ROOT` 指向它 |
 | `pto-isa` 试图联网克隆 | 挂载的源码 bump 了 `runtime/pto_isa.pin`，或 managed checkout 被改动过 | pin 变了之后属于预期行为。若 GitHub HTTP/2 不稳定，执行 `git config --global http.version HTTP/1.1` —— resolver 会重试 GitHub，失败后回退到 GitCode 镜像 |
 
 ### 排查 `507018`
