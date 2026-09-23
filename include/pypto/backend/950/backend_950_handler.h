@@ -78,6 +78,7 @@ class Ascend950Handler : public BackendHandler {
   [[nodiscard]] bool RequiresVtoCFractalAdapt() const override { return true; }
   [[nodiscard]] bool RequiresRuntimeSubblockBridge() const override { return false; }
   [[nodiscard]] bool RequiresNoSplitDualAivDispatch() const override { return false; }
+  [[nodiscard]] bool SplitsCubeToVectorTransportInHardware() const override { return true; }
   // A5 acc->mat tinsert accepts dst=f32, so the Mat scratch may stay f32.
   [[nodiscard]] bool RequiresLowPrecisionMatScratch() const override { return false; }
 

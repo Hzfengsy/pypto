@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "pypto/backend/common/backend.h"
+#include "pypto/backend/common/backend_handler.h"
 #include "pypto/codegen/codegen_base.h"
 #include "pypto/codegen/pto/pto_codegen.h"
 #include "pypto/core/dtype.h"
@@ -92,8 +93,9 @@ static bool EmitTpushTransportValidShape(const char* target, const CallPtr& op, 
     return false;
   }
   const bool dual_aiv_no_split = (split == 0) && codegen.IsDualAivDispatchFunction();
-  const bool acc_to_vec_no_split = (split == 0) && std::string_view(target) == "aiv" &&
-                                   source_tile_type->GetMemorySpace() == ir::MemorySpace::Acc;
+  const bool acc_to_vec =
+      std::string_view(target) == "aiv" && source_tile_type->GetMemorySpace() == ir::MemorySpace::Acc;
+  const bool acc_to_vec_no_split = (split == 0) && acc_to_vec;
   if ((split == 0 && !dual_aiv_no_split && !acc_to_vec_no_split) || tile_buf.empty() || tile_type.empty()) {
     return false;
   }
@@ -102,37 +104,46 @@ static bool EmitTpushTransportValidShape(const char* target, const CallPtr& op, 
   if (tile_view.valid_shape.size() < 2) {
     return false;
   }
+  const bool compact_acc_to_vec = acc_to_vec && tile_view.compact == ir::CompactMode::normal;
+  // Where the transported row count IS the lane partition (a dual-mode TMOV that
+  // hands each lane half the pushed rows), a split push has to carry the box.
+  const bool lanes_locate_own_band = !codegen.GetBackendHandler()->SplitsCubeToVectorTransportInHardware();
 
-  // The transport must carry the full box for both subblocks to receive
-  // complete data: each subblock reads its half of the slot regardless of the
-  // user-declared valid_shape. Narrowing valid_shape on the producer side
-  // before tpush would leave the non-split axis under-written and (on LR
-  // splits in particular) make even subblock 0 see zeros for the cells the
-  // producer skipped. Localization back to the user's logical valid happens
-  // on the consumer side via LocalizeValidDimForSplit.
+  // The default transport is the producer's full box on both axes. Columns
+  // always need it: the FIFO slot's row pitch is the transported column count,
+  // and both the pop's GM stride and LEFT_RIGHT's lane offset assume the box,
+  // so a narrowed column range would mis-stride every row after the first.
+  // Localization back to the user's logical valid happens on the consumer side
+  // via LocalizeValidDimForSplit.
   const auto& shape = source_tile_type->shape_;
   const auto& valid_shape = tile_view.valid_shape;
   ExprPtr transport_row = shape[0];
   ExprPtr transport_col = shape[1];
 
-  // A no-split Acc->Vec FIFO slot is laid out using the source's physical box,
-  // so a partially written COLUMN range leaves stale bytes *inside* the valid
-  // rows -- those columns must be transported at the full box width. An empty
-  // tile remains an empty protocol operation and must not be widened at all.
+  // The ROW extent of an Acc -> Vec push, by contrast, is never needed past
+  // validRow where each lane locates its own band in a GM slot (A2/A3). No lane
+  // reads a slot row at or beyond it as data: a split lane's band is
+  // `clamp(V - lane * S, 0, S)` rows starting at `lane * S` (the balanced
+  // `S = ceil(V / 2)` when the extent is static, the box half when it is
+  // deferred), so every band ends at or before row V, and an empty tile remains
+  // an empty protocol operation that must not be widened at all. Where the push
+  // splits the rows in hardware instead, the box is what places lane 1 at the
+  // box half, so a split push keeps it (and a compact tile is refused below).
   //
-  // The ROW extent is the opposite: it must stay exactly as the producer wrote
-  // it. Every L0C reader derives its source pitch from validRow --
-  // `ceil(validRow/16)*16` for a compact tile, `TileData::Rows` otherwise
-  // (pto-isa `tstore_common.hpp`, `TStoreAccNz2nd`) -- and `mad` laid the
-  // result out at the pitch implied by the L0A operand's *valid* rows
-  // (`TMatmul.hpp`: `uint16_t m = aMatrix.GetValidRow()`). Widening the rows
-  // here re-derives that pitch from the physical box, so TPUSH walks L0C at a
-  // stride `mad` never wrote at: with a 64-row box valid to 16 the push picks
-  // up N-fractal 4j for every fractal j, silently corrupting the valid rows
-  // (issue #2510). Rows past validRow stay stale in the slot, which is exactly
-  // what a narrowed valid_shape already promises about its invalid region --
-  // and the transport moves validRow rows instead of the whole box.
-  if (acc_to_vec_no_split) {
+  // For a no-split push, and for a compact tile at a split whose lanes locate
+  // their own band, the row extent must in fact stay exactly as the producer
+  // wrote it. Every L0C reader
+  // derives its source pitch from validRow -- `ceil(validRow/16)*16` for a
+  // compact tile, `TileData::Rows` otherwise (pto-isa `tstore_common.hpp`,
+  // `TStoreAccNz2nd`) -- and `mad` laid the result out at the pitch implied by
+  // the L0A operand's *valid* rows (`TMatmul.hpp`:
+  // `uint16_t m = aMatrix.GetValidRow()`). Widening the rows here re-derives
+  // that pitch from the physical box, so TPUSH walks L0C at a stride `mad`
+  // never wrote at: with a 64-row box valid to 16 the push picks up N-fractal 4j
+  // for every fractal j, silently corrupting the valid rows (issue #2510; at a
+  // split, 1792 of 2048 valid elements). A non-compact tile reads at `Rows`
+  // either way, so its split transport keeps the full box.
+  if (acc_to_vec_no_split || (split != 0 && compact_acc_to_vec && lanes_locate_own_band)) {
     for (const auto& valid_dim : valid_shape) {
       if (auto dim_const = As<ir::ConstInt>(valid_dim); dim_const && dim_const->value_ == 0) {
         return false;
@@ -163,23 +174,20 @@ static bool EmitTpushTransportValidShape(const char* target, const CallPtr& op, 
     }
   }
 
-  // A genuine row split needs the full box in the slot -- lane 1 reads the band
-  // starting at the box half, which only exists if the producer wrote it -- but
-  // writing it means reading L0C at the physical pitch, which is not the pitch
-  // `mad` used for a row-narrowed operand. The two requirements are mutually
-  // exclusive, so the shape is refused here instead of being lowered into
-  // silently skewed data (measured: a 64-row box valid to 16 across
-  // `pl.split(UP_DOWN)` returns 1808 of 8192 elements wrong). Gated on the
-  // pitches actually differing, so a single-fractal-block accumulator -- where
-  // `ceil(validRow/16)*16 == Rows` -- keeps crossing as before.
-  CHECK_SPAN(!(split != 0 && tile_view.compact == ir::CompactMode::normal) ||
+  // A push that splits its rows in hardware must carry the box, but a compact
+  // tile read at the box's pitch is not what `mad` wrote. The two requirements
+  // are mutually exclusive there, so the shape is refused rather than lowered
+  // into skewed data -- unless the two pitches coincide (a single-fractal-block
+  // accumulator, `ceil(validRow/16)*16 == Rows`).
+  CHECK_SPAN(!(split != 0 && compact_acc_to_vec && !lanes_locate_own_band) ||
                  ir::AccPitchesCoincide(valid_shape[0], shape[0]),
              op->span_)
-      << "a row-narrowed matmul accumulator cannot cross a split Cube-to-Vector boundary: mad wrote "
-      << "L0C at the pitch implied by the matmul's valid rows, while a split transport must carry "
-      << "the full physical box so both vector lanes receive their band. Either drop the row "
-      << "narrowing on the matmul's left operand (narrow the result with pl.set_validshape "
-      << "instead), or route the accumulator through GM and dequantize it in a second scope.";
+      << "a row-narrowed matmul accumulator cannot cross a split Cube-to-Vector boundary on this "
+      << "backend: its split push hands each vector lane half of the transported rows, so it must "
+      << "transport the full physical box, while mad wrote L0C at the pitch implied by the matmul's "
+      << "valid rows. Either drop the row narrowing on the matmul's left operand (narrow the result "
+      << "with pl.set_validshape instead), or route the accumulator through GM and dequantize it in a "
+      << "second scope.";
 
   if (IsSameDimExpr(transport_row, valid_shape[0]) && IsSameDimExpr(transport_col, valid_shape[1])) {
     return false;

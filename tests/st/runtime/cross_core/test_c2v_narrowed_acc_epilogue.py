@@ -34,6 +34,13 @@ The two cases here are the same arithmetic through the two readers:
 The first two returned 14336 of 65536 elements wrong before their fix; the third returned
 75264 of 131072 wrong in the issue's own reproducer, its 48-row tail garbage rather than
 the untouched zeros the others left.
+
+The ``..._across_a_split_boundary`` tests cross the same accumulator into TWO vector
+lanes. A split push used to widen its rows to the box for the lanes' sake, which skews the
+compact L0C read exactly like #2510 (1792 of 2048 valid elements wrong at 16 of 64 rows),
+so the shape was refused outright. On A2/A3 each lane locates its own band and no lane
+reads a row past the valid extent, so the push now keeps the producer's rows; a runtime
+extent additionally pops the full per-lane box and carries the extent on its consumers.
 """
 
 from typing import Any
@@ -41,6 +48,7 @@ from typing import Any
 import pypto.language as pl
 import pytest
 import torch
+from harness import st
 from harness.core.harness import DataType, PTOTestCase, TensorSpec
 
 M_TILE = 64  # physical accumulator rows
@@ -286,6 +294,235 @@ class TestNarrowedAccEpilogue:
         """The TSTORE path over a user-written carry seeded by pl.create_tensor (#2470)."""
         result = test_runner.run(_CarriedKLoopCase(platform=platform))
         assert result.passed, f"carried accumulator failed: {result.error}"
+
+
+def _auto_split_epilogue(mode: pl.SplitMode, valid_rows: int):
+    """A ``pl.split`` scope over an accumulator narrowed through its left operand."""
+
+    @pl.jit
+    def narrowed_acc_auto_split(
+        x: pl.Tensor[[M_TILE, K_ONE_BLOCK], pl.INT8],
+        w: pl.Tensor[[N_TILE, K_ONE_BLOCK], pl.INT8],
+        out: pl.InOut[pl.Tensor[[M_TILE, N_TILE], pl.FP32]],
+    ) -> pl.Tensor[[M_TILE, N_TILE], pl.FP32]:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="narrowed_split", optimizations=[pl.split(mode)]):
+            xk = pl.slice(x, [M_TILE, K_ONE_BLOCK], [0, 0], valid_shape=[valid_rows, K_ONE_BLOCK])
+            acc = pl.matmul(xk, w, b_trans=True, out_dtype=pl.INT32)
+            out[:, :] = pl.cast(acc, target_type=pl.FP32, mode="none")
+        return out
+
+    return narrowed_acc_auto_split
+
+
+@pl.jit
+def narrowed_acc_explicit_split(
+    x: pl.Tensor[[M_TILE, K_ONE_BLOCK], pl.INT8],
+    w: pl.Tensor[[N_TILE, K_ONE_BLOCK], pl.INT8],
+    out: pl.InOut[pl.Tensor[[M_TILE, N_TILE], pl.FP32]],
+) -> pl.Tensor[[M_TILE, N_TILE], pl.FP32]:
+    """The same crossing through a ``pl.split_aiv`` region, rows reaching lane 0 only."""
+    half = M_TILE // 2
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="narrowed_region"):
+        xk = pl.slice(x, [M_TILE, K_ONE_BLOCK], [0, 0], valid_shape=[VALID_ROWS, K_ONE_BLOCK])
+        acc = pl.matmul(xk, w, b_trans=True, out_dtype=pl.INT32)
+        for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+            shard = pl.aiv_shard(acc)
+            out[aiv_id * half : aiv_id * half + half, :] = pl.cast(shard, target_type=pl.FP32, mode="none")
+    return out
+
+
+@pl.jit
+def narrowed_acc_auto_runtime(
+    x: pl.Tensor[[M_TILE, K_ONE_BLOCK], pl.INT8],
+    w: pl.Tensor[[N_TILE, K_ONE_BLOCK], pl.INT8],
+    valid_rows: pl.Tensor[[1], pl.INT32],
+    out: pl.InOut[pl.Tensor[[M_TILE, N_TILE], pl.FP32]],
+) -> pl.Tensor[[M_TILE, N_TILE], pl.FP32]:
+    """A ``pl.split`` crossing whose row extent is only known at runtime."""
+    n = pl.tensor.read(valid_rows, [0])
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="narrowed_split_runtime",
+        optimizations=[pl.split(pl.SplitMode.UP_DOWN)],
+    ):
+        xk = pl.slice(x, [M_TILE, K_ONE_BLOCK], [0, 0], valid_shape=[n, K_ONE_BLOCK])
+        acc = pl.matmul(xk, w, b_trans=True, out_dtype=pl.INT32)
+        out[:, :] = pl.cast(acc, target_type=pl.FP32, mode="none")
+    return out
+
+
+@pl.jit
+def narrowed_acc_region_runtime(
+    x: pl.Tensor[[M_TILE, K_ONE_BLOCK], pl.INT8],
+    w: pl.Tensor[[N_TILE, K_ONE_BLOCK], pl.INT8],
+    valid_rows: pl.Tensor[[1], pl.INT32],
+    out: pl.InOut[pl.Tensor[[M_TILE, N_TILE], pl.FP32]],
+) -> pl.Tensor[[M_TILE, N_TILE], pl.FP32]:
+    """The runtime-extent crossing through a ``pl.split_aiv`` region."""
+    half = M_TILE // 2
+    n = pl.tensor.read(valid_rows, [0])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="narrowed_region_runtime"):
+        xk = pl.slice(x, [M_TILE, K_ONE_BLOCK], [0, 0], valid_shape=[n, K_ONE_BLOCK])
+        acc = pl.matmul(xk, w, b_trans=True, out_dtype=pl.INT32)
+        for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+            shard = pl.aiv_shard(acc)
+            out[aiv_id * half : aiv_id * half + half, :] = pl.cast(shard, target_type=pl.FP32, mode="none")
+    return out
+
+
+@pl.jit
+def narrowed_acc_auto_runtime_row_sum(
+    x: pl.Tensor[[M_TILE, K_ONE_BLOCK], pl.INT8],
+    w: pl.Tensor[[N_TILE, K_ONE_BLOCK], pl.INT8],
+    valid_rows: pl.Tensor[[1], pl.INT32],
+    out: pl.InOut[pl.Tensor[[M_TILE, 1], pl.FP32]],
+) -> pl.Tensor[[M_TILE, 1], pl.FP32]:
+    """A row reduction after the runtime-extent crossing: its result shape differs from the shard's."""
+    n = pl.tensor.read(valid_rows, [0])
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="narrowed_split_row_sum",
+        optimizations=[pl.split(pl.SplitMode.UP_DOWN)],
+    ):
+        xk = pl.slice(x, [M_TILE, K_ONE_BLOCK], [0, 0], valid_shape=[n, K_ONE_BLOCK])
+        acc = pl.matmul(xk, w, b_trans=True, out_dtype=pl.INT32)
+        out[:, :] = pl.row_sum(pl.cast(acc, target_type=pl.FP32, mode="none"))
+    return out
+
+
+@pl.jit
+def narrowed_acc_auto_runtime_two_stores(
+    x: pl.Tensor[[M_TILE, K_ONE_BLOCK], pl.INT8],
+    w: pl.Tensor[[N_TILE, K_ONE_BLOCK], pl.INT8],
+    valid_rows: pl.Tensor[[1], pl.INT32],
+    out: pl.InOut[pl.Tensor[[M_TILE, 2 * N_TILE], pl.FP32]],
+) -> pl.Tensor[[M_TILE, 2 * N_TILE], pl.FP32]:
+    """Two slice writes into one tensor: the first store's result is the second's destination."""
+    n = pl.tensor.read(valid_rows, [0])
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="narrowed_split_two_stores",
+        optimizations=[pl.split(pl.SplitMode.UP_DOWN)],
+    ):
+        xk = pl.slice(x, [M_TILE, K_ONE_BLOCK], [0, 0], valid_shape=[n, K_ONE_BLOCK])
+        acc = pl.matmul(xk, w, b_trans=True, out_dtype=pl.INT32)
+        f = pl.cast(acc, target_type=pl.FP32, mode="none")
+        out[:, 0:N_TILE] = f
+        out[:, N_TILE : 2 * N_TILE] = pl.add(f, f)
+    return out
+
+
+def _two_stores_case(valid_rows: int, name: str):
+    """``out[:valid_rows] = [p, 2p]`` for ``p = x @ w.T``; exact for the same reason as ``_split_case``."""
+    x, w = _split_operands(128)
+    expected = torch.zeros(M_TILE, 2 * N_TILE, dtype=torch.float32)
+    product = (x[:valid_rows].int() @ w.int().T).float()
+    expected[:valid_rows] = torch.cat([product, product * 2], dim=1)
+    return st.case(
+        narrowed_acc_auto_runtime_two_stores,
+        x,
+        w,
+        torch.tensor([valid_rows], dtype=torch.int32),
+        torch.zeros(M_TILE, 2 * N_TILE, dtype=torch.float32),
+        name=name,
+        golden=lambda _: expected,
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
+def _split_operands(bound: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Seeded INT8 ``x`` and ``w`` over one K block, with values in ``(-bound, bound)``."""
+    generator = torch.Generator().manual_seed(0)
+    x = torch.randint(1 - bound, bound, (M_TILE, K_ONE_BLOCK), dtype=torch.int32, generator=generator)
+    w = torch.randint(1 - bound, bound, (N_TILE, K_ONE_BLOCK), dtype=torch.int32, generator=generator)
+    return x.to(torch.int8), w.to(torch.int8)
+
+
+def _row_sum_case(valid_rows: int, name: str):
+    """``out[:valid_rows] = rowsum(x @ w.T)``, compared without tolerance.
+
+    Operands below 8 in magnitude bound every row sum by 128 * 256 * 49 < 2**24,
+    so the FP32 reduction is exact in any order.
+    """
+    x, w = _split_operands(8)
+    expected = torch.zeros(M_TILE, 1, dtype=torch.float32)
+    expected[:valid_rows] = (
+        (x[:valid_rows].to(torch.int64) @ w.to(torch.int64).T).sum(dim=1, keepdim=True).float()
+    )
+    return st.case(
+        narrowed_acc_auto_runtime_row_sum,
+        x,
+        w,
+        torch.tensor([valid_rows], dtype=torch.int32),
+        torch.zeros(M_TILE, 1, dtype=torch.float32),
+        name=name,
+        golden=lambda _: expected,
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
+def _split_case(kernel, valid_rows: int, name: str, *, runtime_extent: bool = False):
+    """``out[:valid_rows] = x @ w.T``; the rows past it keep their zero init.
+
+    ``out`` is ``InOut`` so that init reaches the device: the kernel writes only
+    the valid rows, and the rows past them must come back untouched. With
+    ``runtime_extent`` the kernel reads ``valid_rows`` from a tensor instead of
+    closing over it.
+
+    INT8 x INT8 over one 256-wide K block is bounded by 256 * 127 * 127 < 2**24,
+    so the FP32 result is exact and compared without tolerance.
+    """
+    x, w = _split_operands(128)
+    expected = torch.zeros(M_TILE, N_TILE, dtype=torch.float32)
+    expected[:valid_rows] = (x[:valid_rows].int() @ w.int().T).float()
+    extent = [torch.tensor([valid_rows], dtype=torch.int32)] if runtime_extent else []
+    return st.case(
+        kernel,
+        x,
+        w,
+        *extent,
+        torch.zeros(M_TILE, N_TILE, dtype=torch.float32),
+        name=name,
+        golden=lambda _: expected,
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
+@pytest.mark.platforms("a2a3")
+@st.cases(
+    # Both lanes hold rows: balanced to 20 + 20 (even code).
+    _split_case(_auto_split_epilogue(pl.SplitMode.UP_DOWN, 40), 40, "narrowed_acc_auto_split_ud_v40"),
+    # An odd extent: balanced to 17 + 16 (odd code).
+    _split_case(_auto_split_epilogue(pl.SplitMode.UP_DOWN, 33), 33, "narrowed_acc_auto_split_ud_v33"),
+    # The split is on the columns; the narrowed rows ride along on both lanes.
+    _split_case(_auto_split_epilogue(pl.SplitMode.LEFT_RIGHT, 40), 40, "narrowed_acc_auto_split_lr_v40"),
+    _split_case(narrowed_acc_explicit_split, VALID_ROWS, "narrowed_acc_explicit_split_ud_v16"),
+)
+def test_vector_epilogue_across_a_split_boundary(case_run):
+    """A compact accumulator crosses a split C2V boundary at its own row extent."""
+    case_run.assert_passed()
+
+
+@pytest.mark.platforms("a2a3")
+@st.cases(
+    # Past the box half: lane 1 holds rows 32..39, which it used to read from rows 8..15.
+    _split_case(narrowed_acc_auto_runtime, 40, "narrowed_acc_auto_runtime_v40", runtime_extent=True),
+    # Within the box half: lane 1 is empty, so its store must be skipped.
+    _split_case(narrowed_acc_auto_runtime, 16, "narrowed_acc_auto_runtime_v16", runtime_extent=True),
+    _split_case(narrowed_acc_region_runtime, 40, "narrowed_acc_region_runtime_v40", runtime_extent=True),
+    # A consumer whose result shape differs from the shard's still carries the lane's extent.
+    _row_sum_case(40, "narrowed_acc_auto_runtime_row_sum_v40"),
+    # A chained store (its result is the next store's destination) stays unguarded on
+    # pl.split, as before; an empty lane's zero-row store moves nothing.
+    _two_stores_case(16, "narrowed_acc_auto_runtime_two_stores_v16"),
+    _two_stores_case(40, "narrowed_acc_auto_runtime_two_stores_v40"),
+)
+def test_vector_epilogue_across_a_split_boundary_at_a_runtime_extent(case_run):
+    """A runtime row extent pops the full per-lane box and carries the extent on its consumers."""
+    case_run.assert_passed()
 
 
 if __name__ == "__main__":
