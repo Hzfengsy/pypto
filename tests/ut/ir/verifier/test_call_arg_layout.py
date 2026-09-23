@@ -264,5 +264,170 @@ def test_the_same_slice_out_of_an_nd_driver_is_rejected():
     assert diagnostics[0].error_code == _LAYOUT_MISMATCH
 
 
+# A ``device=`` dispatch may bind an ND host buffer to an NZ parameter, but only
+# as whole matrices: a window inside the last two axes of NZ-packed bytes is a
+# contiguous run of the wrong fractals, which the device reads as one NZ matrix.
+
+
+def test_dispatch_accepts_a_leading_axis_shard_for_an_nz_parameter():
+    """Each rank's plane of a per-shard-packed stack is itself NZ-packed."""
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip(self, w: pl.Tensor[[256, 256], pl.BF16, pl.NZ]):
+            pass
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self, w: pl.Tensor[[2, 256, 256], pl.BF16]):
+            for r in pl.range(2):
+                self.chip(w[r], device=r)
+
+    assert _verify(Prog) == []
+
+
+def test_dispatch_accepts_a_leading_axis_shard_bound_to_a_variable():
+    """The argument is traced through the Var that binds it."""
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip(self, w: pl.Tensor[[256, 256], pl.BF16, pl.NZ]):
+            pass
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self, w: pl.Tensor[[2, 256, 256], pl.BF16]):
+            for r in pl.range(2):
+                shard = w[r]
+                self.chip(shard, device=r)
+
+    assert _verify(Prog) == []
+
+
+def test_dispatch_rejects_a_row_window_for_an_nz_parameter():
+    """The silent case: rows of a once-packed weight are contiguous, but not NZ-packed."""
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip(self, w: pl.Tensor[[256, 256], pl.BF16, pl.NZ]):
+            pass
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self, w: pl.Tensor[[512, 256], pl.BF16]):
+            for r in pl.range(2):
+                self.chip(w[r * 256 : (r + 1) * 256], device=r)
+
+    diagnostics = _verify(Prog)
+
+    assert len(diagnostics) == 1
+    assert diagnostics[0].error_code == _LAYOUT_MISMATCH
+    assert "argument 0 of dispatch to 'chip'" in diagnostics[0].message
+    assert "Pack each shard separately" in diagnostics[0].message
+
+
+def test_dispatch_rejects_a_row_window_bound_to_a_variable():
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip(self, w: pl.Tensor[[256, 256], pl.BF16, pl.NZ]):
+            pass
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self, w: pl.Tensor[[512, 256], pl.BF16]):
+            for r in pl.range(2):
+                shard = w[r * 256 : (r + 1) * 256]
+                self.chip(shard, device=r)
+
+    diagnostics = _verify(Prog)
+
+    assert len(diagnostics) == 1
+    assert diagnostics[0].error_code == _LAYOUT_MISMATCH
+
+
+def test_dispatch_rejects_a_column_window_of_a_leading_axis_shard():
+    """Taking the leading axis first does not excuse a window on the trailing pair."""
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip(self, w: pl.Tensor[[256, 128], pl.BF16, pl.NZ]):
+            pass
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self, w: pl.Tensor[[2, 256, 256], pl.BF16]):
+            for r in pl.range(2):
+                self.chip(w[r, :, 128:256], device=r)
+
+    diagnostics = _verify(Prog)
+
+    assert len(diagnostics) == 1
+    assert diagnostics[0].error_code == _LAYOUT_MISMATCH
+
+
+def test_dispatch_rejects_a_row_window_carried_through_a_loop():
+    """A loop-carried value holds its initial value and every yield, so each is checked."""
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip(self, w: pl.Tensor[[256, 256], pl.BF16, pl.NZ]):
+            pass
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self, w: pl.Tensor[[512, 256], pl.BF16]):
+            first = w[0:256]
+            for r, (shard,) in pl.range(2, init_values=(first,)):
+                self.chip(shard, device=r)
+                following = w[256:512]
+                shard_out = pl.yield_(following)  # noqa: F841
+
+    diagnostics = _verify(Prog)
+
+    assert len(diagnostics) == 1
+    assert diagnostics[0].error_code == _LAYOUT_MISMATCH
+    assert "window inside the matrix" in diagnostics[0].message
+
+
+def test_dispatch_accepts_leading_axis_shards_carried_through_a_loop():
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip(self, w: pl.Tensor[[256, 256], pl.BF16, pl.NZ]):
+            pass
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self, w: pl.Tensor[[2, 256, 256], pl.BF16]):
+            first = w[0]
+            for r, (shard,) in pl.range(2, init_values=(first,)):
+                self.chip(shard, device=r)
+                following = w[1]
+                shard_out = pl.yield_(following)  # noqa: F841
+
+    assert _verify(Prog) == []
+
+
+def test_dispatch_rejects_an_argument_it_cannot_trace_to_a_host_parameter():
+    """A reshape re-associates the axes; the check does not follow it, so it refuses it."""
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip(self, w: pl.Tensor[[256, 256], pl.BF16, pl.NZ]):
+            pass
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self, w: pl.Tensor[[512, 256], pl.BF16]):
+            stacked = pl.reshape(w, [2, 256, 256])
+            for r in pl.range(2):
+                self.chip(stacked[r], device=r)
+
+    diagnostics = _verify(Prog)
+
+    assert len(diagnostics) == 1
+    assert diagnostics[0].error_code == _LAYOUT_MISMATCH
+    assert "produced some other way" in diagnostics[0].message
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
