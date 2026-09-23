@@ -9,7 +9,10 @@
 
 """Protocol and content identity tests; no toolchain or device is required."""
 
+import hashlib
+import io
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -307,7 +310,459 @@ def test_nested_entries_record_their_true_resolved_paths(tmp_path):
     assert recorded["linked.py"] == str((actual / "nested/kernel.py").resolve())
 
 
+def _elf64(
+    path: Path, sections: dict[str, bytes], *, endian: str = "<", program_headers: bytes = b""
+) -> Path:
+    """Write a minimal ELF64 whose named sections carry the given bytes."""
+    names = bytearray(b"\0")
+    name_offset = {}
+    for name in (*sections, ".shstrtab"):
+        name_offset[name] = len(names)
+        names += name.encode() + b"\0"
+
+    body = bytearray(program_headers)
+    placed = []
+    for name, payload in sections.items():
+        placed.append((name, 64 + len(body), len(payload)))
+        body += payload
+    shstrtab_offset = 64 + len(body)
+    body += names
+    table_offset = 64 + len(body)
+
+    header = bytearray(64)
+    header[0:7] = b"\x7fELF\x02\x01\x01"
+    header[5] = 1 if endian == "<" else 2
+    struct.pack_into(endian + "HHI", header, 16, 3, 62, 1)  # ET_DYN, EM_X86_64, EV_CURRENT
+    struct.pack_into(endian + "H", header, 52, 64)
+    if program_headers:
+        struct.pack_into(endian + "Q", header, 32, 64)
+        struct.pack_into(endian + "HH", header, 54, 56, len(program_headers) // 56)
+    struct.pack_into(endian + "Q", header, 40, table_offset)
+    struct.pack_into(endian + "HHH", header, 58, 64, len(placed) + 2, len(placed) + 1)
+
+    entries = bytearray(64)  # index 0 is SHT_NULL
+    for name, offset, size in placed:
+        entry = bytearray(64)
+        struct.pack_into(endian + "I", entry, 0, name_offset[name])
+        struct.pack_into(endian + "I", entry, 4, 1)  # SHT_PROGBITS
+        struct.pack_into(endian + "Q", entry, 24, offset)
+        struct.pack_into(endian + "Q", entry, 32, size)
+        entries += entry
+    entry = bytearray(64)
+    struct.pack_into(endian + "I", entry, 0, name_offset[".shstrtab"])
+    struct.pack_into(endian + "I", entry, 4, 3)  # SHT_STRTAB
+    struct.pack_into(endian + "Q", entry, 24, shstrtab_offset)
+    struct.pack_into(endian + "Q", entry, 32, len(names))
+    entries += entry
+
+    path.write_bytes(bytes(header) + bytes(body) + bytes(entries))
+    return path
+
+
+def test_debug_information_does_not_reach_an_executable_identity(tmp_path):
+    """Same-layout debug payload edits must preserve executable identity."""
+    # Debug sections cannot change what a compiler built from this
+    # installation produces, and on an unstripped build they are most of it.
+    before = _elf64(tmp_path / "a.so", {".text": b"code", ".debug_info": b"aaaa"})
+    after = _elf64(tmp_path / "b.so", {".text": b"code", ".debug_info": b"bbbb"})
+
+    assert _identity._file_digest(before, sections=True)[1] == _identity._file_digest(after, sections=True)[1]
+
+
+@pytest.mark.parametrize("section", [".text", ".rodata", ".dynsym", ".shstrtab"])
+def test_everything_execution_depends_on_still_reaches_the_identity(tmp_path, section):
+    """Code, data, dynamic symbols, and section names must affect identity."""
+    # .dynsym decides what the loader resolves, so it is not debugger-only;
+    # .shstrtab names the sections the digest is built from.
+    payload = {".text": b"code", ".rodata": b"data", ".dynsym": b"syms"}
+    before = _elf64(tmp_path / "a.so", payload)
+    changed = dict(payload)
+    if section == ".shstrtab":
+        changed[".note"] = b"x"
+    else:
+        changed[section] = b"XXXX"
+    after = _elf64(tmp_path / "b.so", changed)
+
+    assert _identity._file_digest(before, sections=True)[1] != _identity._file_digest(after, sections=True)[1]
+
+
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        # .data and .rodata sort adjacently, so these two files present the
+        # digest with the very same byte stream: identical section names (and
+        # so an identical .shstrtab), the same bytes, in the same order. Only
+        # the boundary between the two sections moves.
+        ({".data": b"ab", ".rodata": b"cd"}, {".data": b"abcd", ".rodata": b""}),
+        ({".data": b"", ".rodata": b"abcd"}, {".data": b"abcd", ".rodata": b""}),
+        # The same bytes under a different section name.
+        ({".text": b"code"}, {".rodata": b"code"}),
+    ],
+)
+def test_section_boundaries_are_part_of_the_identity(tmp_path, before, after):
+    """Bytes alone do not say what a file does; which section holds them does.
+
+    Feeding each section's name and size in beside its bytes is what keeps
+    moving bytes between sections, renaming one, or dropping an empty one from
+    producing the same digest as the file that did none of those.
+    """
+    first = _identity._file_digest(_elf64(tmp_path / "a.so", before), sections=True)[1]
+    second = _identity._file_digest(_elf64(tmp_path / "b.so", after), sections=True)[1]
+
+    assert first != second
+
+
+def _as_relocatable(path: Path) -> Path:
+    """Set the synthetic ELF type to ET_REL without changing its sections."""
+    raw = bytearray(path.read_bytes())
+    struct.pack_into("<H", raw, 16, 1)  # ET_REL
+    path.write_bytes(bytes(raw))
+    return path
+
+
+def test_a_relocatable_object_keeps_the_symbol_table_a_linker_reads(tmp_path):
+    """In a .o the symbol table is a linker input, not debugger-only.
+
+    Two objects with identical code and relocations but a rebuilt .symtab --
+    a renamed symbol, a changed binding or visibility -- link differently.
+    GCC's startup objects reach the inventory through the compiler's resources.
+    Both relocatable and finished objects retain their symbol tables.
+    """
+    first = _as_relocatable(_elf64(tmp_path / "a.o", {".text": b"code", ".symtab": b"symA"}))
+    second = _as_relocatable(_elf64(tmp_path / "b.o", {".text": b"code", ".symtab": b"symB"}))
+
+    assert _identity._file_digest(first, sections=True)[1] != _identity._file_digest(second, sections=True)[1]
+
+
+def test_a_shared_object_preserves_non_debug_symbol_tables(tmp_path):
+    """Finished shared objects conservatively retain their non-debug symbol tables."""
+    # Keep non-debug tables conservatively, even in a finished ET_DYN.
+    first = _elf64(tmp_path / "a.so", {".text": b"code", ".symtab": b"symA"})
+    second = _elf64(tmp_path / "b.so", {".text": b"code", ".symtab": b"symB"})
+
+    assert _identity._file_digest(first, sections=True)[1] != _identity._file_digest(second, sections=True)[1]
+
+
+def test_debug_layout_changes_conservatively_invalidate_identity(tmp_path):
+    """Debug payloads are omitted, but layout metadata remains authoritative."""
+    path = _elf64(tmp_path / "x.so", {".text": b"code", ".debug_info": b"a"})
+    size, digest = _identity._file_digest(path, sections=True)
+    assert size == path.stat().st_size - 1
+    before = fingerprint_content((ContentRoot(path),))
+    _elf64(path, {".text": b"code", ".debug_info": b"a" * 64})
+    after_size, after_digest = _identity._file_digest(path, sections=True)
+    assert after_size == size
+    assert after_digest != digest
+    assert fingerprint_content((ContentRoot(path),)) != before
+
+
+def _corrupt(path: Path, offset: int, value: int, code: str = "<Q") -> Path:
+    """Replace one binary field to exercise metadata invalidation and fallback."""
+    raw = bytearray(path.read_bytes())
+    struct.pack_into(code, raw, offset, value)
+    path.write_bytes(bytes(raw))
+    return path
+
+
+@pytest.mark.parametrize("field", ["names_size", "names_offset", "section_size"])
+def test_a_declared_size_the_file_cannot_hold_falls_back(tmp_path, field):
+    """A corrupt header must degrade to a whole-file read, never raise.
+
+    Every size here is read out of the file itself, so a truncated download or
+    a fuzzed artifact can declare a section of exabytes. ``read`` of a 64-bit
+    size raises MemoryError rather than returning short, so without a bound
+    against the file's real length that propagates out of the digest and the
+    whole identity fails instead of covering the file the slow way.
+
+    A declared size the read *can* absorb is caught differently -- the short
+    read is noticed -- but a section whose bytes run past the end would then be
+    reported as truncated content rather than as a file this cannot parse.
+    """
+    path = _elf64(tmp_path / "x.so", {".text": b"code", ".rodata": b"data"})
+    table_offset = struct.unpack_from("<Q", path.read_bytes(), 40)[0]
+    entry_size, count, names_index = struct.unpack_from("<HHH", path.read_bytes(), 58)
+    names_entry = table_offset + names_index * entry_size
+    if field == "names_size":
+        _corrupt(path, names_entry + 32, 1 << 60)
+    elif field == "names_offset":
+        _corrupt(path, names_entry + 24, 1 << 60)
+    else:
+        _corrupt(path, table_offset + entry_size + 32, 1 << 60)
+
+    size, digest = _identity._file_digest(path, sections=True)
+
+    assert digest == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert size == path.stat().st_size
+
+
+@pytest.mark.parametrize("inventory", [False, True])
+def test_elf_truncated_after_section_parsing_is_unavailable(tmp_path, monkeypatch, inventory):
+    """Truncating into a parsed debug range must fail through the identity protocol."""
+    path = _elf64(tmp_path / "x.so", {".text": b"code", ".debug_info": b"aaaa"})
+    original_ranges = _identity._elf_debug_ranges
+
+    def truncate_after_parsing(stream):
+        """Shrink the same inode between parsing ranges and measuring digest length."""
+        skipped = original_ranges(stream)
+        assert skipped
+        with path.open("r+b") as writer:
+            writer.truncate(skipped[-1][1] - 1)
+        return skipped
+
+    monkeypatch.setattr(_identity, "_elf_debug_ranges", truncate_after_parsing)
+    if inventory:
+        result = fingerprint_content((ContentRoot(path),))
+        assert result.digest is None
+        assert result.failure is not None and "changed while being read" in result.failure
+    else:
+        with pytest.raises(ValueError, match="changed while being read"):
+            _identity._file_digest(path, sections=True)
+
+
+def test_a_section_digest_is_tagged_apart_from_a_whole_file_digest(tmp_path):
+    """Filtered ELF identities must be distinguishable from whole-file SHA-256."""
+    # The two coexist in one record, so a reader must never take one for the
+    # other -- an unparsable file falls back to hashing all of its bytes.
+    elf = _elf64(tmp_path / "a.so", {".text": b"code"})
+    plain = tmp_path / "b.bin"
+    plain.write_bytes(b"code")
+
+    assert _identity._file_digest(elf, sections=True)[1].startswith("elf64-debug-filtered-v2:")
+    assert not _identity._file_digest(plain, sections=True)[1].startswith("elf64-debug-filtered-v2:")
+
+
+@pytest.mark.parametrize("endian", ["<", ">"])
+@pytest.mark.parametrize(
+    "field,code,value",
+    [
+        (4, "I", 8),
+        (8, "Q", 4),
+        (16, "Q", 4096),
+        (32, "Q", 2),
+        (40, "I", 2),
+        (44, "I", 1),
+        (48, "Q", 32),
+        (56, "Q", 8),
+    ],
+)
+def test_section_metadata_changes_identity(tmp_path, endian, field, code, value):
+    """Every section attribute, including NOBITS, is an identity input."""
+    path = _elf64(tmp_path / "x.o", {".text": b"code"}, endian=endian)
+    before = _identity._file_digest(path, sections=True)
+    table = struct.unpack_from(endian + "Q", path.read_bytes(), 40)[0]
+    _corrupt(path, table + 64 + field, value, endian + code)
+    assert _identity._file_digest(path, sections=True) != before
+
+
+@pytest.mark.parametrize("field,code,value", [(16, "H", 1), (18, "H", 183), (24, "Q", 4096), (48, "I", 1)])
+def test_elf_header_changes_identity(tmp_path, field, code, value):
+    """Object type, architecture, entry point, and flags must affect identity."""
+    path = _elf64(tmp_path / "x.so", {".text": b"code"})
+    before = _identity._file_digest(path, sections=True)
+    _corrupt(path, field, value, "<" + code)
+    assert _identity._file_digest(path, sections=True) != before
+
+
+@pytest.mark.parametrize(
+    "field,code,value",
+    [
+        (0, "I", 0x6474E551),
+        (4, "I", 7),
+        (16, "Q", 8192),
+        (24, "Q", 8192),
+        (32, "Q", 3),
+        (40, "Q", 32),
+        (48, "Q", 8192),
+    ],
+)
+def test_program_header_changes_identity(tmp_path, field, code, value):
+    """Segment permissions, addresses, sizes, and alignment must affect identity."""
+    program = struct.pack("<IIQQQQQQ", 1, 5, 120, 4096, 4096, 4, 4, 4096)
+    path = _elf64(tmp_path / "x.so", {".text": b"code"}, program_headers=program)
+    before = _identity._file_digest(path, sections=True)
+    _corrupt(path, 64 + field, value, "<" + code)
+    assert _identity._file_digest(path, sections=True) != before
+
+
+@pytest.mark.parametrize("name", [".debug_info", ".debugger", ".comment.extra", ".symtab.extra"])
+def test_only_unallocated_debug_payloads_are_omitted(tmp_path, name):
+    """Allocated sections must remain hashed regardless of their names."""
+    path = _elf64(tmp_path / "x.so", {name: b"aaaa"})
+    table = struct.unpack_from("<Q", path.read_bytes(), 40)[0]
+    _corrupt(path, table + 64 + 8, 2)  # SHF_ALLOC
+    before = _identity._file_digest(path, sections=True)
+    _corrupt(path, 64, 0x62626262, "<I")
+    assert _identity._file_digest(path, sections=True) != before
+
+
+@pytest.mark.parametrize("name", [".debugger", ".comment.extra", ".symtab.extra"])
+def test_debug_name_prefix_does_not_hide_other_sections(tmp_path, name):
+    """A similar section name must not qualify an unrelated payload for omission."""
+    first = _elf64(tmp_path / "a.so", {name: b"aaaa"})
+    second = _elf64(tmp_path / "b.so", {name: b"bbbb"})
+    assert _identity._file_digest(first, sections=True) != _identity._file_digest(second, sections=True)
+
+
+def test_segment_backed_debug_payload_falls_back(tmp_path):
+    """A program-segment reference makes debug filtering unsafe."""
+    program = struct.pack("<IIQQQQQQ", 1, 5, 120, 4096, 4096, 4, 4, 4096)
+    path = _elf64(tmp_path / "x.so", {".debug_info": b"aaaa"}, program_headers=program)
+    assert _identity._file_digest(path, sections=True) == _identity._file_digest(path)
+
+
+def test_bytes_outside_sections_are_preserved(tmp_path):
+    """Data outside section ranges must still contribute to identity."""
+    path = _elf64(tmp_path / "x.so", {".text": b"code"})
+    with path.open("ab") as stream:
+        stream.write(b"extra segment data")
+    before = _identity._file_digest(path, sections=True)
+    _corrupt(path, path.stat().st_size - 1, ord("X"), "B")
+    assert _identity._file_digest(path, sections=True) != before
+
+
+@pytest.mark.parametrize(
+    "offset,code,value",
+    [
+        (5, "B", 0),
+        (5, "B", 3),
+        (6, "B", 0),
+        (16, "H", 4),
+        (20, "I", 2),
+        (40, "Q", 1 << 60),
+        (52, "H", 65),
+        (58, "H", 65535),
+        (60, "H", 65535),
+        (60, "H", 0),
+        (62, "H", 65535),
+        (54, "H", 65535),
+        (56, "H", 65535),
+    ],
+)
+def test_unsupported_elf_headers_fall_back(tmp_path, offset, code, value):
+    """Unrecognized or malformed header layouts must use whole-file hashing."""
+    path = _elf64(tmp_path / "x.so", {".debug_info": b"aaaa"})
+    # A nonzero program count makes its entry size meaningful.
+    if offset == 54:
+        _corrupt(path, 56, 1, "<H")
+    _corrupt(path, offset, value, "<" + code)
+    assert _identity._file_digest(path, sections=True) == _identity._file_digest(path)
+
+
+def test_overlapping_debug_section_falls_back(tmp_path):
+    """A debug range overlapping code must never hide code bytes."""
+    path = _elf64(tmp_path / "x.so", {".text": b"code", ".debug_info": b"aaaa"})
+    table = struct.unpack_from("<Q", path.read_bytes(), 40)[0]
+    _corrupt(path, table + 128 + 24, 64)
+    assert _identity._file_digest(path, sections=True) == _identity._file_digest(path)
+
+
+def test_sparse_string_table_does_not_cause_large_reads(tmp_path):
+    """A sparse multi-gigabyte name table must not trigger an equally large read."""
+    path = _elf64(tmp_path / "x.so", {".debug_info": b"aaaa"})
+    raw = path.read_bytes()
+    table = struct.unpack_from("<Q", raw, 40)[0]
+    names_offset = struct.unpack_from("<Q", raw, table + 128 + 24)[0]
+    _corrupt(path, table + 128 + 32, 1 << 32)
+    with path.open("r+b") as stream:
+        stream.truncate(names_offset + (1 << 32))
+
+    class BoundedReader(io.BufferedReader):
+        def read(self, size=-1):
+            """Reject oversized metadata reads even when the sparse file can hold them."""
+            assert 0 <= size <= 1024 * 1024
+            return super().read(size)
+
+    with path.open("rb", buffering=0) as stream, BoundedReader(stream) as bounded:
+        assert _identity._elf_debug_ranges(bounded) is None
+
+
+@pytest.fixture(scope="module")
+def clang_elf_object(tmp_path_factory):
+    """Exercise genuine Clang sections rather than only synthetic ELF layouts."""
+    clang = shutil.which("clang")
+    if clang is None:
+        pytest.skip("Clang is required for the real ELF regression")
+    directory = tmp_path_factory.mktemp("clang-identity")
+    source = directory / "input.c"
+    source.write_text("char buffer[16]; int read_buffer(void) { return buffer[0]; }\n")
+    path = directory / "input.o"
+    # The parser below requires little-endian ELF64, including on macOS hosts.
+    subprocess.run(
+        [clang, "--target=x86_64-linux-gnu", "-g", "-c", str(source), "-o", str(path)],
+        check=True,
+        capture_output=True,
+    )
+    raw = path.read_bytes()
+    assert raw[:6] == b"\x7fELF\x02\x01", "Expected a little-endian ELF64 object from Clang"
+    return raw
+
+
+def _section_header(raw: bytes, name: bytes) -> int:
+    """Locate a section in the real little-endian ELF64 test object."""
+    table = struct.unpack_from("<Q", raw, 40)[0]
+    entry_size, count, names_index = struct.unpack_from("<HHH", raw, 58)
+    names = struct.unpack_from("<Q", raw, table + names_index * entry_size + 24)[0]
+    for index in range(count):
+        entry = table + index * entry_size
+        start = names + struct.unpack_from("<I", raw, entry)[0]
+        if raw[start : raw.index(b"\0", start)] == name:
+            return entry
+    raise AssertionError(f"Missing ELF section {name!r}")
+
+
+@pytest.mark.parametrize("name,field,value", [(b".bss", 32, 32), (b".bss", 48, 32), (b".text", 8, 2)])
+def test_real_clang_elf_metadata_invalidates_identity(tmp_path, clang_elf_object, name, field, value):
+    """Real BSS layout and code permission changes must invalidate cached identity."""
+    path = tmp_path / "input.o"
+    path.write_bytes(clang_elf_object)
+    before = _identity._file_digest(path, sections=True)
+    entry = _section_header(clang_elf_object, name)
+    if name == b".bss" and field == 32:
+        assert struct.unpack_from("<Q", clang_elf_object, entry + field)[0] == 16
+    _corrupt(path, entry + field, value)
+    assert _identity._file_digest(path, sections=True) != before
+
+
+def test_real_clang_debug_payload_is_skipped(tmp_path, clang_elf_object):
+    """An unchanged-layout debug edit in a real object must preserve identity."""
+    path = tmp_path / "input.o"
+    path.write_bytes(clang_elf_object)
+    before = _identity._file_digest(path, sections=True)
+    entry = _section_header(clang_elf_object, b".debug_info")
+    offset = struct.unpack_from("<Q", clang_elf_object, entry + 24)[0]
+    _corrupt(path, offset, clang_elf_object[offset] ^ 1, "B")
+    assert _identity._file_digest(path, sections=True) == before
+    assert before[0] < len(clang_elf_object)
+
+
+def test_a_file_that_is_not_elf64_is_read_whole(tmp_path):
+    """Non-ELF64 inputs must retain their complete byte identity."""
+    for name, payload in (
+        ("short.bin", b"\x7fELF"),
+        ("elf32.bin", b"\x7fELF\x01" + bytes(59)),
+        ("text.bin", b"not an elf at all"),
+    ):
+        path = tmp_path / name
+        path.write_bytes(payload)
+        size, digest = _identity._file_digest(path, sections=True)
+        assert digest == hashlib.sha256(payload).hexdigest()
+        assert size == len(payload)
+
+
+def test_the_artifact_manifest_still_gets_a_whole_file_sha256(tmp_path):
+    """Artifact integrity checks must include debug bytes as well as executable data."""
+    # _prebuilt recomputes this over the stored bytes to prove they are intact,
+    # so the manifest reading must stay a plain digest of the whole file.
+    elf = _elf64(tmp_path / "a.so", {".text": b"code", ".debug_info": b"aaaa"})
+
+    size, digest = _identity._file_digest(elf)
+
+    assert digest == hashlib.sha256(elf.read_bytes()).hexdigest()
+    assert size == elf.stat().st_size
+
+
 def test_child_replaced_by_symlink_after_hashing_is_unavailable(tmp_path, monkeypatch):
+    """Replacing a hashed directory child with a symlink must reject the inventory."""
     # Whether _file_digest's own metadata comparison notices this swap depends
     # on the filesystem: replacing the name changes st_nlink, but not every
     # filesystem reports that as a ctime change. Swap after the read returns so
@@ -318,8 +773,9 @@ def test_child_replaced_by_symlink_after_hashing_is_unavailable(tmp_path, monkey
     target.write_bytes(b"original")
     original_file_digest = _identity._file_digest
 
-    def replace_after_reading(path):
-        result = original_file_digest(path)
+    def replace_after_reading(path, **options):
+        """Swap the directory child after its file digest has been calculated."""
+        result = original_file_digest(path, **options)
         if path == source and not source.is_symlink():
             source.unlink()
             source.symlink_to(target)

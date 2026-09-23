@@ -22,10 +22,11 @@ import os
 import stat
 import struct
 import threading
+from bisect import bisect_right
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 IDENTITY_SCHEMA = 1
 _COMPONENTS = ("pypto", "runtime", "pto_isa", "ptoas", "device_toolchain")
@@ -88,8 +89,9 @@ def digest_record(value: Any) -> str:
 class ContentRoot:
     """One ordered content input, with its path captured at construction.
 
-    A file contributes its exact bytes. A directory contributes every regular
-    file recursively, except Git metadata and generated Python bytecode.
+    A file contributes its bytes except verified ELF debug payloads.
+    A directory contributes every regular file recursively, except Git metadata
+    and generated Python bytecode.
     ``python_only`` filters directory entries to ``.py`` files for additional
     application source roots; it never filters a directly supplied file.
     Paths participate in identity because source locations and includes are
@@ -121,14 +123,184 @@ class ContentIdentity:
     failure: str | None = None
 
 
-def _file_digest(path: Path) -> tuple[int, str]:
+# Only non-allocated debug payloads may be omitted. All ELF metadata, symbol
+# tables, segment contents, and bytes outside sections remain identity inputs.
+_ELF_MAGIC = b"\x7fELF"
+_SHT_NOBITS = 8
+
+
+def _elf_debug_ranges(stream: BinaryIO) -> list[tuple[int, int]] | None:
+    """Find safely skippable ELF64 debug payloads, or request whole-file hashing.
+
+    Support ordinary ELF64 relocatables, executables, and shared objects in
+    either byte order. Extended numbering, unknown layouts, overlapping
+    sections, and debug payloads referenced by program headers fall back.
+    Reads are bounded independently of the file's declared or sparse size.
+    """
+    length = os.fstat(stream.fileno()).st_size
+    stream.seek(0)
+    header = stream.read(64)
+    if (
+        len(header) != 64
+        or header[:4] != _ELF_MAGIC
+        or header[4] != 2
+        or header[5] not in (1, 2)
+        or header[6] != 1
+    ):
+        return None
+    endian = "<" if header[5] == 1 else ">"
+    kind, _, version, _, phoff, shoff, _, ehsize, phsize, phnum, shsize, shnum, names_index = (
+        struct.unpack_from(endian + "HHIQQQIHHHHHH", header, 16)
+    )
+    if (
+        kind not in (1, 2, 3)
+        or version != 1
+        or ehsize != 64
+        or shsize != 64
+        or not 0 < names_index < shnum < 0xFF00
+        or shoff < 64
+        or phnum == 0xFFFF
+        or (phnum and (phsize != 56 or phoff < 64))
+        or (not phnum and phoff != 0)
+    ):
+        return None
+
+    def in_file(offset: int, size: int) -> bool:
+        """Check a declared byte range without reading or allocating its contents."""
+        return offset <= length and size <= length - offset
+
+    if not in_file(shoff, shsize * shnum) or not in_file(phoff, phsize * phnum):
+        return None
+    stream.seek(shoff)
+    table = stream.read(shsize * shnum)  # At most 0xFEFF fixed-size entries.
+    if len(table) != shsize * shnum or table[:64] != bytes(64):
+        return None
+    sections = list(struct.iter_unpack(endian + "IIQQQQIIQQ", table))
+    _, names_type, _, _, names_offset, names_size, _, _, _, _ = sections[names_index]
+    if names_type != 3 or not names_size or not in_file(names_offset, names_size):
+        return None
+
+    occupied = [(0, 64), (shoff, shoff + len(table))]
+    if phnum:
+        occupied.append((phoff, phoff + phsize * phnum))
+    skipped = []
+    for index, (name, section_type, flags, _, offset, size, _, _, _, _) in enumerate(sections[1:], 1):
+        if name >= names_size:
+            return None
+        stream.seek(names_offset + name)
+        # ELF imposes no short name limit. Unusually long names are supported
+        # by whole-file hashing instead of allocating an unbounded string table.
+        raw_name = stream.read(min(256, names_size - name))
+        end = raw_name.find(b"\0")
+        if end < 0:
+            return None
+        section_name = raw_name[:end]
+        if section_type in (0, _SHT_NOBITS):
+            continue  # Their full headers are still hashed, including BSS size.
+        if not in_file(offset, size):
+            return None
+        if size:
+            occupied.append((offset, offset + size))
+        debug = section_name in (b".debug", b".zdebug", b".comment", b".gnu_debuglink") or (
+            section_name.startswith((b".debug_", b".zdebug_"))
+        )
+        # SHF_COMPRESSED is safe; any other flag or non-PROGBITS type may carry
+        # semantics beyond debug information. Never omit the section-name table.
+        if debug and section_type == 1 and flags & ~0x800 == 0 and index != names_index and size:
+            skipped.append((offset, offset + size))
+    occupied.sort()
+    if any(left[1] > right[0] for left, right in zip(occupied, occupied[1:])):
+        return None
+
+    skipped.sort()
+    if not _elf_segments_avoid_ranges(stream, endian, (phoff, phnum), skipped, length):
+        return None
+    return skipped
+
+
+def _elf_segments_avoid_ranges(
+    stream: BinaryIO,
+    endian: str,
+    headers: tuple[int, int],
+    ranges: list[tuple[int, int]],
+    length: int,
+) -> bool:
+    """Check segment bounds and reject references to sorted debug ranges."""
+    phoff, phnum = headers
+    ends = [end for _, end in ranges]
+    for index in range(phnum):
+        stream.seek(phoff + index * 56)
+        entry = stream.read(56)
+        if len(entry) != 56:
+            return False
+        _, _, offset, _, _, size, _, _ = struct.unpack(endian + "IIQQQQQQ", entry)
+        if offset > length or size > length - offset:
+            return False
+        # The first debug range ending after this segment starts is the only
+        # candidate needed. Avoid a quadratic scan of two file-declared tables.
+        candidate = bisect_right(ends, offset)
+        if size and candidate < len(ranges) and ranges[candidate][0] < offset + size:
+            return False
+    return True
+
+
+def _executable_digest(stream: BinaryIO) -> tuple[int, str] | None:
+    """Hash all ELF bytes except verified debug payloads, retaining all headers.
+
+    In particular, section attributes and SHT_NOBITS sizes, program headers,
+    and segment bytes outside sections must affect identity. Keeping offsets
+    is conservative: debug rebuilds that change layout can invalidate the
+    cache, while same-layout debug edits still avoid hashing their payloads.
+    """
+    skipped = _elf_debug_ranges(stream)
+    if skipped is None:
+        return None
+    length = os.fstat(stream.fileno()).st_size
+    digest = hashlib.sha256()
+    covered = 0
+    offset = 0
+    for start, end in [*skipped, (length, length)]:
+        size = start - offset
+        if size < 0:
+            raise ValueError(
+                f"Identity input changed while being read: ELF range end {start} precedes offset {offset}"
+            )
+        digest.update(struct.pack(">QQ", offset, size))
+        covered += size
+        stream.seek(offset)
+        remaining = size
+        while remaining:
+            chunk = stream.read(min(remaining, 1024 * 1024))
+            if not chunk:
+                raise ValueError("Identity input ended inside a declared ELF range")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        offset = end
+    # Version the tag: the old section-only digest omitted semantic metadata.
+    return covered, f"elf64-debug-filtered-v2:{digest.hexdigest()}"
+
+
+def _file_digest(path: Path, *, sections: bool = False) -> tuple[int, str]:
+    """Digest a file's bytes, and detect a change or replacement during the read.
+
+    ``sections`` selects the identity reading, which skips the parts of an ELF
+    file only a debugger reads; the artifact manifest leaves it off, because it
+    is verifying that stored bytes are intact rather than asking what an
+    installation would compile with, and its record is a plain SHA-256 that
+    other code recomputes over the whole file.
+    """
     with path.open("rb") as stream:
         before = os.fstat(stream.fileno())
         if not stat.S_ISREG(before.st_mode):
             raise ValueError(f"Identity input is not a regular file: {path}")
-        digest = hashlib.sha256()
-        while chunk := stream.read(1024 * 1024):
-            digest.update(chunk)
+        executable = _executable_digest(stream) if sections else None
+        recorded = None if executable is None else executable[1]
+        if recorded is None:
+            digest = hashlib.sha256()
+            stream.seek(0)
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+            recorded = digest.hexdigest()
         after = os.fstat(stream.fileno())
     # Metadata is a race detector, not an identity or a memoization key.
     if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
@@ -146,7 +318,7 @@ def _file_digest(path: Path) -> tuple[int, str]:
         current.st_ctime_ns,
     ):
         raise ValueError(f"Identity input was replaced while being read: {path}")
-    return after.st_size, digest.hexdigest()
+    return (after.st_size if executable is None else executable[0]), recorded
 
 
 def _content_entries(
@@ -157,6 +329,7 @@ def _content_entries(
     resolved: Path | None = None,
     via_symlink: bool = True,
 ) -> list[tuple[Any, ...]]:
+    """Inventory one input recursively, retaining path semantics and detecting replacement."""
     # An entry that is not itself a symlink inherits its parent's resolution,
     # so only a symlinked entry needs a full readlink walk of every component.
     # ``via_symlink`` records which case produced ``resolved``, selecting the
@@ -211,7 +384,7 @@ def _content_entries(
         return entries
     if not stat.S_ISREG(mode):
         raise ValueError(f"Identity input is not a regular file or directory: {path}")
-    size, digest = _file_digest(path)
+    size, digest = _file_digest(path, sections=True)
     # An inherited resolution only has to prove that this entry did not become
     # a symlink while its bytes were read: replacement of an ancestor component
     # is caught by that directory's own post-read check. _file_digest already
