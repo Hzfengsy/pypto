@@ -1208,6 +1208,66 @@ def test_rejects_tensor_view_of_nz():
                 return out
 
 
+# -- A sliced shard handed to a separate kernel -------------------------------
+#
+# `BlockNzTensorViews` blocks a leading-axis slice, but the driver shape that
+# needs it passes the slice as an argument to an outlined kernel. That route
+# goes through `OptimizeOrchTensors`, which used to stamp the parent's logical
+# row-major strides onto the kernel's NZ param -- strides that describe nothing
+# for fractal-blocked bytes -- and blocking then refused the explicit stride.
+# The in-function slice of `test_blocks_a_leading_axis_slice` never reaches
+# that optimizer, so only a call boundary exercises this.
+
+
+@pl.program
+class SlicedNzShardToKernel:
+    """An orchestration body handing one plane of a stacked NZ weight to a kernel."""
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def shard_mm(
+        self,
+        x: pl.Tensor[[64, 512], pl.INT8],
+        w: pl.Tensor[[256, 512], pl.INT8, pl.NZ],
+        out: pl.Out[pl.Tensor[[64, 256], pl.INT32]],
+    ) -> pl.Tensor[[64, 256], pl.INT32]:
+        xt = pl.load(x, [0, 0], [64, 512], target_memory=pl.Mem.Mat)
+        wt = pl.load(w, [0, 0], [256, 512], target_memory=pl.Mem.Mat)
+        acc = pl.matmul(xt, pl.tile.transpose_view(wt), out_dtype=pl.INT32)
+        return pl.store(acc, [0, 0], out)
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self,
+        x: pl.Tensor[[64, 512], pl.INT8],
+        w: pl.Tensor[[2, 256, 512], pl.INT8, pl.NZ],
+        out: pl.Out[pl.Tensor[[64, 256], pl.INT32]],
+    ) -> pl.Tensor[[64, 256], pl.INT32]:
+        shard = w[1]
+        return self.shard_mm(x, shard, out)
+
+
+def test_a_sliced_shard_reaches_its_kernel_unstrided():
+    """`w[b]` passed to an outlined kernel blocks on both sides of the call."""
+    after = _run(SlicedNzShardToKernel)
+
+    # The kernel's own param, not the driver's: `_nz_param` would return
+    # whichever NZ param sorts first, which here is the stacked `[2, ...]` one.
+    kernel = after.get_function("shard_mm")
+    assert kernel is not None
+    param_type = kernel.params[1].type
+    assert isinstance(param_type, ir.TensorType)
+    assert _values(param_type.shape) == [1, 16, 16, 16, 32]
+    # An explicit stride here is what blocking refuses: the NZ stride is derived
+    # from the blocked shape, never carried from the logical parent.
+    assert param_type.tensor_view is not None
+    assert list(param_type.tensor_view.stride) == []
+
+    slices = _nz_slices(after)
+    assert len(slices) == 1
+    assert _values(_elements(slices[0].args[1])) == [1, 16, 16, 16, 32]  # shapes
+    assert _values(_elements(slices[0].args[2])) == [1, 0, 0, 0, 0]  # offsets
+
+
 # -- Temporary guard for hw-native-sys/pto-isa#317 ----------------------------
 # Delete this block together with ``CheckNzGmGapFitsBurstStride`` once the
 # upstream truncation is fixed.
