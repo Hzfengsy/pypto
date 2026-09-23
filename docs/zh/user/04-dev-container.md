@@ -429,7 +429,7 @@ CANN 自己的变量，逻辑编号按列出顺序从 0 开始：
 | `npu-smi` 报 `-9005`，或 `DrvMngGetConsoleLogLevel failed (ret=4)` | 只暴露了部分卡，而 `npu-smi` 试图枚举整机 | 无害。以 `pypto-doctor` 的 `device access: aclrtSetDevice(0) ok` 为准 |
 | `/workspace/pypto` 不存在 | 绑定挂载高了一层 | 挂载包含 `pypto/` 的那一层：用 `-v "$PWD/workspace:/workspace"`，而不是 `-v "$PWD:/workspace"` |
 | `pypto-doctor` 报 simpler binding 与源码不匹配 | 挂进来的源码与镜像构建时用的不是同一份 | `pypto-build && pypto-doctor` |
-| codegen 报 `ptoas at '...' is version X, but PyPTO requires PTOAS >= vY` | 源码 pin 的 ptoas 比镜像自带的（0.61）新 —— 拉取了更新，或把当前 checkout 挂载到 `/workspace` | 跑 `/workspace/pypto/.github/docker/pypto-update.sh` —— 只有它会重装 ptoas，而绑定挂载会把它遮住；见[更新源码并重建](#更新源码并重建) |
+| codegen 报 `ptoas at '...' is version X, but PyPTO requires PTOAS >= vY` | 源码 pin 的 ptoas 比镜像自带的（0.61）新 —— 拉取了更新，或把当前 checkout 挂载到 `/workspace` | 跑 `/workspace/pypto/.github/docker/pypto-update.sh` —— 只有它会重装 ptoas。绑定挂载会把它遮住，而[更新源码并重建](#更新源码并重建)里的手动重建不会重装 ptoas；此时按 [FAQ](appendix/01-faq.md#编译) 安装 `toolchain/versions.env` 中的版本，并把 `PTOAS_ROOT` 指向它 |
 | `pto-isa` 试图联网克隆 | 挂载的源码 bump 了 `runtime/pto_isa.pin`，或 managed checkout 被改动过 | pin 变了之后属于预期行为。若 GitHub HTTP/2 不稳定，执行 `git config --global http.version HTTP/1.1` —— resolver 会重试 GitHub，失败后回退到 GitCode 镜像 |
 
 ### 排查 `507018`
