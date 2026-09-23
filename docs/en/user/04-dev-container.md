@@ -43,11 +43,23 @@ swr.cn-east-3.myhuaweicloud.com/cloud-pypto/pypto-dev:a3-dist
 | Architecture | ARM64 (`linux/arm64`) — will not run on an x86_64 host |
 | Target device | Ascend A2 / A3 (PyPTO platform name `a2a3`) |
 | User space | Ubuntu 22.04, CANN 9.0.0 |
-| ptoas | 0.61 — the version `toolchain/versions.env` pins |
+| ptoas | 0.61 — what the bundled pypto commit pins; `main` has since moved past it |
 | Size, uncompressed | ~16.7 GB |
 | Working directory | `/workspace` |
 | Entry point | Interactive bash with the PyPTO environment already active |
 | Verified digest | `sha256:ffa6bef8ed34f565a2331a66369902303ff957e832476fa1abaad2be435b82b5` |
+
+**The image's ptoas lags `main`.** It matches `toolchain/versions.env` in the pypto commit
+the image was built from — the `pypto` line of `dist-manifest` below — not the repository
+today. Codegen rejects a ptoas older than the source's pin, so as soon as the source in
+the container pins a newer ptoas than the image ships — pulled, or a current checkout
+mounted over `/workspace` — every codegen fails until ptoas is reinstalled; see
+[Updating the source and rebuilding](#updating-the-source-and-rebuilding). Compare the two:
+
+```bash
+grep '^PTOAS_VERSION=' "$PYPTO_SRC/toolchain/versions.env"
+/opt/pypto/ptoas/bin/ptoas --version
+```
 
 `/opt/pypto/dist-manifest` records exactly what went into the image — the pypto, runtime,
 pto-isa, and pypto-lib commits, and when it was built. Quote it when reporting a problem:
@@ -458,7 +470,7 @@ renumbers cards, and exposes only the ones you named.
 | `npu-smi` reports `-9005`, or `DrvMngGetConsoleLogLevel failed (ret=4)` | `npu-smi` tries to enumerate the whole machine while only some cards are exposed | Harmless. Trust `pypto-doctor`'s `device access: aclrtSetDevice(0) ok` instead |
 | `/workspace/pypto` does not exist | Bind mount one level too high | Mount the directory containing `pypto/`: `-v "$PWD/workspace:/workspace"`, not `-v "$PWD:/workspace"` |
 | `pypto-doctor` says the simpler binding does not match its source | The mounted source differs from what the image built | `pypto-build && pypto-doctor` |
-| Codegen fails with `ptoas at '...' is version X, but PyPTO requires PTOAS >= vY` | The assembler has fallen behind `toolchain/versions.env` after a hand-run source update | `/workspace/pypto/.github/docker/pypto-update.sh` — it is the only step that reinstalls ptoas. The image as published is aligned (0.61) |
+| Codegen fails with `ptoas at '...' is version X, but PyPTO requires PTOAS >= vY` | The source pins a newer ptoas than the image ships (0.61) — after pulling, or with a current checkout mounted over `/workspace` | `/workspace/pypto/.github/docker/pypto-update.sh` — it is the only step that reinstalls ptoas, and a bind mount hides it; see [Updating the source and rebuilding](#updating-the-source-and-rebuilding) |
 | `pto-isa` tries to clone over the network | The mounted source bumped `runtime/pto_isa.pin`, or the managed checkout was modified | Expected after a pin bump. If GitHub HTTP/2 is unstable, `git config --global http.version HTTP/1.1` — the resolver retries GitHub and then falls back to the GitCode mirror |
 
 ### Triaging `507018`
