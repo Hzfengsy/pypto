@@ -124,7 +124,7 @@ has mis-synchronized two co-live slots in a loop. Older releases left the second
 unguarded against the next iteration's write, measured wrong on device. The pinned release
 still gets one form of the shape wrong, a slot filled an iteration ahead of its read, which
 produces wrong data or a device hang
-([PTOAS#1519](https://github.com/hw-native-sys/PTOAS/issues/1519), fixed in ptoas 0.63).
+([PTOAS#1519](https://github.com/hw-native-sys/PTOAS/issues/1519): fixed in ptoas 0.63, broken again since 0.64).
 **One slot live per iteration** is the shape the region form exists for, and it is the
 shape to write if you may switch planners.
 

@@ -210,8 +210,9 @@ class TilePhiBaseCollector : public ir::IRVisitor {
 // - The prefetch: slot 0 filled before the loop, then each iteration fills slot
 //   (i+1)%2 while reading slot i%2. ptoas <= 0.62 primes and drains both slots'
 //   events as for a one-slot rotation, which is off by one here — wrong data for
-//   an even trip count, a device hang for an odd one (hw-native-sys/PTOAS#1519,
-//   fixed in 0.63).
+//   an even trip count, a device hang for an odd one (hw-native-sys/PTOAS#1519).
+//   0.63 fixed it; 0.64 and 0.65 prime both slots again and fail on device the
+//   same two ways.
 //
 // This collector only counts slot selections per loop body, so it cannot tell the
 // two apart, and the pinned ptoas still has the second bug. Both are rejected
@@ -1809,10 +1810,10 @@ void PTOCodegen::PlanMultiBufferRegions(const FunctionPtr& func) {
       candidate.blocker = "one of its slots is carried out of an if or a loop as a phi";
     } else if (colive_collector.bases.count(memref->base_.get()) != 0) {
       candidate.blocker =
-          "two of its slots are live at once inside a loop, and ptoas before 0.63 mis-synchronizes "
-          "one form of that — a slot filled an iteration ahead of its read — into wrong data or a "
-          "device hang (hw-native-sys/PTOAS#1519). Take one slot per iteration, which is the shape "
-          "the region form accelerates";
+          "two of its slots are live at once inside a loop, and ptoas mis-synchronizes one form of "
+          "that — a slot filled an iteration ahead of its read — into wrong data or a device hang "
+          "(hw-native-sys/PTOAS#1519: fixed in 0.63, broken again since 0.64). Take one slot per "
+          "iteration, which is the shape the region form accelerates";
     }
   }
 

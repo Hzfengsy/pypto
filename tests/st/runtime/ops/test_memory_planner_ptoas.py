@@ -33,9 +33,9 @@ The double-buffer case is the shape the region form exists for — one slot live
 iteration — and its golden checks the WAR edge ptoas derives from the slot index.
 Two slots live at once inside a loop is **rejected** under PTOAS. ptoas 0.54 guarded
 only the first ``multi_tile_get`` of an iteration, which was measured wrong on device
-(hw-native-sys/PTOAS#1118, fixed in 0.56); the pinned ptoas still mis-syncs the
-prefetch form of the shape (hw-native-sys/PTOAS#1519, fixed in 0.63), which codegen
-cannot tell apart. ``MultiBufferCoLiveProgram`` is the case that pins the refusal.
+(hw-native-sys/PTOAS#1118, fixed in 0.56); the pinned ptoas mis-syncs the
+prefetch form of the shape (hw-native-sys/PTOAS#1519: fixed in 0.63, broken again
+since 0.64), which codegen cannot tell apart. ``MultiBufferCoLiveProgram`` is the case that pins the refusal.
 """
 
 from typing import Any
@@ -214,9 +214,10 @@ class MultiBufferCoLiveProgram:
     a region in an iteration, so the second load raced the next iteration's write.
     Measured wrong on device: ``out`` came back as ``a[block i+1] + a[block i]``
     instead of ``a + b`` (hw-native-sys/PTOAS#1118, fixed in 0.56). The pinned ptoas
-    still mis-syncs the prefetch form of this shape (hw-native-sys/PTOAS#1519, fixed in
-    0.63), and codegen cannot tell the forms apart, so it refuses both; this kernel is
-    the ST that pins that refusal — under PYPTO the same source is fine.
+    mis-syncs the prefetch form of this shape (hw-native-sys/PTOAS#1519: fixed in 0.63,
+    broken again since 0.64), and codegen cannot tell the forms apart, so it refuses
+    both; this kernel is the ST that pins that refusal — under PYPTO the same source is
+    fine.
     """
 
     @pl.function(type=pl.FunctionType.InCore)
@@ -621,7 +622,7 @@ class TestMemoryPlannerPtoas:
 
     def test_multi_buffer_colive_slots_rejected_under_ptoas(self):
         # Two co-live slots include a prefetch form the pinned ptoas mis-syncs
-        # (hw-native-sys/PTOAS#1519, fixed in 0.63; 0.54 also got this
+        # (hw-native-sys/PTOAS#1519: fixed in 0.63, broken again since 0.64; 0.54 also got this
         # same-iteration form wrong on device, #1118). Refuse rather than miscompile.
         #
         # Asserted here through the real `ir.compile` entry point, which surfaces a

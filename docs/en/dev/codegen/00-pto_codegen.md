@@ -474,15 +474,18 @@ top of each other.
 | Form | ptoas behaviour | Upstream |
 | ---- | --------------- | -------- |
 | Two slots filled and read in the same iteration | ≤ 0.55 guards only the first `multi_tile_get`; the second load races the next iteration's write (measured wrong on device with 0.54). 0.56+ guards the body with one static event for the whole region — correct, but none of the per-slot overlap the region form exists for | [PTOAS#1118](https://github.com/hw-native-sys/PTOAS/issues/1118), fixed in 0.56 |
-| Prefetch: slot 0 filled before the loop, then each iteration fills slot `(i+1) % 2` while reading slot `i % 2` | ≤ 0.62 primes and drains both slots' events as for a one-slot rotation, off by one here: wrong data for an even trip count, a device hang for an odd one | [PTOAS#1519](https://github.com/hw-native-sys/PTOAS/issues/1519), fixed in 0.63 |
+| Prefetch: slot 0 filled before the loop, then each iteration fills slot `(i+1) % 2` while reading slot `i % 2` | ≤ 0.62 primes and drains both slots' events as for a one-slot rotation, off by one here: wrong data for an even trip count, a device hang for an odd one. 0.63 primes only the slot the loop writes first; 0.64 and 0.65 prime both again | [PTOAS#1519](https://github.com/hw-native-sys/PTOAS/issues/1519), fixed in 0.63, regressed in 0.64 |
 
 `CoLiveSlotCollector` counts slot selections per loop body, so it cannot tell the
-two forms apart, and the pinned ptoas (0.61) still has the second bug. Codegen
-therefore refuses both and points at the PyPTO planner, whose baked-address
-`alloc_tile` path runs the same-iteration form correctly on device.
+two forms apart, and the second bug is back after its fix. Measured on device, the
+prefetch form runs correctly under 0.63, but under 0.64 and 0.65 it returns a later
+block's data for an even trip count and hangs for an odd one; the same-iteration
+form runs correctly under 0.65. Codegen therefore refuses both and points at the
+PyPTO planner, whose baked-address `alloc_tile` path runs the same-iteration form
+correctly on device.
 Straight-line code is unaffected — with no loop there is no cross-iteration reuse
 to guard. Lifting the restriction is one condition in `PlanMultiBufferRegions`;
-it needs the ptoas pin at 0.63 or later and a device run of both forms.
+it needs a pinned ptoas that runs the prefetch form correctly on device.
 
 Under `PYPTO` no region is emitted at all: a region at `--pto-level=level3` needs
 an explicit base `addr`, which codegen does not emit yet. ptoas is not the limit —
