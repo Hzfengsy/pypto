@@ -2901,7 +2901,7 @@ struct AutoDeferState {
   VarPtr lane_index;                                    ///< the injected subblock_idx binding
   std::unordered_map<const Var*, VarPtr> replacements;  ///< retyped shard: old var -> new var
   std::unordered_set<const Var*> deferred;              ///< the retyped shards (new vars)
-  std::unordered_set<const Var*> chained_store_dests;   ///< see CollectChainedStoreDestinations
+  std::unordered_set<const Var*> read_vars;             ///< every var some expression reads
 };
 
 /// Whether `call` is a Cube -> Vector shard whose lane extents are only known
@@ -2966,15 +2966,16 @@ ExprPtr StoreNonEmptyCondition(const ExprPtr& stored, const AutoDeferState& stat
 }
 
 /// Guard `stmt` (a store of `store_call`) against an empty lane when needed.
-/// A CHAINED store (another store writes through its result) is left unguarded,
-/// as every AUTO store was before: guarding it would need a phi over the stored
-/// / not-stored tensor versions (see CollectChainedStoreDestinations). The
-/// explicit form rejects that shape instead, but here it is ordinary authoring
-/// (two slice writes into one tensor), and a zero-row store moves nothing in a
-/// release build.
+/// Only a store whose result nothing reads is guarded: a plain `if` would leave
+/// a read result (a later store's destination, a loop yield, a return)
+/// conditionally defined, and guarding it soundly needs a phi over the stored
+/// / not-stored tensor versions. Such a store is left unguarded, as every AUTO
+/// store was before -- ordinary authoring (slice writes into one tensor, a
+/// store inside a loop), where a zero-row store moves nothing in a release
+/// build.
 StmtPtr GuardLaneStore(const StmtPtr& stmt, const CallPtr& store_call, const VarPtr& result,
                        const AutoDeferState& state) {
-  if (result && state.chained_store_dests.count(result.get()) != 0) return stmt;
+  if (result && state.read_vars.count(result.get()) != 0) return stmt;
   auto condition = StoreNonEmptyCondition(store_call->args_[0], state, store_call->span_);
   if (!condition) return stmt;
   return std::make_shared<IfStmt>(condition, stmt, std::nullopt, std::vector<VarPtr>{}, store_call->span_);
@@ -3026,8 +3027,9 @@ std::vector<StmtPtr> DeferAutoStmts(const std::vector<StmtPtr>& stmts, AutoDefer
     if (auto if_stmt = std::dynamic_pointer_cast<const IfStmt>(stmt)) {
       auto new_if = MutableCopy(if_stmt);
       new_if->then_body_ = DeferAutoNestedBody(if_stmt->then_body_, state);
-      if (if_stmt->else_body_.has_value())
+      if (if_stmt->else_body_.has_value()) {
         new_if->else_body_ = DeferAutoNestedBody(*if_stmt->else_body_, state);
+      }
       result.push_back(new_if);
       continue;
     }
@@ -3116,7 +3118,9 @@ std::vector<StmtPtr> DeferAutoRuntimeShardExtents(const std::vector<StmtPtr>& st
 
   AutoDeferState state;
   state.split_dim = split_dim;
-  CollectChainedStoreDestinations(stmts, &state.chained_store_dests);
+  var_collectors::VarDefUseCollector reads;
+  for (const auto& stmt : stmts) reads.VisitStmt(stmt);
+  state.read_vars = std::move(reads.var_uses);
   auto result = DeferAutoStmts(stmts, state);
   if (state.replacements.empty()) return result;
   StmtPtr body = (result.size() == 1) ? result[0] : std::make_shared<SeqStmts>(result, span);

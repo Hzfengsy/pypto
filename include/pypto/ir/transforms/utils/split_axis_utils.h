@@ -518,8 +518,9 @@ std::vector<StmtPtr> LocalizeExplicitBoundaryValid(const std::vector<StmtPtr>& s
  * Unlike that walk, nothing downstream is retyped: the halving already typed
  * every consumer and loop carry from its own pre-split type. What remains is
  * (1) retyping each such shard, (2) guarding a store whose stored tile has a
- * lane-dependent, possibly-zero valid extent (a zero-row store is outside the
- * ISA contract; a chained store is left unguarded, as before), and (3) rejecting the
+ * lane-dependent, possibly-zero valid extent and whose result nothing reads (a
+ * zero-row store is outside the ISA contract; a read result would be left
+ * conditionally defined, so that store stays unguarded, as before), and (3) rejecting the
  * direct uses a full-box shard cannot serve: a store, a pad fill, a loop carry,
  * a branch result or a return. A body with no runtime-extent shard is returned
  * unchanged.

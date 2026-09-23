@@ -268,8 +268,8 @@ def _runtime_extent_program(with_consumer: bool):
                 qk_n = pl.tile.set_validshape(qk, n, 128)
                 popped = pl.tile.move(qk_n, target_memory=pl.Mem.Vec)
                 scaled = pl.tile.exp(popped)
-                out_store = pl.tile.store(scaled, [0, 0], out_0)
-                return out_store
+                out_store = pl.tile.store(scaled, [0, 0], out_0)  # noqa: F841
+                return out_0
 
         return WithConsumer
 
@@ -331,6 +331,42 @@ def test_auto_c2v_boundary_defers_a_runtime_split_axis_extent():
     guarded_store = guarded if isinstance(guarded, ir.AssignStmt) else None
     assert guarded_store is not None and isinstance(guarded_store.value, ir.Call)
     assert guarded_store.value.op.name == ir.get_op("tile.store").name
+
+
+def test_auto_runtime_extent_leaves_a_read_store_result_unguarded():
+    """A store whose result is read afterwards stays unguarded, keeping the IR in SSA form.
+
+    A plain ``if`` around ``out_store = pl.tile.store(...)`` would leave the
+    returned ``out_store`` defined on one branch only; guarding it soundly needs a
+    phi over the stored and not-stored tensor versions. The store is left as every
+    AUTO store was before (an empty lane's zero-row store moves nothing in a
+    release build), while the shard itself is still deferred.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def split_auto(
+            n: pl.Scalar[pl.INDEX],
+            qk: pl.Tile[[64, 128], pl.FP32, pl.Mem.Mat],
+            out_0: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+        ) -> pl.Tensor[[64, 128], pl.FP32]:
+            pl.func_attr({"split": pl.SplitMode.UP_DOWN})
+            qk_n = pl.tile.set_validshape(qk, n, 128)
+            popped = pl.tile.move(qk_n, target_memory=pl.Mem.Vec)
+            scaled = pl.tile.exp(popped)
+            out_store = pl.tile.store(scaled, [0, 0], out_0)
+            return out_store
+
+    with passes.PassContext([]):
+        after = passes.lower_auto_vector_split()(Before)
+    body = list(after.functions.values())[0].body
+    assert isinstance(body, ir.SeqStmts)
+    assert not any(isinstance(s, ir.IfStmt) for s in body.stmts), "a read store result must stay unguarded"
+    by_name = {s.var.name_hint: s for s in body.stmts if isinstance(s, ir.AssignStmt)}
+    shard_type = by_name["popped"].var.type
+    assert isinstance(shard_type, ir.TileType) and shard_type.tile_view is None, "the shard is still deferred"
+    assert "out_store" in by_name, "the store stays a top-level binding the return can read"
 
 
 def test_auto_runtime_extent_guards_an_unassigned_store():

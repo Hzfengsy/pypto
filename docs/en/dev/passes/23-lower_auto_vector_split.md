@@ -418,8 +418,9 @@ logical rectangle is rejected with its span. The AUTO arm applies the same *exte
 `LocalizeShardValidForLane`; a body whose shard has a runtime extent then goes
 through `DeferAutoRuntimeShardExtents`, which gives that shard the full-box pop and
 guards a store whose lane may be empty, as the region form does, while its consumers
-and loop carries keep the types the halving already gave them. A chained store is the
-exception: the region form rejects it, while `pl.split` leaves it unguarded as before.
+and loop carries keep the types the halving already gave them. A store whose result is
+read afterwards (a chained store, a loop yield, a return) is the exception: guarding it
+would leave that result conditionally defined, so `pl.split` leaves it unguarded as before.
 
 - **The two lanes' extents must be placeable.** The split-axis extent is not a
   free field: pto-isa derives lane 1's band from the popped tile's own valid

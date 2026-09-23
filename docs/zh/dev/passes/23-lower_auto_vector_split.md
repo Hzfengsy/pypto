@@ -362,7 +362,8 @@ lane 的——lane `L` 持有 `clamp(V - L*half, 0, half)`——因此哪种模�
 报错。AUTO 分支通过 `LocalizeShardValidForLane` 施加同样的 *extent* 修正；若函数体中的
 shard 带有运行期 extent，则再经过 `DeferAutoRuntimeShardExtents`：该 shard 与区域形式一样
 得到完整 box 的 pop，可能为空的 lane 上的 store 会被保护，而其消费者和循环携带值保留折半时已给出的类型。
-链式 store 例外：区域形式会拒绝它，而 `pl.split` 与此前一样不加保护。
+结果随后被读取的 store（链式 store、循环 yield、return）例外：保护它会使该结果只在条件分支中有定义，
+因此 `pl.split` 与此前一样不对其加保护。
 
 - **两个 lane 的 extent 必须可摆放。** 切分轴上的 extent 并不是自由字段：pto-isa 根据
   被弹出 tile 自身的 valid extent 推导 lane 1 的数据段起点——`TILE_UP_DOWN` 下是 `e1`，
