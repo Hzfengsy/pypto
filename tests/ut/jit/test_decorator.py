@@ -1420,23 +1420,23 @@ def _arity_mismatch_body(x: pl.Tensor) -> pl.Tensor:
 
 
 @jit.inline
-def _mixed_pair_inline(x: pl.Tensor):
+def _mixed_pair_inline(x: pl.Tensor, cfg: pl.Tensor):
     """Inline helper returning one typeable local and one the extractor declines.
 
-    ``pl.reshape`` with a non-static shape is strict on purpose (a reshape's
+    ``pl.reshape`` with a runtime extent is strict on purpose (a reshape's
     dims are constrained by the source's element count), so ``opaque`` has no
     meta on the callee side either.
     """
-    opaque = pl.reshape(x, [2, pl.tensor.dim(x, 1)])
+    opaque = pl.reshape(x, [2, pl.tensor.read(cfg, [0])])
     known = pl.create_tensor([4, 4], dtype=pl.FP16)
     return opaque, known
 
 
-def _mixed_pair_body(x: pl.Tensor) -> pl.Tensor:
+def _mixed_pair_body(x: pl.Tensor, cfg: pl.Tensor) -> pl.Tensor:
     """Plain (undecorated) caller: rebinds a known local through a helper that
     returns one typeable result and one it cannot type."""
     a = pl.create_tensor([16, 8], dtype=pl.FP32)
-    a, b = _mixed_pair_inline(a)
+    a, b = _mixed_pair_inline(a, cfg)
     return b
 
 
@@ -1775,7 +1775,10 @@ class TestSliceAndDepReturnMetadata:
         metadata it carried *before* the call — that shape describes a tensor
         the helper already replaced, and the next dep would silently receive it.
         Clearing it restores the clear ``_build_params`` error."""
-        seed = {"x": TensorMeta(shape=(16, 8), dtype=DataType.FP32)}
+        seed = {
+            "x": TensorMeta(shape=(16, 8), dtype=DataType.FP32),
+            "cfg": TensorMeta(shape=(1,), dtype=DataType.INT64),
+        }
         metas = _extract_local_tensor_metas(_mixed_pair_body, seed_meta=seed)
         # ``b`` still resolves from the callee's own pl.create_tensor ...
         assert metas["b"] == TensorMeta(shape=(4, 4), dtype=DataType.FP16)
@@ -2223,6 +2226,127 @@ def _window_local_body(data_buf, signal_buf):
     return data, signal
 
 
+# A dtype bound once at module scope, the way one constant selects the element
+# type of a whole kernel variant. INT32 rather than FP32 so a result that merely
+# fell back to a default cannot pass for a resolved one.
+_WINDOW_DTYPE = pl.INT32
+
+
+def _window_dtype_constant_body(buf):
+    """pld.window whose dtype is a module-level constant, not a ``pl.<NAME>``."""
+    win = pld.window(buf, [1, 256], dtype=_WINDOW_DTYPE)
+    return win
+
+
+def _window_dtype_shadowed_body(buf, _WINDOW_DTYPE):
+    """A parameter shadows the module constant, so the name is a runtime local."""
+    win = pld.window(buf, [1, 256], dtype=_WINDOW_DTYPE)
+    return win
+
+
+def _create_tensor_dtype_of_src_body(src):
+    """create_tensor that takes its dtype from another tensor (``src``'s meta is seeded)."""
+    t = pl.create_tensor([4, 8], dtype=src.dtype)
+    return t
+
+
+# Shape and layout constants for the operand-spelling fixtures below.
+_OPERAND_ROWS = 4
+_SHAPE_LIST = [4, 8]
+_SHAPE_TUPLE = (4, 8)
+_FLAT_SHAPE = (32,)
+_NZ_LAYOUT = pl.NZ
+
+
+def _shape_spellings_body(src):
+    """Every spelling of one ``[4, 8]`` shape that the specializer folds to a
+    literal; ``src``'s meta is seeded as ``(4, 8)``."""
+    by_keyword = pl.create_tensor(shape=[4, 8], dtype=pl.FP32)
+    by_list_constant = pl.create_tensor(_SHAPE_LIST, dtype=pl.FP32)
+    by_tuple_constant = pl.create_tensor(_SHAPE_TUPLE, dtype=pl.FP32)
+    by_tuple_literal = pl.create_tensor((4, 8), dtype=pl.FP32)
+    by_src_shape = pl.create_tensor(src.shape, dtype=pl.FP32)
+    rows, cols = src.shape
+    by_unpacked_dims = pl.create_tensor([rows, cols], dtype=pl.FP32)
+    width = src.shape[1]
+    by_indexed_dim = pl.create_tensor([_OPERAND_ROWS, width], dtype=pl.FP32)
+    by_inline_dims = pl.create_tensor([src.shape[0], pl.tensor.dim(src, 1)], dtype=pl.FP32)
+    return (
+        by_keyword,
+        by_list_constant,
+        by_tuple_constant,
+        by_tuple_literal,
+        by_src_shape,
+        by_unpacked_dims,
+        by_indexed_dim,
+        by_inline_dims,
+    )
+
+
+def _shape_constant_views_body(src):
+    """pl.slice / pl.reshape / pld.window with a shape constant or a ``shape=`` keyword."""
+    view = pl.slice(src, _SHAPE_LIST, [0, 0])
+    flat = pl.reshape(input=src, shape=_FLAT_SHAPE)
+    win = pld.window(src, shape=_SHAPE_TUPLE, dtype=pl.INT32)
+    return view, flat, win
+
+
+def _shadowed_rows_body(_OPERAND_ROWS):
+    """A runtime parameter shadows the module-level extent of the same name."""
+    t = pl.create_tensor([_OPERAND_ROWS, 8], dtype=pl.FP32)
+    return t
+
+
+def _rebound_source_body(src):
+    """Dims bound from ``src`` keep their extent after ``src`` itself is rebound."""
+    rows, cols = src.shape
+    width = src.shape[1]
+    src = pl.reshape(src, [rows * cols])
+    t = pl.create_tensor([rows, width], dtype=pl.FP32)
+    return t
+
+
+def _loop_rebinds_dim_body(src):
+    """A loop target reusing a dim's name makes it a runtime value again."""
+    rows, cols = src.shape
+    for rows in pl.range(2):
+        t = pl.create_tensor([rows, cols], dtype=pl.FP32)
+    return t
+
+
+def _constexpr_slice_body(src, shp):
+    view = pl.slice(src, shp, [0, 0])
+    return view
+
+
+def _starred_unpack_body(src):
+    """A starred unpack shifts positions, so ``cols`` names no single dim."""
+    *lead, cols = src.shape
+    t = pl.create_tensor([4, cols], dtype=pl.FP32)
+    return lead, t
+
+
+def _layout_body():
+    nz = pl.create_tensor([16, 16], dtype=pl.FP16, layout=pl.NZ)
+    by_constant = pl.create_tensor([16, 16], dtype=pl.FP16, layout=_NZ_LAYOUT)
+    nd = pl.create_tensor([16, 16], dtype=pl.FP16, layout=pl.TensorLayout.ND)
+    return nz, by_constant, nd
+
+
+def _unresolved_layout_body(layout):
+    t = pl.create_tensor([16, 16], dtype=pl.FP16, layout=layout)
+    return t
+
+
+def _constexpr_sized_body(rows, acc_dtype):
+    """Sized and typed off ``pl.constexpr`` parameters (their binding is passed in)."""
+    t = pl.create_tensor([rows, 8], acc_dtype)
+    return t
+
+
+_SCALAR_DTYPE = pl.INDEX
+
+
 class TestArgRef:
     """Unit tests for ``_arg_ref`` — caller-side reference classification."""
 
@@ -2305,6 +2429,265 @@ class TestWindowLocalMetadata:
 
         metas = _extract_local_tensor_metas(body, seed_meta={})
         assert "data" not in metas
+
+
+class TestDtypeOperandResolution:
+    """A ``dtype=`` operand is resolved by value, not by its ``pl.<NAME>``
+    spelling, so the inferred meta matches what the specializer folds into the
+    generated source. Before, any other spelling silently dropped the local's
+    meta and the first dep receiving it failed with "missing inferred tensor
+    metadata" — naming that dep, not the line that built the tensor."""
+
+    def test_window_dtype_module_constant(self):
+        metas = _extract_local_tensor_metas(_window_dtype_constant_body, seed_meta={})
+        assert metas["win"] == TensorMeta(shape=(1, 256), dtype=DataType.INT32)
+
+    def test_create_tensor_dtype_closure_constant(self):
+        acc_dtype = pl.BF16
+
+        def body():
+            t = pl.create_tensor([4, 8], dtype=acc_dtype)
+            return t
+
+        metas = _extract_local_tensor_metas(body, seed_meta={})
+        assert metas["t"] == TensorMeta(shape=(4, 8), dtype=DataType.BF16)
+
+    def test_create_tensor_positional_dtype(self):
+        def body():
+            t = pl.create_tensor([4, 8], pl.BF16)
+            return t
+
+        metas = _extract_local_tensor_metas(body, seed_meta={})
+        assert metas["t"] == TensorMeta(shape=(4, 8), dtype=DataType.BF16)
+
+    def test_create_tensor_dtype_of_tracked_tensor(self):
+        seed = {"src": TensorMeta(shape=(16, 16), dtype=DataType.INT8)}
+        metas = _extract_local_tensor_metas(_create_tensor_dtype_of_src_body, seed_meta=seed)
+        assert metas["t"] == TensorMeta(shape=(4, 8), dtype=DataType.INT8)
+
+    def test_local_shadowing_dtype_constant_untracked(self):
+        # The specializer does not fold a name the body binds, so neither may
+        # the walker: the parameter, not the module constant, is what it names.
+        metas = _extract_local_tensor_metas(_window_dtype_shadowed_body, seed_meta={})
+        assert "win" not in metas
+
+    def test_host_window_dtype_constant_reaches_nested_deps(self):
+        """The reported shape end to end: a host driver's window dtype comes
+        from a module constant and must reach the chip orchestrator and the
+        inline helper it calls."""
+
+        @jit.inline
+        def core(x: pl.Tensor[[8, 128], pl.INT32], win: pld.DistributedTensor[[8, 128], pl.INT32]):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                win[0:8, 0:128] = pl.add(x[0:8, 0:128], x[0:8, 0:128])
+
+        @jit
+        def chip(
+            x: pl.Tensor[[8, 128], pl.INT32],
+            y: pl.Out[pl.Tensor[[8, 128], pl.INT32]],
+            win: pld.DistributedTensor[[8, 128], pl.INT32],
+        ):
+            core(x, win)
+            with pl.at(level=pl.Level.CORE_GROUP):
+                y[0:8, 0:128] = win[0:8, 0:128]
+            return y
+
+        @jit.host
+        def host(x: pl.Tensor[[2, 8, 128], pl.INT32], y: pl.Out[pl.Tensor[[2, 8, 128], pl.INT32]]):
+            buf = pld.alloc_window_buffer([8, 128], dtype=_WINDOW_DTYPE)
+            for r in pl.range(pld.world_size()):
+                win = pld.window(buf, [8, 128], dtype=_WINDOW_DTYPE)
+                chip(x[r], y[r], win, device=r)
+
+        program = host.specialize()
+        window_type = "win: pld.DistributedTensor[[8, 128], pl.INT32]"
+        assert window_type in program.get_function("core").as_python()
+        assert window_type in program.get_function("chip").as_python()
+
+
+class TestShapeOperandResolution:
+    """A shape operand resolves to the extent the specializer folds it to,
+    whichever spelling names it: by keyword, a list or tuple constant, a tuple
+    literal, ``src.shape`` whole, or dims taken from ``src.shape`` / ``pl.tensor.dim``.
+    Before, all but the positional list literal dropped the local's meta, and
+    a dim taken from ``src.shape`` became a synthesized dynamic dim although
+    the extent was static."""
+
+    def test_every_spelling_resolves_to_the_same_static_shape(self):
+        seed = {"src": TensorMeta(shape=(4, 8), dtype=DataType.FP32)}
+        metas = _extract_local_tensor_metas(_shape_spellings_body, seed_meta=seed)
+        expected = TensorMeta(shape=(4, 8), dtype=DataType.FP32)
+        for name in (
+            "by_keyword",
+            "by_list_constant",
+            "by_tuple_constant",
+            "by_tuple_literal",
+            "by_src_shape",
+            "by_unpacked_dims",
+            "by_indexed_dim",
+            "by_inline_dims",
+        ):
+            assert metas.get(name) == expected, name
+
+    def test_unpacked_dynamic_dim_keeps_its_symbol(self):
+        # A dim taken from ``src.shape`` is that dim — a declared DynDim flows
+        # through by name instead of being replaced by a synthesized symbol.
+        rows = DynDim(name="M", literal="M", static_bound=4)
+        seed = {"src": TensorMeta(shape=(rows, 8), dtype=DataType.FP32)}
+        metas = _extract_local_tensor_metas(_shape_spellings_body, seed_meta=seed)
+        assert metas["by_unpacked_dims"].shape == (rows, 8)
+        assert metas["by_src_shape"].shape == (rows, 8)
+
+    def test_view_ops_accept_shape_constant_and_keywords(self):
+        seed = {"src": TensorMeta(shape=(4, 8), dtype=DataType.FP16)}
+        metas = _extract_local_tensor_metas(_shape_constant_views_body, seed_meta=seed)
+        assert metas["view"] == TensorMeta(shape=(4, 8), dtype=DataType.FP16)
+        assert metas["flat"] == TensorMeta(shape=(32,), dtype=DataType.FP16)
+        assert metas["win"] == TensorMeta(shape=(4, 8), dtype=DataType.INT32)
+
+    def test_local_shadowing_extent_constant_is_runtime(self):
+        metas = _extract_local_tensor_metas(_shadowed_rows_body, seed_meta={})
+        leading = metas["t"].shape[0]
+        assert isinstance(leading, DynDim) and leading.synthesized
+
+    def test_bound_dim_survives_source_rebinding(self):
+        # Resolved when bound, not when used: reshaping ``src`` afterwards must
+        # not turn ``rows`` into the reshaped tensor's leading dim.
+        seed = {"src": TensorMeta(shape=(4, 8), dtype=DataType.FP32)}
+        metas = _extract_local_tensor_metas(_rebound_source_body, seed_meta=seed)
+        assert metas["t"] == TensorMeta(shape=(4, 8), dtype=DataType.FP32)
+
+    def test_loop_target_drops_bound_dim(self):
+        seed = {"src": TensorMeta(shape=(4, 8), dtype=DataType.FP32)}
+        metas = _extract_local_tensor_metas(_loop_rebinds_dim_body, seed_meta=seed)
+        rows, cols = metas["t"].shape
+        assert isinstance(rows, DynDim) and rows.synthesized
+        assert cols == 8
+
+    def test_spellings_reach_dep_static(self):
+        @jit.inline
+        def fill(t: pl.Tensor, x: pl.Tensor[[16, 128], pl.FP32]):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                t[0:16, 0:128] = pl.add(x[0:16, 0:128], x[0:16, 0:128])
+
+        @jit
+        def entry(x: pl.Tensor[[16, 128], pl.FP32], y: pl.Out[pl.Tensor[[16, 128], pl.FP32]]):
+            rows, cols = x.shape
+            t = pl.create_tensor([rows, cols], dtype=pl.FP32)
+            fill(t, x)
+            with pl.at(level=pl.Level.CORE_GROUP):
+                y[0:16, 0:128] = t[0:16, 0:128]
+            return y
+
+        fill_source = entry.specialize().get_function("fill").as_python()
+        assert "t: pl.Tensor[[16, 128], pl.FP32]" in fill_source
+
+    def test_starred_unpack_binds_no_dim(self):
+        seed = {"src": TensorMeta(shape=(2, 4, 8), dtype=DataType.FP32)}
+        metas = _extract_local_tensor_metas(_starred_unpack_body, seed_meta=seed)
+        cols = metas["t"].shape[1]
+        assert isinstance(cols, DynDim) and cols.synthesized
+
+
+class TestLayoutOperandResolution:
+    """``pl.create_tensor``'s ``layout`` reaches the local's meta. Before it was
+    ignored, so an NZ local reached a dep declaring no layout as ND, silently."""
+
+    def test_layout_resolved_by_value(self):
+        metas = _extract_local_tensor_metas(_layout_body, seed_meta={})
+        nz = TensorMeta(shape=(16, 16), dtype=DataType.FP16, layout=ir.TensorLayout.NZ)
+        assert metas["nz"] == nz
+        assert metas["by_constant"] == nz
+        # ND is what an omitted layout already means, so it is recorded as none.
+        assert metas["nd"] == TensorMeta(shape=(16, 16), dtype=DataType.FP16)
+
+    def test_unresolved_layout_untracked(self):
+        # Claiming ND for a layout the walker cannot see would mis-declare deps.
+        metas = _extract_local_tensor_metas(_unresolved_layout_body, seed_meta={})
+        assert "t" not in metas
+
+
+class TestConstexprOperandResolution:
+    """A shape or dtype operand naming a ``pl.constexpr`` parameter resolves to
+    the folded value rather than to a synthesized runtime extent."""
+
+    def test_constexpr_binding_folds_into_meta(self):
+        metas = _extract_local_tensor_metas(
+            _constexpr_sized_body, seed_meta={}, constexpr_values={"rows": "16", "acc_dtype": "pl.BF16"}
+        )
+        assert metas["t"] == TensorMeta(shape=(16, 8), dtype=DataType.BF16)
+
+    def test_constexpr_whole_shape_folds_into_slice(self):
+        seed = {"src": TensorMeta(shape=(8, 8), dtype=DataType.FP16)}
+        metas = _extract_local_tensor_metas(
+            _constexpr_slice_body, seed_meta=seed, constexpr_values={"shp": "[4, 8]"}
+        )
+        assert metas["view"] == TensorMeta(shape=(4, 8), dtype=DataType.FP16)
+
+    def test_callee_constexpr_binding_reaches_its_returned_local(self):
+        # ``a`` is allocated inside ``make``, sized off ``make``'s own constexpr;
+        # the descent that reads ``a`` back must see the binding this call gives.
+        @jit.inline
+        def make(x: pl.Tensor[[16, 128], pl.FP32], rows: pl.constexpr):
+            a = pl.create_tensor([rows, 128], dtype=pl.FP32)
+            with pl.at(level=pl.Level.CORE_GROUP):
+                a[0:16, 0:128] = x[0:16, 0:128]
+            return a
+
+        @jit.inline
+        def fill(t: pl.Tensor, x: pl.Tensor[[16, 128], pl.FP32]):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                t[0:16, 0:128] = pl.add(x[0:16, 0:128], x[0:16, 0:128])
+
+        @jit
+        def entry(x: pl.Tensor[[16, 128], pl.FP32], y: pl.Out[pl.Tensor[[16, 128], pl.FP32]]):
+            a = make(x, 16)
+            fill(a, x)
+            with pl.at(level=pl.Level.CORE_GROUP):
+                y[0:16, 0:128] = a[0:16, 0:128]
+            return y
+
+        fill_source = entry.specialize().get_function("fill").as_python()
+        assert "t: pl.Tensor[[16, 128], pl.FP32]" in fill_source
+
+    def test_constexpr_sized_local_reaches_dep_static(self):
+        @jit.inline
+        def fill(t: pl.Tensor, x: pl.Tensor[[16, 128], pl.FP32]):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                t[0:16, 0:128] = pl.add(x[0:16, 0:128], x[0:16, 0:128])
+
+        @jit
+        def entry(
+            x: pl.Tensor[[16, 128], pl.FP32],
+            y: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            rows: pl.constexpr = 16,
+        ):
+            t = pl.create_tensor([rows, 128], dtype=pl.FP32)
+            fill(t, x)
+            with pl.at(level=pl.Level.CORE_GROUP):
+                y[0:16, 0:128] = t[0:16, 0:128]
+            return y
+
+        fill_source = entry.specialize().get_function("fill").as_python()
+        assert "t: pl.Tensor[[16, 128], pl.FP32]" in fill_source
+
+
+def test_scalar_param_dtype_constant_is_rendered_by_value():
+    """``pl.Scalar[<constant>]`` compiles under @pl.jit as it does in @pl.program:
+    the generated module binds only ``pl`` / ``pld``, so the constant's name
+    would be undefined there."""
+
+    @jit
+    def entry(
+        x: pl.Tensor[[16, 128], pl.FP32],
+        y: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+        n: pl.Scalar[_SCALAR_DTYPE],
+    ):
+        with pl.at(level=pl.Level.CORE_GROUP):
+            y[0:16, 0:128] = x[0:16, 0:128]
+        return y
+
+    assert "n: pl.Scalar[pl.INDEX]" in entry.specialize().as_python()
 
 
 class TestSlicedDispatchMetadata:

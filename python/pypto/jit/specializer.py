@@ -1796,6 +1796,38 @@ def _is_tuple_annotation(node: ast.expr) -> bool:
     return False
 
 
+def _eval_annotation(source: str, ann_globals: Mapping[str, Any]) -> Any:
+    """Evaluate annotation source in its builtins-free namespace; None when it does not evaluate.
+
+    Trusted input — the kernel's own annotation, evaluated where it was written
+    with builtins stripped, so only type construction can run.
+    """
+    try:
+        return eval(source, dict(ann_globals))  # noqa: S307
+    except Exception:  # noqa: BLE001 — best effort; the caller keeps the annotation as written
+        return None
+
+
+def _scalar_dtype_source(dtype_text: str, ann_globals: Mapping[str, Any]) -> str:
+    """The ``pl.<NAME>`` a scalar annotation's dtype evaluates to, else ``dtype_text``.
+
+    A scalar's dtype may be spelled through a module or closure constant
+    (``n: pl.Scalar[IDX]``). The generated module binds only ``pl`` and ``pld``,
+    so the spelling itself would be undefined there.
+
+    Args:
+        dtype_text: The dtype as written in the annotation
+        ann_globals: The function's builtins-free annotation namespace
+
+    Returns:
+        The rendered dtype, or ``dtype_text`` unchanged when it does not
+        evaluate to a ``DataType``
+    """
+    value = _eval_annotation(dtype_text, ann_globals)
+    rendered = constant_source(value) if isinstance(value, DataType) else None
+    return dtype_text if rendered is None else rendered
+
+
 def _extract_bare_dtype(node: ast.expr) -> str | None:
     """If node is a bare dtype like pl.FP32 or INDEX, return its string."""
     if isinstance(node, ast.Name) and node.id in _DTYPE_NAMES:
@@ -2087,16 +2119,16 @@ class Specializer:
         # Type-form annotations never need builtins, so stripping them keeps the
         # best-effort eval from running anything beyond pure type construction.
         ann_globals = {**ctx.py_globals, "__builtins__": {}}
+        scalar_dtype_strs = {
+            name: _scalar_dtype_source(text, ann_globals) for name, text in scalar_dtype_strs.items()
+        }
         array_param_anns: dict[str, str] = {}
         for arg in func_def.args.args:
             if arg.arg == "self" or arg.annotation is None:
                 continue
             if arg.arg in tensor_params or arg.arg in scalar_dtype_strs:
                 continue
-            try:
-                ann_obj = eval(ast.unparse(arg.annotation), ann_globals)  # noqa: S307
-            except Exception:  # noqa: BLE001 — best effort; unrecognized stays bare
-                continue
+            ann_obj = _eval_annotation(ast.unparse(arg.annotation), ann_globals)
             if isinstance(ann_obj, _LangArray) and ann_obj.extent is not None and ann_obj.dtype is not None:
                 array_param_anns[arg.arg] = f"pl.Array[{ann_obj.extent}, {_array_dtype_str(ann_obj.dtype)}]"
 
