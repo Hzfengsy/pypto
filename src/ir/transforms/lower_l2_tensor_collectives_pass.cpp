@@ -81,6 +81,7 @@
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/program.h"
+#include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/mutator.h"
@@ -182,6 +183,18 @@ struct BuiltinKernelSpec {
       // three genuinely window-bound operands stay distributed, which is also
       // what gives MaterializeDistTensorCtx the CommCtx parameters the kernel
       // needs.
+      //
+      // The public op's trailing `core_num` arg is deliberately NOT a kernel
+      // parameter. This rail's kernel args come from the managed pipeline's own
+      // dispatch (see LowerCollective), where every parameter becomes an
+      // `add_scalar` slot *ahead* of the CommCtx suffix that
+      // MaterializeDistTensorCtx appends, and the shared `kernel.cpp.in` reads
+      // its CommContext from `args[5]` — the first ctx. Making `core_num` part
+      // of the kernel ABI pushed every ctx one slot to the right, so the kernel
+      // reinterpreted the integer `1` as a `CommContext*` and derived a garbage
+      // rankNum/rankId on every rank (one AIV block then spins in
+      // `ExchangeBarrier` until the scheduler's watchdog fires). Kernel ABI
+      // parity with the HOST rail is five operands plus the ctx, nothing more.
       {false, true, true, false, true},
   };
 }
@@ -212,10 +225,16 @@ struct BuiltinKernelSpec {
 }
 
 /// Build the header-only AIV function that stands in for the builtin kernel.
+///
+/// The signature covers the five kernel operands only. `core_num` is the public
+/// op's 6th argument, but it stops at this rail's gate (LowerCollective): every
+/// parameter here becomes a dispatch slot ahead of the CommCtx suffix
+/// MaterializeDistTensorCtx appends, and the shared `kernel.cpp.in` reads its
+/// CommContext from the fixed index `args[5]`.
 [[nodiscard]] FunctionPtr MakeBuiltinKernelFunction(const BuiltinKernelSpec& spec, const CallPtr& call) {
   std::vector<VarPtr> params;
-  params.reserve(call->args_.size());
-  for (size_t i = 0; i < call->args_.size(); ++i) {
+  params.reserve(spec.param_names.size());
+  for (size_t i = 0; i < spec.param_names.size(); ++i) {
     params.push_back(std::make_shared<Var>(
         spec.param_names[i], CanonicalParamType(spec.param_distributed[i], call->args_[i], call->span_),
         call->span_));
@@ -294,17 +313,21 @@ class LowerL2TensorCollectivesMutator : public IRMutator {
   }
 
   [[nodiscard]] CallPtr LowerCollective(const CallPtr& call) {
-    INTERNAL_CHECK_SPAN(call->args_.size() == 5, call->span_)
-        << "LowerL2TensorCollectives: " << call->op_->name_ << " must have 5 args, got "
+    INTERNAL_CHECK_SPAN(call->args_.size() == 6, call->span_)
+        << "LowerL2TensorCollectives: " << call->op_->name_ << " must have 6 args, got "
         << call->args_.size();
 
-    // core_num is the requested block limit L. The first version launches a
-    // single block, so anything else would silently under-deliver; the dynamic
-    // L -> B mapping lands with the multi-AIV entry work.
-    const auto core_num = call->GetKwarg<int>("core_num", 1);
-    CHECK_SPAN(core_num == 1, call->span_)
-        << "CHIP pld.tensor.all_to_all_v currently supports only core_num=1, got core_num=" << core_num
-        << "; multi-AIV launch is not implemented yet";
+    // core_num (args_[5]) is the requested block limit L, carried as a
+    // Scalar[INDEX] argument. This rail supports only a single block: a dynamic
+    // core_num can't even be range-checked here, so only the statically-known
+    // case is rejected explicitly. The value is consumed by this gate and then
+    // dropped — it never reaches the kernel, whose argument layout must stay
+    // identical to the HOST rail's.
+    auto core_num_const = As<ConstInt>(call->args_[5]);
+    CHECK_SPAN(core_num_const && core_num_const->value_ == 1, call->span_)
+        << "CHIP pld.tensor.all_to_all_v currently supports only a compile-time core_num=1, got "
+        << (core_num_const ? std::to_string(core_num_const->value_) : std::string("a dynamic value"))
+        << "; multi-AIV launch is not implemented on this rail yet";
 
     auto target_type = As<DistributedTensorType>(call->args_[1]->GetType());
     INTERNAL_CHECK_SPAN(target_type, call->span_)
@@ -352,7 +375,16 @@ class LowerL2TensorCollectivesMutator : public IRMutator {
     if (inserted == kernels_->end()) {
       kernels_->emplace(spec.function_name, MakeBuiltinKernelFunction(spec, call));
     }
-    return std::make_shared<Call>(std::make_shared<GlobalVar>(spec.function_name), call->args_,
+    // Drop the public op's trailing `core_num` from the kernel call: the kernel
+    // sees the five operands (plus the CommCtx suffix MaterializeDistTensorCtx
+    // appends from the callee's params), exactly as the HOST rail's entry-built
+    // dispatch passes them.
+    INTERNAL_CHECK_SPAN(call->args_.size() == spec.param_names.size() + 1, call->span_)
+        << "LowerL2TensorCollectives: kernel signature must cover every call argument except the "
+           "trailing core_num scalar";
+    std::vector<ExprPtr> kernel_args(
+        call->args_.begin(), call->args_.begin() + static_cast<std::ptrdiff_t>(spec.param_names.size()));
+    return std::make_shared<Call>(std::make_shared<GlobalVar>(spec.function_name), std::move(kernel_args),
                                   call->args_[1]->GetType(), call->span_);
   }
 

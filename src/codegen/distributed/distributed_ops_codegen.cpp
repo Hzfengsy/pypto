@@ -168,6 +168,17 @@ void EmitBuiltinWindowCollectiveDispatch(DistributedCodegen& codegen, const Call
   const std::string cfg_var = ta_var + "_config";
 
   codegen.Emit(ta_var + " = TaskArgs()");
+  // Scalar-typed args (e.g. all_to_all_v's core_num, a genuine argument since
+  // dynamic core_num support was added) can't be emitted inline here — TaskArgs
+  // requires every tensor added before any scalar, and the ordering-token
+  // tensor below still has to follow every window/tile arg. Collect their code
+  // in arg order and emit them after that token AND after the fixed
+  // domain_size/device_ctx scalars, but ahead of the out-of-band core_num
+  // *attr* scalar below. That exact order is load-bearing: entry.cpp.in reads
+  // its slots positionally (scalar(0)=nranks, scalar(1)=CommContext,
+  // scalar(2)=core_num), so reordering these emissions silently shifts every
+  // slot — see ad30598d for what that costs to debug.
+  std::vector<std::string> deferred_scalar_args;
   for (size_t i = 0; i < call->args_.size(); ++i) {
     const std::string tag = ArgDirectionToTensorArgType(arg_directions[i]);
     if (auto dist_type = ir::As<ir::DistributedTensorType>(call->args_[i]->GetType())) {
@@ -193,6 +204,10 @@ void EmitBuiltinWindowCollectiveDispatch(DistributedCodegen& codegen, const Call
                    tag + ")");
       continue;
     }
+    if (ir::As<ir::ScalarType>(call->args_[i]->GetType())) {
+      deferred_scalar_args.push_back(codegen.GetExprAsCode(call->args_[i]));
+      continue;
+    }
     INTERNAL_CHECK_SPAN(false, call->span_)
         << "Internal error: unsupported builtin tensor collective arg type at index " << i;
   }
@@ -211,6 +226,12 @@ void EmitBuiltinWindowCollectiveDispatch(DistributedCodegen& codegen, const Call
     codegen.Emit(ta_var + ".add_scalar(" + *handle_var + "[" + rank_expr + "].domain_size)");
   }
   codegen.Emit(ta_var + ".add_scalar(" + *handle_var + "[" + rank_expr + "].device_ctx)");
+  // A genuine dynamic scalar argument (e.g. all_to_all_v's core_num) — a
+  // reference to its actual runtime value, unlike the `core_num` out-of-band
+  // *attr* parameter just below, which is always baked as a literal.
+  for (const auto& arg_code : deferred_scalar_args) {
+    codegen.Emit(ta_var + ".add_scalar(" + arg_code + ")");
+  }
   if (core_num.has_value()) {
     codegen.Emit(ta_var + ".add_scalar(" + std::to_string(*core_num) + ")");
   }
@@ -411,14 +432,21 @@ REGISTER_DISTRIBUTED_OP(builtin_tensor_all_to_all_v, "builtin.tensor.all_to_all_
   const std::string variant = op->op_->name_ + "__" + dtype.ToString();
 
   if (dist_codegen->MarkBuiltinEmitted(variant)) {
-    dist_codegen->RecordBuiltinNextLevel(op, variant, {{"dtype_cpp", dtype.ToCTypeString()}});
+    dist_codegen->RecordBuiltinNextLevel(
+        op, variant,
+        {{"dtype_cpp", dtype.ToCTypeString()},
+         {"launch_core_count_method",
+          pypto::backend::GetBackend()->GetHandler()->GetLaunchSpecCoreCountMethod()}});
   }
-  // No rank-count scalar: this kernel reads CommContext::rankNum, which is the
-  // same number (see EmitBuiltinWindowCollectiveDispatch). Dropping it makes
-  // this rail's kernel argument layout identical to the managed CHIP rail's, so
-  // both render one byte-identical source from the shared template.
+  // Rank-count scalar re-added (RFC #2521 K2): entry.cpp.in needs the
+  // participating rank count P to compute the admitted block count
+  // B = CalAllToAllVBlocks(P, L) before choosing the launch width. It reaches
+  // only entry.cpp.in's own dispatch args, never the synthesized kernel's own
+  // `CoreTaskArgs` — that kernel still derives nranks from CommContext::rankNum
+  // for its own purposes, so its argument layout remains identical to the
+  // managed CHIP rail's, which renders the same kernel template.
   EmitBuiltinWindowCollectiveDispatch(*dist_codegen, op, variant, /*core_num=*/std::nullopt,
-                                      /*emit_rank_count=*/false);
+                                      /*emit_rank_count=*/true);
   return "";
 }
 

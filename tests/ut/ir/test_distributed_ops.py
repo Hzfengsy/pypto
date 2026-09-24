@@ -35,6 +35,7 @@ from pypto.language.distributed.op import tensor_ops as dsl_tensor_ops
 from pypto.language.distributed.op import unified_ops as dsl_unified
 from pypto.language.distributed.op.tensor_ops import _validate_chunk, _validate_pipeline
 from pypto.language.distributed.typing.distributed_tensor import DistributedTensor
+from pypto.pypto_core import ir as _ir
 
 
 def _make_shape_tuple(values: list[int], span: ir.Span) -> ir.MakeTuple:
@@ -2471,16 +2472,19 @@ def _make_all_to_all_v_args(
     counts_shape: list[int] | None = None,
     counts_dtype: DataType = DataType.INT32,
     recv_shape: list[int] | None = None,
+    signal_shape: list[int] | None = None,
+    core_num: int = 1,
 ) -> list[ir.Expr]:
-    """Build a valid 5-arg operand list, with the counts operands overridable."""
+    """Build a valid 6-arg operand list, with the counts/signal operands and core_num overridable."""
     shape = counts_shape or [_AAV_NR, 1]
     # recv_counts is always [NR, 1] (same layout as the barrier signal).
     return [
         _make_tensor_var("inp", [_AAV_TOTAL, _AAV_SIZE], DataType.FP32, span),
         _make_distributed_tensor_var("target", [_AAV_TOTAL, _AAV_SIZE], DataType.FP32, span),
-        _make_distributed_tensor_var("signal", [_AAV_NR, 1], DataType.INT32, span),
+        _make_distributed_tensor_var("signal", signal_shape or [_AAV_NR, 1], DataType.INT32, span),
         _make_tensor_var("counts", shape, counts_dtype, span),
         _make_distributed_tensor_var("recv_counts", recv_shape or [_AAV_NR, 1], DataType.INT32, span),
+        ir.ConstInt(core_num, DataType.INDEX, span),
     ]
 
 
@@ -2523,7 +2527,7 @@ def test_all_to_all_v_accepts_window_bound_input():
 
 
 def test_all_to_all_v_rejects_1d_signal():
-    """Signal must be 2D [NR, 1] — lowering emits 2-D MakeSignalOffsets."""
+    """Signal must be 2D [NR, S] — lowering emits 2-D MakeSignalOffsets."""
     span = ir.Span.unknown()
     args = _make_all_to_all_v_args(span)
     args[2] = _make_distributed_tensor_var("signal_1d", [_AAV_NR], DataType.INT32, span)
@@ -2531,11 +2535,57 @@ def test_all_to_all_v_rejects_1d_signal():
         ir.create_op_call("pld.tensor.all_to_all_v", args, {}, span)
 
 
+@pytest.mark.parametrize("signal_stride", [1, 2, 3, 5])
+def test_all_to_all_v_accepts_wider_signal_stride(signal_stride):
+    """A [NR, S] signal for any positive compile-time S is accepted (RFC #2521
+    K2's block-aware barrier gives each admitted block a private lane at
+    `peer * S + block_idx`; counts never ride the signal — they are pulled from
+    the send_counts windows — so no lane is reserved. core_num is still gated at
+    1 elsewhere, so this only proves the shape check itself was relaxed, not
+    that block_num>1 is reachable end-to-end yet)."""
+    span = ir.Span.unknown()
+    args = _make_all_to_all_v_args(span, signal_shape=[_AAV_NR, signal_stride])
+    call = ir.create_op_call("pld.tensor.all_to_all_v", args, {}, span)
+    assert isinstance(call.type, ir.DistributedTensorType)
+
+
+def test_all_to_all_v_rejects_zero_width_signal():
+    """Signal second dimension (S) must be a positive compile-time constant."""
+    span = ir.Span.unknown()
+    args = _make_all_to_all_v_args(span, signal_shape=[_AAV_NR, 0])
+    with pytest.raises(
+        ValueError, match="signal second dimension .* must be a positive compile-time constant"
+    ):
+        ir.create_op_call("pld.tensor.all_to_all_v", args, {}, span)
+
+
+def test_all_to_all_v_accepts_dynamic_core_num():
+    """core_num is `int | Scalar[INDEX]` (RFC #2521 item 11.5): a runtime scalar
+    is accepted, because only a statically-known value can be range-checked at
+    compile time — a dynamic one's positivity is validated at the runtime entry
+    instead."""
+    span = ir.Span.unknown()
+    args = _make_all_to_all_v_args(span)
+    args[5] = ir.Var("core_num", ir.ScalarType(DataType.INDEX), span)
+    call = ir.create_op_call("pld.tensor.all_to_all_v", args, {}, span)
+    assert isinstance(call.type, ir.DistributedTensorType)
+
+
+def test_all_to_all_v_rejects_non_integer_core_num():
+    """core_num must be an integer Scalar: a float-typed scalar is rejected at
+    the IR boundary instead of being silently forwarded to the entry."""
+    span = ir.Span.unknown()
+    args = _make_all_to_all_v_args(span)
+    args[5] = ir.Var("core_num", ir.ScalarType(DataType.FP32), span)
+    with pytest.raises(ValueError, match="core_num must be an integer Scalar"):
+        ir.create_op_call("pld.tensor.all_to_all_v", args, {}, span)
+
+
 def test_all_to_all_v_requires_recv_counts_operand():
     """The 4-arg form is rejected — recv_counts exposes the receive-side counts."""
     span = ir.Span.unknown()
     args = _make_all_to_all_v_args(span)[:4]
-    with pytest.raises(ValueError, match="requires 5 args"):
+    with pytest.raises(ValueError, match="requires 6 args"):
         ir.create_op_call("pld.tensor.all_to_all_v", args, {}, span)
 
 
@@ -2581,31 +2631,63 @@ def test_all_to_all_v_rejects_non_divisible_target_rows():
 
 
 def test_all_to_all_v_core_num_defaults_to_one():
-    """An absent core_num means the single-block launch every rail starts from.
-
-    Keeping it optional is what lets IR built before the kwarg existed — hand-built
-    calls, programs deserialized from an older ``.pto`` — keep its meaning.
-    """
+    """An absent core_num means the single-block launch every rail starts from."""
     span = ir.Span.unknown()
-    call = ir.create_op_call("pld.tensor.all_to_all_v", _make_all_to_all_v_args(span), {}, span)
-    assert dict(call.kwargs).get("core_num", 1) == 1
+    args = _make_all_to_all_v_args(span)[:5]
+    call = dist_tensor_ops.all_to_all_v(*args, span=span)
+    assert isinstance(call.args[5], ir.ConstInt)
+    assert call.args[5].value == 1
+    assert "core_num" not in call.kwargs
 
 
-def test_all_to_all_v_carries_core_num_kwarg():
-    """An explicit core_num reaches the Call for the lowering rails to read."""
+def test_all_to_all_v_carries_core_num_arg():
+    """An explicit core_num reaches the Call as a real argument for the lowering rails to read."""
     span = ir.Span.unknown()
-    call = ir.create_op_call("pld.tensor.all_to_all_v", _make_all_to_all_v_args(span), {"core_num": 4}, span)
-    assert dict(call.kwargs)["core_num"] == 4
+    args = _make_all_to_all_v_args(span)[:5]
+    call = dist_tensor_ops.all_to_all_v(*args, core_num=4, span=span)
+    assert isinstance(call.args[5], ir.ConstInt)
+    assert call.args[5].value == 4
+    assert "core_num" not in call.kwargs
 
 
 @pytest.mark.parametrize("core_num", [0, -1])
 def test_all_to_all_v_rejects_non_positive_core_num(core_num):
     """No rail can launch zero or fewer blocks."""
     span = ir.Span.unknown()
+    args = _make_all_to_all_v_args(span)[:5]
     with pytest.raises(ValueError, match="core_num must be positive"):
-        ir.create_op_call(
-            "pld.tensor.all_to_all_v", _make_all_to_all_v_args(span), {"core_num": core_num}, span
-        )
+        dist_tensor_ops.all_to_all_v(*args, core_num=core_num, span=span)
+
+
+def test_all_to_all_v_rejects_core_num_kwarg():
+    """core_num is the 6th operand, so the legacy kwarg spelling must be refused.
+
+    Accepting both would let a Call carry two disagreeing values: lowering reads
+    the operand, while structural compare/hash count the kwarg and the printer
+    emits ``core_num=`` twice, producing IR that cannot be re-parsed.
+    """
+    span = ir.Span.unknown()
+    args = _make_all_to_all_v_args(span)
+    with pytest.raises(ValueError, match="does not accept a 'core_num' keyword argument"):
+        ir.create_op_call("pld.tensor.all_to_all_v", args, {"core_num": 8}, span)
+
+
+def test_all_to_all_v_declares_core_num_as_an_argument():
+    """The schema must describe all six operands, not five."""
+    assert ir.get_op_argument_count("pld.tensor.all_to_all_v") == 6
+
+
+def test_builtin_all_to_all_v_rejects_non_integer_core_num():
+    """The builtin rail validates core_num's type too, not just the public op.
+
+    A float-typed scalar reaching the builtin is otherwise emitted verbatim by
+    the dispatch, and a tensor-typed one fails only as an internal check.
+    """
+    span = ir.Span.unknown()
+    args = _make_all_to_all_v_args(span)
+    args[5] = ir.Var("core_num", ir.ScalarType(DataType.FP32), span)
+    with pytest.raises(ValueError, match="core_num must be an integer Scalar"):
+        _ir._create_internal_op_call("builtin.tensor.all_to_all_v", args, {"dtype": DataType.FP32}, span)
 
 
 def test_all_to_all_v_rejects_input_target_alias():

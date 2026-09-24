@@ -1052,7 +1052,7 @@ def test_incore_all_to_all_v_rejects_multi_core_request():
             row = pl.load(result, [0, 0], [1, SIZE])
             return pl.store(row, [0, 0], out)
 
-    with pytest.raises(ValueError, match="requires core_num=1"):
+    with pytest.raises(ValueError, match="requires a compile-time core_num=1"):
         passes.lower_composite_ops()(MultiCoreInCore)
 
 

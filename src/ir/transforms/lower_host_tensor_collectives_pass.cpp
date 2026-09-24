@@ -409,20 +409,21 @@ void CheckHostWindowBoundArg(const ExprPtr& expr, const char* op_name, const cha
   INTERNAL_CHECK_SPAN(target_type, call->span_)
       << "LowerHostTensorCollectives: pld.tensor.all_to_all_v target must be DistributedTensorType";
 
-  // The HOST builtin runs a single block per rank; multi-AIV AllToAllV is a
-  // CHIP/L2 capability (LowerL2TensorCollectives), so a HOST call that asks for
-  // more cores would silently get one.
-  const auto core_num = call->GetKwarg<int>("core_num", 1);
-  CHECK_SPAN(core_num == 1, call->span_)
-      << "HOST pld.tensor.all_to_all_v does not support core_num > 1, got core_num=" << core_num
-      << "; call it from a CHIP Orchestration function for the multi-AIV managed path";
+  // core_num (args_[5]) is the requested block limit L, carried as a
+  // Scalar[INDEX] argument. Any positive value is admitted on this rail
+  // (RFC #2521 K2): entry.cpp.in computes the admitted block count
+  // B = CalAllToAllVBlocks(nranks, L) and rejects an insufficient signal
+  // stride at the runtime entry, before submitting the AIV task.
+  auto core_num_const = As<ConstInt>(call->args_[5]);
+  CHECK_SPAN(!core_num_const || core_num_const->value_ > 0, call->span_)
+      << "HOST pld.tensor.all_to_all_v core_num must be positive, got " << core_num_const->value_;
 
   return MakeBuiltinCallWithAttrs(
       "builtin.tensor.all_to_all_v", call,
-      {call->args_[0], call->args_[1], call->args_[2], call->args_[3], call->args_[4]},
+      {call->args_[0], call->args_[1], call->args_[2], call->args_[3], call->args_[4], call->args_[5]},
       {{"dtype", target_type->dtype_}}, device, {{"dtype", target_type->dtype_}},
       {ArgDirection::Input, ArgDirection::InOut, ArgDirection::InOut, ArgDirection::Input,
-       ArgDirection::InOut});
+       ArgDirection::InOut, ArgDirection::Input});
 }
 
 struct HostCollectiveRule {
@@ -562,6 +563,15 @@ StmtPtr EmitPerDeviceBuiltinCalls(const CallPtr& call, const HostCollectiveRule&
     if (IsOp(call, "pld.tensor.allreduce")) {
       CheckAllReduceSignalCapacity(call, rule.signal_expr(call), scope->devices_.size(),
                                    /*world_size_known=*/true);
+    } else if (IsOp(call, "pld.tensor.all_to_all_v")) {
+      // Signal is [NR, S] for any positive compile-time S (the op deducer
+      // enforces positivity). S must cover this op's admitted block count B,
+      // and B depends on the runtime rank count, so it is not knowable here —
+      // the generic branch below requires exactly one lane, which would reject
+      // every S > 1. Accept any S and let the runtime entry reject an S smaller
+      // than the B it actually admits.
+      CheckStaticSignalCapacity(call, rule.signal_expr(call), scope->devices_.size(), /*required_lanes=*/1,
+                                /*allow_wider_lanes=*/true);
     } else {
       CheckStaticSignalCapacity(call, rule.signal_expr(call), scope->devices_.size());
     }
@@ -587,6 +597,11 @@ StmtPtr EmitPerDeviceBuiltinCalls(const CallPtr& call, const HostCollectiveRule&
   // checked; pass 0 so only the world-size-independent constraints apply.
   if (IsOp(call, "pld.tensor.allreduce")) {
     CheckAllReduceSignalCapacity(call, rule.signal_expr(call), 0, /*world_size_known=*/false);
+  } else if (IsOp(call, "pld.tensor.all_to_all_v")) {
+    // Same [NR, S] acceptance as the device-list path above: S must cover the
+    // op's admitted block count, which is a runtime value.
+    CheckStaticSignalCapacity(call, rule.signal_expr(call), 0, /*required_lanes=*/1,
+                              /*allow_wider_lanes=*/true);
   } else {
     CheckStaticSignalCapacity(call, rule.signal_expr(call), 0);
   }

@@ -27,6 +27,10 @@
 #define __aicore__ [aicore]
 #endif
 
+// Keep this after the qualifier fallbacks so hardware builds retain the
+// [aicore] entry annotation while using simpler's logical SPMD context.
+#include "intrinsic.h"
+
 namespace {
 
 static constexpr int64_t kTileCount = 256;
@@ -49,12 +53,59 @@ static constexpr int64_t kTileCount = 256;
 // end - never a reset, so a credit from the next invocation that has already
 // arrived is preserved. All ranks must execute the same round order, and the
 // signal must be zero when the buffers are first used.
+//
+// Signal layout is [NR, S] (S = signal_stride, any S >= 1): each of a rank's
+// admitted blocks owns a private lane `peer * S + block_idx`, so blocks
+// rendezvous independently and the barrier works for any launch width up to
+// S (RFC #2521 K2 block-aware addressing). Counts never ride this signal —
+// they are pulled from the send_counts windows — so no lane is reserved.
 
 template <typename T>
 AICORE inline __gm__ T *CommRemotePtr(__gm__ CommContext *ctx, __gm__ T *local_ptr, int pe) {
   uint64_t local_base = ctx->windowsIn[ctx->rankId];
   uint64_t offset = reinterpret_cast<uint64_t>(local_ptr) - local_base;
   return reinterpret_cast<__gm__ T *>(ctx->windowsIn[pe] + offset);
+}
+
+// N-way credit barrier on the private per-block lane at
+// `peer * signal_stride + block_idx`: AtomicAdd(+1) into every peer's lane,
+// then Wait(GE `threshold`) on each peer's lane. `threshold` is the caller's
+// cumulative credit count — GE(1) at Barrier A, GE(2) at Barrier B — because
+// credits accumulate rather than being reset per barrier.
+//
+// Reusing the same lane for both barriers is safe: a rank cannot start
+// occurrence K+1 until its own K has wait+cleared, and cannot finish K until
+// peers have entered K, so notifies cannot cross occurrences. (Ring allreduce
+// needs a distinct column per round because it only syncs adjacent ranks.)
+// A block whose `block_idx` is not < `active_blocks` never calls this — see
+// kernel_entry's early return — so `block_idx` here is always in range.
+AICORE inline void ExchangeBarrier(__gm__ CommContext *comm_ctx, __gm__ int32_t *signal_base, int my_rank,
+                                   int nranks, int64_t signal_stride, int32_t block_idx, int32_t threshold) {
+  for (int peer = 0; peer < nranks; ++peer) {
+    if (peer == my_rank) continue;
+    __gm__ int32_t *remote_signal =
+        CommRemotePtr(comm_ctx, signal_base + my_rank * signal_stride + block_idx, peer);
+    pto::comm::Signal sig(remote_signal);
+    pto::comm::TNOTIFY(sig, static_cast<int32_t>(1), pto::comm::NotifyOp::AtomicAdd);
+  }
+  for (int peer = 0; peer < nranks; ++peer) {
+    if (peer == my_rank) continue;
+    pto::comm::Signal sig(signal_base + peer * signal_stride + block_idx);
+    pto::comm::TWAIT(sig, threshold, pto::comm::WaitCmp::GE);
+  }
+}
+
+// Drop this call's two credits from every peer's lane in ONE AtomicAdd(-2).
+// Never reset to zero: a credit from the next invocation may already have
+// arrived, and keeping the arithmetic additive is what makes back-to-back
+// calls safe.
+AICORE inline void DropBarrierCredits(__gm__ int32_t *signal_base, int my_rank, int nranks, int64_t signal_stride,
+                                     int32_t block_idx) {
+  for (int peer = 0; peer < nranks; ++peer) {
+    if (peer == my_rank) continue;
+    pto::comm::Signal self_sig(signal_base + peer * signal_stride + block_idx);
+    pto::comm::TNOTIFY(self_sig, static_cast<int32_t>(-2), pto::comm::NotifyOp::AtomicAdd);
+  }
 }
 
 }  // namespace
@@ -81,13 +132,34 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
   // that is identical on both rails.
   __gm__ CommContext *comm_ctx = reinterpret_cast<__gm__ CommContext *>(args[5]);
   int nranks = static_cast<int>(comm_ctx->rankNum);
+  int32_t block_idx = get_block_idx(args);
+  int32_t block_num = get_block_num(args);
 
-  if (nranks <= 0) {
+  // Early returns below must agree on every rank: an asymmetric return leaves
+  // peers blocked in ExchangeBarrier (hang, not corruption).
+  if (nranks <= 0 || block_num <= 0 || block_idx < 0 || block_idx >= block_num) {
     pipe_barrier(PIPE_ALL);
     return;
   }
 
   int my_rank = static_cast<int>(comm_ctx->rankId);
+
+  // Block-aware barrier (RFC #2521 K2): signal is [NR, S] with any S >= 1
+  // (the deducer enforces a positive compile-time S) and is barrier-only —
+  // counts are pulled from the send_counts windows (Phase 2 below), never
+  // published on signal, so the full stride is available for per-block lanes
+  // and no column is reserved. `active_blocks` caps at signal_stride so a
+  // block never races into a lane it does not own; a block outside that range
+  // returns immediately rather than calling ExchangeBarrier. Every rank
+  // computes the same `active_blocks`: both `signal_stride` (a tensor shape)
+  // and the launch's `block_num` are uniform.
+  int64_t signal_stride = signal_tensor->ndims == 1 ? 1 : static_cast<int64_t>(signal_tensor->shapes[1]);
+  int32_t active_blocks =
+      block_num < static_cast<int32_t>(signal_stride) ? block_num : static_cast<int32_t>(signal_stride);
+  if (block_idx >= active_blocks) {
+    pipe_barrier(PIPE_ALL);
+    return;
+  }
 
   // MAX_RECV = target.shape[0] / nranks. target is 2D [NR*MAX_RECV, SIZE] and
   // nranks is the comm-domain size (dispatch scalar 0), so the block geometry
@@ -146,17 +218,12 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
   // ==================================================================
   pipe_barrier(PIPE_ALL);
   dsb(DSB_DDR);
-  for (int peer = 0; peer < nranks; ++peer) {
-    if (peer == my_rank) continue;
-    __gm__ int32_t *remote_signal = CommRemotePtr(comm_ctx, signal_base + my_rank, peer);
-    pto::comm::Signal sig(remote_signal);
-    pto::comm::TNOTIFY(sig, static_cast<int32_t>(1), pto::comm::NotifyOp::AtomicAdd);
-  }
-  for (int peer = 0; peer < nranks; ++peer) {
-    if (peer == my_rank) continue;
-    pto::comm::Signal sig(signal_base + peer);
-    pto::comm::TWAIT(sig, static_cast<int32_t>(1), pto::comm::WaitCmp::GE);
-  }
+  // Each admitted block rendezvous-blocks independently on its own signal lane
+  // (signal_base + peer*signal_stride + block_idx), so this remains correct
+  // whether block_num is 1 or many — no per-block ordering (e.g. block 0
+  // leading the rest) is required for this barrier's own correctness.
+  // Threshold GE(1): first of this call's two credit rounds.
+  ExchangeBarrier(comm_ctx, signal_base, my_rank, nranks, signal_stride, block_idx, static_cast<int32_t>(1));
 
   // ==================================================================
   // Phase 2 - scalar counts pull. Barrier A guarantees every peer's send
@@ -280,26 +347,14 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
   // ==================================================================
   pipe_barrier(PIPE_ALL);
   dsb(DSB_DDR);
-  for (int peer = 0; peer < nranks; ++peer) {
-    if (peer == my_rank) continue;
-    __gm__ int32_t *remote_signal = CommRemotePtr(comm_ctx, signal_base + my_rank, peer);
-    pto::comm::Signal sig(remote_signal);
-    pto::comm::TNOTIFY(sig, static_cast<int32_t>(1), pto::comm::NotifyOp::AtomicAdd);
-  }
-  for (int peer = 0; peer < nranks; ++peer) {
-    if (peer == my_rank) continue;
-    pto::comm::Signal sig(signal_base + peer);
-    pto::comm::TWAIT(sig, static_cast<int32_t>(2), pto::comm::WaitCmp::GE);
-  }
+  // Second credit round: credits accumulate across the call's two barrier
+  // phases, so this rendezvous waits for GE(2) rather than GE(1).
+  ExchangeBarrier(comm_ctx, signal_base, my_rank, nranks, signal_stride, block_idx, static_cast<int32_t>(2));
 
-  // Credit epilogue: this call added +1 (A) and +1 (B) to every peer's slot;
-  // drop both in ONE AtomicAdd(-2) per local slot. Never reset to zero - a
-  // credit from the next invocation may already have arrived, and keeping the
+  // Credit epilogue: this block added +1 (A) and +1 (B) to every peer's lane;
+  // drop both in ONE AtomicAdd(-2) per lane. Never reset to zero - a credit
+  // from the next invocation may already have arrived, and keeping the
   // arithmetic additive is what makes back-to-back calls safe.
-  for (int peer = 0; peer < nranks; ++peer) {
-    if (peer == my_rank) continue;
-    pto::comm::Signal self_sig(signal_base + peer);
-    pto::comm::TNOTIFY(self_sig, static_cast<int32_t>(-2), pto::comm::NotifyOp::AtomicAdd);
-  }
+  DropBarrierCredits(signal_base, my_rank, nranks, signal_stride, block_idx);
   pipe_barrier(PIPE_ALL);
 }

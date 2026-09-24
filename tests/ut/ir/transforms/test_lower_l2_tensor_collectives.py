@@ -111,7 +111,14 @@ def test_collective_becomes_a_local_builtin_kernel_call():
 
 
 def test_synthesized_kernel_signature_and_directions():
-    """The kernel is an AIV function carrying the five collective operands."""
+    """The kernel is an AIV function carrying the five collective operands.
+
+    ``core_num`` is the public op's 6th argument but is gated (compile-time 1)
+    and dropped by this rail, because a kernel parameter would become a dispatch
+    slot ahead of the CommCtx suffix and shift the shared `kernel.cpp.in`'s
+    fixed ``args[5]`` CommContext read. The ABI stays exactly the HOST rail's
+    entry-built one.
+    """
     result = passes.lower_l2_tensor_collectives()(_build_program())
 
     kernel = _get_func(result, _KERNEL_NAME)
@@ -282,7 +289,9 @@ def test_kernel_signature_is_canonical_not_call_site_typed():
     kinds = [type(p.type).__name__ for p in kernel.params]
     # input and send_counts canonical to plain Tensor even though the call site
     # passed DistributedTensors; the other three stay distributed, which is what
-    # supplies the CommCtx parameters.
+    # supplies the CommCtx parameters. core_num is not a parameter at all: the
+    # kernel ABI is five operands plus the ctx suffix, so `args[5]` stays the
+    # CommContext the shared kernel template reads.
     assert kinds == [
         "TensorType",
         "DistributedTensorType",
@@ -375,7 +384,7 @@ def test_unsupported_collective_in_a_chip_body_is_named():
 
 def test_multi_core_request_is_rejected():
     """core_num > 1 is not implemented yet and must fail loudly, not silently."""
-    with pytest.raises(ValueError, match="only core_num=1"):
+    with pytest.raises(ValueError, match="only a compile-time core_num=1"):
         passes.lower_l2_tensor_collectives()(_build_program(core_num=2))
 
 

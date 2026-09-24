@@ -409,7 +409,7 @@ keyword attributes.
 
 ```text
 pld.tensor.all_to_all_v(
-    input, target, signal, send_counts, recv_counts, *, core_num: int = 1
+    input, target, signal, send_counts, recv_counts, *, core_num: int | Scalar[INDEX] = 1
 ) -> DistributedTensorType(target)
 ```
 
@@ -417,7 +417,13 @@ Variable-size all-to-all (MPI_Alltoallv). Flat 2D layouts:
 
 - `input` — Tensor or DistributedTensor `[NR*MAX_RECV, SIZE]`
 - `target` — DistributedTensor `[NR*MAX_RECV, SIZE]` (window-as-result)
-- `signal` — DistributedTensor INT32 `[NR, 1]` (credit-based two-round barrier; reusable across consecutive calls — zero-init once, never reset)
+- `signal` — DistributedTensor INT32 `[NR, S]` (credit-based two-round barrier;
+reusable across consecutive calls — zero-init once, never reset). Any positive
+compile-time `S` is accepted. `S` is the per-block lane count of the block-aware
+barrier (RFC #2521 K2): each admitted block owns the private lane
+`peer * S + block_idx`, so the barrier supports any launch width up to `S`.
+Counts never ride the signal — they are pulled from the `send_counts` windows —
+so no lane is reserved for them
 - `send_counts` — INT32 `[NR]` or `[NR, 1]` (runtime rows per dest). On the
 HOST/CHIP builtin rails it must be a window-bound `DistributedTensor` (each
 peer reads this rank's entry through `CommRemotePtr`); a plain `Tensor` is
@@ -488,10 +494,39 @@ actually running. Both rails apply the identical two-sided clamp and the same
 **InCore composite** (`LowerCompositeOps`): the primitive above, decomposed
 into `pld.tile.put` + `pld.system.notify`/`wait` inside a chip kernel.
 
-`core_num` is the requested AIV block limit. Every rail is single-block today,
-so only `core_num=1` is accepted; the parameter exists because the managed CHIP
-rail is where a multi-AIV launch will land. The InCore rail rejects anything
-else outright, naming the CHIP rail in the diagnostic.
+`core_num` is the requested AIV block limit `L` — a maximum, not a promise: the
+admitted block count `B` is the entry's `CalAllToAllVBlocks(NR, L)`, i.e. `L`
+itself while `L < NR`, and otherwise the largest multiple of `NR` not exceeding
+`L`.
+It is a genuine dynamic argument (`int | Scalar[INDEX]`, mirroring
+`pld.tensor.remote_store`'s `peer` parameter), so one compiled binary serves any
+`L` without recompilation: neither `L` nor `B` enters the builtin variant name.
+
+On the HOST rail (RFC #2521 K2) that mapping is applied at the materialised
+entry, which is the single `L -> B` site: the entry derives `B` from the rank
+count and `core_num`, rejects a signal narrower than `B` with an explicit
+runtime argument error **before** submitting the AIV task, and launches exactly
+`B` blocks with `require_sync_start`. The block-aware signal lanes above are
+what make `B > 1` correct. The entry also reports the three quantities §13.3
+names to DFX — one `LOG_TIMING` line per call carrying `requested_core_num=L
+launched_core_num=B active_lanes=min(B, stride)` plus the rank count, at the
+default log threshold — so the launch width is observable from the device log
+alone instead of being inferred from the data path.
+
+`B > 1` is correct but not yet faster. K2 makes the *launch width* dynamic and
+the barrier block-aware; it does not partition the payload, so every admitted
+block runs the whole exchange — it pushes this rank's full payload to every
+peer and writes every `recv_counts` entry. The writes are idempotent, so the
+result is right, but the interconnect traffic scales with `B` and `core_num > 1`
+costs a little more than `core_num = 1` rather than less. Splitting each peer's
+payload across the admitted blocks is the separate K3 work item; until it lands,
+raise `core_num` only to exercise the launch path, not for throughput.
+
+The InCore composite rail rejects any `core_num` other than a compile-time `1`,
+naming the CHIP rail in the diagnostic. The CHIP/L2 rail (below) is deliberately
+left gated at `core_num=1` — wiring a genuine multi-block launch into the
+L2-managed path is a separate, not-yet-started roadmap item (O2), not part of
+K2.
 
 **CHIP builtin** (`LowerL2TensorCollectives`): the same call written one level
 down, in a CHIP `Orchestration` body rather than in `host_orch`. It is rewritten

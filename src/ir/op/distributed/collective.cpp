@@ -604,23 +604,60 @@ void CheckStaticContiguousPayload(const TensorTypePtr& type, const char* role) {
   }
 }
 
+// The documented all_to_all_v contract for core_num is `int | Scalar[INDEX]`:
+// the argument's type must be an integer Scalar. A float-typed scalar would
+// otherwise be forwarded verbatim to the entry by the builtin dispatch, and a
+// tensor-typed one would surface only as an INTERNAL_CHECK deep inside codegen
+// rather than as a user-facing diagnostic. Both the public op and the builtin
+// share this check so the two rails cannot drift apart.
+//
+// The predicate is IsInt() rather than IsIndexLike(): an INT32 Scalar handle is
+// accepted today and narrowing to INDEX-only would reject working programs.
+// Compare pld.*.remote_store, whose `peer` deliberately takes the looser
+// IsA<ScalarType> because dtype narrowing is codegen's job.
+void CheckAllToAllVCoreNumType(const ExprPtr& core_num, const char* op_name) {
+  auto core_num_scalar = As<ScalarType>(core_num->GetType());
+  CHECK(core_num_scalar && core_num_scalar->dtype_.IsInt())
+      << op_name << " core_num must be an integer Scalar, got " << core_num->GetType()->TypeName();
+  if (auto core_num_const = As<ConstInt>(core_num)) {
+    CHECK(core_num_const->value_ > 0)
+        << op_name << " core_num must be positive, got " << core_num_const->value_;
+  }
+}
+
 TypePtr DeduceTensorAllToAllVType(const std::vector<ExprPtr>& args,
                                   const std::vector<std::pair<std::string, std::any>>& kwargs) {
-  CHECK(args.size() == 5) << "pld.tensor.all_to_all_v requires 5 args "
-                             "(input, target, signal, send_counts, recv_counts), but got "
+  // core_num is the 6th *operand*, never a kwarg. The op used to declare it as
+  // `.set_attr<int>("core_num")`; a caller passing it that way would be silently
+  // ignored here while lowering read the operand, and the printer would emit
+  // `core_num=` twice (once for the operand, once for the attr) producing IR that
+  // cannot be re-parsed. Rejecting the schema alone is not enough: ValidateKwargs
+  // is skipped for an op with no declared attrs, so the check belongs here.
+  for (const auto& [key, value] : kwargs) {
+    (void)value;
+    CHECK(key != "core_num") << "pld.tensor.all_to_all_v does not accept a 'core_num' keyword "
+                                "argument; pass it as the 6th positional operand "
+                                "(int | Scalar[INDEX])";
+  }
+  CHECK(args.size() == 6) << "pld.tensor.all_to_all_v requires 6 args "
+                             "(input, target, signal, send_counts, recv_counts, core_num), but got "
                           << args.size();
   for (size_t i = 0; i < args.size(); ++i) {
     CHECK(args[i]) << "pld.tensor.all_to_all_v positional argument #" << i << " must not be null";
   }
 
-  // core_num is the requested AIV block limit for the managed CHIP/L2 rail.
-  // The InCore composite rail requires 1; LowerCompositeOps enforces that, so
-  // the deducer only rejects a value no rail could honour. Optional with a
-  // default of 1: every rail is single-core unless asked otherwise, so IR built
-  // without the kwarg (hand-built calls, programs deserialized from a .pto
-  // written before it existed) keeps its original meaning.
-  auto core_num = GetKwargOr<int>(kwargs, "core_num", 1);
-  CHECK(core_num > 0) << "pld.tensor.all_to_all_v core_num must be positive, got " << core_num;
+  // core_num is the requested AIV block *limit* L for the managed CHIP/L2 or
+  // HOST rail — a maximum, not a promise; the admitted block count B is
+  // computed at the entry (CalAllToAllVBlocks). It is now a genuine argument
+  // (a Scalar[INDEX] Expr), not a compile-time-only kwarg, so a fully dynamic
+  // request can flow through IR: only a statically-known ConstInt is
+  // range-checked here, exactly as no other dynamic scalar argument in this
+  // op (e.g. send_counts' runtime values) is compile-time-checked either. A
+  // dynamic core_num's positivity is validated at the runtime entry instead.
+  // The InCore composite rail requires a compile-time core_num == 1;
+  // LowerCompositeOps enforces that, so this deducer only rejects a
+  // statically-provable non-positive value no rail could ever honour.
+  CheckAllToAllVCoreNumType(args[5], "pld.tensor.all_to_all_v");
 
   // input: flattened send buffer [NR*MAX_RECV, SIZE] — Tensor or DistributedTensor
   // (same Tensor-like contract as symmetric all_to_all / send_counts).
@@ -681,9 +718,12 @@ TypePtr DeduceTensorAllToAllVType(const std::vector<ExprPtr>& args,
         << (*target_type->window_buffer_)->name_hint_ << "'";
   }
 
-  // signal: DistributedTensor INT32 [NR, 1].  Restricted to the 2-D form because
-  // the composite lowering always emits MakeSignalOffsets(rank) → [rank, 0];
-  // pld.system.notify/wait reject a rank mismatch against a 1-D signal.
+  // signal: DistributedTensor INT32 [NR, S] — barrier only (S is the
+  // block-aware barrier's per-block lane count, RFC #2521 K2; any positive
+  // compile-time constant is accepted, same as builtin.tensor.allreduce's own
+  // already-general check). Counts never ride this signal: each rank pulls a
+  // scalar word per peer from those peers' send_counts windows (see the
+  // send_counts comment below).
   auto signal_type = As<DistributedTensorType>(args[2]->GetType());
   CHECK(signal_type) << "pld.tensor.all_to_all_v signal must be a DistributedTensor (window-bound), got "
                      << args[2]->GetType()->TypeName();
@@ -691,11 +731,12 @@ TypePtr DeduceTensorAllToAllVType(const std::vector<ExprPtr>& args,
       << "pld.tensor.all_to_all_v signal must have INT32 element type, got dtype "
       << signal_type->dtype_.ToString();
   CHECK(signal_type->shape_.size() == 2)
-      << "pld.tensor.all_to_all_v signal must be 2D [NR, 1], got " << signal_type->shape_.size() << " dims";
+      << "pld.tensor.all_to_all_v signal must be 2D [NR, S], got " << signal_type->shape_.size() << " dims";
   {
     auto signal_dim1 = As<ConstInt>(signal_type->shape_[1]);
-    CHECK(signal_dim1 && signal_dim1->value_ == 1)
-        << "pld.tensor.all_to_all_v signal second dimension must be 1, got "
+    CHECK(signal_dim1 && signal_dim1->value_ > 0)
+        << "pld.tensor.all_to_all_v signal second dimension (S, signal stride) must be a positive "
+           "compile-time constant, got "
         << (signal_dim1 ? std::to_string(signal_dim1->value_) : "<dynamic>");
   }
 
@@ -823,7 +864,9 @@ REGISTER_OP("pld.tensor.all_to_all_v")
     .add_argument("recv_counts",
                   "Window-bound INT32 DistributedTensor [NR, 1] — after the barrier, "
                   "recv_counts[src, 0] holds how many rows src sent to this rank (InOut)")
-    .set_attr<int>("core_num")
+    .add_argument("core_num",
+                  "Scalar[INDEX] requested AIV block limit L (a maximum, not a promise — the "
+                  "admitted block count B is computed at the entry from L)")
     .no_memory_spec()
     // stays read-only.
     // Composite collective — the data destination is overwritten, not updated:
@@ -1212,13 +1255,14 @@ namespace {
 TypePtr DeduceBuiltinTensorAllToAllVType(const std::vector<ExprPtr>& args,
                                          const std::vector<std::pair<std::string, std::any>>& kwargs) {
   constexpr const char* kOpName = "builtin.tensor.all_to_all_v";
-  CHECK(args.size() == 5) << kOpName
-                          << " requires exactly 5 positional arguments "
-                             "(input, target, signal, send_counts, recv_counts), but got "
+  CHECK(args.size() == 6) << kOpName
+                          << " requires exactly 6 positional arguments "
+                             "(input, target, signal, send_counts, recv_counts, core_num), but got "
                           << args.size();
   for (size_t i = 0; i < args.size(); ++i) {
     CHECK(args[i]) << kOpName << " positional argument #" << i << " must not be null";
   }
+  CheckAllToAllVCoreNumType(args[5], kOpName);
   // input and target must be different windows (same-expression guard; two
   // distinct pld.window(...) views over one alloc are caught later, at
   // lowering time, by CheckDistinctInputTargetWindows against the
@@ -1252,22 +1296,27 @@ TypePtr DeduceBuiltinTensorAllToAllVType(const std::vector<ExprPtr>& args,
       << kOpName << " target dtype " << target_type->dtype_.ToString() << " must match input dtype "
       << input_type->dtype_.ToString();
 
-  // signal: 2D [NR, 1] only — the composite's own deducer already enforces
-  // this exact shape on the pld.tensor.all_to_all_v call this builtin is
-  // constructed from, so there is no 1D case to additionally support here,
-  // unlike builtin.tensor.all_to_all which pre-dates that constraint.
+  // signal: 2D [NR, S] barrier only — the composite's own deducer already
+  // enforces this exact shape on the call this builtin is constructed from,
+  // so there is no 1D case to additionally support here, unlike
+  // builtin.tensor.all_to_all which pre-dates that constraint. S (the
+  // per-rank signal stride) is the block-aware barrier's per-block lane count
+  // (RFC #2521 K2) — any positive compile-time constant is accepted,
+  // mirroring the composite deducer's own relaxation above. Counts never ride
+  // this signal: each rank pulls a scalar word per peer from those peers'
+  // send_counts windows.
   auto signal_type = As<DistributedTensorType>(args[2]->GetType());
   CHECK(signal_type) << kOpName << " signal must be a DistributedTensor (window-bound), got "
                      << args[2]->GetType()->TypeName();
   CHECK(signal_type->dtype_ == DataType::INT32)
       << kOpName << " signal must have INT32 element type, got dtype " << signal_type->dtype_.ToString();
   CHECK(signal_type->shape_.size() == 2)
-      << kOpName << " signal must be 2D [NR, 1], got " << signal_type->shape_.size() << " dims";
+      << kOpName << " signal must be 2D [NR, S], got " << signal_type->shape_.size() << " dims";
   {
     auto signal_dim1 = As<ConstInt>(signal_type->shape_[1]);
-    CHECK(signal_dim1 && signal_dim1->value_ == 1)
-        << kOpName << " signal second dimension must be 1, got "
-        << (signal_dim1 ? std::to_string(signal_dim1->value_) : "<dynamic>");
+    CHECK(signal_dim1 && signal_dim1->value_ > 0)
+        << kOpName << " signal second dimension (S, signal stride) must be a positive compile-time constant, "
+        << "got " << (signal_dim1 ? std::to_string(signal_dim1->value_) : "<dynamic>");
   }
 
   auto target_dim0 = As<ConstInt>(target_type->shape_[0]);
@@ -1354,6 +1403,9 @@ REGISTER_OP("builtin.tensor.all_to_all_v")
     .add_argument("recv_counts",
                   "Window-bound INT32 DistributedTensor [NR, 1] — after the barrier, "
                   "recv_counts[src, 0] holds how many rows src sent to this rank (InOut)")
+    .add_argument("core_num",
+                  "Scalar[INDEX] requested AIV block limit L (a maximum, not a promise — the "
+                  "admitted block count B is computed at the entry from L)")
     .set_attr<DataType>("dtype")
     .no_memory_spec()
     .set_internal_only(true)

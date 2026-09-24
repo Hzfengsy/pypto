@@ -357,7 +357,7 @@ full-slice `get` 要求 `dst` / `src` 形状一致；subregion `get` 允许完�
 
 ```text
 pld.tensor.all_to_all_v(
-    input, target, signal, send_counts, recv_counts, *, core_num: int = 1
+    input, target, signal, send_counts, recv_counts, *, core_num: int | Scalar[INDEX] = 1
 ) -> DistributedTensorType(target)
 ```
 
@@ -365,7 +365,10 @@ pld.tensor.all_to_all_v(
 
 - `input` — Tensor 或 DistributedTensor `[NR*MAX_RECV, SIZE]`
 - `target` — DistributedTensor `[NR*MAX_RECV, SIZE]`（窗口即结果）
-- `signal` — DistributedTensor INT32 `[NR, 1]`（信用式两轮屏障；可在连续多次调用间复用——初始化一次置零，切勿重置）
+- `signal` — DistributedTensor INT32 `[NR, S]`（信用式两轮屏障；可在连续多次调用间复用——初始化一次置零，切勿重置）。接受任意正的编译期常量 `S`。
+  `S` 是块感知屏障的每 block 槽位数（RFC #2521 K2）：每个已准入的 block 拥有私有槽位
+  `peer * S + block_idx`，因此该屏障支持任意不超过 `S` 的启动宽度。
+  计数不经过 signal——它们从 `send_counts` 窗口中拉取——因此没有槽位被预留
 - `send_counts` — INT32 `[NR]` 或 `[NR, 1]`（运行时每目标行数）。在 HOST/CHIP
 builtin 通路上必须是窗口绑定的 `DistributedTensor`（每个对端通过
 `CommRemotePtr` 读取本 rank 的条目）；纯 `Tensor` 仅在 InCore composite
@@ -423,9 +426,31 @@ InCore 路径是一个 `pld.tile.put`，其传输形状为运行时计数，通�
 **InCore composite**（`LowerCompositeOps`）：上述原语在芯片内核中被分解为
 `pld.tile.put` + `pld.system.notify`/`wait`。
 
-`core_num` 是请求的 AIV block 上限。目前所有路径都是单 block，因此只接受
-`core_num=1`；该参数存在是因为多 AIV 启动将落在托管 CHIP 路径上。InCore 路径会
-直接拒绝其他取值，并在诊断信息中指明 CHIP 路径。
+`core_num` 是请求的 AIV block 上限 `L`——它是一个上限，而非承诺：已准入的 block
+数 `B` 由 entry 的 `CalAllToAllVBlocks(NR, L)` 给出，即当 `L < NR` 时就是 `L` 本身，否则是
+不超过 `L` 的 `NR` 的最大倍数。它是真正的动态参数（`int | Scalar[INDEX]`，与
+`pld.tensor.remote_store` 的 `peer` 参数模式一致），因此同一个编译产物可服务任意
+`L`，无需重新编译：`L` 与 `B` 都不会进入 builtin 变体名。
+
+在 HOST 路径上（RFC #2521 K2），该映射在具化后的入口处应用——入口是唯一的
+`L -> B` 位置：它由 rank 数与 `core_num` 推导 `B`，在提交 AIV 任务**之前**以显式
+运行时参数错误拒绝宽度小于 `B` 的 signal，并严格启动 `B` 个 block
+（`require_sync_start`）。上文按 block 划分的 signal 车道正是为 `B > 1` 服务。入口还会把
+§13.3 列出的三个量上报给 DFX——每次调用一行 `LOG_TIMING`，携带 `requested_core_num=L
+launched_core_num=B active_lanes=min(B, stride)` 以及 rank 数，位于默认日志阈值——
+因此启动宽度可直接从设备日志读出，而无需从数据通路上推断。
+
+`B > 1` 目前正确但并不更快。K2 让*启动宽度*成为动态量，并使 barrier 按 block
+划分，但它并不切分负载：每个被准入的 block 都会执行完整的交换——把本 rank 的
+全量负载推送给每个 peer，并写入全部 `recv_counts` 条目。这些写入是幂等的，因此
+结果正确，但互连流量随 `B` 增长，`core_num > 1` 反而比 `core_num = 1` 略慢。把
+每个 peer 的负载按准入 block 切分是独立的 K3 工作项；在它落地之前，提高
+`core_num` 只用于验证启动路径，而非提升吞吐。
+
+InCore 复合路径只接受编译期的 `core_num = 1`，其他取值会被直接拒绝，并在诊断
+信息中指明 CHIP 路径。下文的 CHIP/L2 路径仍刻意保持在 `core_num=1`——把真正的
+多 block 启动接入 L2 托管路径是一个独立的、尚未启动的路线图项（O2），不属于
+K2 范围。
 
 **CHIP builtin**（`LowerL2TensorCollectives`）：同样的调用写在下一层——CHIP
 `Orchestration` 函数体中，而不是 `host_orch` 中。它会被改写成对合成 AIV kernel 的

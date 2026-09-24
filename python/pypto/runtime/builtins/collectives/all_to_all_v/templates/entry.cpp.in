@@ -17,6 +17,16 @@
 
 namespace {
 
+// The maximum admitted AIV block count B for a requested launch-width limit L
+// across P participating ranks (RFC #2521 K2 frozen contract item 3): B = L
+// while L < P, otherwise the largest multiple of P not exceeding L. This is
+// the one place the formula is implemented — the template is compiled
+// standalone, with no link-time path back into the compiler's own C++ sources.
+// tests/ut/codegen/distributed/test_host_orch_distributed.py extracts this
+// function from the template, compiles it and runs the RFC's worked-example
+// table against it, so the boundary cases are pinned on the code that ships.
+int32_t CalAllToAllVBlocks(int32_t p, int32_t l) { return l < p ? l : (l / p) * p; }
+
 template <typename DType>
 void submit_all_to_all_v_kernel(const ChipTaskArgs &orch_args) {
   const Tensor &input = orch_args.tensor(0).ref();
@@ -25,18 +35,93 @@ void submit_all_to_all_v_kernel(const ChipTaskArgs &orch_args) {
   const Tensor &send_counts = orch_args.tensor(3).ref();
   const Tensor &recv_counts = orch_args.tensor(4).ref();
 
+  // nranks (P) and core_num (L) reach only this dispatch's own args, never the
+  // synthesized AICore kernel's `CoreTaskArgs` below — the kernel itself still
+  // derives nranks from CommContext::rankNum, so its argument layout stays
+  // identical to the managed CHIP/L2 rail's, which renders the same kernel
+  // template.
+  // Both arrive in 64-bit scalar slots and are validated on the RAW value,
+  // before any narrowing. Narrowing first would let an out-of-range request
+  // masquerade as a legal one: L = 2^32 + 2 truncates to 2, and the admission
+  // below would then happily launch 2 blocks instead of rejecting the request.
+  // The public contract stays `int | Scalar[INDEX]` (a Python int literal is
+  // INDEX, and even `INT32 scalar + 1` promotes to INDEX), so the range check
+  // belongs here at the runtime entry, not in the IR type.
+  const int64_t requested_nranks = orch_args.scalar<int64_t>(0);
+  const int64_t requested_core_num = orch_args.scalar<int64_t>(2);
+  if (requested_nranks <= 0 || requested_nranks > INT32_MAX) {
+    rt_report_fatal(
+        SIMPLER_ERROR_INVALID_ARGS, "all_to_all_v: nranks must be in [1, %d], got %lld", INT32_MAX,
+        static_cast<long long>(requested_nranks)
+    );
+    return;
+  }
+  if (requested_core_num <= 0 || requested_core_num > INT32_MAX) {
+    rt_report_fatal(
+        SIMPLER_ERROR_INVALID_ARGS, "all_to_all_v: core_num must be in [1, %d], got %lld", INT32_MAX,
+        static_cast<long long>(requested_core_num)
+    );
+    return;
+  }
+  const int32_t nranks = static_cast<int32_t>(requested_nranks);
+  const int32_t core_num = static_cast<int32_t>(requested_core_num);
+  const int32_t admitted_blocks = CalAllToAllVBlocks(nranks, core_num);
+
+  // signal is 2D [NR, S] (collective.cpp's deducer enforces a positive
+  // compile-time S) or 1D [NR] (S == 1, all_to_all_v's own composite deducer
+  // only ever emits the 2D form, but this mirrors CheckStaticSignalCapacity's
+  // rank-1 acceptance for defense in depth).
+  const int64_t signal_stride = signal.ndims == 1 ? 1 : static_cast<int64_t>(signal.shapes[1]);
+  if (signal_stride < admitted_blocks) {
+    rt_report_fatal(
+        SIMPLER_ERROR_INVALID_ARGS,
+        "all_to_all_v: signal stride (%lld) is smaller than the admitted block count (%d) for "
+        "core_num=%d, nranks=%d",
+        static_cast<long long>(signal_stride), admitted_blocks, core_num, nranks
+    );
+    return;
+  }
+
   CoreTaskArgs params;
   params.add_input(input);
   params.add_inout(target);
   params.add_inout(signal);
   params.add_input(send_counts);
   params.add_inout(recv_counts);
-  // No rank-count scalar: the kernel reads CommContext::rankNum, which is the
-  // same number (the context is per comm domain, so its rankNum *is* the
-  // domain size). Dropping it makes this rail's kernel argument layout
-  // identical to the managed CHIP/L2 rail's, so both render one byte-identical
-  // kernel source from the shared template.
-  params.add_scalar(orch_args.scalar(0));  // CommContext device pointer
+  params.add_scalar(orch_args.scalar(1));  // CommContext device pointer
+  params.launch_spec.{{launch_core_count_method}}(admitted_blocks);
+  params.launch_spec.set_require_sync_start(true);
+
+  // RFC #2521 frozen item #10 / §13.3 asks for three quantities to be observable:
+  // the requested limit L, the admitted block count B, and the active lane count
+  // `min(block_num, signal_stride)`. This entry is the single `L -> B` site, so it
+  // is the only place that knows all three before the submit: `admitted_blocks` is
+  // what the launch spec asks the scheduler for, and the stride check above
+  // guarantees `signal_stride >= admitted_blocks`, so the kernel's own clamp
+  // `active_blocks = min(block_num, signal_stride)` agrees with this value whenever
+  // the launch is honoured -- which it always is, because the runtime rejects a
+  // `require_sync_start` task whose `block_num` exceeds the core count
+  // (`SIMPLER_ERROR_REQUIRE_SYNC_START_INVALID`). A launch width that silently
+  // differed from `admitted_blocks` would show up here as `active_lanes !=
+  // launched_core_num`, i.e. as a defect, not as a clamp.
+  // LOG_TIMING sits at the default log threshold. The guard covers a rail whose
+  // DFX sink is compiled out -- the ops table is not contractually required to
+  // carry one.
+  if (current_runtime()->ops->log_timing != nullptr) {
+    // Take the min in 64-bit: signal_stride is only bounded from below (by the
+    // admission check above), so narrowing it first could report a wrong or
+    // even negative lane count. The result is <= admitted_blocks, so the
+    // narrowing below cannot truncate.
+    const int64_t active_lanes64 = static_cast<int64_t>(admitted_blocks) < signal_stride
+                                       ? static_cast<int64_t>(admitted_blocks)
+                                       : signal_stride;
+    const int32_t active_lanes = static_cast<int32_t>(active_lanes64);
+    LOG_TIMING(
+        "all_to_all_v: requested_core_num=%d launched_core_num=%d active_lanes=%d nranks=%d", core_num,
+        admitted_blocks, active_lanes, nranks
+    );
+  }
+
   rt_submit_aiv_task(0, params);
 }
 
@@ -48,8 +133,9 @@ __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_c
     const ChipTaskArgs &orch_args) {
   (void)orch_args;
   return OrchestrationConfig{
-      // 5 window tensors + 1 CommContext scalar.
-      .expected_arg_count = 6,
+      // 5 window tensors + 1 per-rank ordering token + rank-count scalar +
+      // CommContext scalar + core_num scalar.
+      .expected_arg_count = 9,
   };
 }
 

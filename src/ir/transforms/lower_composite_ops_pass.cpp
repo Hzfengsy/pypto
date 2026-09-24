@@ -2515,9 +2515,10 @@ ExprPtr LowerTensorAllToAllRule(const CallPtr& call, const std::vector<ExprPtr>&
 
 ExprPtr LowerTensorAllToAllVRule(const CallPtr& call, const std::vector<ExprPtr>& args, LoweringBuilder& b) {
   const Span& span = call->span_;
-  INTERNAL_CHECK_SPAN(args.size() == 5, span) << "pld.tensor.all_to_all_v rule expects 5 args "
-                                                 "(input, target, signal, send_counts, recv_counts), got "
-                                              << args.size();
+  INTERNAL_CHECK_SPAN(args.size() == 6, span)
+      << "pld.tensor.all_to_all_v rule expects 6 args "
+         "(input, target, signal, send_counts, recv_counts, core_num), got "
+      << args.size();
   const auto& input = args[0];
   const auto& target = args[1];
   const auto& signal = args[2];
@@ -2527,9 +2528,13 @@ ExprPtr LowerTensorAllToAllVRule(const CallPtr& call, const std::vector<ExprPtr>
   // The composite rail expands into point-to-point primitives inside one
   // kernel, so it is single-core by construction. A multi-AIV request belongs
   // on the managed CHIP/L2 rail, which submits a gang of AIV blocks instead.
-  const auto core_num = call->GetKwarg<int>("core_num", 1);
-  CHECK_SPAN(core_num == 1, span)
-      << "InCore pld.tensor.all_to_all_v requires core_num=1, got core_num=" << core_num
+  // core_num (args[5]) is carried as a Scalar[INDEX] argument. This rail's
+  // contract is compile-time-only: a dynamic value can never satisfy it, so it
+  // is rejected the same as any non-1 constant.
+  auto core_num_const = As<ConstInt>(args[5]);
+  CHECK_SPAN(core_num_const && core_num_const->value_ == 1, span)
+      << "InCore pld.tensor.all_to_all_v requires a compile-time core_num=1, got "
+      << (core_num_const ? std::to_string(core_num_const->value_) : std::string("a dynamic value"))
       << "; call it from a CHIP Orchestration function to use the managed multi-AIV path";
 
   // input may be a plain Tensor or a window (DistributedTensor) — pld.tile.put

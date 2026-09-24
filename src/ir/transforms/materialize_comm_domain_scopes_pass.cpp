@@ -418,8 +418,8 @@ class DispatchAnalyzer : public IRVisitor {
     }
 
     if (IsOp(op, "pld.tensor.all_to_all_v")) {
-      // 5-arg push-based form:
-      // pld.tensor.all_to_all_v(input, target, signal, send_counts, recv_counts)
+      // 6-arg push-based form:
+      // pld.tensor.all_to_all_v(input, target, signal, send_counts, recv_counts, core_num)
       // args[0] = input        (window-bound on HOST path; distinct from target)
       // args[1] = target       (DistributedTensor, window-bound, window-as-result)
       // args[2] = signal       (DistributedTensor, window-bound, barrier)
@@ -432,8 +432,10 @@ class DispatchAnalyzer : public IRVisitor {
       // args[4] = recv_counts  (DistributedTensor, window-bound; published
       //                          cross-rank via notify, so needs target's
       //                          device coverage exactly like `signal` does)
-      INTERNAL_CHECK_SPAN(op->args_.size() == 5, op->span_)
-          << "MaterializeCommDomainScopes: pld.tensor.all_to_all_v expects exactly 5 args";
+      // args[5] = core_num     (Scalar[INDEX], not window-bound — irrelevant
+      //                          to this pass's comm-domain scoping)
+      INTERNAL_CHECK_SPAN(op->args_.size() == 6, op->span_)
+          << "MaterializeCommDomainScopes: pld.tensor.all_to_all_v expects exactly 6 args";
       // LowerCompositeOps' CheckAllReduceLoopUse guards the InCore path but
       // never runs for a HOST-orch call (LowerCompositeOps just defers it
       // there). This is the HOST-side equivalent, using repeating_scope_depth_

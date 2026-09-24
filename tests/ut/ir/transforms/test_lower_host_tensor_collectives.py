@@ -148,6 +148,7 @@ def _assert_builtin_dispatch(
     arg_directions: list[ir.ArgDirection],
     kwargs: dict[str, object],
     attrs: dict[str, object] | None = None,
+    trailing_scalar_const: int | None = None,
 ) -> ir.Call:
     """Pin the lowered ``builtin_name`` dispatch, in the pass output *and* in the
     print -> parse round-trip of that output.
@@ -172,6 +173,7 @@ def _assert_builtin_dispatch(
         "arg_directions": arg_directions,
         "kwargs": kwargs,
         "attrs": attrs,
+        "trailing_scalar_const": trailing_scalar_const,
     }
     call = _match_builtin_dispatch(_get_func(result, "host_orch").body, builtin_name, **expectations)
     reparsed = pl.parse_program(ir.python_print(result, format=False))
@@ -191,6 +193,7 @@ def _match_builtin_dispatch(
     kwargs: dict[str, object],
     attrs: dict[str, object] | None = None,
     window_bound_args: bool = True,
+    trailing_scalar_const: int | None = None,
 ) -> ir.Call:
     """Assert the host body dispatches ``builtin_name`` exactly once and pin the
     full emitted structure of the dispatch.
@@ -243,14 +246,26 @@ def _match_builtin_dispatch(
     # device attr is bound to the loop induction var
     assert call.attrs["device"] is loop.loop_var
 
-    # every argument is the expected window-bound DistributedTensor, in order
-    assert len(call.args) == len(arg_names), f"expected {len(arg_names)} args, got {len(call.args)}"
-    for actual, expected in zip(call.args, arg_names):
+    # every leading argument is the expected window-bound DistributedTensor, in
+    # order; an optional trailing scalar (e.g. all_to_all_v's core_num) is
+    # checked separately below, not as a window-bound Var.
+    expected_len = len(arg_names) + (1 if trailing_scalar_const is not None else 0)
+    assert len(call.args) == expected_len, f"expected {expected_len} args, got {len(call.args)}"
+    tensor_args = call.args[:-1] if trailing_scalar_const is not None else call.args
+    for actual, expected in zip(tensor_args, arg_names):
         var = _as_var(actual)
         assert var.name_hint == expected, f"expected arg window var {expected!r}, got {var.name_hint!r}"
         assert isinstance(var.type, ir.DistributedTensorType)
         if window_bound_args:
             assert var.type.window_buffer is not None, f"arg {expected!r} must be window-bound"
+    if trailing_scalar_const is not None:
+        scalar_arg = call.args[-1]
+        assert isinstance(scalar_arg, ir.ConstInt), (
+            f"expected a trailing scalar const arg, got {type(scalar_arg).__name__}"
+        )
+        assert scalar_arg.value == trailing_scalar_const, (
+            f"expected trailing scalar const {trailing_scalar_const}, got {scalar_arg.value}"
+        )
 
     assert list(call.arg_directions) == arg_directions
     # arg_directions is mirrored in attrs
@@ -1509,9 +1524,126 @@ def test_host_all_to_all_v_lowers_to_namesake_builtin():
             ir.ArgDirection.InOut,
             ir.ArgDirection.Input,
             ir.ArgDirection.InOut,
+            ir.ArgDirection.Input,
         ],
         kwargs={"dtype": pl.FP32},
         attrs={"dtype": pl.FP32},
+        trailing_scalar_const=1,
+    )
+
+
+def test_host_all_to_all_v_accepts_signal_wider_than_one_lane():
+    """Signal may be [NR, S] for any positive compile-time S on the HOST rail.
+
+    The lane count S has to cover this op's admitted block count B, and B comes
+    from the runtime rank count, so no compile-time check can bound it. The
+    device-list and loop paths therefore accept any S and leave the S >= B
+    reject to the runtime entry.
+    """
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(
+            self,
+            inp: pld.DistributedTensor[[8, 256], pl.FP32],
+            data: pld.DistributedTensor[[8, 256], pl.FP32],
+            sig: pld.DistributedTensor[[4, 4], pl.INT32],
+            counts: pld.DistributedTensor[[4, 1], pl.INT32],
+            recv: pld.DistributedTensor[[4, 1], pl.INT32],
+        ):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            input_buf = pld.alloc_window_buffer(8 * 256 * pl.FP32.get_byte())
+            data_buf = pld.alloc_window_buffer(8 * 256 * pl.FP32.get_byte())
+            signal_buf = pld.alloc_window_buffer(4 * 4 * pl.INT32.get_byte())
+            counts_buf = pld.alloc_window_buffer(4 * pl.INT32.get_byte())
+            recv_buf = pld.alloc_window_buffer(4 * pl.INT32.get_byte())
+            inp = pld.window(input_buf, [8, 256], dtype=pl.FP32)
+            data = pld.window(data_buf, [8, 256], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [4, 4], dtype=pl.INT32)
+            counts = pld.window(counts_buf, [4, 1], dtype=pl.INT32)
+            recv = pld.window(recv_buf, [4, 1], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(inp, data, signal, counts, recv, device=r)
+            data = pld.tensor.all_to_all_v(inp, data, signal, counts, recv)
+            return 0
+
+    program = passes.materialize_comm_domain_scopes()(P)
+    result = passes.lower_host_tensor_collectives()(program)
+    _assert_builtin_dispatch(
+        result,
+        "builtin.tensor.all_to_all_v",
+        arg_names=["inp", "data", "signal", "counts", "recv"],
+        arg_directions=[
+            ir.ArgDirection.Input,
+            ir.ArgDirection.InOut,
+            ir.ArgDirection.InOut,
+            ir.ArgDirection.Input,
+            ir.ArgDirection.InOut,
+            ir.ArgDirection.Input,
+        ],
+        kwargs={"dtype": pl.FP32},
+        attrs={"dtype": pl.FP32},
+        trailing_scalar_const=1,
+    )
+
+
+def test_host_all_to_all_v_accepts_multicore_request_with_wider_signal():
+    """RFC #2521 K2: core_num > 1 and a signal wider than [NR, 1] both lower
+    cleanly now — the entry-level admission check (CalAllToAllVBlocks + the
+    signal-capacity reject) is this PR's own runtime-side responsibility, not
+    something a compile-time pass can fully verify without a concrete P."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(
+            self,
+            inp: pld.DistributedTensor[[8, 256], pl.FP32],
+            data: pld.DistributedTensor[[8, 256], pl.FP32],
+            sig: pld.DistributedTensor[[4, 4], pl.INT32],
+            counts: pld.DistributedTensor[[4, 1], pl.INT32],
+            recv: pld.DistributedTensor[[4, 1], pl.INT32],
+        ):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            input_buf = pld.alloc_window_buffer(8 * 256 * pl.FP32.get_byte())
+            data_buf = pld.alloc_window_buffer(8 * 256 * pl.FP32.get_byte())
+            signal_buf = pld.alloc_window_buffer(4 * 4 * pl.INT32.get_byte())
+            counts_buf = pld.alloc_window_buffer(4 * pl.INT32.get_byte())
+            recv_buf = pld.alloc_window_buffer(4 * pl.INT32.get_byte())
+            inp = pld.window(input_buf, [8, 256], dtype=pl.FP32)
+            data = pld.window(data_buf, [8, 256], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [4, 4], dtype=pl.INT32)
+            counts = pld.window(counts_buf, [4, 1], dtype=pl.INT32)
+            recv = pld.window(recv_buf, [4, 1], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(inp, data, signal, counts, recv, device=r)
+            data = pld.tensor.all_to_all_v(inp, data, signal, counts, recv, core_num=4)
+            return 0
+
+    program = passes.materialize_comm_domain_scopes()(P)
+    result = passes.lower_host_tensor_collectives()(program)
+    _assert_builtin_dispatch(
+        result,
+        "builtin.tensor.all_to_all_v",
+        arg_names=["inp", "data", "signal", "counts", "recv"],
+        arg_directions=[
+            ir.ArgDirection.Input,
+            ir.ArgDirection.InOut,
+            ir.ArgDirection.InOut,
+            ir.ArgDirection.Input,
+            ir.ArgDirection.InOut,
+            ir.ArgDirection.Input,
+        ],
+        kwargs={"dtype": pl.FP32},
+        attrs={"dtype": pl.FP32},
+        trailing_scalar_const=4,
     )
 
 
