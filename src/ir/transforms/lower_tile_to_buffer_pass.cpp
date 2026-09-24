@@ -29,6 +29,7 @@
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
+#include "pypto/ir/memory_space.h"
 #include "pypto/ir/memref.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/program.h"
@@ -43,6 +44,7 @@
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/structural_comparison.h"
+#include "pypto/ir/transforms/utils/attrs.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/verifier/property_verifier_registry.h"
@@ -83,12 +85,38 @@ BufferTypePtr DenseDescriptor(const TileTypePtr& tile, const Span& span) {
   return std::make_shared<BufferType>(shape, tile->dtype_, MemorySpace::Vec, valid);
 }
 
+// A cube-space tile keeps its resolved fractal layout. Its physical extents
+// are already whole boxes, so the descriptor is exact without a byte view.
+BufferTypePtr MatrixDescriptor(const TileTypePtr& tile, MemorySpace space, const Span& span) {
+  const auto view = tile_view_semantics::GetEffectiveTileView(*tile);
+  CHECK_SPAN(tile->shape_.size() == 2 && backend::IsMatrixBufferDtype(space, tile->dtype_) &&
+                 view.pad == PadValue::null && view.stride.empty(),
+             span)
+      << "LowerTileToBuffer: " << MemorySpaceToString(space)
+      << " recipes require unpadded rank-2 FP16/BF16/FP32/INT8 cube operands or FP32/INT32 accumulators, got "
+      << tile->dtype_.ToString() << " rank " << tile->shape_.size();
+  const auto view_offset = As<ConstInt>(view.start_offset);
+  CHECK_SPAN(!view.start_offset || (view_offset && view_offset->value_ == 0), span)
+      << "LowerTileToBuffer: nonzero tile view offsets require an explicit Buffer view recipe";
+  const auto shape = StaticExtents(tile->shape_, span);
+  const auto valid = StaticExtents(view.valid_shape.empty() ? tile->shape_ : view.valid_shape, span);
+  return std::make_shared<BufferType>(shape, tile->dtype_, space, valid, view.blayout, view.slayout,
+                                      view.fractal, view.pad, view.compact);
+}
+
+BufferTypePtr StorageDescriptor(const TileTypePtr& tile, const Span& span) {
+  const auto space = tile->GetMemorySpace();
+  if (space && backend::IsMatrixBufferSpace(*space)) return MatrixDescriptor(tile, *space, span);
+  return DenseDescriptor(tile, span);
+}
+
 /// Planned members retain their descriptors; storage is represented once.
 struct StorageMember {
-  TileTypePtr tile;
+  TileTypePtr tile;  // Null for a write view that no Tile variable names.
   MemRefPtr memory;
   BufferTypePtr descriptor;
   Span span;
+  const Call* write_view = nullptr;  // The call writing through that view.
 };
 
 struct BufferStorage {
@@ -117,7 +145,7 @@ class StorageIndex : public IRVisitor {
       CHECK_SPAN(offset && offset->value_ >= 0, expr->span_)
           << "LowerTileToBuffer: expected a static nonnegative storage window address";
       roots[memory->base_.get()].members.push_back(
-          {tile, memory, DenseDescriptor(tile, expr->span_), expr->span_});
+          {tile, memory, StorageDescriptor(tile, expr->span_), expr->span_});
     }
     IRVisitor::VisitExpr(expr);
   }
@@ -130,6 +158,7 @@ class StorageIndex : public IRVisitor {
 
   std::unordered_map<const Var*, BufferStorage> roots;
   std::unordered_map<const TileType*, VarPtr> handles;
+  std::unordered_map<const Call*, VarPtr> write_views;
 
  protected:
   void VisitStmt_(const AssignStmtPtr& assign) override {
@@ -137,7 +166,34 @@ class StorageIndex : public IRVisitor {
       INTERNAL_CHECK_SPAN(declarations_.emplace(assign->var_.get(), call).second, assign->span_)
           << "Internal error: duplicate planned allocation definition";
     }
+    if (auto call = As<Call>(assign->value_); call && IsOp(call, "tile.matmul_acc")) {
+      IndexProductView(call, assign->var_);
+    }
     IRVisitor::VisitStmt_(assign);
+  }
+
+  // tile.matmul_acc may accumulate into a wider valid rectangle than its
+  // product. Both native forms write only the product rectangle, and PTOAS
+  // requires a static pto.tmatmul[.acc] destination to equal it, so such an
+  // accumulator gets a same-storage view with the product's valid extents,
+  // matching the legacy emitter's native write.
+  void IndexProductView(const CallPtr& call, const VarPtr& result) {
+    const auto accumulator = As<TileType>(result->GetType());
+    const auto lhs = As<TileType>(call->args_[1]->GetType());
+    const auto rhs = As<TileType>(call->args_[2]->GetType());
+    INTERNAL_CHECK_SPAN(accumulator && lhs && rhs, call->span_)
+        << "Internal error: tile.matmul_acc requires Tile accumulator and operands";
+    const auto descriptor = StorageDescriptor(accumulator, call->span_);
+    const std::vector<int64_t> product{StorageDescriptor(lhs, call->span_)->valid_shape_[0],
+                                       StorageDescriptor(rhs, call->span_)->valid_shape_[1]};
+    if (product == descriptor->valid_shape_) return;
+    auto view = std::make_shared<BufferType>(
+        descriptor->shape_, descriptor->dtype_, descriptor->memory_space_, product, descriptor->blayout_,
+        descriptor->slayout_, descriptor->fractal_, descriptor->pad_, descriptor->compact_);
+    auto memory = GetDefinedMemRef(accumulator);
+    INTERNAL_CHECK_SPAN(memory && memory->base_, call->span_)
+        << "Internal error: tile.matmul_acc accumulator storage must be planned";
+    roots[memory->base_.get()].members.push_back({nullptr, memory, view, call->span_, call.get()});
   }
 
   // Initializers are visited once at their lexical binding. Body references
@@ -173,9 +229,18 @@ class StorageIndex : public IRVisitor {
     INTERNAL_CHECK_SPAN(call->args_.size() == 2, span) << "Internal error: malformed planned tile.alloc";
     auto size = As<ConstInt>(call->args_[1]);
     auto space = As<ConstInt>(call->args_[0]);
-    CHECK_SPAN(size && size->value_ > 0 && space && space->value_ == static_cast<int64_t>(MemorySpace::Vec),
-               span)
-        << "LowerTileToBuffer: storage root requires a static positive Vec allocation capacity";
+    std::optional<MemorySpace> memory_space;
+    for (const auto candidate :
+         {MemorySpace::Vec, MemorySpace::Mat, MemorySpace::Left, MemorySpace::Right, MemorySpace::Acc}) {
+      if (space && space->value_ == static_cast<int64_t>(candidate)) memory_space = candidate;
+    }
+    CHECK_SPAN(size && size->value_ > 0 && memory_space, span)
+        << "LowerTileToBuffer: storage root requires a static positive Vec, Mat, Left, Right or Acc "
+           "allocation capacity";
+    for (const auto& member : storage.members) {
+      INTERNAL_CHECK_SPAN(member.descriptor->memory_space_ == *memory_space, member.span)
+          << "Internal error: a planned tile's memory space differs from its allocation";
+    }
     const auto capacity = static_cast<uint64_t>(size->value_);
     // Address placement rebases each member. Only a full-capacity member can
     // establish the origin; guessing the minimum interior address loses bytes.
@@ -186,6 +251,10 @@ class StorageIndex : public IRVisitor {
       CHECK_SPAN(!origin || *origin == address, span)
           << "LowerTileToBuffer: full-capacity storage members disagree on the allocation origin";
       origin = address;
+    }
+    if (backend::IsMatrixBufferSpace(*memory_space)) {
+      FinalizeMatrixRoot(base, storage, capacity, origin, span);
+      return;
     }
     CHECK_SPAN(origin, span) << "LowerTileToBuffer: addressed storage needs a full-capacity MemRef anchor; "
                                 "interior windows alone do not determine the planned allocation origin";
@@ -251,7 +320,89 @@ class StorageIndex : public IRVisitor {
       views.emplace(key, Define(storage, "_view", "buffer.reshape", {window}, descriptor, span));
     }
     for (size_t i = 0; i < storage.members.size(); ++i) {
+      INTERNAL_CHECK_SPAN(storage.members[i].tile, storage.members[i].span)
+          << "Internal error: only matrix storage carries untyped write views";
       handles.emplace(storage.members[i].tile.get(), views.at(member_keys[i]));
+    }
+  }
+
+  // Every descriptor field except the root's shared memory space.
+  using MatrixKey = std::tuple<uint64_t, std::string, std::vector<int64_t>, std::vector<int64_t>, int, int,
+                               uint64_t, int, int>;
+
+  static MatrixKey MakeMatrixKey(uint64_t address, const BufferTypePtr& type) {
+    return {address,
+            type->dtype_.ToString(),
+            type->shape_,
+            type->valid_shape_,
+            static_cast<int>(type->blayout_),
+            static_cast<int>(type->slayout_),
+            type->fractal_,
+            static_cast<int>(type->pad_),
+            static_cast<int>(type->compact_)};
+  }
+
+  // Fractal descriptors have no byte-view form. Addressed planners already
+  // placed every window, so each distinct window is its own allocation at its
+  // final effective address; windows sharing an address alias exactly as the
+  // planner decided. Without addresses, one allocation can carry only one
+  // window, relabelled in place by same-size reshapes (NZ <-> ZN).
+  void FinalizeMatrixRoot(const Var* base, BufferStorage& storage, uint64_t capacity,
+                          std::optional<int64_t> origin, const Span& span) {
+    std::map<MatrixKey, VarPtr> handles_by_window;
+    std::vector<std::pair<MatrixKey, BufferTypePtr>> member_keys;
+    for (const auto& member : storage.members) {
+      const auto address = As<ConstInt>(member.memory->byte_offset_)->value_;
+      const auto bytes = backend::PhysicalBufferBytes(member.descriptor);
+      INTERNAL_CHECK_SPAN(bytes.has_value(), member.span)
+          << "Internal error: matrix storage descriptor must have a physical byte extent";
+      CHECK_SPAN(*bytes <= capacity, member.span)
+          << "LowerTileToBuffer: descriptor window exceeds the planned allocation capacity";
+      if (origin) {
+        CHECK_SPAN(address >= *origin && static_cast<uint64_t>(address - *origin) <= capacity - *bytes,
+                   member.span)
+            << "LowerTileToBuffer: descriptor window exceeds the planned allocation capacity";
+      }
+      member_keys.emplace_back(MakeMatrixKey(static_cast<uint64_t>(address), member.descriptor),
+                               member.descriptor);
+    }
+    VarPtr root;
+    uint64_t root_offset = 0;
+    for (size_t i = 0; i < storage.members.size(); ++i) {
+      const auto& [key, descriptor] = member_keys[i];
+      auto [entry, inserted] = handles_by_window.emplace(key, nullptr);
+      if (inserted) {
+        if (addressed_ || !root) {
+          std::vector<ExprPtr> args{std::make_shared<MakeTuple>(std::vector<ExprPtr>{}, span)};
+          if (addressed_) {
+            args.push_back(
+                std::make_shared<ConstInt>(static_cast<int64_t>(std::get<0>(key)), DataType::INDEX, span));
+          }
+          auto handle = std::make_shared<Var>(base->name_hint_ + "_buffer", descriptor, span);
+          auto allocation =
+              OpRegistry::GetInstance().CreateInternal("buffer.alloc", args, {}, descriptor, span);
+          storage.definitions.push_back(std::make_shared<AssignStmt>(handle, allocation, span));
+          entry->second = handle;
+          if (!root) {
+            root = handle;
+            root_offset = std::get<0>(key);
+            storage.handle = root;
+          }
+        } else {
+          CHECK_SPAN(std::get<0>(key) == root_offset &&
+                         backend::PhysicalBufferBytes(descriptor) ==
+                             backend::PhysicalBufferBytes(As<BufferType>(root->GetType())),
+                     storage.members[i].span)
+              << "LowerTileToBuffer: an addressless " << MemorySpaceToString(descriptor->memory_space_)
+              << " allocation can hold only one window; distinct windows require separate allocations";
+          entry->second = Define(storage, "_view", "buffer.reshape", {root}, descriptor, span);
+        }
+      }
+      if (storage.members[i].tile) {
+        handles.emplace(storage.members[i].tile.get(), entry->second);
+      } else {
+        write_views.emplace(storage.members[i].write_view, entry->second);
+      }
     }
   }
 
@@ -469,7 +620,10 @@ class TileToBufferMutator : public IRMutator {
 
   StmtPtr LowerCall(const CallPtr& call, const VarPtr& result) {
     INTERNAL_CHECK_SPAN(call->op_, call->span_) << "Internal error: device call has no operator";
-    CHECK_SPAN(call->attrs_.empty(), call->span_)
+    // Pipeline membership only constrains storage planning, whose result is
+    // already fixed in the MemRefs (AllocateMemoryAddr strips it; PTOAS keeps
+    // it). Every other attribute still needs an explicit conversion contract.
+    CHECK_SPAN(StripAttr(call->attrs_, kPipelineMembershipAttr).empty(), call->span_)
         << "LowerTileToBuffer: device-call attributes require an explicit conversion contract";
     for (const auto& [logical, physical] : {std::pair{"tile.get_block_idx", "buffer.get_block_idx"},
                                             std::pair{"tile.get_block_num", "buffer.get_block_num"},
@@ -529,6 +683,10 @@ class TileToBufferMutator : public IRMutator {
           GetIntKwarg(call->kwargs_, "atomic", 0) == 0 && GetIntKwarg(call->kwargs_, "st_phase", 0) == 0,
           call->span_)
           << "LowerTileToBuffer: atomic and phased stores require a Buffer transfer recipe";
+      CHECK_SPAN(!GetOptionalDoubleKwarg(call->kwargs_, "pre_quant") &&
+                     !GetKwargOr<bool>(call->kwargs_, "pre_relu", false),
+                 call->span_)
+          << "LowerTileToBuffer: fix-pipe pre_quant/pre_relu stores require a Buffer transfer recipe";
       auto output = VisitExpr(call->args_[2]);
       if (result) tensor_aliases_[result.get()] = output;
       return Operation("buffer.store",
@@ -574,6 +732,69 @@ class TileToBufferMutator : public IRMutator {
       const auto kwargs = IsOp(call, "tile.full") ? decltype(call->kwargs_){} : call->kwargs_;
       auto lowered = OpRegistry::GetInstance().CreateInternal(recipe->buffer_op, args, kwargs, call->span_);
       return std::make_shared<EvalStmt>(lowered, call->span_);
+    }
+    if (IsOp(call, "tile.transpose_view")) {
+      // StorageIndex already declared the relabelled window at the source's
+      // storage: an addressed alias allocation, or an addressless reshape.
+      INTERNAL_CHECK_SPAN(result && call->args_.size() == 1, call->span_)
+          << "Internal error: tile.transpose_view requires a source and a result";
+      const auto source = GetDefinedMemRef(As<TileType>(call->args_[0]->GetType()));
+      const auto destination = GetDefinedMemRef(As<TileType>(result->GetType()));
+      INTERNAL_CHECK_SPAN(
+          source->base_ == destination->base_ &&
+              structural_equal(source->byte_offset_, destination->byte_offset_) &&
+              backend::PhysicalBufferBytes(As<BufferType>(Handle(call->args_[0])->GetType())) ==
+                  backend::PhysicalBufferBytes(As<BufferType>(Handle(result)->GetType())),
+          call->span_)
+          << "Internal error: planned tile.transpose_view must relabel its source storage window";
+      return Empty(call->span_);
+    }
+    if (IsOp(call, "tile.extract")) {
+      INTERNAL_CHECK_SPAN(result && call->args_.size() == 4, call->span_)
+          << "Internal error: tile.extract requires source, offsets, shape and a result";
+      const auto& entry = OpRegistry::GetInstance().GetEntry(call->op_->name_);
+      ValidateKwargs(call->kwargs_, entry.GetOp()->GetAttrs(), call->op_->name_);
+      // The static window shape already selected the destination descriptor.
+      return Operation(
+          "buffer.extract",
+          {Handle(call->args_[0]), VisitExpr(call->args_[1]), VisitExpr(call->args_[2]), Handle(result)},
+          call->span_);
+    }
+    if (IsOp(call, "tile.matmul") || IsOp(call, "tile.matmul_acc")) {
+      // Neither operator declares attributes; reject any kwarg instead of dropping it.
+      ValidateKwargs(call->kwargs_, OpRegistry::GetInstance().GetEntry(call->op_->name_).GetOp()->GetAttrs(),
+                     call->op_->name_);
+    }
+    if (IsOp(call, "tile.matmul")) {
+      INTERNAL_CHECK_SPAN(result && call->args_.size() == 2, call->span_)
+          << "Internal error: tile.matmul requires lhs, rhs and a result";
+      return Operation("buffer.matmul", {Handle(call->args_[0]), Handle(call->args_[1]), Handle(result)},
+                       call->span_);
+    }
+    if (IsOp(call, "tile.matmul_acc")) {
+      INTERNAL_CHECK_SPAN(result && (call->args_.size() == 3 || call->args_.size() == 4), call->span_)
+          << "Internal error: tile.matmul_acc requires acc, lhs, rhs, an optional init_cond and a result";
+      const auto destination = Handle(result);
+      // MaterializeSemanticAliases binds the reused accumulator to its result.
+      INTERNAL_CHECK_SPAN(Handle(call->args_[0]) == destination, call->span_)
+          << "Internal error: tile.matmul_acc must accumulate in place; its accumulator and result need the "
+             "same planned storage";
+      // A wider accumulator is written through its product-shaped view.
+      const auto view = storage_.write_views.find(call.get());
+      const std::vector<ExprPtr> operands{Handle(call->args_[1]), Handle(call->args_[2]),
+                                          view == storage_.write_views.end() ? destination : view->second};
+      if (call->args_.size() == 3) return Operation("buffer.matmul_acc", operands, call->span_);
+      // init_cond overwrites instead of accumulating. A literal selects one
+      // form; a runtime predicate selects between both explicit writes.
+      const auto& init = call->args_[3];
+      std::optional<bool> literal;
+      if (auto value = As<ConstInt>(init)) literal = value->value_ != 0;
+      if (auto value = As<ConstBool>(init)) literal = value->value_;
+      if (literal) return Operation(*literal ? "buffer.matmul" : "buffer.matmul_acc", operands, call->span_);
+      return std::make_shared<IfStmt>(
+          VisitExpr(init), Operation("buffer.matmul", operands, call->span_),
+          std::optional<StmtPtr>(Operation("buffer.matmul_acc", operands, call->span_)),
+          std::vector<VarPtr>{}, call->span_);
     }
     if (IsOp(call, "tile.move")) {
       INTERNAL_CHECK_SPAN(result && !call->args_.empty(), call->span_)
