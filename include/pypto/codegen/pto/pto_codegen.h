@@ -101,6 +101,28 @@ class PTOCodegen : public CodegenBase {
   [[nodiscard]] const backend::BackendHandler* GetBackendHandler() const;
 
   /**
+   * @brief Warn that `high_precision=True` will not run on the target backend.
+   *
+   * Call this wherever a `precisionType` attribute is written. Two emitters do:
+   * the Tile op callbacks in `pto_ops_elementwise.cpp` and the Buffer IR
+   * emitter in `pto_buffer_codegen.cpp`. Both lower the same `tile.div` /
+   * `tile.log` / `tile.recip` onto the same `pto.*` op, so a backend that
+   * ignores the attribute must be reported identically from either path --
+   * which is why the check lives here rather than beside one of them.
+   *
+   * Silent when the backend honours the request. Otherwise reported once per
+   * `op_name` and source location, so copies of one written op (an unrolled
+   * loop body, which shares a span) collapse into a single diagnostic.
+   *
+   * @param op_name Logical op the user wrote, e.g. `tile.div` -- never the
+   *        `buffer.*` spelling an internal lowering happens to use.
+   * @param pto_op_name Emitted PTO op, e.g. `pto.tdiv`.
+   * @param span Source location of the call being emitted.
+   */
+  void WarnIfHighPrecisionIgnored(const std::string& op_name, const std::string& pto_op_name,
+                                  const ir::Span& span);
+
+  /**
    * @brief Generate PTO-ISA MLIR format code from IR Program
    *
    * @param program Input PyPTO IR Program
@@ -1179,6 +1201,10 @@ class PTOCodegen : public CodegenBase {
 
   /// True when the module needs the wrapper-defined counter-completion adapter.
   bool needs_deferred_completion_adapter_ = false;
+
+  /// Sites already reported by WarnIfHighPrecisionIgnored, cleared by Generate
+  /// so a second compilation in the same process warns again.
+  std::set<std::string> reported_precision_sites_;
 
   const backend::Backend* backend_;  ///< Backend instance for querying op info
 

@@ -424,6 +424,7 @@ static std::string MakePrecisionCodegenPTO(const std::string& pto_op_name, size_
     code += " {precisionType = #pto<";
     code += attr_kind;
     code += " high_precision>}";
+    codegen.WarnIfHighPrecisionIgnored(op->op_->name_, pto_op_name, op->span_);
   }
   codegen.Emit(code);
   return "";
