@@ -252,6 +252,206 @@ def test_auto_c2v_boundary_localizes_a_ragged_split_axis():
     ir.assert_structural_equal(_lower(Before), Expected)
 
 
+def _runtime_extent_program(with_consumer: bool):
+    """A ``pl.split`` function crossing a 64-row cube tile valid to a RUNTIME ``n``."""
+    if with_consumer:
+
+        @pl.program
+        class WithConsumer:
+            @pl.function(type=pl.FunctionType.InCore)
+            def split_auto(
+                n: pl.Scalar[pl.INDEX],
+                qk: pl.Tile[[64, 128], pl.FP32, pl.Mem.Mat],
+                out_0: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+            ) -> pl.Tensor[[64, 128], pl.FP32]:
+                pl.func_attr({"split": pl.SplitMode.UP_DOWN})
+                qk_n = pl.tile.set_validshape(qk, n, 128)
+                popped = pl.tile.move(qk_n, target_memory=pl.Mem.Vec)
+                scaled = pl.tile.exp(popped)
+                out_store = pl.tile.store(scaled, [0, 0], out_0)  # noqa: F841
+                return out_0
+
+        return WithConsumer
+
+    @pl.program
+    class DirectStore:
+        @pl.function(type=pl.FunctionType.InCore)
+        def split_auto(
+            n: pl.Scalar[pl.INDEX],
+            qk: pl.Tile[[64, 128], pl.FP32, pl.Mem.Mat],
+            out_0: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+        ) -> pl.Tensor[[64, 128], pl.FP32]:
+            pl.func_attr({"split": pl.SplitMode.UP_DOWN})
+            qk_n = pl.tile.set_validshape(qk, n, 128)
+            popped = pl.tile.move(qk_n, target_memory=pl.Mem.Vec)
+            out_store = pl.tile.store(popped, [0, 0], out_0)
+            return out_store
+
+    return DirectStore
+
+
+def test_auto_c2v_boundary_defers_a_runtime_split_axis_extent():
+    """A RUNTIME split-axis extent must not reach the AUTO shard itself.
+
+    pto-isa places lane 1's band inside the FIFO slot at the popped tile's own
+    split-axis extent. With a runtime ``n`` the lanes are the two box halves, so a
+    shard typed ``clamp(n - lane * 32, 0, 32)`` sends lane 1 to row ``n - 32``
+    instead of row 32 (on device, ``n = 40`` read rows 8..15 into rows 32..39).
+    The AUTO path therefore gets the explicit ``pl.aiv_shard`` treatment: the
+    shard keeps the full box, the lane's extent lands on its first consumer, and
+    the store, whose lane may be empty, is guarded.
+
+    Asserted on the IR rather than against a parsed ``Expected``: a view-less
+    annotation parses back to the deducer's lane-agnostic view, so no DSL text
+    spells the full-box shard, and the roundtrip instrument is off for the same
+    reason.
+    """
+    with passes.PassContext([]):
+        after = passes.lower_auto_vector_split()(_runtime_extent_program(with_consumer=True))
+    body = list(after.functions.values())[0].body
+    assert isinstance(body, ir.SeqStmts)
+    by_name = {s.var.name_hint: s for s in body.stmts if isinstance(s, ir.AssignStmt)}
+
+    shard = by_name["popped"]
+    assert isinstance(shard.value, ir.Call) and shard.value.op.name == ir.get_op("tile.aiv_shard").name
+    shard_type = shard.var.type
+    assert isinstance(shard_type, ir.TileType)
+    assert [d.value for d in shard_type.shape if isinstance(d, ir.ConstInt)] == [32, 128]
+    assert shard_type.tile_view is None, "the deferred shard must declare the full per-lane box"
+
+    scaled_type = by_name["scaled"].var.type
+    assert isinstance(scaled_type, ir.TileType) and scaled_type.tile_view is not None
+    lane_extent = scaled_type.tile_view.valid_shape[0]
+    assert not isinstance(lane_extent, ir.ConstInt), "the consumer must carry the lane's runtime extent"
+    assert "subblock_idx" in str(lane_extent)
+
+    guards = [s for s in body.stmts if isinstance(s, ir.IfStmt)]
+    assert len(guards) == 1, "the store of a possibly-empty lane must be guarded"
+    guarded = guards[0].then_body
+    guarded_store = guarded if isinstance(guarded, ir.AssignStmt) else None
+    assert guarded_store is not None and isinstance(guarded_store.value, ir.Call)
+    assert guarded_store.value.op.name == ir.get_op("tile.store").name
+
+
+def test_auto_runtime_extent_leaves_a_read_store_result_unguarded():
+    """A store whose result is read afterwards stays unguarded, keeping the IR in SSA form.
+
+    A plain ``if`` around ``out_store = pl.tile.store(...)`` would leave the
+    returned ``out_store`` defined on one branch only; guarding it soundly needs a
+    phi over the stored and not-stored tensor versions. The store is left as every
+    AUTO store was before (an empty lane's zero-row store moves nothing in a
+    release build), while the shard itself is still deferred.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def split_auto(
+            n: pl.Scalar[pl.INDEX],
+            qk: pl.Tile[[64, 128], pl.FP32, pl.Mem.Mat],
+            out_0: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+        ) -> pl.Tensor[[64, 128], pl.FP32]:
+            pl.func_attr({"split": pl.SplitMode.UP_DOWN})
+            qk_n = pl.tile.set_validshape(qk, n, 128)
+            popped = pl.tile.move(qk_n, target_memory=pl.Mem.Vec)
+            scaled = pl.tile.exp(popped)
+            out_store = pl.tile.store(scaled, [0, 0], out_0)
+            return out_store
+
+    with passes.PassContext([]):
+        after = passes.lower_auto_vector_split()(Before)
+    body = list(after.functions.values())[0].body
+    assert isinstance(body, ir.SeqStmts)
+    assert not any(isinstance(s, ir.IfStmt) for s in body.stmts), "a read store result must stay unguarded"
+    by_name = {s.var.name_hint: s for s in body.stmts if isinstance(s, ir.AssignStmt)}
+    shard_type = by_name["popped"].var.type
+    assert isinstance(shard_type, ir.TileType) and shard_type.tile_view is None, "the shard is still deferred"
+    assert "out_store" in by_name, "the store stays a top-level binding the return can read"
+
+
+def test_auto_runtime_extent_guards_an_unassigned_store():
+    """A store written as a statement reads the lane's extent too, so it is guarded the same way."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def split_auto(
+            n: pl.Scalar[pl.INDEX],
+            qk: pl.Tile[[64, 128], pl.FP32, pl.Mem.Mat],
+            out_0: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+        ) -> pl.Tensor[[64, 128], pl.FP32]:
+            pl.func_attr({"split": pl.SplitMode.UP_DOWN})
+            qk_n = pl.tile.set_validshape(qk, n, 128)
+            popped = pl.tile.move(qk_n, target_memory=pl.Mem.Vec)
+            scaled = pl.tile.exp(popped)
+            pl.tile.store(scaled, [0, 0], out_0)
+            return out_0
+
+    with passes.PassContext([]):
+        after = passes.lower_auto_vector_split()(Before)
+    body = list(after.functions.values())[0].body
+    assert isinstance(body, ir.SeqStmts)
+    guards = [s for s in body.stmts if isinstance(s, ir.IfStmt)]
+    assert len(guards) == 1, "an unassigned store of a possibly-empty lane must be guarded"
+    guarded = guards[0].then_body
+    assert isinstance(guarded, ir.EvalStmt) and isinstance(guarded.expr, ir.Call)
+    assert guarded.expr.op.name == ir.get_op("tile.store").name
+    assert not any(isinstance(s, ir.EvalStmt) and isinstance(s.expr, ir.Call) for s in body.stmts), (
+        "the store must not also remain unguarded"
+    )
+
+
+def test_explicit_region_guards_an_unassigned_store_of_an_empty_lane():
+    """The explicit ``pl.aiv_shard`` walk guards a statement-form store like an assigned one.
+
+    5 of 16 rows never reach lane 1, and a zero-row store is outside the ISA
+    contract, so the store must run only where the lane holds data.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def split_region(
+            qk: pl.Tile[[16, 128], pl.FP32, pl.Mem.Mat, pl.TileView(valid_shape=[5, 128])],
+            out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+        ) -> pl.Tensor[[16, 128], pl.FP32]:
+            for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                shard = pl.aiv_shard(qk)
+                scaled = pl.tile.exp(shard)
+                pl.tile.store(scaled, [aiv_id * 8, 0], out_0)
+            return out_0
+
+    class StoreGuards(ir.IRVisitor):
+        guarded = 0
+        unguarded = 0
+
+        def visit_if_stmt(self, op):
+            then_body = op.then_body
+            if isinstance(then_body, ir.EvalStmt) and isinstance(then_body.expr, ir.Call):
+                if then_body.expr.op.name == ir.get_op("tile.store").name:
+                    self.guarded += 1
+                    return
+            super().visit_if_stmt(op)
+
+        def visit_eval_stmt(self, op):
+            if isinstance(op.expr, ir.Call) and op.expr.op.name == ir.get_op("tile.store").name:
+                self.unguarded += 1
+            super().visit_eval_stmt(op)
+
+    with passes.PassContext([]):
+        after = passes.lower_auto_vector_split()(Before)
+    guards = StoreGuards()
+    guards.visit_program(after)
+    assert (guards.guarded, guards.unguarded) == (1, 0)
+
+
+def test_auto_c2v_boundary_rejects_a_direct_store_of_a_runtime_extent():
+    """A store straight off a deferred shard has no consumer to carry the lane's extent."""
+    with passes.PassContext([]):
+        with pytest.raises(ValueError, match="consumes a Cube -> Vector boundary tile directly"):
+            passes.lower_auto_vector_split()(_runtime_extent_program(with_consumer=False))
+
+
 def test_store_offset_at_nonzero_base_localizes_additively():
     """AdjustOffsets ADDS ``subblock_idx * half`` on the split axis rather than
     overwriting the offset: a store at base row 16 becomes ``16 + subblock_idx * 64``.

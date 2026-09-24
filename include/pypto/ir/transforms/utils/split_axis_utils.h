@@ -127,10 +127,12 @@ ExprPtr ResolveLaneStride(const std::vector<StmtPtr>& stmts, int split_dim);
  * A dynamic (non-ConstInt) box or valid extent has no compile-time lane extents,
  * so no code can be verified against them. It keeps the even code, which is exact
  * only when the boundary tile also declares the full split-axis box: the producer
- * transports that box, so lane 1's band sits at the box half and the even code
- * points there whatever the extent turns out to be. LocalizeExplicitBoundaryValid
- * establishes that pairing for a ``pl.split_aiv`` region (WithFullSplitAxisValid)
- * and moves the lane's own extent onto the boundary's consumers. A hand-written
+ * lays its rows at their box positions, so lane 1's band sits at the box half and
+ * the even code points there whatever the extent turns out to be.
+ * LocalizeExplicitBoundaryValid establishes that pairing for a ``pl.split_aiv``
+ * region and DeferAutoRuntimeShardExtents for a ``pl.split`` body
+ * (WithFullSplitAxisValid); the lane's own extent is carried by the boundary's
+ * consumers. A hand-written
  * ``tile.tpop_from_aic`` keeps its declared per-lane extent and is still
  * misplaced for such a boundary — see RebuildTpopWithHalvedShape.
  *
@@ -186,7 +188,7 @@ std::optional<std::pair<int64_t, int64_t>> StaticLaneExtents(const TypePtr& full
  * ShardSplitCode can only keep (or refuse) that promise when both the box and
  * the valid extent are constants. When they are not, the per-lane extent must
  * NOT be materialized onto the boundary tile: pto-isa would place lane 1's band
- * at that extent, while the producer transported the full physical box. The
+ * at that extent, while the producer laid its rows out at their box positions. The
  * boundary tile keeps its full split-axis extent instead, and the lane's real
  * extent is carried by its consumers.
  *
@@ -201,8 +203,11 @@ bool HasStaticLaneExtents(const TypePtr& full_type, int split_dim, const ExprPtr
  * @brief The same tile type with its split-axis extent declared FULL.
  *
  * pto-isa finds lane 1's band inside the FIFO slot from the POPPED tile's own
- * split-axis extent, while the producer always transports the full physical box
- * (PTO codegen's ``EmitTpushTransportValidShape`` widens every split tpush). The
+ * split-axis extent, while the producer lays every row out at its position in
+ * the physical box (PTO codegen's ``EmitTpushTransportValidShape`` widens every
+ * split tpush's columns to the box, and its rows too, except a compact
+ * accumulator's on a backend whose lanes locate their own band (A2/A3), which
+ * stop at its valid extent). The
  * two agree only when the lanes' extents were verifiable at compile time — the
  * balanced partition and the odd codes exist exactly to make them agree. When
  * they were not (see HasStaticLaneExtents), the boundary tile must declare the
@@ -500,6 +505,33 @@ std::vector<StmtPtr> ProcessStmts(const std::vector<StmtPtr>& stmts, SplitMode m
  */
 std::vector<StmtPtr> LocalizeExplicitBoundaryValid(const std::vector<StmtPtr>& stmts, int split_dim,
                                                    const Span& region_span);
+
+/**
+ * @brief Give an AUTO-halved body's runtime-extent Cube -> Vector shards the full per-lane box.
+ *
+ * The AUTO halving types each ``tile.aiv_shard`` with its lane's own split-axis
+ * extent, which pto-isa reads to place lane 1's band. That is exact only for
+ * compile-time lane extents; a runtime extent must leave the shard at the full
+ * box (``WithFullSplitAxisValid``), the pairing ``LocalizeExplicitBoundaryValid``
+ * establishes for the explicit form.
+ *
+ * Unlike that walk, nothing downstream is retyped: the halving already typed
+ * every consumer and loop carry from its own pre-split type. What remains is
+ * (1) retyping each such shard, (2) guarding a store whose stored tile has a
+ * lane-dependent, possibly-zero valid extent and whose result nothing reads (a
+ * zero-row store is outside the ISA contract; a read result would be left
+ * conditionally defined, so that store stays unguarded, as before), and (3) rejecting the
+ * direct uses a full-box shard cannot serve: a store, a pad fill, a loop carry,
+ * a branch result or a return. A body with no runtime-extent shard is returned
+ * unchanged.
+ *
+ * @param stmts The lowered body, including the ``tile.get_subblock_idx`` binding.
+ * @param split_dim The partitioned tile dimension (see SplitDimension).
+ * @param span Span for the rebuilt sequence.
+ * @return The rewritten statement list (input order preserved).
+ */
+std::vector<StmtPtr> DeferAutoRuntimeShardExtents(const std::vector<StmtPtr>& stmts, int split_dim,
+                                                  const Span& span);
 
 /**
  * @brief Replace a shard result type's split-axis valid extent with the lane's own.

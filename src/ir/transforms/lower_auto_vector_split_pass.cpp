@@ -113,6 +113,19 @@ SplitAivScopeStmtPtr RewrapSplitRegion(const SplitAivScopeStmtPtr& region, const
   return lowered;
 }
 
+// The halving types each C->V shard with its lane's own extent, which is what
+// pto-isa reads to place lane 1's band inside the FIFO slot. That is exact only
+// for compile-time lane extents (balanced or odd, see ShardSplitCode); a runtime
+// extent would send lane 1 to its own extent instead of the box half the lanes
+// are partitioned on. See split_axis::DeferAutoRuntimeShardExtents. Bodies whose
+// lane extents are all static are returned unchanged.
+StmtPtr DeferRuntimeLaneExtents(const StmtPtr& body, int split_dim, const Span& span) {
+  auto stmts = transform_utils::FlattenToStmts(body);
+  auto deferred = split_axis::DeferAutoRuntimeShardExtents(stmts, split_dim, span);
+  if (deferred == stmts) return body;
+  return (deferred.size() == 1) ? deferred[0] : std::make_shared<SeqStmts>(deferred, span);
+}
+
 // Make a split-kwarg call. On tile.aiv_shard / tile.aic_gather the split int
 // attr is the authored SplitMode, NOT the pto-isa split code; ExpandMixedKernel
 // derives the code from it (see split_axis::ShardSplitCode / GatherSplitCode).
@@ -302,6 +315,7 @@ std::vector<StmtPtr> LowerStmts(const std::vector<StmtPtr>& stmts, SplitMode mod
       if (!r_var_repl.empty()) {
         region_body = transform_utils::Substitute(region_body, r_var_repl);
       }
+      region_body = DeferRuntimeLaneExtents(region_body, rdim, reg->span_);
       result.push_back(RewrapSplitRegion(reg, region_body));
       continue;
     }
@@ -991,6 +1005,7 @@ FunctionPtr LowerFunction(const FunctionPtr& func, SplitMode mode) {
   if (!var_replacements.empty()) {
     new_body = transform_utils::Substitute(new_body, var_replacements);
   }
+  new_body = DeferRuntimeLaneExtents(new_body, split_dim, func->span_);
   auto [cloned_body, clone_map_unused] = DeepClone(new_body);
   (void)clone_map_unused;
 

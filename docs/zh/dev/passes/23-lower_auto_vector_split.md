@@ -359,8 +359,11 @@ lane 的——lane `L` 持有 `clamp(V - L*half, 0, half)`——因此哪种模�
 `LocalizeExplicitBoundaryValid` 在本 pass 修正该猜测——区域自身的
 `aiv_id = tile.get_subblock_idx()` 在作用域内——并把逐 lane extent 传给那些原样透传
 `valid_shape` 的消费者；若消费者会改变逻辑矩形（reduction、slice），则连同 span 一并
-报错。AUTO 分支通过 `LocalizeShardValidForLane` 施加同样的 *extent* 修正，但不含下面的
-store 保护——它的消费者由折半遍历重建，而非本遍历。
+报错。AUTO 分支通过 `LocalizeShardValidForLane` 施加同样的 *extent* 修正；若函数体中的
+shard 带有运行期 extent，则再经过 `DeferAutoRuntimeShardExtents`：该 shard 与区域形式一样
+得到完整 box 的 pop，可能为空的 lane 上的 store 会被保护，而其消费者和循环携带值保留折半时已给出的类型。
+结果随后被读取的 store（链式 store、循环 yield、return）例外：保护它会使该结果只在条件分支中有定义，
+因此 `pl.split` 与此前一样不对其加保护。
 
 - **两个 lane 的 extent 必须可摆放。** 切分轴上的 extent 并不是自由字段：pto-isa 根据
   被弹出 tile 自身的 valid extent 推导 lane 1 的数据段起点——`TILE_UP_DOWN` 下是 `e1`，
@@ -372,9 +375,9 @@ store 保护——它的消费者由折半遍历重建，而非本遍历。
 - **运行期的切分轴 valid extent 弹出完整 box。** split code 是编译期属性，而两个 lane
   需要哪一个取决于它们的**运行期** extent：16 行的轴上 valid 12 会让两 lane 变成 8 与 4，
   valid 16 则是 8 与 8，没有哪个 code 对两者都正确。因此边界算子干脆不携带逐 lane
-  extent——`LocalizeExplicitBoundaryValid` 给它完整 box
-  （`split_axis::WithFullSplitAxisValid`），并把 lane 的 extent 放到第一个消费者上。
-  这与偶数 code 恰好配套：生产者搬运的是完整物理 box，lane 1 的数据段就落在 box 的一半处，
+  extent——`LocalizeExplicitBoundaryValid`（区域形式）和 `DeferAutoRuntimeShardExtents`
+  （`pl.split`）给它完整 box（`split_axis::WithFullSplitAxisValid`），lane 的 extent 由其消费者携带。
+  这与偶数 code 恰好配套：生产者把各行放在其 box 中的位置上，lane 1 的数据段就落在 box 的一半处，
   偶数 code 正好指向那里，与运行期 extent 无关。已在 a2a3 上对 16 行边界的 1..16 全部
   extent 验证。[pto-isa 的 pop](https://github.com/hw-native-sys/pto-isa/issues/263)
   确实按被弹出 tile 自身的 extent 放置 lane 1，与其源码读法一致——此前得出相反结论的实测，

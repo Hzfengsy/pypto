@@ -335,6 +335,19 @@ class BackendHandler {
   [[nodiscard]] virtual bool RequiresNoSplitDualAivDispatch() const = 0;
 
   /**
+   * @brief Whether a split Cube-to-Vector push divides its transported extent
+   *        between the two AIV lanes itself.
+   *
+   * Ascend950 pushes L0C straight into both lanes' UB with a dual-mode TMOV
+   * (`DualModeSplitM` / `DualModeSplitN`) that hands each lane half of the
+   * transported rows / cols, so the transported extent IS the lane partition.
+   * Ascend910B stages the tile through a GM slot, and each lane locates its own
+   * band there from its popped extent, so the transported extent only has to
+   * cover the rows the lanes read.
+   */
+  [[nodiscard]] virtual bool SplitsCubeToVectorTransportInHardware() const = 0;
+
+  /**
    * @brief Whether a tiled (offset) Acc->Mat FIXPIPE writeback must downcast to
    *        a low-precision (bf16/f16) destination.
    *

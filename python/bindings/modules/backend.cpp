@@ -157,6 +157,9 @@ void BindBackend(nb::module_& m) {
            "Whether split AIV wrappers must source the subblock id from the runtime context")
       .def("requires_no_split_dual_aiv_dispatch", &BackendHandler::RequiresNoSplitDualAivDispatch,
            "Whether mixed kernels with no split mode must still be dispatched on both AIV lanes")
+      .def("splits_cube_to_vector_transport_in_hardware",
+           &BackendHandler::SplitsCubeToVectorTransportInHardware,
+           "Whether a split Cube-to-Vector push divides its transported extent between the AIV lanes itself")
       .def("get_gm_access_granularity_bytes", &BackendHandler::GetGmAccessGranularityBytes,
            "GM access granularity in bytes (issue #1180 perf-hint threshold input)")
       .def("get_l2_cache_line_bytes", &BackendHandler::GetL2CacheLineBytes, "L2 cache line size in bytes")

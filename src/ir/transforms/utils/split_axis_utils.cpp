@@ -713,6 +713,27 @@ void RejectDeferredValidStore(bool deferred, const CallPtr& call) {
          "  * keep the extent at or below the box half, so the second lane is empty";
 }
 
+// A pad fill of a boundary tile whose split-axis extent was left at the
+// transport's box (see WithFullSplitAxisValid) would fill up to the box, not to
+// the lane's data, and declare the transport's padding valid. `crossing` names
+// the author's crossing in the advice: `pl.aiv_shard(acc)` for an explicit
+// region, the first vector op for the AUTO path.
+void RejectDeferredPadFill(bool deferred, const CallPtr& call, const char* crossing) {
+  CHECK_SPAN(!(deferred && FillsPadRegion(call)), call->span_)
+      << call->op_->name_
+      << ": this fills the padding of a Cube -> Vector boundary tile whose split-axis valid extent "
+         "is a RUNTIME value. The boundary has to declare the transport's full box (that is what "
+         "places lane 1's band where the producer wrote it), so by the time the fill runs there is "
+         "no per-lane boundary left to fill up to, and it would define nothing.\n"
+      << "Author one of these instead:\n"
+      << "  * fill the padding on the CUBE side, before the crossing: pl.fillpad(acc) ahead of " << crossing
+      << ", so the transported box carries defined padding\n"
+      << "  * put the lane's own compute first — any op that passes valid_shape through (a cast, an "
+         "elementwise) materializes the lane extent, and a fill after it works normally\n"
+      << "  * make the split-axis valid extent a compile-time constant, so it rides the boundary "
+         "itself";
+}
+
 CallPtr RebuildTpopWithHalvedShape(const CallPtr& call, int split_code, int split_dim,
                                    const ExprPtr& subblock_idx, const ExprPtr& lane_stride) {
   // NOT widened for a runtime extent, unlike the boundary ops in
@@ -2368,12 +2389,13 @@ int ShardSplitCode(SplitMode mode, const TypePtr& full_type, int split_dim, cons
   auto extents = ComputeLaneExtents(tt, split_dim, lane_stride);
   // No compile-time lane extents (a runtime box, valid extent or stride): the
   // even code, which is exact only when the boundary tile carries the FULL
-  // split-axis box rather than the lane's extent. The producer transports the
-  // full box (PTO codegen widens every split tpush), so lane 1's band sits at
-  // the box half and the even code points pto-isa there; which lane holds how
-  // much data is carried by the tile's CONSUMERS, where no band offset depends
-  // on it. LocalizeExplicitBoundaryValid establishes that pairing for a
-  // pl.split_aiv region's boundary op (WithFullSplitAxisValid).
+  // split-axis box rather than the lane's extent. The producer lays each row out
+  // at its box position (PTO codegen widens every split tpush's columns), so
+  // lane 1's band sits at the box half and the even code points pto-isa there;
+  // which lane holds how much data is carried by the tile's CONSUMERS, where no
+  // band offset depends on it. LocalizeExplicitBoundaryValid establishes that
+  // pairing for a pl.split_aiv region's boundary op, and for a pl.split body
+  // that holds one (WithFullSplitAxisValid).
   //
   // The pairing is what makes this safe. The even code beside a PER-LANE extent
   // silently mis-places lane 1: a 16-row box valid to 12 leaves the lanes 8 and
@@ -2479,6 +2501,18 @@ const LocalizedTile* FindTrackedSource(const CallPtr& call, const LocalizeState&
     if (it != state.tracked.end()) return &it->second;
   }
   return nullptr;
+}
+
+/// `extent > 0`, typed after the extent.
+ExprPtr MakeNonEmpty(const ExprPtr& extent, const Span& span) {
+  return MakeGt(extent, std::make_shared<ConstInt>(0, GetScalarDtype(extent), span), span);
+}
+
+/// Run `store` only on a lane whose split-axis extent is non-zero. A zero-row
+/// store is outside pto-isa's contract (see the AssignStmt store arm).
+StmtPtr GuardNonEmptyLane(const StmtPtr& store, const ExprPtr& lane_extent, const Span& span) {
+  return std::make_shared<IfStmt>(MakeNonEmpty(lane_extent, span), store, std::nullopt, std::vector<VarPtr>{},
+                                  span);
 }
 
 /// Recurse into a nested body, preserving its statement kind.
@@ -2614,12 +2648,18 @@ std::vector<StmtPtr> LocalizeStmts(const std::vector<StmtPtr>& stmts, int split_
 
     // A store whose result is ignored is an EvalStmt, so the AssignStmt walk below
     // never sees it — but it reads the boundary tile's extent just the same, and
-    // a deferred one would put the transport's padding in the output.
+    // a deferred one would put the transport's padding in the output. Its lane
+    // may be empty too, and with no SSA result it can never be a chained store,
+    // so it always takes the empty-lane guard (see the AssignStmt arm).
     if (auto eval = std::dynamic_pointer_cast<const EvalStmt>(stmt)) {
       if (auto eval_call = AsCall(eval->expr_);
           eval_call && eval_call->op_ && IsOp(eval_call, "tile.store")) {
         if (const LocalizedTile* eval_source = FindTrackedSource(eval_call, state)) {
           RejectDeferredValidStore(eval_source->deferred, eval_call);
+          if (!IsProvablyPositive(eval_source->lane_extent)) {
+            result.push_back(GuardNonEmptyLane(stmt, eval_source->lane_extent, eval_call->span_));
+            continue;
+          }
         }
       }
       result.push_back(stmt);
@@ -2670,7 +2710,7 @@ std::vector<StmtPtr> LocalizeStmts(const std::vector<StmtPtr>& stmts, int split_
       // Where the extent may LAND. It belongs on the shard itself only when the
       // transport was verified to place both lanes' bands, which needs
       // compile-time lane extents: pto-isa reads lane 1's band offset off this
-      // very tile, and the producer transported the full box. A runtime extent
+      // very tile, and the producer laid its rows at their box positions. A runtime extent
       // leaves the shard full-width and hands the lane's extent to the consumers
       // below (see WithFullSplitAxisValid).
       const bool deferred = !HasStaticLaneExtents(operand, split_dim, /*lane_stride=*/nullptr);
@@ -2790,10 +2830,7 @@ std::vector<StmtPtr> LocalizeStmts(const std::vector<StmtPtr>& stmts, int split_
                "inside the region\n"
             << "  * make the split axis fully valid before the crossing (pl.set_validshape to the "
                "full extent) so every lane is non-empty";
-        auto zero = std::make_shared<ConstInt>(0, GetScalarDtype(source->lane_extent), call->span_);
-        auto non_empty = MakeGt(source->lane_extent, zero, call->span_);
-        result.push_back(
-            std::make_shared<IfStmt>(non_empty, stmt, std::nullopt, std::vector<VarPtr>{}, call->span_));
+        result.push_back(GuardNonEmptyLane(stmt, source->lane_extent, call->span_));
         continue;
       }
       result.push_back(stmt);
@@ -2804,19 +2841,7 @@ std::vector<StmtPtr> LocalizeStmts(const std::vector<StmtPtr>& stmts, int split_
     // result is fully valid by construction, so it hits the widen shortcut below
     // and the deferred extent would be dropped — leaving the fill with nothing to
     // do and the transport's padding declared as data.
-    CHECK_SPAN(!(source->deferred && FillsPadRegion(call)), call->span_)
-        << call->op_->name_
-        << ": this fills the padding of a Cube -> Vector boundary tile whose split-axis valid extent "
-           "is a RUNTIME value. The boundary has to declare the transport's full box (that is what "
-           "places lane 1's band where the producer wrote it), so by the time the fill runs there is "
-           "no per-lane boundary left to fill up to, and it would define nothing.\n"
-        << "Author one of these instead:\n"
-        << "  * fill the padding on the CUBE side, before the crossing: pl.fillpad(acc) ahead of "
-           "pl.aiv_shard(acc), so the transported box carries defined padding\n"
-        << "  * put the lane's own compute first — any op that passes valid_shape through (a cast, an "
-           "elementwise) materializes the lane extent, and a fill after it works normally\n"
-        << "  * make the split-axis valid extent a compile-time constant, so it rides the boundary "
-           "itself";
+    RejectDeferredPadFill(source->deferred, call, "pl.aiv_shard(acc)");
 
     // A consumer that WIDENS the logical region back to the whole physical box
     // (a set_validshape to the full extent) deliberately drops the per-lane
@@ -2865,6 +2890,240 @@ std::vector<StmtPtr> LocalizeExplicitBoundaryValid(const std::vector<StmtPtr>& s
   // inside nested control flow) at the retyped vars, mirroring how the AUTO
   // halving path finishes in ProcessStmts.
   StmtPtr body = (result.size() == 1) ? result[0] : std::make_shared<SeqStmts>(result, region_span);
+  return transform_utils::FlattenToStmts(transform_utils::Substitute(body, state.replacements));
+}
+
+namespace {
+
+/// Mutable state threaded through DeferAutoRuntimeShardExtents' walk.
+struct AutoDeferState {
+  int split_dim = 0;
+  VarPtr lane_index;                                    ///< the injected subblock_idx binding
+  std::unordered_map<const Var*, VarPtr> replacements;  ///< retyped shard: old var -> new var
+  std::unordered_set<const Var*> deferred;              ///< the retyped shards (new vars)
+  std::unordered_set<const Var*> read_vars;             ///< every var some expression reads
+};
+
+/// Whether `call` is a Cube -> Vector shard whose lane extents are only known
+/// at runtime: not rebalanced (no `lane_stride`), partially valid on the split
+/// axis (or on an odd one), and not statically resolvable into lane extents.
+bool IsRuntimeExtentShard(const CallPtr& call, int split_dim) {
+  if (!IsOp(call, "tile.aiv_shard") || call->args_.empty() || call->HasKwarg("lane_stride")) return false;
+  auto operand = std::dynamic_pointer_cast<const TileType>(call->args_[0]->GetType());
+  if (!operand || split_dim >= static_cast<int>(operand->shape_.size())) return false;
+  const auto operand_valid = tile_view_semantics::GetEffectiveTileView(*operand).valid_shape;
+  const bool fully_valid_even = static_cast<int>(operand_valid.size()) <= split_dim ||
+                                (AreExprsEqual(operand_valid[split_dim], operand->shape_[split_dim]) &&
+                                 !IsOddSplitExtent(operand->shape_[split_dim]));
+  return !fully_valid_even && !HasStaticLaneExtents(operand, split_dim, /*lane_stride=*/nullptr);
+}
+
+/// Whether `expr` names a shard this walk retyped to the full box.
+bool IsDeferredShard(const ExprPtr& expr, const AutoDeferState& state) {
+  auto var = AsVarLike(expr);
+  if (!var) return false;
+  auto replaced = state.replacements.find(var.get());
+  const Var* key = (replaced != state.replacements.end()) ? replaced->second.get() : var.get();
+  return state.deferred.count(key) != 0;
+}
+
+/// A deferred shard declares the transport's box rather than the lane's data, so
+/// it may only feed an op whose own result the halving typed with the lane's
+/// extent. Binding it to a carry, a branch result or a return would hand the
+/// box to a binding the halving typed with the lane's extent.
+void RejectDeferredShardBinding(const std::vector<ExprPtr>& values, const char* binding, const Span& span,
+                                const AutoDeferState& state) {
+  for (const auto& value : values) {
+    CHECK_SPAN(!IsDeferredShard(value, state), span)
+        << "pl.split: a Cube -> Vector boundary tile whose split-axis valid extent is a RUNTIME value "
+           "is bound directly to a "
+        << binding
+        << ". The tile has to declare the transport's full box (that is what places lane 1's band where "
+           "the producer wrote it), so it cannot carry the lane's own extent across that binding.\n"
+        << "Author one of these instead:\n"
+        << "  * apply the lane's own compute first (a cast, an elementwise op) and bind its result\n"
+        << "  * make the split-axis valid extent a compile-time constant";
+  }
+}
+
+/// The condition under which a store of `stored` has data on this lane: every
+/// valid extent that depends on the lane index and is not provably positive
+/// must be non-zero. Null when the store cannot be empty on either lane.
+ExprPtr StoreNonEmptyCondition(const ExprPtr& stored, const AutoDeferState& state, const Span& span) {
+  if (!state.lane_index) return nullptr;
+  auto tile = std::dynamic_pointer_cast<const TileType>(stored->GetType());
+  if (!tile) return nullptr;
+  ExprPtr condition;
+  for (const auto& extent : tile_view_semantics::GetEffectiveTileView(*tile).valid_shape) {
+    if (!extent || IsProvablyPositive(extent)) continue;
+    var_collectors::VarDefUseCollector uses;
+    uses.VisitExpr(extent);
+    if (uses.var_uses.count(state.lane_index.get()) == 0) continue;
+    auto non_empty = MakeNonEmpty(extent, span);
+    condition = condition ? MakeAnd(condition, non_empty, span) : non_empty;
+  }
+  return condition;
+}
+
+/// Guard `stmt` (a store of `store_call`) against an empty lane when needed.
+/// Only a store whose result nothing reads is guarded: a plain `if` would leave
+/// a read result (a later store's destination, a loop yield, a return)
+/// conditionally defined, and guarding it soundly needs a phi over the stored
+/// / not-stored tensor versions. Such a store is left unguarded, as every AUTO
+/// store was before -- ordinary authoring (slice writes into one tensor, a
+/// store inside a loop), where a zero-row store moves nothing in a release
+/// build.
+StmtPtr GuardLaneStore(const StmtPtr& stmt, const CallPtr& store_call, const VarPtr& result,
+                       const AutoDeferState& state) {
+  if (result && state.read_vars.count(result.get()) != 0) return stmt;
+  auto condition = StoreNonEmptyCondition(store_call->args_[0], state, store_call->span_);
+  if (!condition) return stmt;
+  return std::make_shared<IfStmt>(condition, stmt, std::nullopt, std::vector<VarPtr>{}, store_call->span_);
+}
+
+std::vector<StmtPtr> DeferAutoStmts(const std::vector<StmtPtr>& stmts, AutoDeferState& state);
+
+StmtPtr DeferAutoNestedBody(const StmtPtr& body, AutoDeferState& state) {
+  if (!body) return body;
+  auto inner = DeferAutoStmts(transform_utils::FlattenToStmts(body), state);
+  if (inner.size() == 1) return inner[0];
+  return std::make_shared<SeqStmts>(inner, body->span_);
+}
+
+std::vector<ExprPtr> IterArgInits(const std::vector<IterArgPtr>& iter_args) {
+  std::vector<ExprPtr> inits;
+  for (const auto& iter_arg : iter_args) {
+    if (iter_arg) inits.push_back(iter_arg->initValue_);
+  }
+  return inits;
+}
+
+std::vector<StmtPtr> DeferAutoStmts(const std::vector<StmtPtr>& stmts, AutoDeferState& state) {
+  std::vector<StmtPtr> result;
+  result.reserve(stmts.size());
+  for (const auto& stmt : stmts) {
+    if (auto for_stmt = std::dynamic_pointer_cast<const ForStmt>(stmt)) {
+      RejectDeferredShardBinding(IterArgInits(for_stmt->iter_args_), "loop carry", for_stmt->span_, state);
+      auto new_body = DeferAutoNestedBody(for_stmt->body_, state);
+      result.push_back(new_body == for_stmt->body_
+                           ? stmt
+                           : loop_repair::RebuildForStmt(for_stmt, for_stmt->iter_args_, new_body,
+                                                         for_stmt->return_vars_));
+      continue;
+    }
+    if (auto while_stmt = std::dynamic_pointer_cast<const WhileStmt>(stmt)) {
+      RejectDeferredShardBinding(IterArgInits(while_stmt->iter_args_), "loop carry", while_stmt->span_,
+                                 state);
+      auto new_body = DeferAutoNestedBody(while_stmt->body_, state);
+      if (new_body == while_stmt->body_) {
+        result.push_back(stmt);
+      } else {
+        auto new_while = MutableCopy(while_stmt);
+        new_while->body_ = new_body;
+        result.push_back(new_while);
+      }
+      continue;
+    }
+    if (auto if_stmt = std::dynamic_pointer_cast<const IfStmt>(stmt)) {
+      auto new_if = MutableCopy(if_stmt);
+      new_if->then_body_ = DeferAutoNestedBody(if_stmt->then_body_, state);
+      if (if_stmt->else_body_.has_value()) {
+        new_if->else_body_ = DeferAutoNestedBody(*if_stmt->else_body_, state);
+      }
+      result.push_back(new_if);
+      continue;
+    }
+    if (auto seq = std::dynamic_pointer_cast<const SeqStmts>(stmt)) {
+      for (auto& s : DeferAutoStmts(seq->stmts_, state)) result.push_back(s);
+      continue;
+    }
+    if (auto yield = std::dynamic_pointer_cast<const YieldStmt>(stmt)) {
+      RejectDeferredShardBinding(yield->value_, "loop or branch result", yield->span_, state);
+      result.push_back(stmt);
+      continue;
+    }
+    if (auto ret = std::dynamic_pointer_cast<const ReturnStmt>(stmt)) {
+      RejectDeferredShardBinding(ret->value_, "function return", ret->span_, state);
+      result.push_back(stmt);
+      continue;
+    }
+
+    CallPtr call;
+    VarPtr bound;
+    if (auto assign = std::dynamic_pointer_cast<const AssignStmt>(stmt)) {
+      call = AsCall(assign->value_);
+      bound = assign->var_;
+    } else if (auto eval = std::dynamic_pointer_cast<const EvalStmt>(stmt)) {
+      call = AsCall(eval->expr_);
+    }
+    if (!call || !call->op_) {
+      result.push_back(stmt);
+      continue;
+    }
+
+    if (bound && IsOp(call, "tile.get_subblock_idx")) {
+      state.lane_index = bound;
+      result.push_back(stmt);
+      continue;
+    }
+
+    // --- The boundary: a runtime lane extent must not reach the pop. --------
+    if (bound && IsRuntimeExtentShard(call, state.split_dim)) {
+      auto full_type = WithFullSplitAxisValid(bound->GetType(), state.split_dim);
+      auto new_var = std::make_shared<Var>(bound->name_hint_, full_type, bound->span_);
+      auto new_call = std::make_shared<Call>(call->op_, call->args_, call->kwargs_, full_type, call->span_);
+      state.replacements[bound.get()] = new_var;
+      state.deferred.insert(new_var.get());
+      result.push_back(std::make_shared<AssignStmt>(new_var, new_call, stmt->span_));
+      continue;
+    }
+
+    // --- The two consumers that read the deferred box itself. ---------------
+    const bool reads_deferred = !call->args_.empty() && IsDeferredShard(call->args_[0], state);
+    RejectDeferredPadFill(reads_deferred, call, "the first vector op that reads acc");
+    if (IsOp(call, "tile.store") && !call->args_.empty()) {
+      RejectDeferredValidStore(reads_deferred, call);
+      result.push_back(GuardLaneStore(stmt, call, bound, state));
+      continue;
+    }
+    result.push_back(stmt);
+  }
+  return result;
+}
+
+/// Whether any Cube -> Vector shard in `body` has lane extents only known at runtime.
+class RuntimeLaneExtentShardFinder : public IRVisitor {
+ public:
+  explicit RuntimeLaneExtentShardFinder(int split_dim) : split_dim_(split_dim) {}
+  [[nodiscard]] bool Found() const { return found_; }
+
+ protected:
+  void VisitExpr_(const CallPtr& op) override {
+    if (!found_) found_ = IsRuntimeExtentShard(op, split_dim_);
+    IRVisitor::VisitExpr_(op);
+  }
+
+ private:
+  int split_dim_;
+  bool found_ = false;
+};
+
+}  // namespace
+
+std::vector<StmtPtr> DeferAutoRuntimeShardExtents(const std::vector<StmtPtr>& stmts, int split_dim,
+                                                  const Span& span) {
+  RuntimeLaneExtentShardFinder finder(split_dim);
+  for (const auto& stmt : stmts) finder.VisitStmt(stmt);
+  if (!finder.Found()) return stmts;
+
+  AutoDeferState state;
+  state.split_dim = split_dim;
+  var_collectors::VarDefUseCollector reads;
+  for (const auto& stmt : stmts) reads.VisitStmt(stmt);
+  state.read_vars = std::move(reads.var_uses);
+  auto result = DeferAutoStmts(stmts, state);
+  if (state.replacements.empty()) return result;
+  StmtPtr body = (result.size() == 1) ? result[0] : std::make_shared<SeqStmts>(result, span);
   return transform_utils::FlattenToStmts(transform_utils::Substitute(body, state.replacements));
 }
 

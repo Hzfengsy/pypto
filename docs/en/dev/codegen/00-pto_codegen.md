@@ -296,7 +296,7 @@ or call `set_validshape` on the source tile before taking the view.
   tpop result is not a locally bound PTOAS tile, so `pto.set_validshape` cannot restore it in place).
   The split-axis extent is one exception: it stays per-lane on the TPOP operands, because that is
   what tells the ISA where lane 1's band begins — which is also why a per-lane extent the compiler
-  could not verify must never get there. A `pl.split_aiv` boundary whose split-axis extent is a
+  could not verify must never get there. A `pl.split` or `pl.split_aiv` boundary whose split-axis extent is a
   runtime value keeps the FULL box on the popped tile (`split_axis::WithFullSplitAxisValid`) so the
   even code's band lands on the box half, and carries the lane's own extent on the consumers
   instead.
@@ -309,14 +309,19 @@ or call `set_validshape` on the source tile before taking the view.
   (issue #2510). The rows past `validRow` stay stale in the slot, which is what a narrowed
   `valid_shape` already promises about its invalid region, and the transport moves `validRow` rows
   instead of the whole box.
-- A **split** Acc-to-Vec transport cannot take that route: lane 1 reads the band starting at the box
-  half, which exists only if the producer wrote the full box — and writing it means reading L0C at
-  the physical pitch, which is not the pitch `mad` used. The two requirements are mutually exclusive,
-  so a row-narrowed compact accumulator crossing a `pl.split` / `pl.split_aiv` boundary is **rejected**
-  with a message naming both DSL alternatives (narrow the result instead of the operand, or stage the
-  accumulator through GM), rather than lowered into silently skewed data — measured on device at 1808
-  of 8192 elements wrong before the refusal. The refusal is gated on the pitches actually differing,
-  so a single-fractal-block accumulator (`ceil(validRow/16)*16 == Rows`) keeps crossing as before.
+- A **split** Acc-to-Vec transport of a *compact* tile keeps the producer's rows too on a backend
+  whose lanes locate their own band in a GM slot (A2/A3). No lane reads a
+  slot row at or past `validRow` as data — a lane's band is `clamp(V - lane * S, 0, S)` rows starting
+  at `lane * S`, with `S` the balanced `ceil(V / 2)` for a static extent and the box half for a
+  deferred one — so the box rows were never needed, and widening them skews the compact L0C read
+  exactly as above (1792 of 2048 valid elements wrong for a 64-row box valid to 16 across
+  `pl.split(UP_DOWN)`). A non-compact tile reads L0C at `Rows` whatever its `validRow`, so its split
+  transport keeps the full box. Where the push splits the rows between the lanes in hardware
+  (`BackendHandler::SplitsCubeToVectorTransportInHardware`, A5's dual-mode TMOV), the transported
+  rows *are* the lane partition, so a split push keeps the box and a compact tile whose two pitches
+  differ is **rejected** there. A *runtime* row extent is transported the same way: both the
+  `pl.split` and the `pl.split_aiv` forms then pop the full box (see the popped-tile rule above);
+  lane 1 loads its whole half, and the rows past the valid extent are stale but never treated as data.
 - When a tpop result `TileView.valid_shape` differs from the physical tile shape, PTO codegen emits PTOAS frontend operands as `%buf = pto.tpop_from_*(%valid_row, %valid_col) {[id = I, ]split = N} -> !pto.tile_buf<..., v_row=?, v_col=?, ...>`. This covers dynamic expressions and static non-full shapes such as `[0, 0]`; the operands carry the logical extents used by compute and store. The full-box Cube-to-Vector transport above overrides this for a statically-shaped, non-empty partial pop, because `pto.treshape` carries no valid-row/valid-col operands and so can only restore *static* logical extents.
 - For split consumers of a hand-written pop, `SplitVectorKernel` localizes those dynamic tpop
   valid-shape operands per subblock (for example global `[8, 16]` becomes

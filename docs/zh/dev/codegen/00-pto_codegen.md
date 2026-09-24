@@ -280,7 +280,7 @@ tile 调用 `set_validshape`。
   shape——消费侧通过纯元数据的 `pto.treshape` 恢复（前端 tpop 结果不是 PTOAS 的本地
   绑定 tile，`pto.set_validshape` 无法就地修改它）。第一个例外是切分轴上的 extent：它必须保持
   逐 lane 的值并留在 TPOP 操作数上，因为 ISA 正是靠它定位 lane 1 的数据段起点——也正因如此，
-  编译期无法核验的逐 lane extent 绝不能到达那里。`pl.split_aiv` 区域中切分轴 extent 为运行期
+  编译期无法核验的逐 lane extent 绝不能到达那里。`pl.split` 或 `pl.split_aiv` 中切分轴 extent 为运行期
   值的边界，会让被弹出的 tile 保留完整 box（`split_axis::WithFullSplitAxisValid`），使偶数
   code 的数据段落在 box 的一半处，而把 lane 自身的 extent 交给消费者携带。
 - 第二个例外是**非切分** Acc-to-Vec TPUSH 的**行**维度：它必须保持 producer 写入时
@@ -291,13 +291,19 @@ tile 调用 `set_validshape`。
   box 只有 16 行有效时，fractal `j` 会读到 `4j`（issue #2510）。超出 `validRow` 的行
   会在 slot 中保留旧数据，这正是窄化 `valid_shape` 对其无效区域给出的承诺，同时传输
   量也从整个 box 降到 `validRow` 行。
-- **切分**的 Acc-to-Vec 传输走不了这条路：lane 1 从 box 一半处开始读自己的数据段，而
-  该数据段只有在 producer 写满整个 box 时才存在——但写满 box 就意味着按物理 pitch 读
-  L0C，而那并不是 `mad` 使用的 pitch。二者互斥，因此行窄化的 compact 累加器跨
-  `pl.split` / `pl.split_aiv` 边界时会被**拒绝**，并给出指明两种 DSL 替代写法的报错
-  （窄化结果而非操作数，或让累加器经 GM 中转），而不是下降成静默错位的数据——在加入该
-  拒绝之前，设备上实测 8192 个元素中有 1808 个是错的。该拒绝以 pitch 确实不同为前提，
-  因此单个 fractal 行块的累加器（`ceil(validRow/16)*16 == Rows`）仍可照常跨越。
+- 在各 lane 于 GM slot 中自行定位数据段的后端（A2/A3）上，**切分**的 Acc-to-Vec 传输对
+  *compact* tile 同样保持 producer 的行数。没有任何 lane 会把
+  slot 中位于 `validRow` 及之后的行当作数据读取——一个 lane 的数据段是从 `lane * S` 开始的
+  `clamp(V - lane * S, 0, S)` 行，其中 extent 为静态时 `S` 是均衡的 `ceil(V / 2)`，延迟
+  （deferred）时是 box 的一半——因此从来不需要 box 的其余行，而把行扩成 box 会像上面一样
+  使 compact 的 L0C 读取错位（64 行 box 只有 16 行有效、跨 `pl.split(UP_DOWN)` 时，2048 个
+  有效元素中有 1792 个是错的）。非 compact 的 tile 无论 `validRow` 为何都按 `Rows` 读取
+  L0C，因此其切分传输仍保持完整 box。在由硬件把行拆给两个 lane 的后端上
+  （`BackendHandler::SplitsCubeToVectorTransportInHardware`，即 A5 的 dual-mode TMOV），
+  传输的行数*就是* lane 划分，因此切分 push 保持完整 box，两种 pitch 不同的 compact tile
+  在该后端上会被**拒绝**。*运行期*行 extent 也按同样方式传输：`pl.split` 和
+  `pl.split_aiv` 两种形式随后都会 pop 完整 box（见上文 popped tile 规则）；lane 1 载入它的整个
+  一半，超出有效 extent 的行是旧数据，但从不被当作数据使用。
 - 当 tpop 结果的 `TileView.valid_shape` 与物理 tile shape 不一致时，PTO codegen 会生成 PTOAS 前端操作数：`%buf = pto.tpop_from_*(%valid_row, %valid_col) {[id = I, ]split = N} -> !pto.tile_buf<..., v_row=?, v_col=?, ...>`。这同时覆盖动态表达式和 `[0, 0]` 这类静态非满形状；operand 携带后续计算和 store 使用的逻辑范围。对于静态形状、非空的部分 pop，上述 Cube-to-Vector 完整 box 传输优先，因为 `pto.treshape` 不带 valid-row/valid-col operand，只能恢复*静态*逻辑范围。
 - 对于手写 pop 的 split consumer，`SplitVectorKernel` 会按 subblock 本地化这些动态
   tpop valid-shape operand（例如 `[16, 16]` tile 做上下切分时，全局

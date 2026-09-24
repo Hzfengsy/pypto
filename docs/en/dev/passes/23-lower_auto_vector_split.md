@@ -415,8 +415,12 @@ not part of an op's type function). `LocalizeExplicitBoundaryValid` repairs that
 guess here, where the region's `aiv_id` is in scope, and carries the per-lane
 extent to consumers that pass `valid_shape` through; one that reshapes the
 logical rectangle is rejected with its span. The AUTO arm applies the same *extent* repair through
-`LocalizeShardValidForLane`, but not the store guard below — its consumers are
-rebuilt by the halving walk rather than by this one.
+`LocalizeShardValidForLane`; a body whose shard has a runtime extent then goes
+through `DeferAutoRuntimeShardExtents`, which gives that shard the full-box pop and
+guards a store whose lane may be empty, as the region form does, while its consumers
+and loop carries keep the types the halving already gave them. A store whose result is
+read afterwards (a chained store, a loop yield, a return) is the exception: guarding it
+would leave that result conditionally defined, so `pl.split` leaves it unguarded as before.
 
 - **The two lanes' extents must be placeable.** The split-axis extent is not a
   free field: pto-isa derives lane 1's band from the popped tile's own valid
@@ -431,10 +435,11 @@ rebuilt by the halving walk rather than by this one.
   compile-time attr, but which one the lanes need depends on their *runtime*
   extents: 12 of a 16-row axis leaves them at 8 and 4, 16 leaves them at 8 and 8.
   No code is right for both, so the boundary op does not carry a per-lane extent
-  at all — `LocalizeExplicitBoundaryValid` gives it the full box
-  (`split_axis::WithFullSplitAxisValid`) and moves the lane's extent onto the
-  first consumer. That pairs exactly with the even code: the producer transports
-  the full physical box, so lane 1's band sits at the box half and the even code
+  at all — `LocalizeExplicitBoundaryValid` (region form) and
+  `DeferAutoRuntimeShardExtents` (`pl.split`) give it the full box
+  (`split_axis::WithFullSplitAxisValid`) and the lane's extent rides on its
+  consumers. That pairs exactly with the even code: the producer lays its rows at
+  their box positions, so lane 1's band sits at the box half and the even code
   points there, whatever the extent turns out to be. Confirmed on a2a3 for every
   extent 1..16 of a 16-row boundary. The [pto-isa
   pop](https://github.com/hw-native-sys/pto-isa/issues/263) does place lane 1 at
