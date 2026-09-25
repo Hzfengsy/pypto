@@ -20,10 +20,13 @@ same way it surfaces a Submit's. The forward-sticky ``pl.dump_tag`` statement
 itself is covered in ``test_dump_tag_dsl.py``.
 """
 
+import ast
+
 import pypto.language as pl
 import pytest
 from pypto import ir
-from pypto.language.parser.diagnostics import ParserTypeError
+from pypto.language.parser.ast_parser import ASTParser
+from pypto.language.parser.diagnostics import ParserSyntaxError, ParserTypeError
 
 
 def _kernel_calls(program: ir.Program, callee_name: str = "kernel") -> list[ir.Call]:
@@ -208,6 +211,205 @@ def test_at_dumps_records_dump_vars_on_scope() -> None:
 
     printed = P.as_python()
     assert "dumps=[a]" in printed, printed
+
+
+def _spmd_dumps_with() -> ir.Program:
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def orch(
+            self,
+            a: pl.Tensor[[512, 128], pl.FP32],
+            out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+        ) -> pl.Tensor[[512, 128], pl.FP32]:
+            with pl.spmd(4, dumps=[a]):
+                i = pl.tile.get_block_idx()
+                t: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [i * 128, 0], [128, 128])
+                out = pl.store(t, [i * 128, 0], out)
+            return out
+
+    return P
+
+
+def _spmd_dumps_as_tid() -> ir.Program:
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def orch(
+            self,
+            a: pl.Tensor[[512, 128], pl.FP32],
+            out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+        ) -> pl.Tensor[[512, 128], pl.FP32]:
+            with pl.spmd(4, dumps=[a]) as tid:  # noqa: F841 — the capture selects the `as tid` form
+                i = pl.tile.get_block_idx()
+                t: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [i * 128, 0], [128, 128])
+                out = pl.store(t, [i * 128, 0], out)
+            return out
+
+    return P
+
+
+def _spmd_dumps_for() -> ir.Program:
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def orch(
+            self,
+            a: pl.Tensor[[512, 128], pl.FP32],
+            out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+        ) -> pl.Tensor[[512, 128], pl.FP32]:
+            for i in pl.spmd(4, dumps=[a]):
+                t: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [i * 128, 0], [128, 128])
+                out = pl.store(t, [i * 128, 0], out)
+            return out
+
+    return P
+
+
+def _cluster_dumps() -> ir.Program:
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def orch(
+            self,
+            a: pl.Tensor[[64, 64], pl.FP32],
+            b: pl.Tensor[[64, 64], pl.FP32],
+            d: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+        ) -> pl.Tensor[[64, 64], pl.FP32]:
+            with pl.cluster(dumps=[a]):
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    mm = pl.matmul(a, b, out_dtype=pl.FP32)
+                    d = pl.add(mm, b)
+            return d
+
+    return P
+
+
+def _cluster_dumps_with_name_hint() -> ir.Program:
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def orch(
+            self,
+            a: pl.Tensor[[64, 64], pl.FP32],
+            b: pl.Tensor[[64, 64], pl.FP32],
+            d: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+        ) -> pl.Tensor[[64, 64], pl.FP32]:
+            with pl.cluster(name_hint="grp", dumps=[a]):
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    mm = pl.matmul(a, b, out_dtype=pl.FP32)
+                    d = pl.add(mm, b)
+            return d
+
+    return P
+
+
+def _graph_dumps() -> ir.Program:
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def orch(
+            self,
+            a: pl.Tensor[[16, 16], pl.FP32],
+            d: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            with pl.graph("g", dumps=[a]):
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    d = pl.add(a, a)
+            return d
+
+    return P
+
+
+@pytest.mark.parametrize(
+    ("build", "header"),
+    [
+        (_spmd_dumps_with, "pl.spmd(4, dumps=[a]):"),
+        (_spmd_dumps_as_tid, "pl.spmd(4, dumps=[a]) as tid:"),
+        (_spmd_dumps_for, "pl.spmd(4, dumps=[a]):"),
+        (_cluster_dumps, "pl.cluster(dumps=[a]):"),
+        (_cluster_dumps_with_name_hint, 'pl.cluster(name_hint="grp", dumps=[a]):'),
+        (_graph_dumps, 'pl.graph("g", dumps=[a]):'),
+    ],
+    ids=["spmd_with", "spmd_as_tid", "spmd_for", "cluster", "cluster_name_hint", "graph"],
+)
+def test_container_scope_dumps_round_trips(build, header: str) -> None:
+    """``dumps=[t]`` on ``pl.spmd`` (all three forms), ``pl.cluster`` and
+    ``pl.graph`` records ``t`` on that construct's own ScopeStmt — not on a nested
+    or auto-synthesised InCore — and prints back on the same header, so the mark
+    survives print -> reparse."""
+    program = build()
+    outer = program.get_function("orch").body.stmts[0]
+    if isinstance(outer, ir.AssignStmt):  # `as tid` placeholder precedes the scope
+        outer = program.get_function("orch").body.stmts[1]
+    assert [v.name_hint for v in outer.attrs["dump_vars"]] == ["a"]
+    assert "dump_vars" not in dict(outer.body.attrs), "dumps= must not leak onto the inner carrier"
+
+    printed = program.as_python()
+    assert header in printed, printed
+    ir.assert_structural_equal(program, pl.parse_program(printed))
+
+
+@pytest.mark.parametrize(
+    ("api", "scope"),
+    [
+        ("pl.spmd", "pl.spmd(4, dumps=[n])"),
+        ("pl.cluster", "pl.cluster(dumps=[n])"),
+        ("pl.graph", 'pl.graph("g", dumps=[n])'),
+    ],
+)
+def test_container_scope_dumps_rejects_non_tensor(api: str, scope: str) -> None:
+    """A non-tensor ``dumps=`` entry is rejected with the construct's own name."""
+    source = f"""
+@pl.program
+class P:
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def orch(
+        self,
+        a: pl.Tensor[[16, 16], pl.FP32],
+        n: pl.Scalar[pl.INT32],
+        d: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+    ) -> pl.Tensor[[16, 16], pl.FP32]:
+        with {scope}:
+            with pl.at(level=pl.Level.CORE_GROUP):
+                d = pl.add(a, a)
+        return d
+"""
+    with pytest.raises(ParserTypeError, match=rf"{api}\(dumps=\[\.\.\.\]\) entry 'n' is not a tensor"):
+        pl.parse_program(source)
+
+
+@pytest.mark.parametrize(
+    ("api", "call"),
+    [
+        ("pl.spmd", "pl.spmd(4, dumps={first}, dumps={second})"),
+        ("pl.cluster", "pl.cluster(dumps={first}, dumps={second})"),
+        ("pl.graph", 'pl.graph("g", dumps={first}, dumps={second})'),
+    ],
+)
+@pytest.mark.parametrize(("first", "second"), [("[]", "[a]"), ("[a]", "[n]")])
+def test_container_scope_rejects_duplicate_dumps(api: str, call: str, first: str, second: str) -> None:
+    """Direct AST parsing rejects duplicates, including after an empty first list."""
+    scope = call.format(first=first, second=second)
+    source = f"""
+def orch(
+    a: pl.Tensor[[16, 16], pl.FP32],
+    n: pl.Scalar[pl.INT32],
+    d: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+) -> pl.Tensor[[16, 16], pl.FP32]:
+    with {scope}:
+        with pl.at(level=pl.Level.CORE_GROUP):
+            d = pl.add(a, a)
+    return d
+"""
+    # ast.parse retains duplicate keywords. pl.parse_program compiles first,
+    # where Python rejects them before ASTParser sees the function.
+    func_def = ast.parse(source).body[0]
+    assert isinstance(func_def, ast.FunctionDef)
+    parser = ASTParser("<duplicate_dumps>", source.splitlines(), 0, 0)
+    with pytest.raises(ParserSyntaxError, match="got multiple values for argument 'dumps'") as exc:
+        parser.parse_function(func_def, func_type=ir.FunctionType.Orchestration)
+    assert f"{api}()" in str(exc.value)
 
 
 def test_at_dumps_rejects_non_tensor() -> None:
