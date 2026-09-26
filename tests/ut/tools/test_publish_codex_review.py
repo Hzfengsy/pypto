@@ -718,7 +718,10 @@ def workflow_expression(expression, context, *, cancelled=False, success=True):
             return left != right
         raise AssertionError(f"Unsupported workflow expression: {ast.dump(node)}")
 
-    expression = expression.removeprefix("${{").removesuffix("}}")
+    if expression.startswith("${{"):
+        expression = expression[3:]
+    if expression.endswith("}}"):
+        expression = expression[:-2]
     expression = expression.replace("&&", "and").replace("||", "or").replace("== false", "== False")
     expression = re.sub(r"!(?!=)", "not ", expression)
     tree = ast.parse(expression.strip(), mode="eval")
@@ -796,6 +799,22 @@ def test_invalidation_is_independent_of_review_cancellation(workflow):
     assert jobs["publish"]["concurrency"]["cancel-in-progress"] is True
     groups = [jobs[name]["concurrency"]["group"] for name in ("invalidate", "review", "publish")]
     assert len(set(groups)) == 3
+
+
+@pytest.mark.parametrize(
+    "script_name",
+    ["publish_codex_review", "prepare_codex_review", "manage_codex_review_session", "perf_guard"],
+)
+def test_ci_helpers_import_on_supported_python(monkeypatch, script_name):
+    """Exercise actual imports on the CI matrix, including evaluated type annotations."""
+    scripts = Path(__file__).resolve().parents[3] / ".github/scripts"
+    path = scripts / f"{script_name}.py"
+    ast.parse(path.read_text(), filename=str(path), feature_version=8)
+    monkeypatch.syspath_prepend(str(scripts))
+    spec = importlib.util.spec_from_file_location(script_name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
 
 
 def test_review_workflow_has_no_merge_permission(workflow):

@@ -102,6 +102,12 @@ head 已更新时，会跳过审查和产物发布。GitHub 状态仍可能在�
 - 监听 relay 端口 `17895` 且健康的 `pypto-codex-proxy-relay` 容器
 - 仅监听 loopback 的 mixed proxy `127.0.0.1:7895`
 
+`.github/scripts/` 中的独立 CI 辅助脚本支持 Python 3.8 及更新版本。
+脚本延迟求值类型注解，避免导入时依赖 Python 3.9 的内置泛型或 Python 3.10 的联合类型
+运算符。该兼容范围仅限这些宿主机脚本；PyPTO 本身仍要求 Python 3.10 及更新版本。
+CI 会在 Python 3.8 和 3.10 上运行辅助脚本测试，无需构建 PyPTO。审查工作流使用
+宿主机解释器，不安装 Python，也不依赖审查容器内的 Python 版本。
+
 Codex 在只读容器中以 UID/GID `1002:1003` 运行；仓库以只读方式挂载，同时移除
 能力（capability）、实施资源限制并使用内部 Docker 网络。拥有 PR 写权限的 GitHub
 令牌（token）仅提供给独立的发布任务（publishing job）。如果审查输出包含 Codex
