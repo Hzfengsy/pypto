@@ -401,5 +401,34 @@ class TestWhileLoopRoundTrip:
         assert "pl.tile.create_tile(" not in printed
 
 
+@pytest.mark.parametrize("memory", ["", ", pl.Mem.Vec"])
+@pytest.mark.parametrize("explicit_view", [False, True])
+def test_tile_assignment_full_box_view_overrides_inference(memory, explicit_view):
+    """Explicit full views override a narrowed RHS even after canonicalization."""
+    view = ", pl.TileView()" if explicit_view else ""
+    source = f"""
+import pypto.language as pl
+
+@pl.function
+def main(x: pl.Tile[[16, 128], pl.FP32{memory}, pl.TileView(valid_shape=[8, 128])]):
+    y: pl.Tile[[16, 128], pl.FP32{memory}{view}] = pl.tile.exp(x)
+"""
+    function = parse(source)
+    assert isinstance(function, ir.Function)
+    assert isinstance(function.body, ir.AssignStmt)
+    tile_type = function.body.var.type
+    assert isinstance(tile_type, ir.TileType)
+    if explicit_view:
+        assert tile_type.tile_view is None
+    else:
+        assert tile_type.tile_view is not None
+        rows = tile_type.tile_view.valid_shape[0]
+        assert isinstance(rows, ir.ConstInt) and rows.value == 8
+    for explicit_layout in (False, True):
+        printed = ir.python_print(function, explicit_layout=explicit_layout)
+        reparsed = parse("import pypto.language as pl\n" + printed)
+        ir.assert_structural_equal(function, reparsed)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

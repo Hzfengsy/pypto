@@ -406,7 +406,11 @@ tile_with_view = ir.TileType(shape, DataType.FP16, memref, tile_view, ir.Mem.Lef
 对于 Python DSL 类型标注，省略的 `TileView` 语法会被规范化为一个隐式
 TileView：它由 tile shape 以及（如果存在）tile memory space 推导得到。
 像 `pl.TileView()` 这样的冗余显式默认写法，会与省略写法被视为语义等价，
-并且在 printer 输出时可能统一成规范形式。`TileView.compact` 记录部分有效的
+并且在 printer 输出时可能统一成规范形式。但在带类型标注的赋值中，省略
+`TileView` 会继承右侧表达式推导的 view；显式写出 `pl.TileView()` 则选择完整的
+隐式 view，即使它在 IR 中被规范化为无显式 view。打印器会在完整 view 的 tile
+赋值上保留 `pl.TileView()`，以区分这两种语义。
+`TileView.compact` 记录部分有效的
 boxed tile 是采用 PTO 的有效区域紧凑表示（`CompactMode.normal`），还是普通的
 物理 box 表示（默认的 `CompactMode.null`）。它只在 fractal 空间——`Left` / `Right` /
 `Acc`——有意义，因为它本身描述的就是 N-fractal pitch；`AccCompactValid` 校验器会拒绝
