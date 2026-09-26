@@ -53,22 +53,6 @@ def api(publisher, monkeypatch):
             "changed_files": 1,
         },
         "files": [{"filename": "src/example.cpp"}],
-        "rules": [
-            {
-                "type": "pull_request",
-                "parameters": {
-                    "dismiss_stale_reviews_on_push": True,
-                    "required_approving_review_count": 1,
-                },
-            },
-            {
-                "type": "required_status_checks",
-                "parameters": {
-                    "strict_required_status_checks_policy": True,
-                    "required_status_checks": [{"context": "unit-tests", "integration_id": 15368}],
-                },
-            },
-        ],
         "reviews": [],
         "comments": [],
         "posted": [],
@@ -79,6 +63,7 @@ def api(publisher, monkeypatch):
     def request(endpoint, payload=None, *, paginate=False):
         """Return API fixtures and inject the requested publication race."""
         if payload is not None:
+            assert endpoint.endswith("/reviews"), "Review publishing must not merge pull requests"
             state["posted"].append(payload)
             if state.get("retarget_at") == "post":
                 state["pr"]["base"]["ref"] = "release"
@@ -87,20 +72,25 @@ def api(publisher, monkeypatch):
             assert paginate
             return state["files"]
         if "/rules/" in endpoint:
-            assert paginate
-            return state["rules"]
+            raise AssertionError("Review approval must not depend on branch protection rules")
         if "/reviews?" in endpoint:
             return state["reviews"]
         if "/comments?" in endpoint:
             assert paginate
             return state["comments"]
         if "/compare/" in endpoint:
-            return {"merge_base_commit": {"sha": "e" * 40}}
+            base_sha = endpoint.split("/compare/", 1)[1].split("...", 1)[0]
+            if state.get("invalid_merge_base"):
+                return {"merge_base_commit": {"sha": "invalid"}}
+            changed = state.get("merge_base_changed") and base_sha != BASE
+            return {"merge_base_commit": {"sha": ("f" if changed else "e") * 40}}
         state["reads"] += 1
         if state.get("retarget_at") == state["reads"]:
             state["pr"]["base"]["ref"] = "release"
         if state.get("change_at") == state["reads"]:
             state["pr"]["head"]["sha"] = "c" * 40
+        if state.get("base_change_at") == state["reads"]:
+            state["pr"]["base"]["sha"] = "d" * 40
         return json.loads(json.dumps(state["pr"]))
 
     def run(command, **kwargs):
@@ -202,35 +192,31 @@ def test_unanchored_review_needs_no_metadata(
     assert api["posted"][0]["event"] == "COMMENT"
 
 
-@pytest.mark.parametrize("failure", ["request", "json", "missing", "invalid"])
-def test_optional_merge_base_failure_keeps_findings(
+@pytest.mark.parametrize("failure", ["request", "json", "missing"])
+def test_merge_base_lookup_failure_keeps_findings(
     publisher, review_file, api, located_review, monkeypatch, failure
 ):
-    """A failed optional lookup is attempted once and cannot block summary publication."""
+    """A failed diff check keeps findings visible without approving."""
     finding = located_review({"path": "src/example.cpp", "line": 500, "side": "LEFT"})
-    review = json.loads(review_file.read_text())
-    review["findings"].append({**finding, "title": "Second finding"})
-    review_file.write_text(json.dumps(review))
     request = publisher.github_api
-    calls = []
 
     def fail_compare(endpoint, *args, **kwargs):
         if "/compare/" in endpoint:
-            calls.append(endpoint)
             if failure == "request":
                 raise publisher.subprocess.CalledProcessError(1, ["gh", "api"])
             if failure == "json":
                 raise json.JSONDecodeError("Invalid response", "", 0)
-            return {} if failure == "missing" else {"merge_base_commit": {"sha": "invalid"}}
+            return {}
         return request(endpoint, *args, **kwargs)
 
     monkeypatch.setattr(publisher, "github_api", fail_compare)
     publisher.publish(review_file, "owner/repo", "12", HEAD, BASE, "main", True)
     posted = api["posted"][0]
-    assert len(calls) == 1
-    assert finding["body"] in posted["body"] and "Second finding" in posted["body"]
-    assert "src/example.cpp:500 (LEFT)" in posted["body"]
-    assert "/blob/" not in posted["body"] and posted["event"] == "COMMENT"
+    assert posted["event"] == "COMMENT"
+    assert finding["body"] in posted["body"]
+    assert "Cannot verify that the reviewed PR diff is current" in posted["body"]
+    assert "/blob/" not in posted["body"]
+    assert not posted.get("comments")
 
 
 @pytest.mark.parametrize("endpoint_part", ["/files?", "/comments?"])
@@ -358,8 +344,8 @@ def test_inline_size_budget(publisher, review_file, api, located_review):
     assert not api["posted"]
 
 
-def test_clean_review_approves_exact_commit(publisher, review_file, api):
-    """Bind a valid approval to exactly the reviewed head commit."""
+def test_clean_review_approves_exact_commit_without_branch_rules(publisher, review_file, api):
+    """Bind a clean review to the examined commit without reading merge rules."""
     assert publisher.publish(review_file, "owner/repo", "12", HEAD, BASE, "main", True).startswith("Approved")
     assert api["posted"][0]["event"] == "APPROVE"
     assert api["posted"][0]["commit_id"] == HEAD
@@ -466,33 +452,12 @@ def test_policy_changes_require_human_review(publisher, review_file, api, path, 
     "gate",
     [
         "disabled",
-        "no_rules",
-        "stale_allowed",
-        "zero_approvals",
-        "missing_approval_count",
-        "no_check_rule",
-        "non_strict_checks",
-        "empty_checks",
         "truncated_files",
         "no_files",
     ],
 )
-def test_policy_gates_fail_closed(publisher, review_file, api, gate):
-    """Withhold approval when a required safety gate is absent."""
-    if gate == "no_rules":
-        api["rules"] = []
-    if gate == "stale_allowed":
-        api["rules"][0]["parameters"]["dismiss_stale_reviews_on_push"] = False
-    if gate == "zero_approvals":
-        api["rules"][0]["parameters"]["required_approving_review_count"] = 0
-    if gate == "missing_approval_count":
-        del api["rules"][0]["parameters"]["required_approving_review_count"]
-    if gate == "no_check_rule":
-        api["rules"] = api["rules"][:1]
-    if gate == "non_strict_checks":
-        api["rules"][1]["parameters"]["strict_required_status_checks_policy"] = False
-    if gate == "empty_checks":
-        api["rules"][1]["parameters"]["required_status_checks"] = []
+def test_review_gates_fail_closed(publisher, review_file, api, gate):
+    """Withhold approval when a required review input is absent."""
     if gate == "truncated_files":
         api["pr"]["changed_files"] = 2
     if gate == "no_files":
@@ -502,10 +467,10 @@ def test_policy_gates_fail_closed(publisher, review_file, api, gate):
     assert api["posted"][0]["event"] == "COMMENT"
 
 
-@pytest.mark.parametrize("change", ["head", "base", "draft", "closed"])
+@pytest.mark.parametrize("change", ["head", "draft", "closed"])
 def test_obsolete_or_closed_pr_skipped(publisher, review_file, api, change):
     """Skip artifacts whose PR state no longer matches the review event."""
-    if change in {"head", "base"}:
+    if change == "head":
         api["pr"][change]["sha"] = "d" * 40
     elif change == "draft":
         api["pr"]["draft"] = True
@@ -513,6 +478,106 @@ def test_obsolete_or_closed_pr_skipped(publisher, review_file, api, change):
         api["pr"]["state"] = "closed"
     publisher.publish(review_file, "owner/repo", "12", HEAD, BASE, "main", True)
     assert not api["posted"]
+
+
+@pytest.mark.parametrize("base_change_at", [1, 2, 3])
+def test_base_advance_does_not_invalidate_approval(publisher, review_file, api, base_change_at):
+    """A base-branch commit must not invalidate a review of the same PR head."""
+    api["base_change_at"] = base_change_at
+    assert publisher.publish(review_file, "owner/repo", "12", HEAD, BASE, "main", True).startswith("Approved")
+    assert api["pr"]["base"]["sha"] != BASE
+    assert api["posted"][0]["event"] == "APPROVE"
+    assert not api["dismissed"]
+
+
+@pytest.mark.parametrize("base_change_at", [1, 2, 3])
+def test_merge_base_change_blocks_stale_approval(publisher, review_file, api, base_change_at):
+    """Reject a base rewrite that changes the diff despite an unchanged PR head."""
+    api["base_change_at"] = base_change_at
+    api["merge_base_changed"] = True
+    publisher.publish(review_file, "owner/repo", "12", HEAD, BASE, "main", True)
+    if base_change_at == 3:
+        assert api["posted"][0]["event"] == "APPROVE"
+        assert len(api["dismissed"]) == 1
+        assert "/reviews/42/dismissals" in api["dismissed"][0][2]
+    else:
+        assert api["posted"][0]["event"] == "COMMENT"
+        assert "Cannot verify that the reviewed PR diff is current" in api["posted"][0]["body"]
+
+
+def test_invalid_merge_base_fails_closed(publisher, review_file, api):
+    """Do not publish an approval from an invalid GitHub compare response."""
+    api["invalid_merge_base"] = True
+    publisher.publish(review_file, "owner/repo", "12", HEAD, BASE, "main", True)
+    assert api["posted"][0]["event"] == "COMMENT"
+
+
+@pytest.mark.parametrize("failure_at", [3, 4])
+def test_compare_failure_around_publication(publisher, review_file, api, monkeypatch, failure_at):
+    """Comment before posting or dismiss approval if diff verification fails later."""
+    request = publisher.github_api
+    compare_reads = 0
+
+    def fail_late_compare(endpoint, *args, **kwargs):
+        nonlocal compare_reads
+        if "/compare/" in endpoint:
+            compare_reads += 1
+            if compare_reads == failure_at:
+                raise publisher.subprocess.CalledProcessError(1, ["gh", "api"])
+        return request(endpoint, *args, **kwargs)
+
+    monkeypatch.setattr(publisher, "github_api", fail_late_compare)
+    publisher.publish(review_file, "owner/repo", "12", HEAD, BASE, "main", True)
+    if failure_at == 3:
+        assert api["posted"][0]["event"] == "COMMENT"
+        assert not api["dismissed"]
+    else:
+        assert api["posted"][0]["event"] == "APPROVE"
+        assert len(api["dismissed"]) == 1
+        assert "/reviews/42/dismissals" in api["dismissed"][0][2]
+
+
+def test_prepost_compare_failure_moves_findings_to_summary(
+    publisher, review_file, api, located_review, monkeypatch
+):
+    """Avoid inline anchors when the reviewed diff cannot be verified."""
+    finding = located_review({"path": "src/example.cpp", "line": 21, "side": "RIGHT"})
+    request = publisher.github_api
+    compare_reads = 0
+
+    def fail_prepost_compare(endpoint, *args, **kwargs):
+        nonlocal compare_reads
+        if "/compare/" in endpoint:
+            compare_reads += 1
+            if compare_reads == 3:
+                raise publisher.subprocess.CalledProcessError(1, ["gh", "api"])
+        return request(endpoint, *args, **kwargs)
+
+    monkeypatch.setattr(publisher, "github_api", fail_prepost_compare)
+    publisher.publish(review_file, "owner/repo", "12", HEAD, BASE, "main", True)
+    posted = api["posted"][0]
+    assert posted["event"] == "COMMENT"
+    assert finding["body"] in posted["body"]
+    assert not posted.get("comments")
+
+
+def test_post_publication_pr_read_failure_dismisses_approval(publisher, review_file, api, monkeypatch):
+    """Dismiss an approval if GitHub cannot confirm the PR after posting."""
+    request = publisher.github_api
+    pr_reads = 0
+
+    def fail_final_read(endpoint, *args, **kwargs):
+        nonlocal pr_reads
+        if endpoint == "repos/owner/repo/pulls/12":
+            pr_reads += 1
+            if pr_reads == 3:
+                raise publisher.subprocess.CalledProcessError(1, ["gh", "api"])
+        return request(endpoint, *args, **kwargs)
+
+    monkeypatch.setattr(publisher, "github_api", fail_final_read)
+    publisher.publish(review_file, "owner/repo", "12", HEAD, BASE, "main", True)
+    assert api["posted"][0]["event"] == "APPROVE"
+    assert len(api["dismissed"]) == 1
 
 
 @pytest.mark.parametrize("change_at", [2, 3])
@@ -728,6 +793,13 @@ def test_invalidation_is_independent_of_review_cancellation(workflow):
     assert jobs["publish"]["concurrency"]["cancel-in-progress"] is True
     groups = [jobs[name]["concurrency"]["group"] for name in ("invalidate", "review", "publish")]
     assert len(set(groups)) == 3
+
+
+def test_review_workflow_has_no_merge_permission(workflow):
+    """Review publishing can approve but cannot write repository contents."""
+    jobs = workflow["jobs"]
+    assert jobs["publish"]["permissions"]["pull-requests"] == "write"
+    assert all(job["permissions"].get("contents") != "write" for job in jobs.values())
 
 
 if __name__ == "__main__":
