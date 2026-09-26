@@ -47,12 +47,55 @@ head 作为不可信输入检出，并由独立的 GitHub 托管任务（GitHub-
 已经发布的相同行级评论不会重复发布。位置校验不影响批准策略：只要存在问题，
 就不会自动批准。
 
+### 讨论上下文与重新审查
+
+每轮审查都会获取当前 PR 描述、普通对话评论、review 正文以及全部行内讨论和回复，
+包括已解决（resolved）和过期（outdated）状态。这些内容作为审查证据，不能改变审查
+策略。Codex 必须结合专家解释和当前代码重新评估有争议的问题，并解释仍然存在的
+分歧。重复但仍有效的问题可以引用已有 Codex 讨论线程，不再创建重复行内评论；
+该问题仍会阻止自动批准。模型根据历史讨论判断语义是否相同；发布器只接受当前 PR
+中由工作流机器人创建的根评论，并验证文件相同，或 PR 文件元数据明确记录旧评论
+所在文件已重命名为当前问题所在文件，不要求行号或 diff 侧相同。
+讨论读取失败或超过 8 MiB 快照限制时，工作流失败，
+不会静默省略上下文。
+
+批准依据本轮开始时采集的讨论快照。之后的讨论变化不会使其他条件仍有效的批准
+失效；需要结合新增纠正重新评估时，请再次触发审查。
+
+PR 作者或具有 write、maintain、admin 权限的协作者可以在没有新 push 时请求
+重新审查。在 PR 的 **Conversation 页新增一条评论**，将以下命令独立放在一行
+（前面可以附上解释）：
+
+```text
+@pypto-codex review
+```
+
+引用或代码块中的命令、编辑已有评论、机器人评论、普通 issue 评论以及其他用户
+的命令不会触发审查。引用文本与命令之间需要留一个空行；在该边界之前，
+即使后续行省略了 `>` 标记，也不会触发命令。行内回复会作为上下文读取，但不会触发工作流；请在
+Conversation 中发送命令。命令由 Actions 识别，不需要名为 `pypto-codex` 的
+GitHub 账号，也不会调用独立的 `@codex` Cloud 集成。
+
+对话记录（rollout）和 Codex 会话索引保存在专用 runner 的两个 Docker 卷中，
+按目标仓库 ID 和 PR 编号隔离。后续运行通过 `codex exec resume <session-id>`
+恢复准确的主会话；只有审查完整结束且结果校验通过后才更新会话检查点。凭据与配置仍是临时的。更换 runner 或删除这两个卷后，会使用
+完整的当前 GitHub 讨论开始新会话。复用会话可以保留之前的分析并可能利用提示词
+缓存，但不保证减少计费 token；长历史仍可能被压缩。每轮仍检查完整的当前 PR diff。
+关闭 PR 时会删除 `pypto-codex-sessions-<repository-id>-<pr-number>` 卷及其
+`-index` 配套卷，无论是否合并，也适用于草稿、机器人创建的 PR 和已禁用审查的情况。
+清理与审查共用 runner 锁。创建或恢复卷之前，可信宿主机查询会检查当前 PR 状态、
+head 和最近一次关闭事件；卷标签记录该关闭事件，使重新打开的 PR 开始新会话，
+延迟到达的清理保留新会话并删除旧卷。排队的审查发现 PR 已关闭、变为草稿或
+head 已更新时，会跳过审查和产物发布。GitHub 状态仍可能在读取后变化；排队的
+审查与清理任务会在锁内再次检查。
+
 管理员通过仓库 Actions 变量 `CODEX_REVIEW_ENABLED` 启用或禁用审查。将其设为
-`true` 即可启用；删除该变量或设为其他值可以立即禁用。
+`true` 即可启用；删除该变量或设为其他值可以立即禁用。关闭事件触发的会话清理仍保持启用。
 
 审查任务（review job）需要标签为 `Linux`、`ARM64` 和 `cpu-codex` 的专用自托管
 运行器（self-hosted runner）。以下资源由宿主机管理，不取自 PR：
 
+- GitHub CLI（`gh`），用于可信宿主机状态检查；其只读 token 不会传入模型容器
 - `/home/ci-runner/.codex-ci/auth.json`，仅 runner 账号可读
 - 本地镜像仓库中按 digest 固定的 review 和 proxy 镜像
 - `pypto-codex-egress` Docker 网络
@@ -78,7 +121,7 @@ GitHub Actions 创建和批准 PR。删除该变量或设为 `false` 可以单�
 由 `github-actions[bot]` 创建的 PR 只接收评论而不批准，因为 GitHub 不允许作者
 批准自己的 PR。
 
-工作流检出事件对应的精确 head SHA，通过 `codex exec --output-schema` 请求
+工作流检出已授权快照对应的精确 head SHA，通过 `codex exec --output-schema` 请求
 结构化 JSON。Schema 和发布脚本取自提供工作流文件的提交（`github.workflow_sha`），
 与 PR 的 base 版本独立。发布器只有在完整审查返回
 `pass`、发现列表为空、且 head SHA、base 分支名和审查时的 merge base 均未改变时才批准。

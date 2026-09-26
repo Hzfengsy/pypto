@@ -53,14 +53,71 @@ An identical inline comment from this workflow on the same commit is not posted
 again. Location validation does not affect the approval policy: any finding
 still prevents automatic approval.
 
+### Discussion context and re-review
+
+Every run fetches the current PR description, conversation comments, review
+bodies, and all inline threads and replies, including resolved/outdated state.
+These are evidence for the review, not authority to change its policy. Codex
+must reassess disputed findings against expert explanations and current code,
+and explain any remaining disagreement. A repeated actionable finding can cite
+its existing Codex thread instead of posting a new inline comment; it still
+prevents approval. The model judges semantic equivalence using the discussion;
+the publisher accepts only a workflow-bot root comment from this PR whose file
+matches the finding or was renamed to the finding's current file according to
+the PR file metadata. Matching line numbers or diff sides are not required.
+Missing or oversized discussion input fails the run rather
+than silently omitting context (the snapshot limit is 8 MiB).
+
+Approval uses the discussion snapshot collected at the start of that review.
+Later discussion changes do not invalidate an otherwise valid approval; request
+another review after posting a correction when a new assessment is needed.
+
+The PR author or a collaborator with write, maintain, or admin permission can
+request another review without pushing. Add a **new PR Conversation comment**
+containing this exact command on its own line (explanations can precede it):
+
+```text
+@pypto-codex review
+```
+
+Quoted/fenced commands, edited comments, bots, ordinary issue comments, and
+commands from other users do not start a review. After quoted text, leave a
+blank line before the command: continuation lines remain inactive until that
+boundary, even when they omit the `>` marker. Inline replies are included
+as context but do not trigger the workflow: post the command in Conversation.
+The command is handled by Actions; it does not require a GitHub account named
+`pypto-codex` and does not invoke the separate `@codex` Cloud integration.
+
+Conversation rollouts and the Codex session index persist in two Docker volumes
+on the dedicated runner, keyed by base repository ID and PR number. Later runs
+use `codex exec resume <session-id>` with the exact saved root session ID.
+The checkpoint is updated only after a completed, validated review. Credentials
+and configuration remain ephemeral. A runner change or removal of those volumes
+starts a fresh session with the complete current GitHub discussion. Session
+reuse preserves prior analysis and can benefit from prompt caching, but does
+not guarantee fewer billed tokens; long histories can be compacted. Each run
+still reviews the full current PR diff.
+
+Closing a PR deletes its `pypto-codex-sessions-<repository-id>-<pr-number>`
+volume and `-index` companion, whether merged or unmerged, including draft or
+bot-authored PRs and when reviews are disabled. Cleanup and review use the same
+runner lock. Before creating or resuming volumes, a trusted host query checks
+the live PR state/head and its latest close event. Volume labels record that
+close event, so a reopened PR starts fresh and delayed cleanup preserves its
+new session while removing older volumes. A queued review of a closed, draft,
+or superseded head skips without publishing an artifact. GitHub state can
+change after a read; queued review and cleanup jobs recheck under the lock.
+
 Administrators enable or disable reviews with the repository Actions variable
 `CODEX_REVIEW_ENABLED`. Set it to `true` to enable reviews; unset it or use any
-other value to disable them immediately.
+other value to disable them immediately. Close-event session cleanup remains enabled.
 
 The review job requires a dedicated self-hosted runner labelled `Linux`,
 `ARM64`, and `cpu-codex`. The runner provides the following host-managed
 resources, none of which come from the pull request:
 
+- GitHub CLI (`gh`) for trusted host-only state checks; its read token is never
+  passed to the model container
 - `/home/ci-runner/.codex-ci/auth.json`, readable only by the runner account
 - the digest-pinned review and proxy images in the local registry
 - the `pypto-codex-egress` Docker network
@@ -90,7 +147,7 @@ reviews continue to be posted. The repository's required CI checks still apply.
 PRs authored by `github-actions[bot]` receive comments instead of approvals,
 because GitHub does not allow authors to approve their own PRs.
 
-The workflow checks out the event's exact head SHA and requests structured
+The workflow checks out the authorized snapshot's exact head SHA and requests structured
 JSON through `codex exec --output-schema`. The schema and publishing script
 come from the commit supplying the workflow file (`github.workflow_sha`),
 independently of the PR's base revision. The publisher approves only a complete
