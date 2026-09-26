@@ -454,6 +454,11 @@ syntax. On an annotated assignment, however, omitting `TileView` inherits the
 RHS-inferred view; explicitly writing `pl.TileView()` selects the full implicit
 view even when it canonicalizes to an absent IR view. The printer preserves this
 distinction by including `pl.TileView()` on full-view tile assignments.
+The printer and parser preserve declared IR views for roundtrip, including
+types that differ from operation inference. This does not certify semantic
+validity: IR type verifiers own those checks. For example, a full-view alias
+of a partial tile roundtrips unchanged, then `AssignTypeSymmetry` diagnoses
+the assignment's unequal types.
 `TileView.compact` records whether a partial boxed tile uses PTO's
 valid-region-packed representation (`CompactMode.normal`) or the ordinary
 physical-box representation (`CompactMode.null`, the default). It is meaningful

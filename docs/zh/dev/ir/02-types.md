@@ -410,6 +410,10 @@ TileView：它由 tile shape 以及（如果存在）tile memory space 推导得
 `TileView` 会继承右侧表达式推导的 view；显式写出 `pl.TileView()` 则选择完整的
 隐式 view，即使它在 IR 中被规范化为无显式 view。打印器会在完整 view 的 tile
 赋值上保留 `pl.TileView()`，以区分这两种语义。
+打印器和解析器为往返转换保留 IR 中声明的 view，包括与算子推导结果不同的类型。
+这并不保证语义合法：这些检查由 IR 类型校验器负责。例如，将部分有效 tile 赋给
+完整 view 的别名后，该赋值仍可原样往返；随后 `AssignTypeSymmetry` 会诊断
+赋值两侧的类型不一致。
 `TileView.compact` 记录部分有效的
 boxed tile 是采用 PTO 的有效区域紧凑表示（`CompactMode.normal`），还是普通的
 物理 box 表示（默认的 `CompactMode.null`）。它只在 fractal 空间——`Left` / `Right` /
