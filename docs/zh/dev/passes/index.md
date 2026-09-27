@@ -1,9 +1,23 @@
 # Passes
 
-PyPTO 在 IR 之上运行的全部变换，编号与其在默认流水线中的位置一致。
+PyPTO IR 变换的参考文档，按阅读顺序组织。实际执行顺序请查阅 pass manager。
 
-pass 文档按编号组织，因此从头读到尾就是按执行顺序走完整条编译流水。`01`–`49` 是流水线
-pass；`91` 及以后保留给"在多个位置运行的 pass"以及"根本不是流水线 pass 的基础设施"。
+## 文档编号
+
+下表是当前的 pass 文档索引。请通过 pass manager 实现
+（`python/pypto/ir/pass_manager.py`）核对执行顺序，以及可选或依赖后端的 pass 的运行条件。
+
+- `00` 用于 pass manager 概述。
+- `01`–`89` 预留给流水线 pass 页面，按默认流水线的顺序排列。
+  可选 pass 在对应表项和独立页面中说明。
+- `90` 及以上预留给工具 pass（utility passes）和基础设施。在多个位置运行的工具 pass
+  集中记录，不为每次调用分配独立的页面编号。
+- 文档编号表示阅读顺序，不是绝对执行位置；重复调用的工具 pass 和条件执行的 pass
+  可能使两者不同。
+- 如果某个流水线 pass 尚无独立页面，请预留其编号并在索引中注明缺口，保持后续页面编号对齐。
+
+新增、删除或调整 pass 顺序时，请更新受影响的页面编号、本索引、pass manager 概述、
+站点导航和交叉引用，并保持中英文文档同步。
 
 ## 框架
 
@@ -28,7 +42,7 @@ pass；`91` 及以后保留给"在多个位置运行的 pass"以及"根本不是
 | 11 | [ConvertTensorToTileOps](11-convert_tensor_to_tile_ops.md) | 在 InCore 函数中把 tensor 算子转为 tile 算子，并更新编排层调用点 |
 | 12 | [OptimizeOrchTensors](12-optimize_orch_tensors.md) | 消除编排层冗余分配并改善数据流 |
 | 13 | [LowerCompositeOps](13-lower_composite_ops.md) | 把复合 tile / 分布式算子分解为基础原语 |
-| 13 | [FlattenTileNdTo2D](14-flatten_tile_nd_to_2d.md) | 合并除最后一维外的所有维度，把 3D+ tile 操作拍平为 2D |
+| 14 | [FlattenTileNdTo2D](14-flatten_tile_nd_to_2d.md) | 合并除最后一维外的所有维度，把 3D+ tile 操作拍平为 2D |
 | 15 | [BlockNzTensorViews](15-block_nz_tensor_views.md) | 把逻辑 `pl.NZ` 张量改写为 pto-isa 的分块 rank-5 形式，并同步改写其 `tile.load` 坐标 |
 | 16 | [BlockMxScaleTensorViews](16-block_mx_scale_tensor_views.md) | 将逻辑 MX scale 视图迁移为规范的 rank-5 物理分块形式 |
 | 17 | [LegalizeTileCast](17-legalize_tile_cast.md) | 把 ISA 无法单条指令完成的 `tile.cast` 展开为最短的原生 cast 链 |
@@ -50,8 +64,8 @@ pass；`91` 及以后保留给"在多个位置运行的 pass"以及"根本不是
 | 33 | [MaterializeTensorStrides](33-materialize_tensor_strides.md) | 为每个尚无 stride 的 tensor view 填入紧致规范 stride |
 | 34 | [InitMemRef](34-init_memref.md) | 初始化 MemRef 并创建地址未分配的 alloc 操作 |
 | 35 | [MaterializeSemanticAliases](35-materialize_semantic_aliases.md) | 强制语义要求同一分配的缓冲区真正共用一块（循环携带、原地更新） |
-| 36 | [MemoryReuse](36-memory_reuse.md) | 基于生命周期分析复用缓冲区并删除冗余 alloc |
-| 37 | [AllocateMemoryAddr](37-allocate_memory_addr.md) | 为已有 alloc 操作分配真实地址 |
+| 36 | [MemoryReuse](36-memory_reuse.md) | 基于生命周期分析复用缓冲区并删除冗余 alloc；`memory_planner=DSA_RP` 或 `PTOAS` 时跳过 |
+| 37 | [AllocateMemoryAddr](37-allocate_memory_addr.md) | 为已有 alloc 操作分配真实地址；`memory_planner=PTOAS` 时跳过 |
 | 38 | [FoldNoOpReshape](38-fold_no_op_reshape.md) | 折叠既不改变物理形状也不改变分配的 `tile.reshape` |
 | 39 | [FuseCreateAssembleToSlice](39-fuse_create_assemble_to_slice.md) | 把 `tensor.create` + `tensor.assemble` 融合为单个 `tensor.slice` 视图 |
 | 40 | [LowerL2TensorCollectives](40-lower_l2_tensor_collectives.md) | 把写在 CHIP orchestration 函数体里的托管集合通信改写成一个本地 builtin AIV task，不按设备扇出，也不产生嵌套 L2 dispatch |

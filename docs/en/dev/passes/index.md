@@ -1,12 +1,28 @@
 # Passes
 
-Every transformation PyPTO runs over the IR, numbered to match its position in the
-default pipeline.
+Reference for PyPTO IR transformations, organized for reading. Consult the pass
+manager for execution order.
 
-Pass documentation is numbered so that reading it front to back walks the
-compilation pipeline in execution order. `01`–`49` are pipeline passes; `91`+ is
-reserved for passes that run at several positions and for infrastructure that is not
-a pipeline pass at all.
+## Documentation numbering
+
+The tables below are the current pass documentation index. Use the pass manager
+implementation (`python/pypto/ir/pass_manager.py`) to verify execution order and
+the conditions under which optional or backend-dependent passes run.
+
+- `00` is the pass manager overview.
+- `01`–`89` are reserved for pipeline pass pages, ordered by the default pipeline.
+  Optional passes are identified in their entries and individual pages.
+- `90` and above are reserved for utility passes and infrastructure. Utility
+  passes that run at multiple positions are documented together rather than
+  receiving a page number for every invocation.
+- Documentation numbers are reading-order labels, not absolute execution slots:
+  repeated utility passes and conditional passes can make those numbers differ.
+- If a pipeline pass has no page yet, reserve its number and note the gap in the
+  index so subsequent page numbers remain aligned.
+
+When adding, removing, or reordering passes, update the affected page numbers,
+this index, the pass manager overview, site navigation, and cross-references.
+Keep the English and Chinese documentation synchronized.
 
 ## Framework
 
@@ -31,7 +47,7 @@ a pipeline pass at all.
 | 11 | [ConvertTensorToTileOps](11-convert_tensor_to_tile_ops.md) | Converts tensor ops to tile ops in InCore functions, updating orchestration call sites |
 | 12 | [OptimizeOrchTensors](12-optimize_orch_tensors.md) | Eliminates redundant orchestration allocations and improves data flow |
 | 13 | [LowerCompositeOps](13-lower_composite_ops.md) | Decomposes composite tile / distributed ops into primitives |
-| 13 | [FlattenTileNdTo2D](14-flatten_tile_nd_to_2d.md) | Flattens 3D+ tile operations to 2D by merging all but the last dimension |
+| 14 | [FlattenTileNdTo2D](14-flatten_tile_nd_to_2d.md) | Flattens 3D+ tile operations to 2D by merging all but the last dimension |
 | 15 | [BlockNzTensorViews](15-block_nz_tensor_views.md) | Rewrites logical `pl.NZ` tensors into pto-isa's blocked rank-5 form and retargets their `tile.load` coordinates |
 | 16 | [BlockMxScaleTensorViews](16-block_mx_scale_tensor_views.md) | Migrates logical MX scale views into canonical packed rank-5 physical form |
 | 17 | [LegalizeTileCast](17-legalize_tile_cast.md) | Expands `tile.cast` pairs the ISA cannot emit as one instruction into the shortest native chain |
@@ -53,8 +69,8 @@ a pipeline pass at all.
 | 33 | [MaterializeTensorStrides](33-materialize_tensor_strides.md) | Fills in the packed canonical stride for every tensor view that carries none |
 | 34 | [InitMemRef](34-init_memref.md) | Initializes MemRefs and creates alloc operations with unallocated addresses |
 | 35 | [MaterializeSemanticAliases](35-materialize_semantic_aliases.md) | Forces buffers that program semantics require to be one allocation (loop-carry, in-place) |
-| 36 | [MemoryReuse](36-memory_reuse.md) | Reuses buffers by lifetime analysis and removes redundant allocs |
-| 37 | [AllocateMemoryAddr](37-allocate_memory_addr.md) | Assigns real addresses to existing alloc operations |
+| 36 | [MemoryReuse](36-memory_reuse.md) | Reuses buffers by lifetime analysis and removes redundant allocs; skipped with `memory_planner=DSA_RP` or `PTOAS` |
+| 37 | [AllocateMemoryAddr](37-allocate_memory_addr.md) | Assigns real addresses to existing alloc operations; skipped with `memory_planner=PTOAS` |
 | 38 | [FoldNoOpReshape](38-fold_no_op_reshape.md) | Folds `tile.reshape` calls that change neither physical shape nor allocation |
 | 39 | [FuseCreateAssembleToSlice](39-fuse_create_assemble_to_slice.md) | Fuses `tensor.create` + `tensor.assemble` into one `tensor.slice` view |
 | 40 | [LowerL2TensorCollectives](40-lower_l2_tensor_collectives.md) | Rewrites a managed collective written in a CHIP orchestration body into one local builtin AIV task, with no per-device fan-out and no nested L2 dispatch |
