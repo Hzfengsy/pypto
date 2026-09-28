@@ -604,8 +604,7 @@ MANUAL）在进入时快照 `manual_task_id_map_`、`manual_task_id_map_by_key_`
 `TaskId[N]` 声明在更外层。槽位写入就地生成，但该 *carry* 是在闭合花括号之后、由外层循环的
 yield 读取的。把它恢复掉会让该 yield 把 Array 值误判为标量 TaskId，因此
 `PreserveEnclosingArrayCarries` 会保留所有底层数组生命周期长于该块的 carry——两种作用域
-形态皆然。局部性判定按形态区分：MANUAL 作用域会提升自己的分配，因此直接知道其局部名字集合；
-AUTO 作用域不做任何提升，故仅当进入前已有 carry 命名了该存储时，才视其为外层存储。
+形态皆然。两种作用域都直接跟踪局部名字；提升到外层作用域的声明会从当前作用域的局部集合中移除。
 
 ### 无法解析的依赖边
 
@@ -671,6 +670,24 @@ yield 或存入数组不得被误判为来自已关闭作用域的生产者。�
 二者结合后，无论张量在块之前还是块内部创建、并在块后被读取，都会解析到外层作用域中唯一的
 `const ChipTensor& buf = ...;`——块后 task 只需 `add_input(buf)`，不再产生任何按 SSA 版本
 的别名。
+
+**跨 AUTO 作用域的 Tensor carry。** 显式 `pl.scope()` 可能在外层循环的 yield
+之前结束。特别是，当动态 block 数可能为零时，`LegalizeSpmdLaunches` 会为 launch
+引入 Tensor phi；若这些 phi 声明在 AUTO 块内，后续 yield 就会引用已关闭的 C++
+作用域中的名字。codegen 对 AUTO 和 MANUAL 块体都进行缓冲：对于直接声明在块体中、
+且初始化值在外层作用域有效的 Tensor carry/phi，将其连同初始化一起提升到外层。
+在原块体层级复制这些已提升的句柄时，复用外层名字；嵌套循环中的复制仍保留快照语义。
+分支赋值和 task 提交保持原位，AUTO 缓冲区分配也仍留在原调度作用域内。
+
+**将使用检查与名称查询分离。** `ValidateValueUse(value, use_span)` 是编排代码生成中
+Tensor 操作数的统一检查接口，用于表达式读取、task 参数、张量操作、派发谓词、循环初始化
+及循环回写。它通过 `emit_name_map_` 解析已有 SSA 别名，拒绝使用已关闭 AUTO 作用域
+拥有的名字，并报告使用位置。检查复用作用域已有的局部名字集合；已提升的名字会在作用域
+关闭前移出集合，因此仍可使用。若后续 task 需要缓冲区，应在外层作用域分配，或把消费者
+留在分配所在的作用域中。
+
+`GetVarName()`、`TryGetVarName()` 和名称预留不执行该检查。新 SSA 定义可以复用
+已关闭局部变量的源代码名字并获得唯一 C++ 名字，不会被误判为读取旧变量。
 
 ### `pl.parallel` TaskId iter_arg 的 array carry
 

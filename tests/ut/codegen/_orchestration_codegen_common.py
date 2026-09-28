@@ -121,7 +121,7 @@ def _out_of_scope_tensor_refs(code: str) -> list[str]:
 
     Walks brace scopes recording the tensor identifiers declared in each, then
     flags any *use* that names a declared tensor not visible at the use site.
-    Three use shapes are scanned (a name escaping a closed ``SIMPLER_SCOPE`` block
+    Four use shapes are scanned (a name escaping a closed ``SIMPLER_SCOPE`` block
     can surface as any of them):
 
       * ``add_input/output/inout/no_dep(X)``         — call-arg reads (#1697)
@@ -129,6 +129,7 @@ def _out_of_scope_tensor_refs(code: str) -> list[str]:
         method-receiver reads (the after-scope ``buf_rv.reshape(...)`` shape that
         an ``add_*``-only checker missed, #1713)
       * ``... = X;`` / ``... = X.method(...)``        — assignment-RHS reads
+      * ``X = ...;``                                — assignment-target writes
 
     A used name out of scope is flagged when it is *either* declared as a tensor
     somewhere (``declared_anywhere``) *or* an SSA-versioned tensor temp
@@ -147,6 +148,7 @@ def _out_of_scope_tensor_refs(code: str) -> list[str]:
     use_add = re.compile(r"\badd_(?:input|output|inout|no_dep)\(\s*(\w+)\s*\)")
     use_method = re.compile(r"\b(\w+)\s*\.(?:reshape|view|transpose|assemble|slice|get_ref)\s*\(")
     use_rhs = re.compile(r"=\s*(\w+)\s*[;.]")
+    use_lhs = re.compile(r"^\s*(\w+)\s*=(?!=)")
     scopes: list[set[str]] = [set()]
     bad: list[str] = []
     for raw in code.splitlines():
@@ -160,6 +162,7 @@ def _out_of_scope_tensor_refs(code: str) -> list[str]:
         names = [m.group(1) for m in use_add.finditer(line)]
         names += [m.group(1) for m in use_method.finditer(line)]
         names += [m.group(1) for m in use_rhs.finditer(line)]
+        names += [m.group(1) for m in use_lhs.finditer(line)]
         for name in names:
             if any(name in s for s in scopes):
                 continue

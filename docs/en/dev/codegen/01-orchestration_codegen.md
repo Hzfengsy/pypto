@@ -638,10 +638,8 @@ scope registers a carry whose backing `TaskId[N]` was declared further out. The
 slot write is emitted in place, but the *carry* is read after the closing brace,
 by the enclosing loop's yield. Restoring it away makes that yield misread an
 Array value as a scalar TaskId, so `PreserveEnclosingArrayCarries` keeps any
-carry whose backing array outlives the block — for both scope kinds. Locality is
-decided per kind: a MANUAL scope hoists its allocations and knows its local
-names outright; an AUTO scope hoists nothing, so storage counts as enclosing
-exactly when a pre-entry carry already named it.
+carry whose backing array outlives the block — for both scope kinds. Both scope kinds track local names directly; declarations hoisted into the
+enclosing scope are removed from the current scope's local set.
 
 ### Unresolvable dep edges
 
@@ -721,6 +719,30 @@ mechanisms enforce this, both gated on whether a name is *enclosing-scope-valid*
 Together these make a tensor created before *or* inside the scope and read after
 it resolve to a single enclosing-scope `const ChipTensor& buf = ...;` — the
 after-scope task simply does `add_input(buf)`, with no per-SSA-version alias.
+
+**Tensor carries across AUTO scopes.** An explicit `pl.scope()` may close before
+its enclosing loop's yield. In particular, `LegalizeSpmdLaunches` introduces
+Tensor phis for launches whose dynamic block count may be zero. Declaring those
+phis inside the AUTO block would leave the later yield referencing a closed
+C++ scope. Codegen buffers AUTO bodies as well as MANUAL bodies and hoists
+initialized Tensor carries/phis declared directly in the body when their
+initializer is valid in the enclosing scope. Copies of those hoisted handles
+at the original body level reuse the enclosing name; copies inside nested loops
+remain snapshots. Branch assignments and task submissions stay in place, and
+AUTO buffer allocations remain inside their scheduling scope.
+
+**Validate uses separately from names.** `ValidateValueUse(value, use_span)` is
+the shared check for Tensor operands emitted by orchestration codegen: expression
+reads, task arguments, tensor operations, dispatch predicates, loop initialization,
+and loop writeback. It resolves existing SSA aliases through `emit_name_map_` and
+rejects a name owned by a closed AUTO scope, reporting the use site's span. The
+scope's existing local-name set supplies this information; hoisted names are
+removed before closure and remain usable. Allocate buffers in an enclosing scope
+when later tasks need them, or keep their consumers inside the allocating scope.
+
+`GetVarName()`, `TryGetVarName()`, and name reservation remain independent of this
+validation. A fresh SSA definition can therefore reuse the source spelling of a
+closed local and receive a new, unique C++ name without being mistaken for a read.
 
 ### Array carry for `pl.parallel` TaskId iter_args
 

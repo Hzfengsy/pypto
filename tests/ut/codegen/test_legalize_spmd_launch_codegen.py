@@ -14,7 +14,7 @@ import re
 import pypto
 import pypto.language as pl
 import pytest
-from _orchestration_codegen_common import _generate_orch_code
+from _orchestration_codegen_common import _generate_orch_code, _out_of_scope_tensor_refs
 from pypto import backend, ir, passes
 from pypto.backend import BackendType
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
@@ -26,6 +26,43 @@ def _compile(program, auto_deps):
     pm = PassManager.get_strategy(OptimizationStrategy.Default, analyze_auto_scopes_for_deps=auto_deps)
     result = pm.run_passes(program)
     return result, _generate_orch_code(result)
+
+
+@pytest.mark.parametrize("inside_scope", [False, True])
+def test_scope_detector_checks_tensor_assignment_targets(inside_scope):
+    assignment = "carry = input;"
+    code = "Tensor input;\nSIMPLER_SCOPE() {\nTensor carry = input;\n"
+    code += assignment + "\n}\n" if inside_scope else "}\n" + assignment + "\n"
+    assert _out_of_scope_tensor_refs(code) == ([] if inside_scope else ["carry"])
+
+
+@pytest.mark.parametrize("auto_deps", [False, True])
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_dynamic_launch_inside_explicit_scope_loop_carry(auto_deps, dynamic):
+    """A guarded output must remain visible to the yield after an explicit scope."""
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
+        def main(
+            self,
+            ctrl: pl.Tensor[[1], pl.INT32],
+            a: pl.Tensor[[16, 16], pl.FP32],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            if dynamic:
+                n = pl.tensor.read(ctrl, [0])
+            else:
+                n = pl.const(4, pl.INT32)
+            for i in pl.range(2):
+                # Keep work before the scope: the loop yield then sits outside it.
+                count = pl.min(n - i, 16)
+                with pl.scope():
+                    for bi in pl.spmd(count, allow_early_resolve=True):
+                        a[0:16, 0:16] = pl.add(a, 1.0)
+            return a
+
+    _, code = _compile(Program, auto_deps)
+    assert not _out_of_scope_tensor_refs(code), code
 
 
 @pytest.mark.parametrize("auto_deps", [False, True])
