@@ -45,6 +45,7 @@
 #include "pypto/ir/memory_space.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/stmt.h"
+#include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/structural_comparison.h"
@@ -101,6 +102,22 @@ std::optional<std::vector<ExprPtr>> NarrowedValidShape(const TileTypePtr& init_t
   return any ? std::optional<std::vector<ExprPtr>>{std::move(narrowed)} : std::nullopt;
 }
 
+std::optional<std::vector<ExprPtr>> NarrowedTensorValidShape(const TensorTypePtr& init_type,
+                                                             const TensorTypePtr& yield_type) {
+  if (!init_type || !yield_type || init_type->shape_.size() != 2 ||
+      !AreExprVectorsEqual(init_type->shape_, yield_type->shape_)) {
+    return std::nullopt;
+  }
+  // Only a fresh, full-box seed can adopt a product's valid region. Existing
+  // partial accumulators may contain data outside that region.
+  if (!AreExprVectorsEqual(GetEffectiveTensorValidShape(*init_type), init_type->shape_)) {
+    return std::nullopt;
+  }
+  const auto& valid = GetEffectiveTensorValidShape(*yield_type);
+  if (AreExprVectorsEqual(valid, init_type->shape_)) return std::nullopt;
+  return valid;
+}
+
 /// Where each Var is defined, and which half-open clock range each loop spans.
 ///
 /// One pre-order sweep. It answers the only structural question this repair asks -- "is
@@ -117,6 +134,25 @@ class ScopeIndex : public IRVisitor {
     return it == defining_call_.end() ? nullptr : it->second;
   }
 
+  [[nodiscard]] bool IsMatmulResult(const ExprPtr& expr) const {
+    auto var = AsVarLike(expr);
+    return var && matmul_results_.count(var.get());
+  }
+
+  [[nodiscard]] TypePtr MatmulProductType(const ExprPtr& expr) const {
+    auto var = AsVarLike(expr);
+    auto it = var ? matmul_results_.find(var.get()) : matmul_results_.end();
+    return it == matmul_results_.end() ? nullptr : it->second;
+  }
+
+  [[nodiscard]] bool IsFreshTileSeed(const Var* var) const {
+    auto call = DefiningCall(var);
+    if (IsOp(call, "tile.create")) return true;
+    if (!IsOp(call, "tile.set_validshape") || call->args_.empty()) return false;
+    auto storage = AsVarLike(call->args_[0]);
+    return storage && IsOp(DefiningCall(storage.get()), "tile.create");
+  }
+
   /// Whether @p var is defined inside @p loop -- an interval test, O(log N).
   ///
   /// A var this index never saw (a function parameter, or one defined in an outer
@@ -131,13 +167,42 @@ class ScopeIndex : public IRVisitor {
  protected:
   void VisitStmt_(const AssignStmtPtr& op) override {
     Define(op->var_.get());
-    if (auto call = As<Call>(op->value_)) defining_call_[op->var_.get()] = call;
+    if (auto call = As<Call>(op->value_)) {
+      defining_call_[op->var_.get()] = call;
+      if (IsOp(call, "tensor.matmul") || IsOp(call, "tile.matmul")) {
+        // The fresh product supplies valid extents and, after lowering, the
+        // compact layout. An accumulating branch still inherits the old seed.
+        matmul_results_[op->var_.get()] = call->GetType();
+      } else if (IsOp(call, "tensor.matmul_acc") || IsOp(call, "tile.matmul_acc")) {
+        matmul_results_[op->var_.get()] = nullptr;
+      } else if (IsOp(call, "tile.set_validshape") && !call->args_.empty() &&
+                 IsMatmulResult(call->args_[0])) {
+        // Lowering retains the explicit narrowing of an accumulating branch.
+        // Keep its provenance without treating the stale Acc layout as a product.
+        matmul_results_[op->var_.get()] = MatmulProductType(call->args_[0]) ? call->GetType() : nullptr;
+      }
+    } else if (IsMatmulResult(op->value_)) {
+      matmul_results_[op->var_.get()] = MatmulProductType(op->value_);
+    }
     IRVisitor::VisitStmt_(op);
   }
 
   void VisitStmt_(const IfStmtPtr& op) override {
     for (const auto& rv : op->return_vars_) Define(rv.get());
     IRVisitor::VisitStmt_(op);
+    if (!op->else_body_) return;
+    const auto then_values = TrailingYieldValues(op->then_body_);
+    const auto else_values = TrailingYieldValues(*op->else_body_);
+    if (then_values.size() != op->return_vars_.size() || else_values.size() != then_values.size()) return;
+    for (size_t i = 0; i < then_values.size(); ++i) {
+      if (IsMatmulResult(then_values[i]) && IsMatmulResult(else_values[i])) {
+        auto then_product = MatmulProductType(then_values[i]);
+        auto else_product = MatmulProductType(else_values[i]);
+        // Do not merge distinct product regions or choose one by branch order.
+        if (then_product && else_product && !structural_equal(then_product, else_product)) continue;
+        matmul_results_[op->return_vars_[i].get()] = then_product ? then_product : else_product;
+      }
+    }
   }
 
   void VisitStmt_(const ForStmtPtr& op) override {
@@ -170,6 +235,7 @@ class ScopeIndex : public IRVisitor {
   std::map<const Var*, size_t> def_clock_;
   std::map<const Stmt*, std::pair<size_t, size_t>> loop_span_;
   std::map<const Var*, CallPtr> defining_call_;
+  std::map<const Var*, TypePtr> matmul_results_;
 };
 
 /// The valid shape to declare for a carry, keyed by the ``IterArg`` that carries it.
@@ -178,7 +244,8 @@ using CarryDecisions = std::map<const Var*, std::vector<ExprPtr>>;
 /// Decides which carries to re-declare. Reads types; rewrites nothing.
 class CarryAnalyzer : public IRVisitor {
  public:
-  explicit CarryAnalyzer(const ScopeIndex& index) : index_(index) {}
+  explicit CarryAnalyzer(const ScopeIndex& index, bool tensor_mode = false)
+      : index_(index), tensor_mode_(tensor_mode) {}
 
   [[nodiscard]] CarryDecisions Take() { return std::move(decisions_); }
 
@@ -202,9 +269,32 @@ class CarryAnalyzer : public IRVisitor {
     if (yields.size() != iter_args.size()) return;
 
     for (size_t i = 0; i < iter_args.size(); ++i) {
+      if (tensor_mode_) {
+        auto narrowed = NarrowedTensorValidShape(As<TensorType>(iter_args[i]->GetType()),
+                                                 As<TensorType>(index_.MatmulProductType(yields[i])));
+        auto seed = AsVarLike(iter_args[i]->initValue_);
+        if (narrowed && seed && IsOp(index_.DefiningCall(seed.get()), "tensor.create") &&
+            index_.IsMatmulResult(yields[i]) && ExtentsAreVisibleBefore(*narrowed, loop)) {
+          decisions_[static_cast<const Var*>(iter_args[i].get())] = std::move(*narrowed);
+        }
+        continue;
+      }
       auto init_tile = As<TileType>(iter_args[i]->GetType());
-      auto yield_tile = As<TileType>(yields[i]->GetType());
+      // A conditional is typed from its then branch, which may still inherit
+      // the seed's non-compact layout. Inspect the fresh product in either arm.
+      auto product_tile = As<TileType>(index_.MatmulProductType(yields[i]));
+      auto yield_tile = product_tile ? product_tile : As<TileType>(yields[i]->GetType());
       auto narrowed = NarrowedValidShape(init_tile, yield_tile);
+      bool needs_compact_repair = false;
+      // SSA may already have narrowed a tensor seed. Once lowered, its fresh
+      // tile.create -> set_validshape still needs the product's compact layout.
+      if (!narrowed && init_tile && yield_tile &&
+          AreExprVectorsEqual(GetValidShape(init_tile), GetValidShape(yield_tile)) &&
+          tile_view_semantics::GetEffectiveTileView(*init_tile).compact !=
+              tile_view_semantics::GetEffectiveTileView(*yield_tile).compact) {
+        narrowed = GetValidShape(yield_tile);
+        needs_compact_repair = true;
+      }
       if (!narrowed) continue;
       // Only an L0C carry is re-declared, and `tile.set_validshape` is 2D.
       if (narrowed->size() != 2) continue;
@@ -214,11 +304,11 @@ class CarryAnalyzer : public IRVisitor {
       // row count whatever the valid rows are. The same predicate `AccCompactValid` uses,
       // so a carry this declines is also a carry the verifier does not ask about, and a
       // `[16, N]` accumulator keeps the exact form it has today.
-      if (AccPitchesCoincide(narrowed->at(0), init_tile->shape_[0])) continue;
+      if (!needs_compact_repair && AccPitchesCoincide(narrowed->at(0), init_tile->shape_[0])) continue;
       if (!ExtentsAreVisibleBefore(*narrowed, loop)) continue;
       // Only a `tile.create` seed can be re-declared as a narrowed box.
       auto seed = AsVarLike(iter_args[i]->initValue_);
-      if (!seed || !IsOp(index_.DefiningCall(seed.get()), "tile.create")) continue;
+      if (!seed || !index_.IsFreshTileSeed(seed.get())) continue;
 
       decisions_[static_cast<const Var*>(iter_args[i].get())] = std::move(*narrowed);
     }
@@ -257,6 +347,7 @@ class CarryAnalyzer : public IRVisitor {
   };
 
   const ScopeIndex& index_;
+  bool tensor_mode_;
   CarryDecisions decisions_;
 };
 
@@ -274,8 +365,8 @@ class CarryAnalyzer : public IRVisitor {
 /// orchestration level, where no Acc tile carry can reach it.
 class CarryRewriter : public IRMutator {
  public:
-  CarryRewriter(const ScopeIndex& index, CarryDecisions decisions)
-      : index_(index), decisions_(std::move(decisions)) {}
+  CarryRewriter(const ScopeIndex& index, CarryDecisions decisions, bool tensor_mode = false)
+      : index_(index), decisions_(std::move(decisions)), tensor_mode_(tensor_mode) {}
 
  protected:
   ExprPtr VisitExpr_(const VarPtr& op) override {
@@ -292,7 +383,31 @@ class CarryRewriter : public IRMutator {
     auto rebuilt = IRMutator::VisitStmt_(op);
     auto assign = As<AssignStmt>(rebuilt);
     if (!assign) return rebuilt;
-    return BindResult(op, assign, RededuceIfOperandsMoved(op, assign));
+    auto value = RededuceIfOperandsMoved(op, assign);
+    auto call = As<Call>(value);
+    if (!tensor_mode_ && IsOp(call, "tile.set_validshape") && OperandsMoved(op->value_, value) &&
+        structural_equal(call->GetType(), call->args_[0]->GetType())) {
+      // Once the repaired tile accumulator already carries these extents, the
+      // tensor-stage narrowing is an identity. A plain SSA alias also lets
+      // MemoryReuse follow the in-place producer when reconciling branch storage.
+      return BindResult(op, assign, call->args_[0]);
+    }
+    if (tensor_mode_ && IsOp(call, "tensor.matmul_acc") && OperandsMoved(op->value_, value)) {
+      auto acc_type = As<TensorType>(call->args_[0]->GetType());
+      if (acc_type && acc_type->shape_.size() == 2 && acc_type->tensor_view_ &&
+          !acc_type->tensor_view_->valid_shape.empty()) {
+        // Keep matmul_acc's public deducer unchanged. Narrow its fresh SSA
+        // result explicitly to the repaired carry's region before yielding it.
+        auto raw = std::make_shared<Var>(op->var_->name_hint_ + "_full", value->GetType(), op->span_);
+        const auto& valid = GetEffectiveTensorValidShape(*acc_type);
+        auto narrowed =
+            OpRegistry::GetInstance().Create("tensor.set_validshape", {raw, valid[0], valid[1]}, op->span_);
+        return SeqStmts::Flatten(
+            {std::make_shared<AssignStmt>(raw, value, op->span_), BindResult(op, assign, narrowed)},
+            op->span_);
+      }
+    }
+    return BindResult(op, assign, value);
   }
 
   /// The value to bind, re-deduced when this visit moved one of a call's operands.
@@ -497,15 +612,27 @@ class CarryRewriter : public IRMutator {
   /// Returns null when the seed is not one this repair can re-declare.
   ExprPtr BuildNarrowedInit(const IterArgPtr& iter_arg, const std::vector<ExprPtr>& valid,
                             std::vector<StmtPtr>* prologue) {
-    auto init_tile = As<TileType>(iter_arg->GetType());
     auto seed = AsVarLike(iter_arg->initValue_);
-    if (!init_tile || !seed || !IsOp(index_.DefiningCall(seed.get()), "tile.create")) return nullptr;
+    if (!seed) return nullptr;
 
     // The extents were chosen against the types as the analyzer found them; an enclosing
     // rewrite may since have replaced the vars they name.
     std::vector<ExprPtr> visited_valid;
     visited_valid.reserve(valid.size());
     for (const auto& extent : valid) visited_valid.push_back(VisitExpr(extent));
+
+    if (tensor_mode_) {
+      if (!IsOp(index_.DefiningCall(seed.get()), "tensor.create")) return nullptr;
+      auto narrowed = OpRegistry::GetInstance().Create(
+          "tensor.set_validshape", {VisitExpr(seed), visited_valid[0], visited_valid[1]}, iter_arg->span_);
+      auto narrowed_var =
+          std::make_shared<Var>(seed->name_hint_ + "_narrowed", narrowed->GetType(), iter_arg->span_);
+      prologue->push_back(std::make_shared<AssignStmt>(narrowed_var, narrowed, iter_arg->span_));
+      return narrowed_var;
+    }
+
+    auto init_tile = As<TileType>(iter_arg->GetType());
+    if (!init_tile || !index_.IsFreshTileSeed(seed.get())) return nullptr;
 
     auto narrowed = acc_init::BuildNarrowedAccInit(init_tile->shape_, visited_valid, init_tile->dtype_,
                                                    seed->name_hint_ + "_narrowed", iter_arg->span_);
@@ -515,29 +642,34 @@ class CarryRewriter : public IRMutator {
 
   const ScopeIndex& index_;
   CarryDecisions decisions_;
+  bool tensor_mode_;
   std::map<const Var*, VarPtr> replaced_;
 };
 
-}  // namespace
-
-FunctionPtr NarrowAccCarries(const FunctionPtr& func) {
+FunctionPtr NarrowCarries(const FunctionPtr& func, bool tensor_mode) {
   if (!func || !func->body_) return func;
 
   ScopeIndex index;
   index.Build(func->body_);
 
-  CarryAnalyzer analyzer(index);
+  CarryAnalyzer analyzer(index, tensor_mode);
   analyzer.VisitStmt(func->body_);
   auto decisions = analyzer.Take();
   if (decisions.empty()) return func;
 
-  CarryRewriter rewriter(index, std::move(decisions));
+  CarryRewriter rewriter(index, std::move(decisions), tensor_mode);
   auto new_body = rewriter.VisitStmt(func->body_);
   if (new_body.get() == func->body_.get()) return func;
   auto new_func = MutableCopy(func);
   new_func->body_ = new_body;
   return new_func;
 }
+
+}  // namespace
+
+FunctionPtr NarrowAccCarries(const FunctionPtr& func) { return NarrowCarries(func, false); }
+
+FunctionPtr NarrowTensorMatmulCarries(const FunctionPtr& func) { return NarrowCarries(func, true); }
 
 }  // namespace narrow_loop_carry
 }  // namespace ir
