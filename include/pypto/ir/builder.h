@@ -13,6 +13,7 @@
 #define PYPTO_IR_BUILDER_H_
 
 #include <any>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <optional>
@@ -327,10 +328,15 @@ class IRBuilder {
    * Finalizes the scope statement and pops the context from the stack.
    *
    * @param end_span Source location for end of scope
+   * @param devices CommDomain device indices (empty means all devices)
+   * @param slots CommDomain window slots, resolved after their body definitions
+   * @param extra_attrs Attributes resolved after body-local definitions
    * @return The built scope statement
    * @throws RuntimeError if not inside a scope context
    */
-  StmtPtr EndScope(const Span& end_span);
+  StmtPtr EndScope(const Span& end_span, std::vector<int64_t> devices = {},
+                   std::vector<WindowBufferPtr> slots = {},
+                   std::vector<std::pair<std::string, std::any>> extra_attrs = {});
 
   // ========== Statement Recording ==========
 

@@ -640,6 +640,17 @@ class DistributedTensorType(TensorType):
     def __init__(self, shape: Sequence[Expr], dtype: DataType, window_buffer: WindowBuffer) -> None:
         """Create a distributed tensor type bound to a specific WindowBuffer (produced by ``pld.window``)."""
 
+    @overload
+    def __init__(
+        self,
+        shape: Sequence[Expr],
+        dtype: DataType,
+        memref: MemRef | None,
+        tensor_view: TensorView | None,
+        window_buffer: WindowBuffer | None,
+    ) -> None:
+        """Create a distributed tensor type preserving all optional metadata."""
+
 class TileView:
     """Tile view: read-only representation of valid shape, stride, start offset,
     layouts, fractal, pad, and compact mode. Construct with all values; fields cannot be mutated
@@ -2615,10 +2626,10 @@ class CommDomainScopeStmt(ScopeStmt):
     buffers=[CommBufferSpec(...)]) as __comm_d<n>:`` block at the top of the
     host orchestration function, then emits ``body`` inside that block.
 
-    Synthesized by the ``MaterializeCommDomainScopes`` pass; no user DSL surface.
-    The Python printer is
-    transparent over this stmt — reparse + re-run the pass pipeline restores
-    the scope. ``.pto`` binary round-trip is lossless via reflection.
+    Synthesized by the ``MaterializeCommDomainScopes`` pass. The Python printer
+    preserves it with private ``pl._dump.comm_domain(...)`` syntax, including
+    shared window references. Parsing a self-contained printed Program restores
+    the scope directly without rerunning materialization.
     """
 
     devices: Final[list[int]]
@@ -3829,11 +3840,20 @@ class IRBuilder:
                 auto dependency tracking. Must be None for other scope kinds.
         """
 
-    def end_scope(self, end_span: Span) -> ScopeStmt:
+    def end_scope(
+        self,
+        end_span: Span,
+        devices: Sequence[int] = (),
+        slots: Sequence[WindowBuffer] = (),
+        attrs: dict[str, Any] | list[tuple[str, Any]] | None = None,
+    ) -> ScopeStmt:
         """End building a scope statement.
 
         Args:
             end_span: Source location for end of scope
+            devices: Device indices for a communication-domain scope.
+            slots: Window allocations for a communication-domain scope.
+            attrs: Additional metadata resolved after body-local definitions.
 
         Returns:
             The built scope statement
