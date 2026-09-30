@@ -215,6 +215,12 @@ see *Cross-scope tensors and `manual_scope`* below) keeps the decl path. A
 runtime-allocated output bound to `task_<n>_outs.get_ref(k)` likewise keeps its
 `const ChipTensor&` binding.
 
+Copies of hoisted tensor carries inside a nested runtime scope remain distinct
+snapshots. When the source is valid outside that scope, codegen hoists the copy's
+declaration with `EmitMutableTensorCarryDecl` and keeps its assignment at the
+original position. Later readers can name the snapshot without observing a
+subsequent carry update; no tensor allocation moves with the declaration.
+
 ### Core Type Inference
 
 The codegen determines whether to submit to AIC (CUBE) or AIV (VECTOR) based on the callee's `MemorySpace`:
@@ -731,6 +737,13 @@ at the original body level reuse the enclosing name; copies inside nested loops
 remain snapshots. Branch assignments and task submissions stay in place, and
 AUTO buffer allocations remain inside their scheduling scope.
 
+Consecutive nested AUTO scopes may hoist a descriptor through multiple wrappers
+when its initializer is immutable and visible outside each wrapper. Hoisting stops
+at a loop or branch boundary, a MANUAL scope, or a scope-local initializer. The
+original body level still controls SSA-copy collapse, preserving nested snapshots.
+Copies of immutable enclosing Tensors reuse their existing names in either scope
+mode, including aliases left after a single-iteration loop is simplified away.
+
 **Validate uses separately from names.** `ValidateValueUse(value, use_span)` is
 the shared check for Tensor operands emitted by orchestration codegen: expression
 reads, task arguments, tensor operations, dispatch predicates, loop initialization,
@@ -739,6 +752,24 @@ rejects a name owned by a closed AUTO scope, reporting the use site's span. The
 scope's existing local-name set supplies this information; hoisted names are
 removed before closure and remain usable. Allocate buffers in an enclosing scope
 when later tasks need them, or keep their consumers inside the allocating scope.
+
+Descriptor copies and branch/loop yields also retain allocation-source edges.
+When a scope closes, codegen invalidates its allocations and propagates that state
+to dependent descriptors. Descriptors hoisted out of AUTO scopes and their aliases are checked against
+this state, so a hoisted descriptor cannot hide a reclaimed buffer. Each value and dependency edge is visited once per propagated flag. MANUAL
+allocation batches belong to the enclosing scope where they are emitted; existing
+MANUAL carry behavior is unchanged.
+
+Source edges identify values rather than mutable C++ names. A loop carry has
+separate entry and exit values, so yielding a new buffer does not retroactively
+change an earlier snapshot. A known single iteration has no backedge; repeated
+or unknown iterations connect the exit to the next entry and recheck body reads
+affected by that connection. Zero iterations return only the initializer, and
+unknown trip counts also retain that zero-iteration path. Branch yields continue
+to merge their possible sources into the branch result.
+
+Yield writeback validates the destination's lexical scope without reading its old
+storage; allocation lifetime is checked on the yielded value and later reads.
 
 `GetVarName()`, `TryGetVarName()`, and name reservation remain independent of this
 validation. A fresh SSA definition can therefore reuse the source spelling of a

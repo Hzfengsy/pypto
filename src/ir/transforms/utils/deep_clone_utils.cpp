@@ -11,8 +11,10 @@
 
 #include "pypto/ir/transforms/utils/deep_clone_utils.h"
 
+#include <functional>
 #include <memory>
 #include <optional>
+#include <string>
 #include <tuple>
 #include <type_traits>
 #include <unordered_map>
@@ -40,8 +42,9 @@ namespace {
 /// reflection to identify which Var fields are definition sites.
 class DeepCloneMutator : public IRMutator {
  public:
-  explicit DeepCloneMutator(const std::unordered_map<const Var*, ExprPtr>& var_map, bool clone_def_vars)
-      : expr_map_(var_map), clone_def_vars_(clone_def_vars) {
+  explicit DeepCloneMutator(const std::unordered_map<const Var*, ExprPtr>& var_map, bool clone_def_vars,
+                            const std::function<std::string(const std::string&)>& fresh_name)
+      : expr_map_(var_map), clone_def_vars_(clone_def_vars), fresh_name_(fresh_name) {
     seed_keys_.reserve(var_map.size());
     for (const auto& [key, _val] : var_map) {
       seed_keys_.insert(key);
@@ -185,7 +188,8 @@ class DeepCloneMutator : public IRMutator {
       return;
     }
     auto new_type = RemapType(op->GetType());
-    auto fresh = std::make_shared<Var>(op->name_hint_, std::move(new_type), op->span_);
+    auto name = fresh_name_ ? fresh_name_(op->name_hint_) : op->name_hint_;
+    auto fresh = std::make_shared<Var>(std::move(name), std::move(new_type), op->span_);
     expr_map_[op.get()] = fresh;
   }
 
@@ -256,13 +260,15 @@ class DeepCloneMutator : public IRMutator {
   /// so only entries created by the clone traversal are returned.
   std::unordered_set<const Var*> seed_keys_;
   bool clone_def_vars_;
+  std::function<std::string(const std::string&)> fresh_name_;
 };
 
 }  // namespace
 
 DeepCloneResult DeepClone(const StmtPtr& body, const std::unordered_map<const Var*, ExprPtr>& var_map,
-                          bool clone_def_vars) {
-  DeepCloneMutator mutator(var_map, clone_def_vars);
+                          bool clone_def_vars,
+                          const std::function<std::string(const std::string&)>& fresh_name) {
+  DeepCloneMutator mutator(var_map, clone_def_vars, fresh_name);
   auto cloned = mutator.VisitStmt(body);
   return {cloned, mutator.GetVarMap()};
 }

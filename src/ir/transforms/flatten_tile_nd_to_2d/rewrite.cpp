@@ -80,51 +80,6 @@ bool IsNzSourceLoad(const std::vector<ExprPtr>& args) {
          tensor_type->tensor_view_->layout == TensorLayout::NZ;
 }
 
-/// Carry the assignment's MemRef onto a type re-deduced by `OpRegistry::Create`.
-///
-/// Re-deducing yields authoritative shape / dtype / view metadata but never a
-/// MemRef — op type deduction does not produce one. So the assignment's MemRef
-/// is strictly additional information, not a stale override, and the re-created
-/// op denotes the same storage. Dropping it would silently un-bind the two
-/// things that legitimately put a MemRef on a tile before InitMemRef: a user
-/// allocation (`pl.Tile[..., pl.MemRef("ping"), ...]`) and a re-parsed
-/// post-allocation dump. Same merge ConvertToSSA applies to an LHS MemRef.
-///
-/// The MemRef is read from the *assigned Var*, not from the RHS Call: ConvertToSSA
-/// merges it into the Var's type only, and op type deduction leaves the Call's
-/// type MemRef-less. Sourcing it from `call->GetType()` silently matches nothing.
-///
-/// The memory space is carried across for the same reason and from the same
-/// place. Re-deducing a `tile.load` / `tile.create` from args + kwargs yields an
-/// unset space whenever the producer left `target_memory` off (the normal case
-/// now that unset means "the compiler will place it"), while the annotated Var
-/// still holds whatever the author wrote. Dropping it loses a stated fact; worse,
-/// pairing a MemRef with an unset space trips the TileType invariant that the two
-/// must agree (`src/ir/type.cpp` ValidateTileMemorySpaceConsistency), so the pass
-/// throws on perfectly valid DSL. The DSL already refuses a MemRef annotation
-/// without an explicit space, so whenever `memref` is present the Var's space is
-/// too.
-TypePtr WithCarriedMemRef(const TypePtr& deduced, const AssignStmtPtr& assign) {
-  if (!assign || !assign->var_) return deduced;
-  auto memref = GetTypeMemRef(assign->var_->GetType());
-
-  std::optional<MemorySpace> carried_space;
-  if (auto var_tile = As<TileType>(assign->var_->GetType())) {
-    if (auto deduced_tile = As<TileType>(deduced); deduced_tile && !deduced_tile->memory_space_.has_value()) {
-      carried_space = var_tile->memory_space_;
-    }
-  }
-
-  if (!memref.has_value() || GetTypeMemRef(deduced).has_value()) {
-    // No MemRef to merge, but a stated space may still need carrying.
-    if (!carried_space.has_value()) return deduced;
-    auto deduced_tile = As<TileType>(deduced);
-    return std::make_shared<TileType>(deduced_tile->shape_, deduced_tile->dtype_, deduced_tile->memref_,
-                                      deduced_tile->tile_view_, carried_space);
-  }
-  return CloneTypeWithMemRef(deduced, memref, carried_space);
-}
-
 /**
  * @brief Flatten a >2D `tile.create` / `tile.full` allocation to its 2D form.
  *
@@ -173,7 +128,7 @@ VarPtr EmitFlattenedTileAlloc(const CallPtr& call, const AssignStmtPtr& assign,
     create_kwargs.emplace_back("target_memory", MemorySpace::Acc);
   }
   auto deduced = op_registry.Create(op_name, new_args, create_kwargs, span);
-  auto created_type = WithCarriedMemRef(deduced->GetType(), assign);
+  auto created_type = WithCarriedMemRef(deduced->GetType(), assign->var_->GetType());
   auto new_call = std::make_shared<Call>(deduced->op_, deduced->args_, deduced->kwargs_, deduced->attrs_,
                                          created_type, deduced->span_);
   auto flat_var = std::make_shared<Var>(assign->var_->name_hint_, created_type, assign->var_->span_);
@@ -225,8 +180,9 @@ VarPtr TryFoldNdAssembleOffset(const CallPtr& call, const AssignStmtPtr& assign,
   };
 
   auto deduced = op_registry.Create("tile.assemble", new_args, call->kwargs_, span);
-  auto new_call = std::make_shared<Call>(deduced->op_, deduced->args_, deduced->kwargs_, deduced->attrs_,
-                                         WithCarriedMemRef(deduced->GetType(), assign), deduced->span_);
+  auto new_call =
+      std::make_shared<Call>(deduced->op_, deduced->args_, deduced->kwargs_, deduced->attrs_,
+                             WithCarriedMemRef(deduced->GetType(), assign->var_->GetType()), deduced->span_);
   auto flat_var = std::make_shared<Var>(assign->var_->name_hint_, new_call->GetType(), assign->var_->span_);
   result->push_back(std::make_shared<AssignStmt>(flat_var, new_call, assign->span_));
   return flat_var;
@@ -271,8 +227,9 @@ VarPtr TryFlattenRankRaisingView(const CallPtr& call, const AssignStmtPtr& assig
   std::vector<ExprPtr> new_args = {Substitute(call->args_[0], ctx.var_map),
                                    MakeShapeTupleFromInts({merged, last}, span)};
   auto deduced = op_registry.Create(op_name, new_args, call->kwargs_, span);
-  auto new_call = std::make_shared<Call>(deduced->op_, deduced->args_, deduced->kwargs_, deduced->attrs_,
-                                         WithCarriedMemRef(deduced->GetType(), assign), deduced->span_);
+  auto new_call =
+      std::make_shared<Call>(deduced->op_, deduced->args_, deduced->kwargs_, deduced->attrs_,
+                             WithCarriedMemRef(deduced->GetType(), assign->var_->GetType()), deduced->span_);
   auto flat_var = std::make_shared<Var>(assign->var_->name_hint_, new_call->GetType(), assign->var_->span_);
   result->push_back(std::make_shared<AssignStmt>(flat_var, new_call, assign->span_));
   return flat_var;
@@ -1063,7 +1020,7 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
       }
       // ≤2D tile.load: honor any pending var_map substitutions
       auto deduced_call = op_registry.Create(op_name, sub_args, call->kwargs_, span);
-      auto loaded_type = WithCarriedMemRef(deduced_call->GetType(), assign);
+      auto loaded_type = WithCarriedMemRef(deduced_call->GetType(), assign->var_->GetType());
       auto new_call = std::make_shared<Call>(deduced_call->op_, deduced_call->args_, deduced_call->kwargs_,
                                              call->attrs_, loaded_type, deduced_call->span_);
       auto new_var =
@@ -1300,7 +1257,8 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
         if (op_name.substr(0, 5) == "tile.") {
           auto deduced = op_registry.Create(op_name, new_args, call->kwargs_, span);
           new_call = std::make_shared<Call>(deduced->op_, deduced->args_, deduced->kwargs_, deduced->attrs_,
-                                            WithCarriedMemRef(deduced->GetType(), assign), deduced->span_);
+                                            WithCarriedMemRef(deduced->GetType(), assign->var_->GetType()),
+                                            deduced->span_);
         } else {
           new_call = std::make_shared<Call>(call->op_, new_args, call->kwargs_, call->GetType(), call->span_);
         }

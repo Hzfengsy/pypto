@@ -1560,7 +1560,10 @@ void BindCallTypeVar(const VarPtr& var, const ExprPtr& value, const std::string&
   // A callee placeholder can also appear verbatim in the caller's annotation.
   // Treat that as an uninformative unification constraint so a later concrete
   // actual can refine the placeholder.
-  if (var.get() == value.get()) return;
+  if (var.get() == value.get()) {
+    constraints.push_back({var, value, value, context});
+    return;
+  }
 
   auto [it, inserted] = var_map.emplace(var.get(), value);
   if (inserted) return;
@@ -1703,23 +1706,54 @@ TypePtr SubstituteCallReturnType(const TypePtr& type, const TypeVarMap& var_map)
       type, memref, [&var_map](const ExprPtr& expr) { return transform_utils::Substitute(expr, var_map); });
 }
 
-}  // namespace
-
-std::vector<TypePtr> DeduceCallReturnType(const std::vector<VarPtr>& callee_params,
-                                          const std::vector<ExprPtr>& args,
-                                          const std::vector<TypePtr>& return_types) {
-  if (return_types.empty()) return return_types;
+void CollectCallTypeBindings(const std::vector<VarPtr>& callee_params, const std::vector<ExprPtr>& args,
+                             TypeVarMap& var_map, std::vector<CallTypeBindingConstraint>& constraints) {
   CHECK(callee_params.size() == args.size())
-      << "DeduceCallReturnType: callee_params size (" << callee_params.size() << ") must match args size ("
+      << "DeduceCallTypeBindings: callee_params size (" << callee_params.size() << ") must match args size ("
       << args.size() << ")";
 
-  TypeVarMap var_map;
-  std::vector<CallTypeBindingConstraint> constraints;
   for (size_t i = 0; i < callee_params.size(); ++i) {
     if (!callee_params[i] || !args[i]) continue;
     CollectCallTypeBindings(callee_params[i]->GetType(), args[i]->GetType(), "argument " + std::to_string(i),
                             var_map, constraints);
   }
+}
+
+}  // namespace
+
+std::unordered_map<const Var*, ExprPtr> DeduceCallTypeBindings(const std::vector<VarPtr>& callee_params,
+                                                               const std::vector<ExprPtr>& args) {
+  TypeVarMap var_map;
+  std::vector<CallTypeBindingConstraint> constraints;
+  CollectCallTypeBindings(callee_params, args, var_map, constraints);
+  // An identity observation denotes a dimension already owned by the caller.
+  // Keep it even when another argument has a padded physical extent.
+  for (const auto& constraint : constraints) {
+    if (constraint.var.get() == constraint.existing.get()) {
+      var_map[constraint.var.get()] = constraint.var;
+    }
+  }
+  // A callee-only symbol cannot describe two incompatible actual extents.
+  // Leave it unbound rather than silently sizing a cloned local from whichever
+  // argument happened to be visited first. Compare caller expressions verbatim.
+  for (const auto& constraint : constraints) {
+    auto it = var_map.find(constraint.var.get());
+    if (it == var_map.end() || it->second.get() == constraint.var.get()) continue;
+    if (!structural_equal(constraint.existing, constraint.candidate) &&
+        ProveValidExtentEqual(constraint.existing, constraint.candidate) != ProofResult::kTrue) {
+      var_map.erase(it);
+    }
+  }
+  return var_map;
+}
+
+std::vector<TypePtr> DeduceCallReturnType(const std::vector<VarPtr>& callee_params,
+                                          const std::vector<ExprPtr>& args,
+                                          const std::vector<TypePtr>& return_types) {
+  if (return_types.empty()) return return_types;
+  TypeVarMap var_map;
+  std::vector<CallTypeBindingConstraint> constraints;
+  CollectCallTypeBindings(callee_params, args, var_map, constraints);
   if (var_map.empty()) return return_types;
 
   // Validate repeated bindings only after all arguments have contributed.

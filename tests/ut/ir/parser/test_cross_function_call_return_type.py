@@ -572,9 +572,10 @@ def test_tensor_dim_is_not_folded_in_an_inline_callee():
     """An Inline callee's ``tensor.dim`` must stay a runtime read.
 
     Its placeholder is not the caller's: the same callee can be inlined into a
-    caller that passes a statically-shaped tensor, and ``InlineFunctions`` does
-    not rewrite the callee's dyn symbols. Only an Orchestration body -- where
-    codegen defines the symbol from the task-arg descriptor -- may fold.
+    caller that passes a statically-shaped tensor. Shape specialization happens
+    later in ``InlineFunctions``; parsing must preserve the runtime read. Only
+    an Orchestration body -- where codegen defines the symbol from the task-arg
+    descriptor -- may fold at this stage.
     """
     tokens = pl.dynamic("TOKENS_DYN")
 

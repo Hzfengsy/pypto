@@ -18,6 +18,7 @@ from _orchestration_codegen_common import _generate_orch_code, _out_of_scope_ten
 from pypto import backend, ir, passes
 from pypto.backend import BackendType
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
+from pypto.runtime import RunConfig
 
 
 def _compile(program, auto_deps):
@@ -251,6 +252,98 @@ def test_composite_positive_bound_survives_late_simplify(auto_deps):
     assert "if (" in code
     # The author guard suffices; no generated launch-count guard is needed.
     assert "_nonempty" not in ir.python_print(result)
+
+
+@pytest.mark.parametrize("conditional", [False, True])
+def test_nested_inline_conditional_output_keeps_dynamic_shape(conditional, tmp_path):
+    """Nested inline allocation and padding must retain the output's actual shape."""
+    n_dim = pl.dynamic("n_dim")
+
+    @pl.jit.inline
+    def pad(ids: pl.Tensor[[n_dim], pl.INT32], out: pl.Tensor[[n_dim, 16], pl.FP32]):
+        n = pl.tensor.dim(ids, 0)
+        with pl.spmd(n, name_hint="pad_output_init") as tid:
+            bi = pl.tile.get_block_idx()
+            if conditional:
+                if pl.read(ids, [bi]) < 0:
+                    out[bi : bi + 1, :] = pl.full([1, 16], dtype=pl.FP32, value=0.0)
+            else:
+                out[bi : bi + 1, :] = pl.full([1, 16], dtype=pl.FP32, value=0.0)
+        _fence = pl.system.task_dummy(deps=[tid])
+        return out
+
+    @pl.jit.inline
+    def allocate(ids: pl.Tensor[[n_dim], pl.INT32], positions: pl.Tensor[[n_dim], pl.INT32]):
+        rows = pl.tensor.dim(positions, 0)
+        out = pl.create_tensor([rows, 16], dtype=pl.FP32)
+        out = pad(ids, out)
+        return out
+
+    @pl.jit
+    def main(ids: pl.Tensor[[n_dim], pl.INT32], positions: pl.Tensor[[n_dim], pl.INT32]):
+        return allocate(ids, positions)
+
+    # Text roundtrip normalizes redundant pre-SSA aliases in the nested inline
+    # body. Keep every pass's property checks and lossless binary roundtrip.
+    def check_binary_roundtrip(_pass, intermediate):
+        ir.assert_structural_equal(
+            intermediate, ir.deserialize(ir.serialize(intermediate)), enable_auto_mapping=True
+        )
+
+    with passes.PassContext(
+        [
+            passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER),
+            passes.CallbackInstrument(after_pass=check_binary_roundtrip),
+        ]
+    ):
+        compiled = main.compile(
+            config=RunConfig(codegen_only=True, save_kernels=True, save_kernels_dir=str(tmp_path))
+        )
+    assert compiled is not None
+
+
+@pytest.mark.parametrize("auto_deps", [False, True])
+@pytest.mark.parametrize("scope_inside_loop", [False, True])
+@pytest.mark.parametrize("nested_scopes", [0, 1, 3])
+def test_guarded_tuple_launch_result_survives_auto_scope(auto_deps, scope_inside_loop, nested_scopes):
+    source = """
+@pl.program
+class Program:
+    @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
+    def main(
+        self,
+        ctrl: pl.Tensor[[1], pl.INT32],
+        a: pl.Tensor[[16, 16], pl.FP32],
+        out: pl.Tensor[[16, 16], pl.FP32],
+    ) -> pl.Tensor[[16, 16], pl.FP32]:
+        n = pl.tensor.read(ctrl, [0])
+        with pl.scope():
+            for layer in pl.range(2):
+                for bi in pl.spmd(n):
+                    a = pl.assemble(a, pl.add(a, 1.0), [0, 0])
+                    out = pl.assemble(out, pl.add(out, 2.0), [0, 0])
+        with pl.scope():
+            for bi in pl.spmd(1):
+                out = pl.assemble(out, pl.add(a, out), [0, 0])
+        return out
+"""
+    if scope_inside_loop:
+        source = source.replace(
+            "with pl.scope():\n            for layer in pl.range(2):",
+            "for layer in pl.range(2):\n            with pl.scope():",
+        )
+    for _ in range(nested_scopes):
+        lines: list[str] = source.splitlines()
+        start = next(
+            i
+            for i, line in enumerate(lines)
+            if line.startswith("        with pl.scope():") or line.startswith("        for layer")
+        )
+        end = next(i for i in range(start + 1, len(lines)) if lines[i].startswith("        with pl.scope():"))
+        lines[start:end] = ["        with pl.scope():"] + ["    " + line for line in lines[start:end]]
+        source = "\n".join(lines)
+    _, code = _compile(pl.parse_program(source), auto_deps)
+    assert not _out_of_scope_tensor_refs(code), code
 
 
 if __name__ == "__main__":

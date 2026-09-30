@@ -27,6 +27,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -1049,6 +1050,12 @@ inline std::vector<ExprPtr> AdjustFp4E2M1x2CastStrides(std::vector<ExprPtr> src_
   if (!IsFp4PackedCastGeometryChange(src, dst)) return src_strides;
   return RowMajorStridesFromShape(dst_shape, span);
 }
+
+/// Compiler-internal helper to infer callee type-variable bindings from actual
+/// argument shapes and view metadata. Does not enforce cross-argument equality:
+/// inline expansion preserves each actual argument's own type.
+std::unordered_map<const Var*, ExprPtr> DeduceCallTypeBindings(const std::vector<VarPtr>& callee_params,
+                                                               const std::vector<ExprPtr>& args);
 
 /**
  * @brief Deduce return types for a cross-function call by substituting dynamic

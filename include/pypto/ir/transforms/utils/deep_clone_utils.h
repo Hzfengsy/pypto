@@ -12,6 +12,8 @@
 #ifndef PYPTO_IR_TRANSFORMS_UTILS_DEEP_CLONE_UTILS_H_
 #define PYPTO_IR_TRANSFORMS_UTILS_DEEP_CLONE_UTILS_H_
 
+#include <functional>
+#include <string>
 #include <unordered_map>
 
 #include "pypto/ir/expr.h"
@@ -42,9 +44,12 @@ struct DeepCloneResult {
 ///               definition site. If false, keep original Var objects at def
 ///               sites — useful when the IR uses shared Var pointers for the
 ///               same source-level variable across multiple assignments.
+/// @param fresh_name Optional naming callback for cloned definition-site Vars.
+///               Seeded replacements and IterArg names are preserved.
 /// @return DeepCloneResult with cloned body and definition-site var mapping.
 DeepCloneResult DeepClone(const StmtPtr& body, const std::unordered_map<const Var*, ExprPtr>& var_map = {},
-                          bool clone_def_vars = true);
+                          bool clone_def_vars = true,
+                          const std::function<std::string(const std::string&)>& fresh_name = {});
 
 }  // namespace ir
 }  // namespace pypto

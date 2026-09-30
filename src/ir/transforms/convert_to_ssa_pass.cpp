@@ -71,25 +71,6 @@ static std::string BuildAutoNamedVersion(const std::string& name, const std::str
 // Var*, so no name-based canonicalization is needed.
 // ═══════════════════════════════════════════════════════════════════════════
 
-static TypePtr GetAuthoritativeAssignmentType(const TypePtr& lhs_type, const ExprPtr& value) {
-  auto value_type = value ? value->GetType() : nullptr;
-  const bool rhs_carries_authoritative_metadata = AsVarLike(value) ||
-                                                  std::dynamic_pointer_cast<const ShapedType>(value_type) ||
-                                                  As<TupleType>(value_type);
-  auto chosen = value_type && !As<UnknownType>(value_type) && rhs_carries_authoritative_metadata ? value_type
-                                                                                                 : lhs_type;
-  // The RHS wins on shape / dtype / view metadata, but it can never carry a
-  // MemRef: op type deduction does not produce one. So an LHS MemRef is strictly
-  // *additional* information, not a stale override, and dropping it would lose
-  // the two ways it legitimately reaches here — an author-declared allocation
-  // (`pl.Tile[..., pl.MemRef("ping"), ...]`, consumed by InitMemRef) and a re-parsed
-  // post-allocation dump (`pl.MemRef(mem_vec_3, 0, 16384)`). Merge it back on.
-  if (!GetTypeMemRef(chosen).has_value() && GetTypeMemRef(lhs_type).has_value()) {
-    chosen = CloneTypeWithMemRef(chosen, GetTypeMemRef(lhs_type));
-  }
-  return chosen;
-}
-
 class TypeCollector : public IRVisitor {
  public:
   std::unordered_map<const Var*, TypePtr> types;

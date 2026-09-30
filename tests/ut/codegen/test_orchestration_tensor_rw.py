@@ -287,7 +287,10 @@ class TestTensorReadWriteOffsetCodegen:
             re.MULTILINE,
         )
         identity_edges = list(identity_edge_re.finditer(code))
-        assert {match["lhs_base"] for match in identity_edges} == {"a", "b"}, code
+        # Immutable aliases may disappear entirely. Each output must still be
+        # accounted for by an identity edge or a direct external-tensor input.
+        direct_inouts = set(re.findall(r"params_t\d+\.add_inout\(ext_([ab])\);", code))
+        assert {match["lhs_base"] for match in identity_edges} | direct_inouts == {"a", "b"}, code
         cross_wires = [
             match.group(0).strip() for match in identity_edges if match["lhs_base"] != match["rhs_base"]
         ]

@@ -83,6 +83,44 @@ inline TypePtr CloneTypeWithMemRef(const TypePtr& type, const std::optional<MemR
   return type;
 }
 
+/// Keep newly inferred shape / dtype / view metadata, filling only missing storage metadata.
+/// Op type deduction may omit a declared MemRef or tile memory space. For a
+/// re-deduced assignment, carry them from the assigned Var's type: ConvertToSSA
+/// records allocation metadata there, not on the RHS Call.
+inline TypePtr WithCarriedMemRef(const TypePtr& deduced, const TypePtr& original) {
+  auto memref = GetTypeMemRef(deduced);
+  bool changed = false;
+  if (!memref && GetTypeMemRef(original)) {
+    memref = GetTypeMemRef(original);
+    changed = true;
+  }
+  std::optional<MemorySpace> memory_space;
+  auto tile = As<TileType>(deduced);
+  auto original_tile = As<TileType>(original);
+  if (tile && original_tile && !tile->memory_space_ && original_tile->memory_space_) {
+    memory_space = original_tile->memory_space_;
+    changed = true;
+  }
+  return changed ? CloneTypeWithMemRef(deduced, memref, memory_space) : deduced;
+}
+
+/// Select assignment metadata consistently in inlining and SSA conversion.
+inline TypePtr GetAuthoritativeAssignmentType(const TypePtr& lhs_type, const ExprPtr& value) {
+  auto value_type = value ? value->GetType() : nullptr;
+  const bool rhs_carries_authoritative_metadata = AsVarLike(value) ||
+                                                  std::dynamic_pointer_cast<const ShapedType>(value_type) ||
+                                                  As<TupleType>(value_type);
+  auto chosen = value_type && !As<UnknownType>(value_type) && rhs_carries_authoritative_metadata ? value_type
+                                                                                                 : lhs_type;
+  // The RHS wins on shape / dtype / view metadata. Op type deduction does not
+  // produce a MemRef, so an LHS MemRef supplies additional allocation metadata
+  // (an author-declared allocation or a re-parsed post-allocation dump).
+  if (!GetTypeMemRef(chosen).has_value() && GetTypeMemRef(lhs_type).has_value()) {
+    chosen = CloneTypeWithMemRef(chosen, GetTypeMemRef(lhs_type));
+  }
+  return chosen;
+}
+
 template <typename RemapExprFn>
 inline std::vector<ExprPtr> RemapTypeExprVector(const std::vector<ExprPtr>& exprs,
                                                 const RemapExprFn& remap_expr, bool& changed) {
